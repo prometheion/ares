@@ -1103,12 +1103,12 @@ sequence it has seen). Client `/var/tmp/ares-tools/prod-ab/parallel.py`, session
 alternated, two rounds each, machine load 2 to 5 unless named.
 | | fork | Ares |
 | --- | --- | --- |
-| One request alone, de / en / code, tokens/s | 58-65 / 60-64 / 73-76 | 72-73 / 63-75 / 91-98 |
-| Two at once, sum while both run, de / en / code | 98 / 104-108 / 127-129 | 105-111 / 93-111 / 106-134 |
-| Two at once, the two requests | even (48 + 50) | uneven (40 + 71, 42 + 92) |
+| One request alone, de / en / code, tokens/s | 58-65 / 60-64 / 73-76 | 72-74 / 63-75 / 91-103 |
+| Two at once, sum while both run, de / en / code | 98 / 104-108 / 116-129 | 105-111 / 93-116 / 106-134 |
+| Two at once, the two requests (quiet round) | even (49 + 50, 52 + 55, 57 + 59) | uneven (49 + 67, 52 + 68, 85 + 58) |
 | 3 / 4 / 8 requests at once, sum tokens/s (`--parallel 2`) | 86-87 / 100-109 / 95-97 | 115 / 107 / 110 |
-| the same with `--parallel 4` / `8` (Ares) | | 120-149-150 / 115-154-206 |
-| 8 at once, slowest first token | 19.3 s | 17.6 s (p2), 11.1 s (p4), 0.48 s (p8) |
+| the same with `--parallel 4` / `8` (Ares) | | 117-120 / 139-149 / 143-150; 115-124 / 142-154 / 204-206 |
+| 8 at once, slowest first token | 19.3 s | 17.6 s (p2), 11.0 s (p4), 0.51 s (p8) |
 | 8k prompt beside a generating request: first token (alone) | 15.2-15.5 s (9.1-9.3) | 20.4 s (7.9) |
 | the generating request's rate meanwhile (alone) | 21-23 tokens/s (60-65) | 34-35 (67-72) |
 | 32k prompt beside it: first token (alone) | 59.8-59.9 s (34.1) | 124.1-124.4 s (49.0-49.1) |
@@ -1118,8 +1118,8 @@ alternated, two rounds each, machine load 2 to 5 unless named.
 | a turn with a 5.8k tool result at 17k depth, alone / both agents at once | 6.6-7.6 s / 9-17 s | 10.0-10.2 s / 12.1 and 26-29 s |
 | small cached turns | 0.23-1.1 s | 0.15-0.25 s |
 | session walls, cold pair / warm pair | 70 + 80 s / 38-40 s | 69-71 s / 31-37 s |
-| A short request beside two generations (both places busy) | 24.5-25.8 s | priority 0: 0.15 s, same priority: 18-21 s |
-| the same beside a generation and a 32k prompt | 54.9-56.9 s | priority 0: 0.28-0.41 s, same priority: 39-54 s |
+| A short request beside two generations (both places busy) | 24.5-25.8 s | priority 0: 0.15-0.22 s (the generation that gives way: a gap of 0.55-0.71 s, ends 1 s later), same priority: 18-21 s |
+| the same beside a generation and a 32k prompt | 54.9-57.9 s | priority 0: 0.28-0.41 s, same priority: 38-54 s |
 | VRAM peak (p2; p8) | 11.5 / 11.6 GiB | 11.2 / 9.9 GiB; 11.3 / 11.2 GiB |
 What Ares does better: three or more requests (a place each, at the same context), priorities, the
 system prompt two agents send at once (the second waits for the first's announced pages and shares
@@ -1138,9 +1138,19 @@ them), cached turns, one request alone. What it does worse, and why:
 - [ ] A turn that continues at 17-23k reads 576 tokens/s (fork 880; Ares 1020 from the start of a
       prompt): the attention at depth (the long-context piece).
 - [ ] Two generating sequences share a step's draft rows by their chance (`window::choose`) up to
-      the 8-row edge of the price table (8 rows 31.0 ms, 9 rows 37.1, 16 rows 47.8): the sum is as
-      good as the fork's or better, but one request gets 1.5 tokens a step and the other 2.1 to 3.3.
-      A cheaper 9-to-16-row step, or a fairness term.
+      the 8-row edge of the price table (8 rows 31.0 ms, 9 rows 37.1, 16 rows 47.8): the step stays
+      at 32-35 ms (alone 32), one request gets 1.6 tokens a step and the other 2.2 to 3.5. The fork's
+      step grows from 33.6 to 40-44 ms and keeps each slot's drafts (2.0-2.7 tokens a step each).
+      Ares' slower request is as fast as the fork's slower one and the other is faster (quiet machine:
+      49 + 67, 52 + 68, 85 + 58 against 49 + 50, 52 + 55, 57 + 59 tokens/s), so this is not behind;
+      a cheaper 9-to-16-row step would lift the slower one.
+- Fourteen busy loops beside the server (a machine busy with builds): Ares loses 6 to 12 % alone and
+  for two at once, the fork 12 to 24 % (its step grows from 33.6 to 40 ms: its samplers and host
+  work). One Ares round during heavy builds (load 13 to 28) lost more (4 at once 83 against 108
+  tokens/s); not repeated.
+- Seen of the fork: a short request sent 0.5 s before a 32k prompt had its first token after 34 s
+  (three of four runs): its prompt went into the same batches as the long one, since concurrent
+  prefill starts only once a slot generates. Ares in the same spot: 0.15-0.75 s.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
