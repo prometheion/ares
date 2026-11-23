@@ -238,8 +238,14 @@ OPTIONS:
                                prompt, as a client sends it back in
                                reasoning_content: it must for a conversation to
                                continue from what was computed [default: on]
-    A budget for the thinking tokens is not built: the engine cannot put the
-    tokens that end the thinking into a sequence.
+        --reasoning-budget-tokens <N>
+                               The most tokens the thinking of a reply may take:
+                               then the budget's message and the end of the
+                               thinking are written, and the answer follows
+                               [default: none, no budget]
+        --reasoning-budget-message <TEXT>
+                               What is written before the end of the thinking
+                               when its budget is spent [default: none]
 
     What a request gets for a field it leaves out. An option has the name of
     the field with dashes (--top-p for top_p), and a request's own value always
@@ -1180,6 +1186,17 @@ mod tests {
         match with(args, variables) {
             Ok(Command::Run(options)) => *options,
             other => panic!("{args:?} {variables:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_help_names_every_option() {
+        for flag in every_option() {
+            let named = USAGE.match_indices(flag).any(|(at, _)| {
+                let after = USAGE[at + flag.len()..].chars().next();
+                !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+            assert!(named, "--help does not name {flag}");
         }
     }
 
