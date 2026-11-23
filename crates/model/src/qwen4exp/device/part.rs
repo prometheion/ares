@@ -65,7 +65,7 @@ mod predict;
 mod resume;
 mod wide;
 
-pub use pass::{MicroPlan, PassAt, PassLayout, PassSizes, chunk_rows, chunks_of, micro_batches};
+pub use pass::{MicroPlan, PassAt, PassLayout, PassSizes, chunk_rows, chunks_of, micro_batches_at};
 
 use super::board::Board;
 use super::load::{
@@ -569,6 +569,10 @@ struct Inbox {
 #[derive(Clone, Debug)]
 pub(crate) struct Frame {
     slot_bytes: u64,
+    /// Per layer of the part, the bytes of a slot that hold its state (its recurrent state,
+    /// its indexer's carried keys, the n-gram history at its layer): what a save inside a
+    /// pass copies of the layer as the pass goes past the position.
+    layer_slot: Vec<Range<u64>>,
     /// The exact slots of the K/V group, and the bytes it takes besides the
     /// pages on the device and in page-locked host memory.
     exact_slots: u32,
@@ -784,10 +788,12 @@ impl Frame {
             raw_bytes = (raw_bytes + window * bytes).next_multiple_of(64);
             at
         };
+        let mut layer_slot = Vec::with_capacity(shape.shares.len());
         for (i, share) in shape.shares.iter().enumerate() {
             let layer = shape.first + i;
             let heads = u64::from(share.heads.end.saturating_sub(share.heads.start));
             let (mut r_at, mut a_at) = (None, None);
+            let slot_start = slot.bytes();
             if heads == 0 {
                 // The layer's heads are all on the peer.
             } else if c.is_attention(layer) {
@@ -820,6 +826,7 @@ impl Frame {
             }
             recurrent.push(r_at);
             attention.push(a_at);
+            layer_slot.push(slot_start..slot.bytes());
         }
 
         // The scratch of a step.
@@ -1023,6 +1030,7 @@ impl Frame {
             kv::group_bytes(&geos, exact_slots, u64::from(opts.table_entries()));
         Ok(Self {
             slot_bytes: slot.bytes().max(64),
+            layer_slot,
             exact_slots,
             exact_device,
             exact_host,

@@ -2165,14 +2165,17 @@ impl Conductor {
                 // A model that saves the state inside a step wider than its own rows (a
                 // prompt read layer by layer) takes the checkpoints due inside its rows there,
                 // and the step goes on.
-                let inside = !step.replay
-                    && step.rows > self.model.own_rows()
-                    && self.model.saves_inside_steps();
+                let margin = self.model.saves_inside_steps();
+                let inside = !step.replay && margin > 0 && step.rows > self.model.own_rows();
+                let named = self.inner_due.len();
                 if let Some(cache) = &self.cache {
                     let (mut last, mut from) = (a.checkpoint_at, step.from);
                     while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
                     {
-                        if inside && at < to {
+                        if inside
+                            && at >= step.from + u64::from(margin)
+                            && at + u64::from(margin) <= to
+                        {
                             self.inner_due.push((step.slot, at));
                             (last, from) = (at, at);
                             continue;
@@ -2180,6 +2183,17 @@ impl Conductor {
                         step.rows = step.rows.min((at - step.from) as u32);
                         break;
                     }
+                }
+                // A cut after them may have left the saves inside the step too close to its
+                // end, or the step no wider than the model's own rows (no pass, which saves
+                // nothing inside): it then ends at the first of them instead.
+                let end = step.from + u64::from(step.rows);
+                if let Some(&(_, at)) = self.inner_due.get(named)
+                    && (step.rows <= self.model.own_rows()
+                        || self.inner_due[named..].iter().any(|s| s.1 + u64::from(margin) > end))
+                {
+                    step.rows = (at - step.from) as u32;
+                    self.inner_due.truncate(named);
                 }
                 // The image rows the step stages, of the stage's room.
                 if !a.spans.is_empty() {

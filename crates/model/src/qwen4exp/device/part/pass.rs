@@ -85,6 +85,22 @@ pub fn micro_batches(rows: u32, own: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// [`micro_batches`] of a pass whose rows are cut at `cuts` (rows from its first, ascending,
+/// each at least [`MIN_MICRO`] rows from the next and from the ends): no micro-batch crosses a
+/// cut, so the pass is at a cut in every layer between two of its micro-batches.
+pub fn micro_batches_at(rows: u32, own: u32, cuts: &[u32]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for &cut in cuts.iter().chain(std::iter::once(&rows)) {
+        if cut <= start || cut > rows {
+            continue;
+        }
+        out.extend(micro_batches(cut - start, own).into_iter().map(|(f, n)| (f + start, n)));
+        start = cut;
+    }
+    out
+}
+
 /// The chunks of a pass: consecutive micro-batches of at most `cap` rows together, at least
 /// one each; the range of the micro-batches of each.
 pub fn chunks_of(micro: &[(u32, u32)], cap: u32) -> Vec<Range<usize>> {
@@ -447,6 +463,12 @@ impl Part {
         {
             *at = no;
         }
+    }
+
+    /// The bytes of a sequence slot that hold the state of layer `i` of the part, which a
+    /// save inside a pass copies as the pass goes past its position.
+    pub fn layer_slot(&self, i: usize) -> Range<u64> {
+        self.f.layer_slot.get(i).cloned().unwrap_or(0..0)
     }
 
     /// Whether a pass runs on the part (it is open and not paused).

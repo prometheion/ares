@@ -147,6 +147,23 @@ impl NgramFeed {
         Ok(out)
     }
 
+    /// What [`NgramFeed::save`] gives of a sequence at cell `position` whose last tokens
+    /// before it are `before` (at least as many as the hash reads, or all of the sequence's).
+    pub(super) fn saved_at(&self, position: u32, before: &[u32]) -> Vec<u8> {
+        let keep = self.ngram.as_ref().map_or(0, |g| g.ngram_size.saturating_sub(1));
+        let recent = &before[before.len().saturating_sub(keep)..];
+        let mut out = vec![0u8; self.saved_bytes() as usize];
+        if out.is_empty() {
+            return out;
+        }
+        out[..4].copy_from_slice(&position.to_le_bytes());
+        out[4..8].copy_from_slice(&(recent.len() as u32).to_le_bytes());
+        for (word, token) in out[8..].as_chunks_mut::<4>().0.iter_mut().zip(recent) {
+            word.copy_from_slice(&token.to_le_bytes());
+        }
+        out
+    }
+
     /// The sequence in `slot` goes on from what [`NgramFeed::save`] gave of
     /// another (a checkpoint the slot was restored from): its rows start
     /// where that sequence was, after the same tokens.

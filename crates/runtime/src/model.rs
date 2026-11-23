@@ -567,12 +567,13 @@ pub trait Model: Send + Sync + 'static {
 
     /// Whether the model saves a sequence's state at positions inside a step of
     /// one prompt wider than [`Model::own_rows`] (a prompt read layer by layer
-    /// saves each layer's state as it goes past the position): the conductor
-    /// then does not end such a step where a checkpoint of the prefix cache is
-    /// due, and names the checkpoint in the record
+    /// saves each layer's state as it goes past the position), as the fewest
+    /// rows such a position lies from either end of the step; 0 for none. The
+    /// conductor does not end such a step where a checkpoint of the prefix
+    /// cache is due that far inside it, and names the checkpoint in the record
     /// ([`RecordWriter::inner_saves`](crate::RecordWriter::inner_saves)).
-    fn saves_inside_steps(&self) -> bool {
-        false
+    fn saves_inside_steps(&self) -> u32 {
+        0
     }
 
     /// Whether a step of the model can wait for what it fetches while it

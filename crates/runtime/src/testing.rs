@@ -488,6 +488,25 @@ impl Executor for HostExecutor {
             }
         }
         let paused_slot = self.pauses.as_ref().and_then(|p| p.at).map(|((slot, ..), _)| slot);
+        // A save inside a step is one the model can make: in a step of one prompt wider than
+        // its own rows (a pass), with as many rows as it asks for on either side.
+        let margin = self.model.saves_inside_steps();
+        for i in 0..view.inner_saves() {
+            let save = view.inner_save(i);
+            let inside = (0..view.segments()).map(|s| view.segment(s)).any(|s| {
+                let (from, end) = (s.pos0 as u32, s.pos0 as u32 + s.n_rows);
+                s.slot == save.slot
+                    && s.n_rows > self.model.own_rows()
+                    && save.position >= from + margin
+                    && save.position + margin <= end
+            });
+            if !inside {
+                note(
+                    &self.problems,
+                    format!("a save inside a step at {} that no pass makes", save.position),
+                );
+            }
+        }
         let mut tables = self.tables.lock().expect("tables");
         // The page-table updates, as the device copies them.
         let mut taken = 0;

@@ -26,21 +26,35 @@ use ares_runtime::{Logits, ModelError, StepContext};
 
 use super::super::misses::{Misses, Progress, SpanPicks};
 use super::super::part::{
-    MicroPlan, Part, PassAt, PassLayout, PassSizes, StepEnv, chunk_rows, chunks_of, micro_batches,
+    MicroPlan, Part, PassAt, PassLayout, PassSizes, StepEnv, chunk_rows, chunks_of,
+    micro_batches_at,
 };
 use super::{Feed, Flow, Qwen4ExpDevice, Routing, invalid, model_error};
 
-/// The prompt rows a pass reads: its sequence's slot, its first position and its rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The prompt rows a pass reads: its sequence's slot, its first position and its rows, and
+/// the rows (from its first) at which it saves the state for checkpoints inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PassKey {
     pub slot: u32,
     pub pos0: i32,
     pub rows: u32,
+    pub cuts: Vec<u32>,
+}
+
+impl PassKey {
+    /// Whether `other` reads the same rows: a record that goes on with a paused pass names
+    /// no checkpoint inside it any more (the pass keeps those of its first record).
+    pub(super) fn same(&self, other: &PassKey) -> bool {
+        (self.slot, self.pos0, self.rows) == (other.slot, other.pos0, other.rows)
+    }
 }
 
 /// The loan of a pass on every device.
 pub(super) struct PassLoan {
     key: PassKey,
+    /// A number that is new for every pass that takes a loan: two passes of the same rows
+    /// one after the other are two passes.
+    generation: u64,
     /// Per device: the bytes of each piece lent (in the order of the store's pieces), and
     /// where the pass keeps its rows.
     held: Vec<Vec<u64>>,
@@ -54,8 +68,8 @@ pub(super) const PARCELS: usize = 2;
 
 /// The rows of a pass of `rows` rows on parts whose own scratch holds `own` rows: its
 /// micro-batches and the rows of each of its chunks.
-fn shape_of(rows: u32, own: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
-    let micro = micro_batches(rows, own);
+fn shape_of(rows: u32, own: u32, cuts: &[u32]) -> (Vec<(u32, u32)>, Vec<u32>) {
+    let micro = micro_batches_at(rows, own, cuts);
     let chunks = chunks_of(&micro, chunk_rows(own))
         .into_iter()
         .map(|range| micro[range].iter().map(|(_, n)| n).sum())
@@ -67,7 +81,7 @@ fn shape_of(rows: u32, own: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
 /// what each device can lend (`lendable`, per device the bytes of each piece), for parts that
 /// keep `sizes`.
 pub(super) fn pass_fits(sizes: &[PassSizes], lendable: &[Vec<u64>], own: u32, rows: u32) -> bool {
-    let (_, chunks) = shape_of(rows, own);
+    let (_, chunks) = shape_of(rows, own, &[]);
     sizes.iter().zip(lendable).all(|(s, l)| PassLayout::new(s, &chunks, l).is_some())
 }
 
@@ -101,11 +115,11 @@ impl Flow {
     pub(super) fn lend_pass(
         &self,
         feed: &mut Feed,
-        pass: Option<PassKey>,
+        pass: Option<&PassKey>,
     ) -> Result<(), ModelError> {
         let mut current = self.pass.lock().unwrap_or_else(|e| e.into_inner());
         if let (Some(loan), Some(key)) = (current.as_ref(), pass)
-            && loan.key == key
+            && loan.key.same(key)
             && !loan.done
         {
             return Ok(());
@@ -114,9 +128,10 @@ impl Flow {
             && loan.done
             && let Some(at) = self.place_pass(feed, key, &loan.held, false)?
         {
-            loan.key = key;
+            loan.key = key.clone();
             loan.at = at;
             loan.done = false;
+            loan.generation = self.pass_count.fetch_add(1, Ordering::AcqRel) + 1;
             self.pass_sent.store(0, Ordering::Release);
             self.pass_released.store(0, Ordering::Release);
             self.pass_go.store(0, Ordering::Release);
@@ -139,13 +154,14 @@ impl Flow {
         })?;
         let held = (0..self.pass_sizes.len())
             .map(|d| {
-                let (_, chunks) = shape_of(key.rows, self.own_rows);
+                let (_, chunks) = shape_of(key.rows, self.own_rows, &key.cuts);
                 PassLayout::new(&self.pass_sizes[d], &chunks, &lendable[d])
                     .map(|layout| layout.held)
                     .unwrap_or_default()
             })
             .collect();
-        *current = Some(PassLoan { key, held, at, done: false });
+        let generation = self.pass_count.fetch_add(1, Ordering::AcqRel) + 1;
+        *current = Some(PassLoan { key: key.clone(), generation, held, at, done: false });
         Ok(())
     }
 
@@ -155,11 +171,11 @@ impl Flow {
     fn place_pass(
         &self,
         feed: &mut Feed,
-        key: PassKey,
+        key: &PassKey,
         pieces: &[Vec<u64>],
         lend: bool,
     ) -> Result<Option<Vec<PassAt>>, ModelError> {
-        let (_, chunks) = shape_of(key.rows, self.own_rows);
+        let (_, chunks) = shape_of(key.rows, self.own_rows, &key.cuts);
         let mut layouts = Vec::with_capacity(self.pass_sizes.len());
         for (sizes, pieces) in self.pass_sizes.iter().zip(pieces) {
             match PassLayout::new(sizes, &chunks, pieces) {
@@ -210,11 +226,11 @@ impl Flow {
     }
 
     /// Where part `index` keeps the rows of the pass of the step being begun.
-    fn pass_at(&self, index: usize, key: PassKey) -> Result<PassAt, ModelError> {
+    fn pass_at(&self, index: usize, key: &PassKey) -> Result<PassAt, ModelError> {
         let current = self.pass.lock().unwrap_or_else(|e| e.into_inner());
         let loan = current
             .as_ref()
-            .filter(|l| l.key == key)
+            .filter(|l| l.key.same(key))
             .ok_or_else(|| invalid("no loan for the pass"))?;
         loan.at
             .get(index)
@@ -243,22 +259,27 @@ impl Flow {
     }
 
     /// Whether the pass `key` holds its loan and has not read all its rows.
-    pub(super) fn pass_live(&self, key: PassKey) -> bool {
+    pub(super) fn pass_live(&self, key: &PassKey, generation: u64) -> bool {
         self.pass
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|loan| loan.key == key && !loan.done)
+            .is_some_and(|loan| loan.key.same(key) && loan.generation == generation && !loan.done)
     }
 
-    /// Both devices on every layer: the picks of the pass `key` that the mixer's thread made
-    /// room for, once it has.
-    fn await_picks(&self, key: PassKey) -> Result<Arc<SpanPicks>, ModelError> {
+    /// The number of the pass that holds the loan now (0: none).
+    pub(super) fn pass_generation(&self) -> u64 {
+        self.pass.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |l| l.generation)
+    }
+
+    /// Both devices on every layer: the picks of the pass numbered `generation` that the
+    /// mixer's thread made room for, once it has.
+    fn await_picks(&self, generation: u64) -> Result<Arc<SpanPicks>, ModelError> {
         let started = Instant::now();
         loop {
             if let Some((at, picks)) =
                 self.pass_picks.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-                && *at == key
+                && *at == generation
             {
                 return Ok(picks.clone());
             }
@@ -342,6 +363,10 @@ struct Micro {
 /// A pass on one device part: its micro-batches and where it is.
 pub(super) struct PassRun {
     key: PassKey,
+    /// The loan's number of the pass ([`Flow::pass_generation`]).
+    generation: u64,
+    /// The checkpoints inside the pass: the row of the step each is at, and its place.
+    saves: Vec<(u32, u32)>,
     micro: Vec<Micro>,
     /// The step of all the rows, for the rounds of the experts, with its segments and tokens.
     span: StepRecord,
@@ -365,8 +390,8 @@ pub(super) struct PassRun {
 
 impl PassRun {
     /// The pass reads the rows of `key`.
-    pub(super) fn is(&self, key: PassKey) -> bool {
-        self.key == key
+    pub(super) fn is(&self, key: &PassKey) -> bool {
+        self.key.same(key)
     }
 }
 
@@ -393,7 +418,18 @@ impl Qwen4ExpDevice {
                 self.flow.pass_rows
             )));
         }
-        Ok(Some(PassKey { slot: segment.slot, pos0: segment.pos0, rows }))
+        // The checkpoints the conductor names inside the rows: the pass cuts its
+        // micro-batches there and saves each layer's state as it goes past.
+        let mut cuts: Vec<u32> = (0..record.inner_saves())
+            .map(|i| record.inner_save(i))
+            .filter(|s| s.slot == segment.slot)
+            .map(|s| s.position.saturating_sub(segment.pos0 as u32))
+            .collect();
+        cuts.sort_unstable();
+        if cuts.iter().any(|c| *c < 16 || *c + 16 > rows) {
+            return Err(invalid(format!("checkpoints at rows {cuts:?} of a pass of {rows}")));
+        }
+        Ok(Some(PassKey { slot: segment.slot, pos0: segment.pos0, rows, cuts }))
     }
 
     /// Pauses the pass `run` (between two micro-batches, or before this part's first when the
@@ -409,7 +445,7 @@ impl Qwen4ExpDevice {
     /// Drops what this part keeps of a pass that has ended or was given up meanwhile.
     pub(super) fn forget_ended_pass(&mut self) {
         if let Some(run) = &self.pass_run
-            && !self.flow.pass_live(run.key)
+            && !self.flow.pass_live(&run.key, run.generation)
         {
             self.pass_run = None;
             self.part.pass_close();
@@ -417,7 +453,7 @@ impl Qwen4ExpDevice {
     }
 
     /// Whether the step goes on with the pass this part paused (the same rows).
-    pub(super) fn resumes(&self, key: Option<PassKey>) -> bool {
+    pub(super) fn resumes(&self, key: Option<&PassKey>) -> bool {
         matches!((&self.pass_run, key), (Some(run), Some(key)) if run.is(key))
     }
 
@@ -444,7 +480,7 @@ impl Qwen4ExpDevice {
         let asked = step.record.asked();
         let budget = step.record.pause_after();
         let stream = step.stream;
-        let mut run = match self.pass_run.take().filter(|run| run.is(key)) {
+        let mut run = match self.pass_run.take().filter(|run| run.is(&key)) {
             // A part before the last that has handed its rows over waits for the others.
             Some(run) if run.done => {
                 self.pass_run = Some(run);
@@ -455,8 +491,8 @@ impl Qwen4ExpDevice {
                 run
             }
             None => {
-                let at = self.flow.pass_at(self.index, key)?;
-                self.open_pass(step, key, at)?
+                let at = self.flow.pass_at(self.index, &key)?;
+                self.open_pass(step, key.clone(), at)?
             }
         };
         // By layers: the residual of every micro-batch comes from the device before, once it
@@ -536,6 +572,11 @@ impl Qwen4ExpDevice {
                     replay: &micro.replay,
                 };
                 self.part.pass_layer(&env, i, m, &mut micro.plan)?;
+                // A checkpoint where this micro-batch ends: the layer's state there.
+                let end = micro.first + micro.rows;
+                if let Some(&(_, place)) = run.saves.iter().find(|(row, _)| *row == end) {
+                    self.resume.save_layer(stream, &self.part, i, key.slot, place)?;
+                }
                 self.flow.pump()?;
                 run.next += 1;
                 ran += 1;
@@ -617,6 +658,11 @@ impl Qwen4ExpDevice {
                     // has to have taken them.
                     stream.synchronize()?;
                     block.follow(stream, &direct, self.part.pass_residual(m - 1)?)?;
+                    // A checkpoint where the micro-batch before ends: the block's state there.
+                    if let Some(&(_, place)) = run.saves.iter().find(|(row, _)| *row == micro.first)
+                    {
+                        self.resume.save_block(stream, key.slot, place)?;
+                    }
                 }
                 block.step(stream, &micro.segments, &micro.tokens, &micro.replay, None, false)?;
             }
@@ -660,7 +706,7 @@ impl Qwen4ExpDevice {
         at: PassAt,
     ) -> Result<PassRun, ModelError> {
         let stream = step.stream;
-        let micro = micro_batches(key.rows, self.flow.own_rows);
+        let micro = micro_batches_at(key.rows, self.flow.own_rows, &key.cuts);
         self.part.pass_open(stream, &self.segments, &self.replay, step.pages, at, &micro)?;
         let replay = !self.replay.is_empty();
         let segment = self.segments[0];
@@ -708,7 +754,7 @@ impl Qwen4ExpDevice {
         let picks = match self.routing.mixer {
             // A worker reads the picks the mixer's router made, which the mixer's thread
             // makes room for when it opens the pass.
-            Some(_) => self.flow.await_picks(key)?,
+            Some(_) => self.flow.await_picks(self.flow.pass_generation())?,
             None => {
                 let picks = match self.picks.take() {
                     Some(picks) if picks.holds(key.rows, top_k) => picks,
@@ -719,7 +765,7 @@ impl Qwen4ExpDevice {
                 self.picks = Some(picks.clone());
                 picks.reset();
                 *self.flow.pass_picks.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((key, picks.clone()));
+                    Some((self.flow.pass_generation(), picks.clone()));
                 picks
             }
         };
@@ -729,8 +775,24 @@ impl Qwen4ExpDevice {
             Some(_) => Some(self.flow.await_rows()?),
             None => None,
         };
+        // The checkpoints inside the pass: the row each is at and its place. What the n-gram
+        // feed keeps of the sequence there goes into the place now.
+        let saves: Vec<(u32, u32)> = (0..step.record.inner_saves())
+            .map(|i| step.record.inner_save(i))
+            .filter(|s| s.slot == key.slot)
+            .map(|s| (s.position - key.pos0 as u32, s.place))
+            .collect();
+        if self.drives_ngram {
+            for &(row, place) in &saves {
+                let position = key.pos0 as u32 + row;
+                let bytes = self.flow.lock_ngram().saved_at(position, &self.tokens[..row as usize]);
+                self.resume.save_host(place, &bytes)?;
+            }
+        }
         Ok(PassRun {
             key,
+            generation: self.flow.pass_generation(),
+            saves,
             micro: steps,
             span,
             segments: self.segments.clone(),

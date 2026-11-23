@@ -326,6 +326,67 @@ impl Places {
         Ok(())
     }
 
+    /// Copies the bytes `range` of extent `extent` of `slot` into `place` (where the extent's
+    /// bytes lie in a place), and with `host` the host's bytes of the sequence: a save made
+    /// in parts (a prompt read layer by layer saves each layer's state as it goes past the
+    /// position). Queued on `stream`, as [`Places::save`].
+    pub(crate) fn save_part(
+        &mut self,
+        stream: &Stream,
+        checkpoint: &Checkpoint,
+        slot: u32,
+        place: u32,
+        extent: usize,
+        range: std::ops::Range<u64>,
+    ) -> Result<(), ModelError> {
+        let e = checkpoint
+            .extents
+            .get(extent)
+            .ok_or_else(|| invalid(format!("a checkpoint has no extent {extent}")))?;
+        if self.bytes == 0 || range.is_empty() {
+            return Ok(());
+        }
+        if range.end > e.bytes {
+            return Err(invalid(format!("bytes {range:?} of an extent of {}", e.bytes)));
+        }
+        let offset: u64 = checkpoint.extents[..extent].iter().map(|e| e.bytes).sum();
+        let at = self.pointer(place)?;
+        // SAFETY: as in `save`; the range lies in the extent and in the place.
+        unsafe {
+            stream.copy_to_host(
+                at.add((offset + range.start) as usize),
+                e.base.offset(u64::from(slot) * e.stride + range.start),
+                (range.end - range.start) as usize,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Writes the host's bytes of a sequence into `place` (the rest of a save made in parts).
+    pub(crate) fn save_host(
+        &mut self,
+        checkpoint: &Checkpoint,
+        place: u32,
+        host: &[u8],
+    ) -> Result<(), ModelError> {
+        if self.bytes == 0 || checkpoint.host == 0 {
+            return Ok(());
+        }
+        if host.len() as u64 != checkpoint.host {
+            return Err(invalid(format!(
+                "{} bytes of a sequence on the host; a checkpoint keeps {}",
+                host.len(),
+                checkpoint.host
+            )));
+        }
+        let at = self.pointer(place)?;
+        // SAFETY: the place holds the host's bytes behind the extents; no copy writes them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(host.as_ptr(), at.add(checkpoint.host_at()), host.len())
+        };
+        Ok(())
+    }
+
     /// Copies `place` into the slot: the opposite of [`Places::save`]. The
     /// host's bytes of the sequence come back in `host`, at once.
     pub(crate) fn restore(

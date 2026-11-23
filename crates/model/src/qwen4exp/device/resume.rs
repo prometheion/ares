@@ -71,6 +71,39 @@ impl Resume {
         self.checkpoint.bytes()
     }
 
+    /// A save inside a pass: copies the state of layer `i` of `part` in `slot` into `place`,
+    /// as the pass goes past the save's position in that layer.
+    pub(super) fn save_layer(
+        &mut self,
+        stream: &Stream,
+        part: &Part,
+        i: usize,
+        slot: u32,
+        place: u32,
+    ) -> Result<(), ModelError> {
+        self.places.save_part(stream, &self.checkpoint, slot, place, 0, part.layer_slot(i))
+    }
+
+    /// A save inside a pass: copies the MTP block's state of `slot` into `place` (its
+    /// extents follow the part's), once the block has followed the rows up to the position.
+    pub(super) fn save_block(
+        &mut self,
+        stream: &Stream,
+        slot: u32,
+        place: u32,
+    ) -> Result<(), ModelError> {
+        for (k, e) in self.checkpoint.extents.clone().iter().enumerate().skip(1) {
+            self.places.save_part(stream, &self.checkpoint, slot, place, k, 0..e.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// A save inside a pass: what the host keeps of the sequence at the position (the n-gram
+    /// feed's), into `place`.
+    pub(super) fn save_host(&mut self, place: u32, host: &[u8]) -> Result<(), ModelError> {
+        self.places.save_host(&self.checkpoint, place, host)
+    }
+
     /// Enqueues the copies of `record` (after the commit of the step before
     /// and the block's following of it): saves, page copies, restores.
     #[allow(clippy::too_many_arguments)]

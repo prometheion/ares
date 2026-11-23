@@ -324,7 +324,9 @@ pub(super) struct Flow {
     /// Both devices on every layer: the pieces of the pass the mixer has let run, and the
     /// picks its router made, which the worker takes.
     pass_go: AtomicU64,
-    pass_picks: Mutex<Option<(PassKey, Arc<SpanPicks>)>>,
+    pass_picks: Mutex<Option<(u64, Arc<SpanPicks>)>>,
+    /// The passes that took a loan so far: each is numbered by it.
+    pass_count: AtomicU64,
 }
 
 impl Flow {
@@ -406,7 +408,7 @@ impl Flow {
         windows: Option<StepWindows<'_>>,
         index: usize,
         stream: &Stream,
-        pass: Option<PassKey>,
+        pass: Option<&PassKey>,
     ) -> Result<(), ModelError> {
         let mut feed = self.lock_feed();
         if self.begun.load(Ordering::Acquire) != step {
@@ -1721,6 +1723,7 @@ impl Qwen4Exp {
                     pass_released: AtomicUsize::new(0),
                     pass_go: AtomicU64::new(0),
                     pass_picks: Mutex::new(None),
+                    pass_count: AtomicU64::new(0),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
                         ..Default::default()
@@ -1996,6 +1999,15 @@ impl Model for Qwen4Exp {
                 lane_values: self.opts.part.max_rows * self.config.wide() as u32,
             },
             _ => LinkSpec::default(),
+        }
+    }
+
+    fn saves_inside_steps(&self) -> u32 {
+        // A pass saves each layer's state as it goes past a checkpoint, between two
+        // micro-batches, each wider than the decode kernels take.
+        match self.pass_span.get() {
+            Some(&span) if span > 0 => 2 * MAX_BATCH,
+            _ => 0,
         }
     }
 
@@ -2331,10 +2343,12 @@ impl Qwen4ExpDevice {
         if record.gives_up_paused() {
             self.give_up_pass();
         }
-        self.forget_ended_pass();
         let pass = self.pass_of(step)?;
-        let resumes = self.resumes(pass);
-        self.flow.begin(number, rows, windows, self.index, stream, pass)?;
+        self.flow.begin(number, rows, windows, self.index, stream, pass.as_ref())?;
+        // What this part keeps of a pass that has ended, or that another pass of the same
+        // rows has taken the loan of, goes; a paused pass goes on.
+        self.forget_ended_pass();
+        let resumes = self.resumes(pass.as_ref());
         self.part.set_lent(self.flow.lent(self.index));
 
         // The draft windows of the step before: how many rows count.

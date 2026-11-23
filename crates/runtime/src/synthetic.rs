@@ -622,8 +622,8 @@ impl Model for SyntheticModel {
         self.config.max_rows
     }
 
-    fn saves_inside_steps(&self) -> bool {
-        self.config.inner_saves
+    fn saves_inside_steps(&self) -> u32 {
+        if self.config.inner_saves { 4 } else { 0 }
     }
 
     fn own_rows(&self) -> u32 {
