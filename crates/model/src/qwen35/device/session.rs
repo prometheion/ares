@@ -241,11 +241,6 @@ impl Session {
     pub fn last_time(&self) -> StepTime {
         self.last
     }
-
-    /// What each device thread measured in the last step.
-    pub fn device_times(&self) -> &[ares_runtime::DeviceTimes] {
-        &self.out.devices
-    }
 }
 
 impl Drop for Session {

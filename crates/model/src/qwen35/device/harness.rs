@@ -5,8 +5,7 @@
 
 use ares_core::Ledger;
 use ares_cuda::{
-    Device, DeviceBuffer, ENTRY_CELLS, Event, Kernels, Segment, StateFormat, StepDims, StepRecord,
-    Stream,
+    Device, DeviceBuffer, ENTRY_CELLS, Kernels, Segment, StateFormat, StepDims, StepRecord, Stream,
 };
 use ares_runtime::{ModelError, PinnedRam};
 
@@ -29,9 +28,6 @@ pub struct Harness {
     state: StateFormat,
     /// The record of the last step, for its commit.
     last: Option<StepRecord>,
-    start: Event,
-    end: Event,
-    last_ms: f32,
 }
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
@@ -112,9 +108,6 @@ impl Harness {
             d: c.n_embd,
             state: opts.state,
             last: None,
-            start: Event::timed(device)?,
-            end: Event::timed(device)?,
-            last_ms: 0.0,
             stream,
         };
         // Slot `s` owns the pages `s * table_stride ..`, in order.
@@ -134,19 +127,9 @@ impl Harness {
         &self.part
     }
 
-    /// The part, to change it.
-    pub fn part_mut(&mut self) -> &mut Part {
-        &mut self.part
-    }
-
     /// The device's memory accounts: who reserved what.
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
-    }
-
-    /// Device milliseconds of the last step, from its first kernel to its last.
-    pub fn last_step_ms(&self) -> f32 {
-        self.last_ms
     }
 
     fn upload(&mut self, record: &StepRecord) -> Result<StepDims, ModelError> {
@@ -220,12 +203,9 @@ impl Harness {
             exchange: None,
             replay: &[],
         };
-        self.start.record(&self.stream)?;
         let logits = self.part.enqueue(&env)?;
-        self.end.record(&self.stream)?;
         self.stream.synchronize()?;
         drop(staged);
-        self.last_ms = self.end.elapsed_ms_since(&self.start)?;
         self.last = Some(record);
         let Some(logits) = logits else { return Ok(Vec::new()) };
         let mut bytes = vec![0u8; out_rows.len() * logits.stride as usize * 4];

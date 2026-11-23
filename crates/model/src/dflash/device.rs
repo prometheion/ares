@@ -300,8 +300,6 @@ pub struct Drafter {
     pass: Vec<PassSeq>,
     /// The drafts' shares of the last pass, copied to the host.
     probs_host: PinnedBuffer,
-    /// Drafts of another drafter on their way into the list.
-    put_host: PinnedBuffer,
     drafted: u32,
     clock: [Event; 2],
     clock_pending: bool,
@@ -470,7 +468,6 @@ impl Drafter {
             taps: 0,
             pass: Vec::new(),
             probs_host: PinnedBuffer::new(device, drafted * 4)?,
-            put_host: PinnedBuffer::new(device, drafted * 4)?,
             drafted: 0,
             clock: [Event::timed(device)?, Event::timed(device)?],
             clock_pending: false,
@@ -1088,36 +1085,6 @@ impl Drafter {
     /// other list: a draft per draft row of every slot.
     pub fn own_list(&self) -> DevicePtr {
         self.at(self.s.drafts)
-    }
-
-    /// Puts drafts another drafter of the model made into the list at
-    /// `place`, so that a step with windows of both has one list. After the
-    /// pass of the step.
-    pub fn put_drafts(
-        &mut self,
-        stream: &Stream,
-        place: u32,
-        drafts: &[u32],
-    ) -> Result<(), ModelError> {
-        let at = place as usize * 4;
-        let end = at + drafts.len() * 4;
-        if end > self.put_host.len() || end > self.s.probs as usize - self.s.drafts as usize {
-            return Err(invalid("drafts past the drafter's list"));
-        }
-        for (i, t) in drafts.iter().enumerate() {
-            self.put_host[at + i * 4..at + i * 4 + 4].copy_from_slice(&t.to_le_bytes());
-        }
-        // SAFETY: the range is inside the pinned buffer and the list; the
-        // pinned bytes stay until the step has run.
-        unsafe {
-            stream.copy_from_host(
-                self.at(self.s.drafts).offset(at as u64),
-                self.put_host.as_ptr().add(at),
-                drafts.len() * 4,
-            )?;
-        }
-        self.drafted = self.drafted.max(place + drafts.len() as u32);
-        Ok(())
     }
 
     /// The sequences of the last pass.

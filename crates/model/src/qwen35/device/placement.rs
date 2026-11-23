@@ -424,11 +424,6 @@ impl Placement {
         self.devices.len()
     }
 
-    /// The device that embeds the step's tokens.
-    pub fn embedding_device(&self) -> usize {
-        self.devices.iter().position(|d| d.embedding).unwrap_or(0)
-    }
-
     /// The rows of the token embedding table that lie on the device that
     /// embeds: those of the tokens the MTP block can pick, none without a
     /// MTP block. The device gets the other rows from the host.
@@ -440,15 +435,6 @@ impl Placement {
     /// that embeds keeps the rows of fewer than all tokens.
     pub fn stages_rows(&self, c: &Config) -> bool {
         self.kept_rows() < c.n_vocab as u32
-    }
-
-    /// The range of blocks device `index` holds under a layer split, or all
-    /// blocks otherwise.
-    pub fn layers_of(&self, index: usize) -> Range<usize> {
-        let blocks = &self.devices[index].blocks;
-        let first = blocks.iter().position(Option::is_some).unwrap_or(0);
-        let last = blocks.iter().rposition(Option::is_some).map_or(0, |l| l + 1);
-        first..last
     }
 }
 
