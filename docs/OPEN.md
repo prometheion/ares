@@ -410,7 +410,7 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       times). A step could predict only now and then while no place qualifies, to keep the
       counts, through the board as wide steps are asked.
       (A first attempt with the prediction on the host was rejected: it changed the text and
-      halved generation on two cards; branch `moe/read-ahead` is kept as a record.)
+      halved generation on two cards; the branch was deleted on 2026-11-23, the numbers are here.)
 - [ ] The shared expert's output in the prediction's input (Run My AI: 11 % fewer misses on
       Ling): the part that routes has it only when it computes the shared expert itself
       (not with `--shared worker`), and the routed experts add into the same buffer, so it
