@@ -1457,6 +1457,54 @@ fn a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it() {
     }
 }
 
+/// An agent's next turn right after a short one, with one checkpoint place: the short turn's
+/// end state is saved with the next record, the next turn restores it in that record, and its
+/// rows are read layer by layer with checkpoints due inside them, whose places are taken
+/// before the record is written and give the end state up. The save still runs before the
+/// restore, and the turn answers as the reference does, in every placement. (Without it the
+/// restore read a place nothing was saved in, and the step failed: "the rows of slot 0 start
+/// at cell 53 and its sequence is at cell 0".)
+#[test]
+fn a_turn_read_layer_by_layer_from_an_end_state_saved_with_its_record_answers_as_the_reference() {
+    if !enabled() {
+        return;
+    }
+    let first = prompt(50, 5);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    for placement in placements() {
+        // The bytes of one checkpoint, for a budget that holds one.
+        let (probe, inner) = start_passing(&path, placement, 16, 512, 32);
+        let bytes = inner.prefix_cache().expect("the model takes part in the cache").bytes();
+        probe.shutdown();
+        let config = RuntimeConfig {
+            cache_ram: bytes + bytes / 2,
+            checkpoint_prompt_interval: 128,
+            ..RuntimeConfig::default()
+        };
+        let (runtime, _) =
+            start_serving_with(&path, placement, 16, 512, 32, Serve::Measured, None, config);
+        // Less than a page with its answer: the end state is the one checkpoint.
+        let start = runtime.snapshot().expect("the runtime runs").counters;
+        let said = ask(&runtime, 1, &first, 4);
+        let saved = runtime.snapshot().expect("the runtime runs").counters;
+        let mut next = first.clone();
+        next.extend(&said);
+        next.extend(prompt(300, 11));
+        let again = ask(&runtime, 2, &next, 16);
+        let counters = runtime.snapshot().expect("the runtime runs").counters;
+        runtime.shutdown();
+        let reference = reference_answer_at(&path, &next, 16);
+        let saves = saved.checkpoints_saved - start.checkpoints_saved;
+        assert_eq!(saves, 1, "{placement:?}: the end state is saved");
+        let restores = counters.checkpoints_restored - saved.checkpoints_restored;
+        assert_eq!(restores, 1, "{placement:?}: the end state is restored");
+        let replayed = counters.replay_rows - saved.replay_rows;
+        assert_eq!(replayed, 0, "{placement:?}: nothing is replayed");
+        assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} against {reference:?}");
+    }
+}
+
 /// [`start_passing`] whose misses are served as `serve` says, with `slot_bytes` bytes of
 /// expert slots in VRAM per device when given.
 fn start_serving(
