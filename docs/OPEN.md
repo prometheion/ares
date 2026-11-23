@@ -1116,6 +1116,16 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
   - [x] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's):
         `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` passes on the RTX 4070 + RTX 3060
         (2026-11-22). Not run with the real file on two cards.
+  - [ ] **Defect since the prompt kernel (`attn/long-context`) is on main**, seen in the merge
+        check (2026-11-23, `integrate2`): `qwen4exp_runtime k_and_v_beyond_vram_change_no_token`
+        fails in its case of lent wide steps (steps of 32 rows on a loan, K and V beyond the first
+        page in RAM): 0 of 16 tokens as the reference's, where every page in VRAM gives 16 and the
+        same branch on the base before that merge gave 16 and 16. Decode steps, wide steps of the
+        own scratch, passes (`a_prompt_read_layer_by_layer_reads_k_and_v_beyond_vram_from_a_copy`)
+        and a sequence that starts on a far page pass. The prompt kernel takes the far pool
+        (`conv_entry`) as the other kernels do; what else of that merge meets the lent step's copy
+        of the far slots is not found. Lent steps serve a prompt only where passes do not (DFlash,
+        formats with exact tiles).
   - [ ] **Defect, seen in the merge check (2026-11-23, `integrate2`)**: on the two local cards with
         IQ2_XS, `--ram 8G`, no `--context`, a prompt of 80 507 tokens (483 far pages) and then an
         unrelated short request: the short request hung in its first step until the watchdog took
