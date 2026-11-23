@@ -1265,6 +1265,12 @@ the agents' builds):
       qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
+- [ ] `qwen4exp_device` with several tests at once on the same cards (2026-11-23, both local
+      cards, `cuda/tested-archs` and its base e6d7676 alike): with four test threads
+      `every_layer_matches_the_reference`, `every_layer_of_wide_steps_matches_the_reference` and
+      `a_long_step_that_misses_experts_ends` fail and the tests with experts on the CPU or
+      uploaded run past 15 minutes; one at a time each passes in seconds, and the whole suite
+      with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
 - Inkling 2 Mini on Strata is set aside (the owner, 2026-11-23): Strata serves it with thinking
