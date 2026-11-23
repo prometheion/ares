@@ -53,12 +53,12 @@ use super::feed::{
     Feed, Layout, MtpExperts, build_store, cpu_pool, device_slots, expert_map, owners, places,
     plan_transit, reader,
 };
-use super::misses::{Misses, Progress, WideStats};
+use super::misses::{Misses, Progress, SpanPicks, WideStats};
 use super::mtp::{MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
 use super::part::{
-    ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Pieces, Ports,
-    StepEnv,
+    ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, PassSizes, Pieces,
+    Ports, StepEnv,
 };
 use super::placement::{MARGIN, PartPlan, Placement};
 use super::prune::{self, PruneMask};
@@ -74,6 +74,10 @@ use crate::qwen3vl::{Projector, TowerAt};
 use crate::qwen4exp::reference::mtp_config;
 use crate::qwen4exp::weights::{MtpWeights, Weights};
 use crate::qwen4exp::{Config, Error as FileError};
+
+mod pass;
+
+use pass::{PassKey, PassLoan, PassRun};
 
 /// How many layers a device thread enqueues ahead of the last layer of its
 /// part whose route record the store has handled.
@@ -256,6 +260,8 @@ struct Build {
     lendable: Vec<Vec<u64>>,
     multiprocessors: Vec<u32>,
     lone_rows: u32,
+    /// The most rows of a prompt read layer by layer (0: none).
+    pass_rows: u32,
 }
 
 /// The plan of the expert store and what it was made from.
@@ -302,6 +308,14 @@ pub(super) struct Flow {
     lent_at: Vec<Option<Pieces>>,
     /// Whether the running step runs on the loan.
     on_loan: AtomicBool,
+    /// Prompts read layer by layer (`runtime/pass.rs`): the most rows of one (0: none), what
+    /// each part keeps of a row, the picks of a row, the loan of the pass that runs or ran
+    /// last, and whether the step being run is a pass.
+    pass_rows: u32,
+    pass_sizes: Vec<PassSizes>,
+    top_k: u32,
+    pass: Mutex<Option<PassLoan>>,
+    pass_completed: AtomicBool,
 }
 
 impl Flow {
@@ -375,6 +389,7 @@ impl Flow {
     /// is the MTP block's, whose experts are resident, and the work between
     /// two steps of the store (the heat's decay, the slots that move, the RAM
     /// tier that grows) is counted in the model's steps.
+    #[allow(clippy::too_many_arguments)]
     fn begin(
         &self,
         step: u64,
@@ -382,6 +397,7 @@ impl Flow {
         windows: Option<StepWindows<'_>>,
         index: usize,
         stream: &Stream,
+        pass: Option<PassKey>,
     ) -> Result<(), ModelError> {
         let mut feed = self.lock_feed();
         if self.begun.load(Ordering::Acquire) != step {
@@ -389,7 +405,13 @@ impl Flow {
                 counter.store(0, Ordering::Release);
             }
             self.finished.store(0, Ordering::Release);
-            let wide = rows > self.own_rows && windows.is_some();
+            // A prompt read layer by layer keeps its rows on a loan of its own; the loan of
+            // one before goes back first, or serves it.
+            if windows.is_some() {
+                self.lend_pass(&mut feed, pass)?;
+            }
+            self.pass_completed.store(false, Ordering::Release);
+            let wide = rows > self.own_rows && windows.is_some() && pass.is_none();
             if wide {
                 self.lend(&mut feed)?;
             }
@@ -553,10 +575,15 @@ impl Flow {
                 // begun the next.
                 drop(feed.store.take_released());
             }
+            // A pass that ended in this step has read its rows; its loan stays until the
+            // next step begins.
+            if self.pass_completed.load(Ordering::Acquire) {
+                self.pass_done();
+            }
             // VRAM lent for wide steps goes back after the first step that did
             // not run on it: that step's start still read what the last one
             // left there (the MTP block follows its rows).
-            if !self.on_loan.load(Ordering::Acquire) {
+            if !self.on_loan.load(Ordering::Acquire) && !self.has_pass_loan() {
                 for device in 0..self.lent.len() {
                     feed.store.return_scratch(device).map_err(|e| invalid(e.to_string()))?;
                 }
@@ -601,6 +628,19 @@ pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32,
         rows /= 2;
     }
     Ok(rows)
+}
+
+/// Whether a model opened with `opts` on `devices` devices, with a DFlash drafter or
+/// without (`dflash`), reads a prompt wider than the parts' own scratch layer by layer
+/// ([`SessionOptions::pass_rows`]): its micro-batches take the many-row kernels, K and V
+/// have no exact pool (whose tiles convert per step for every layer at once), no DFlash
+/// drafter reads the residual of a step's rows at some layers, and the placement is one the
+/// pass is built for.
+pub fn reads_layer_by_layer(opts: &Options, devices: usize, dflash: bool) -> bool {
+    opts.own_rows() >= 2 * MAX_BATCH
+        && crate::blocks::kv::Group::window_limit(opts.kv.0, opts.kv.1).is_none()
+        && !dflash
+        && devices == 1
 }
 
 /// The most rows of a step the model is opened with.
@@ -802,6 +842,9 @@ pub struct Qwen4Exp {
     /// The rows of the widest step, once the parts are open: what the expert
     /// slots can lend the scratch for, at most `opts.part.max_rows`.
     lone_rows: OnceLock<u32>,
+    /// The most rows of a prompt read layer by layer, once the parts are open: what the
+    /// expert slots can lend for its kept rows, at most `opts.pass_rows`; 0 for none.
+    pass_span: OnceLock<u32>,
     /// The order of the output head's rows and the draft head's rows, which
     /// every drafter reads (`blocks/head.rs`).
     view: HeadView,
@@ -926,6 +969,7 @@ impl Qwen4Exp {
                 lendable: vec![Vec::new(); n],
                 multiprocessors: vec![0; n],
                 lone_rows: 0,
+                pass_rows: 0,
             }),
             flow: OnceLock::new(),
             reports: Mutex::new(Vec::new()),
@@ -939,6 +983,7 @@ impl Qwen4Exp {
             usage: Usage::default(),
             rows,
             lone_rows: OnceLock::new(),
+            pass_span: OnceLock::new(),
             view: HeadView::new(config_vocab, config_vocab, None).map_err(OpenError::Choice)?,
             projector: None,
         })
@@ -1551,6 +1596,20 @@ impl Qwen4Exp {
                     Ok::<bool, ModelError>(fits)
                 })?;
                 build.lone_rows = rows;
+                // The widest prompt read layer by layer: its kept rows in what every device's
+                // slots can lend.
+                let pass_sizes: Vec<PassSizes> =
+                    (0..n).map(|d| PassSizes::of(c, self.placement.part(c, d).role)).collect();
+                build.pass_rows = if self.reads_layer_by_layer(n) {
+                    pass::pass_span(own, self.opts.pass_rows, |rows| {
+                        pass::pass_fits(&pass_sizes, &build.lendable, own, rows)
+                    })
+                } else {
+                    0
+                };
+                if build.pass_rows <= own {
+                    build.pass_rows = 0;
+                }
                 for d in 0..n {
                     let (pieces, raw) = match rows > own {
                         true => lent_of(d, rows)?
@@ -1641,6 +1700,11 @@ impl Qwen4Exp {
                     lent: build.lent_pieces.clone(),
                     lent_at: build.lent_at.clone(),
                     on_loan: AtomicBool::new(false),
+                    pass_rows: build.pass_rows,
+                    pass_sizes,
+                    top_k: c.experts.used as u32,
+                    pass: Mutex::new(None),
+                    pass_completed: AtomicBool::new(false),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
                         ..Default::default()
@@ -1677,6 +1741,7 @@ impl Qwen4Exp {
                 (build.ports[other], build.cores[other].clone(), tensor.mixer, lent_raw)
             });
             let _ = self.lone_rows.set(build.lone_rows);
+            let _ = self.pass_span.set(build.pass_rows);
             (
                 build.places[index].clone(),
                 build.flow.clone().ok_or_else(|| invalid("no flow was made"))?,
@@ -1687,6 +1752,9 @@ impl Qwen4Exp {
             )
         };
         part.set_experts(places)?;
+        if flow.pass_rows > 0 && !part.takes_passes() {
+            return Err(invalid("a part cannot read prompts layer by layer"));
+        }
         let PartPlan { role, first, shares, head } = self.placement.part(c, index);
         let lendable = self.meeting.lock().value.lendable[index].clone();
         part.lend_rows(c, &PartShape { role, first, shares, head }, self.max_rows(), &lendable)?;
@@ -1749,6 +1817,9 @@ impl Qwen4Exp {
             dflash_embedding,
             passes: Vec::new(),
             residual: None,
+            picks: None,
+            pass_run: None,
+            paused: false,
             chains: Vec::new(),
             only_drafts: false,
             drives_ngram: part.ngram_layer().is_some(),
@@ -1779,6 +1850,16 @@ impl Qwen4Exp {
 }
 
 impl Qwen4Exp {
+    /// Whether the model on `devices` devices reads a prompt wider than the parts' own
+    /// scratch layer by layer: asked for, with micro-batches the many-row kernels take, K and
+    /// V without an exact pool (whose tiles convert per step for every layer at once), no
+    /// DFlash drafter (which reads the residual of a step's rows at some layers), and a
+    /// placement the pass is built for.
+    fn reads_layer_by_layer(&self, devices: usize) -> bool {
+        self.opts.pass_rows > self.opts.part.own_rows()
+            && reads_layer_by_layer(&self.opts.part, devices, self.dflash.is_some())
+    }
+
     /// Everything besides the tokens that changes the bytes of a page or of a
     /// checkpoint as the device parts hand them out
     /// ([`ares_runtime::Durable::fingerprint`]):
@@ -1915,8 +1996,13 @@ impl Model for Qwen4Exp {
     }
 
     fn max_rows(&self) -> u32 {
-        // Once the parts are open: the rows the slots can lend for.
-        self.lone_rows.get().copied().unwrap_or(self.opts.part.max_rows)
+        // Once the parts are open: the rows the slots can lend for, a prompt read layer by
+        // layer's or a lent step's.
+        match (self.pass_span.get(), self.lone_rows.get()) {
+            (Some(&pass), _) if pass > 0 => pass,
+            (_, Some(&lone)) => lone,
+            _ => self.opts.part.max_rows.max(self.opts.pass_rows),
+        }
     }
 
     fn prompt_rows(&self) -> u32 {
@@ -2030,6 +2116,11 @@ struct Qwen4ExpDevice {
     passes: Vec<crate::dflash::PassSeq>,
     /// Where the part left the residual of the rows of its last step.
     residual: Option<DevicePtr>,
+    /// The host's copy of the picks of a pass's layer, kept for the next pass.
+    picks: Option<Arc<SpanPicks>>,
+    /// The pass this part paused, and whether the step that ended last was paused.
+    pass_run: Option<PassRun>,
+    paused: bool,
     /// The windows of the step whose drafts the MTP block makes.
     chains: Vec<MtpChain>,
     /// The step being run only drafts.
@@ -2214,7 +2305,15 @@ impl Qwen4ExpDevice {
             .map(|_| (0..rows).map(|row| record.row_worth(row).unwrap_or(0.0)).collect());
         self.only_drafts = record.drafts_only();
         let windows = (!self.only_drafts).then_some((windows.as_slice(), worth.as_deref()));
-        self.flow.begin(number, rows, windows, self.index, stream)?;
+        // A prompt wider than the parts' own scratch is read layer by layer; a record may
+        // give up the pass a step before paused, or go on with it.
+        self.paused = false;
+        if record.gives_up_paused() {
+            self.give_up_pass();
+        }
+        let pass = self.pass_of(step)?;
+        let resumes = self.resumes(pass);
+        self.flow.begin(number, rows, windows, self.index, stream, pass)?;
         self.part.set_lent(self.flow.lent(self.index));
 
         // The draft windows of the step before: how many rows count.
@@ -2318,12 +2417,15 @@ impl Qwen4ExpDevice {
         if !self.chains.is_empty() {
             return Err(invalid("the MTP block's chains run in a step that only drafts"));
         }
-        if let Some(block) = &mut self.mtp {
+        // (A pass's rows are followed by the block after the pass, micro-batch by
+        // micro-batch.)
+        if let Some(block) = self.mtp.as_mut().filter(|_| pass.is_none()) {
             block.step(stream, &self.segments, &self.tokens, &self.replay, None, false)?;
         }
 
-        // The rows of the n-gram table, and where the sequences are now.
-        if self.drives_ngram {
+        // The rows of the n-gram table, and where the sequences are now (a pass that goes on
+        // read its rows when it started).
+        if self.drives_ngram && !resumes {
             let mut ngram = self.flow.lock_ngram();
             let mut parts = Vec::with_capacity(self.segments.len());
             for s in &self.segments {
@@ -2345,6 +2447,9 @@ impl Qwen4ExpDevice {
         self.windows.extend(self.segments.iter().filter(|s| !s.direct).map(|s| (s.slot, s.row0)));
         self.shape.clear();
         self.shape.extend(self.segments.iter().map(|s| (s.slot, s.direct, s.n_rows, s.row0)));
+        if let Some(key) = pass {
+            return self.enqueue_pass(step, key, number as u32);
+        }
 
         // The residual streams start from the embeddings, which the part that
         // embeds stages and gathers itself (`blocks/rows.rs`).
@@ -2556,6 +2661,10 @@ impl DeviceModel for Qwen4ExpDevice {
                 }
             }
         }
+    }
+
+    fn paused(&self) -> bool {
+        self.paused
     }
 
     fn rows_not_exact(&mut self, out: &mut Vec<u32>) {

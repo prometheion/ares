@@ -19,7 +19,7 @@ use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
     Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread,
-    TensorChoice, batch_rows, place, profile_key, step_rows,
+    TensorChoice, batch_rows, place, profile_key, reads_layer_by_layer, step_rows,
 };
 use ares_model::qwen4exp::{Config, MtpWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
@@ -44,6 +44,11 @@ const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
 /// the file once per this many rows (chosen by measurement, see "Large prompt
 /// steps on lent VRAM" in `docs/ARCHITECTURE.md`).
 const DEFAULT_BATCH: u32 = 8192;
+
+/// The same for a prompt read layer by layer, which keeps about 56 KiB of a row (Flash-Next)
+/// where a step keeps 0.5 to 0.7 MiB: a long prompt reads each expert once per this many
+/// rows (Strata's chunks of prompt reach the same).
+const DEFAULT_PASS: u32 = 32768;
 
 /// The rows of a sequence's window unless `--window` says otherwise: the
 /// newest token and three drafts. A row of this model routes to experts of
@@ -379,28 +384,46 @@ pub(crate) fn load(
             .map_err(|e| named_split(e.to_string()))?;
     log_trial(&placement, &held);
     let spread = pinned(spread, &placement);
-    // The rows of the step a prompt read alone takes: as many as asked or the
-    // default, as far as the expert slots can lend the scratch for them.
-    let asked = options.batch.unwrap_or(DEFAULT_BATCH).max(own_rows);
-    let max_rows = batch_rows(
-        &Gguf::open(&options.model)?,
-        &devices,
-        &session(longest, pages, spread, own_rows),
-        &placement,
-        pages,
-        &page_bytes,
-        asked,
-    )
-    .map_err(|e| LoadError::Model(e.to_string()))?;
-    if options.batch.is_some_and(|b| max_rows < b) {
-        return Err(refuse(format!(
-            "--batch-size {asked}: the expert slots can lend the scratch of a step of {max_rows} \
-             rows at most, beside steps of {own_rows} rows in the parts' own memory"
-        )));
-    }
+    // A prompt read alone runs layer by layer where the model can (`device/runtime/pass.rs`):
+    // its steps are passes of up to as many rows as asked or the default, as far as the
+    // expert slots lend for the rows they keep, and the parts' steps never take more than
+    // their own scratch. Elsewhere it takes steps as many rows wide as asked or the default,
+    // as far as the expert slots can lend the scratch for them.
+    let passes = reads_layer_by_layer(
+        &session(longest, pages, spread, own_rows).part,
+        devices.len(),
+        dflash.is_some(),
+    );
+    let (max_rows, pass_rows) = if passes {
+        (own_rows, options.batch.unwrap_or(DEFAULT_PASS).max(own_rows))
+    } else {
+        let asked = options.batch.unwrap_or(DEFAULT_BATCH).max(own_rows);
+        let max_rows = batch_rows(
+            &Gguf::open(&options.model)?,
+            &devices,
+            &session(longest, pages, spread, own_rows),
+            &placement,
+            pages,
+            &page_bytes,
+            asked,
+        )
+        .map_err(|e| LoadError::Model(e.to_string()))?;
+        if options.batch.is_some_and(|b| max_rows < b) {
+            return Err(refuse(format!(
+                "--batch-size {asked}: the expert slots can lend the scratch of a step of \
+                 {max_rows} rows at most, beside steps of {own_rows} rows in the parts' own memory"
+            )));
+        }
+        (max_rows, 0)
+    };
     tracing::info!(
         "steps of up to {own_rows} rows in the parts' own memory{}",
-        if max_rows > own_rows {
+        if pass_rows > own_rows {
+            format!(
+                ", and a prompt read alone layer by layer in steps of up to {pass_rows} rows, \
+                 its rows kept on VRAM the expert slots lend for the step"
+            )
+        } else if max_rows > own_rows {
             format!(
                 ", and of up to {max_rows} rows for a prompt read alone, on VRAM the expert \
                  slots lend for the step"
@@ -412,7 +435,7 @@ pub(crate) fn load(
     let (placement, page_bytes) =
         place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread, max_rows))
             .map_err(|e| named_split(e.to_string()))?;
-    let opts = session(longest, pages, spread, max_rows);
+    let opts = SessionOptions { pass_rows, ..session(longest, pages, spread, max_rows) };
     if let (Some(dir), None, Some(tensor)) = (&options.cache, &remembered, &placement.tensor) {
         Split::write(dir, &options.model, &devices, &tensor.choice);
     }
@@ -680,7 +703,18 @@ pub(crate) fn load(
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
-    if model.max_rows() > own_rows {
+    if model.max_rows() > own_rows && pass_rows > own_rows {
+        tracing::info!(
+            "a prompt read alone runs layer by layer in steps of up to {} rows, kept on VRAM \
+             the expert slots lend",
+            model.max_rows()
+        );
+    } else if pass_rows > own_rows {
+        tracing::warn!(
+            "the expert slots cannot lend for a prompt read layer by layer: a prompt read \
+             alone takes steps of {own_rows} rows"
+        );
+    } else if model.max_rows() > own_rows {
         tracing::info!(
             "a prompt read alone takes steps of up to {} rows on VRAM the expert slots lend",
             model.max_rows()

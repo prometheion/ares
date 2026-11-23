@@ -865,6 +865,75 @@ fn a_prompt_read_alone_runs_on_vram_the_expert_slots_lend() {
     }
 }
 
+/// A prompt read alone in a step wider than the parts' own scratch runs layer by layer
+/// (`device/runtime/pass.rs`): every micro-batch of the parts' own rows through a layer, then
+/// the layer's experts once for all rows, the rows kept on VRAM the expert slots lend. It
+/// answers as the CPU reference does (the first tokens; later ones of a made-up model follow
+/// near ties, which the order of the experts' sums flips) and as the same prompt read in steps
+/// of the own scratch, with micro-batches in one chunk and in several.
+#[test]
+fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(400, 5);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let reference = reference_answer_at(&path, &prompt, 16);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    for placement in placements().into_iter().filter(|p| *p == Placement::One) {
+        for own in [32, 16] {
+            let (runtime, _) = start_passing(&path, placement, 16, 0, own);
+            let steps = ask(&runtime, 1, &prompt, 16);
+            runtime.shutdown();
+            let (runtime, model) = start_passing(&path, placement, 16, 512, own);
+            assert_eq!(runtime_rows(&model), (512, own));
+            let passed = ask(&runtime, 1, &prompt, 16);
+            // Asked again, the prompt comes from the cache: its last rows run as a step.
+            let again = ask(&runtime, 2, &prompt, 16);
+            let stats = model.take_store_stats().expect("the parts are open");
+            runtime.shutdown();
+            eprintln!(
+                "PASS {placement:?} own {own}: {} tokens as the reference's before the first                  difference (steps of {own} rows: {}), {} as those steps'; {} loans",
+                leading(&passed, &reference),
+                leading(&steps, &reference),
+                leading(&passed, &steps),
+                stats.scratch_loans,
+            );
+            assert!(stats.scratch_loans >= 1, "{placement:?}: no pass lent VRAM");
+            assert!(
+                leading(&passed, &reference) >= 2,
+                "{placement:?}: {passed:?} against {reference:?}"
+            );
+            assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the pass");
+        }
+    }
+}
+
+/// [`start_at`] whose prompts read alone run layer by layer in steps of up to `pass_rows`
+/// rows (0: in steps of the own scratch), in micro-batches of `own` rows.
+fn start_passing(
+    path: &std::path::Path,
+    placement: Placement,
+    pages: u32,
+    pass_rows: u32,
+    own: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(path).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let mut opts = options(placement, n_layer, pages, MAX_ROWS, own);
+    opts.pass_rows = pass_rows;
+    let inner =
+        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
+    let config =
+        RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    gpu.ram_limit += 256 << 20;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+}
+
 /// The rows of a step on VRAM the made-up model's expert slots lend.
 const LENT_ROWS: u32 = 32;
 

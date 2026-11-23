@@ -155,6 +155,13 @@ pub struct SessionOptions {
     /// locks or gives back at a time. `None` for the store's own size; tests
     /// of a small model name a smaller one.
     pub ram_piece: Option<usize>,
+    /// The most rows of a prompt read layer by layer through the runtime: a step of one
+    /// prompt wider than the parts' own scratch ([`Options::own_rows`]) runs as a pass, every
+    /// row through a layer before the next layer, each expert brought once for the step, its
+    /// rows kept on VRAM the expert slots lend (as many as they can lend for: the model's
+    /// `max_rows` says). 0: none; a prompt read alone takes lent steps of up to
+    /// [`Options::max_rows`] rows.
+    pub pass_rows: u32,
 }
 
 impl Default for SessionOptions {
@@ -176,6 +183,7 @@ impl Default for SessionOptions {
             transit: None,
             read_ahead: false,
             ram_piece: None,
+            pass_rows: 0,
         }
     }
 }

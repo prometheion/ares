@@ -60,9 +60,12 @@ use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
 mod dflash;
 mod mtp;
+mod pass;
 mod predict;
 mod resume;
 mod wide;
+
+pub use pass::{MicroPlan, PassAt, PassLayout, PassSizes, chunk_rows, chunks_of, micro_batches};
 
 use super::board::Board;
 use super::load::{
@@ -1261,6 +1264,8 @@ pub struct Part {
     /// What steps wider than the decode kernels take need; `None` when no step has more
     /// than [`MAX_BATCH`] rows.
     wide_state: Option<wide::State>,
+    /// A prompt read layer by layer (`pass.rs`), while one is open.
+    pass: Option<pass::State>,
     /// What a part that runs the model's MTP block needs besides a layer.
     mtp: Option<mtp::State>,
     /// The pruning of the routers of a part that routes.
@@ -1578,6 +1583,7 @@ impl Part {
             status_copied: Event::new(device)?,
             marks,
             wide_state,
+            pass: None,
             mtp: None,
             prune: None,
             predict,
@@ -1792,6 +1798,14 @@ impl Part {
     }
 
     fn at(&self, offset: u64) -> DevicePtr {
+        // A micro-batch of a pass keeps its rows of some ranges elsewhere.
+        if let Some(pass) = &self.pass {
+            for &(start, len, at) in &pass.redirects {
+                if offset >= start && offset < start + len {
+                    return at.offset(offset - start);
+                }
+            }
+        }
         match (&self.lent, self.on_loan) {
             (Some(pieces), true) => pieces.address(offset),
             _ => self.base.offset(offset),
@@ -2878,17 +2892,16 @@ impl Part {
         }
         let emb = self.act_values(s.emb, self.n, rows);
         let step = self.inbox_at(ib.record);
+        // The page-locked buffer the step's inbox is sent from: the part's own, or the one
+        // of a pass's ring its micro-batch is sent from.
+        let host = self.staging_host();
         // SAFETY: the inbox section holds the rows of the most rows; the
         // scratch and the state arena are this part's.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                fetched.as_ptr(),
-                self.inbox_host.as_mut_ptr().add(ib.ngram as usize),
-                bytes,
-            );
+            std::ptr::copy_nonoverlapping(fetched.as_ptr(), host.add(ib.ngram as usize), bytes);
             stream.copy_from_host(
                 self.inbox_at(ib.ngram),
-                self.inbox_host.as_ptr().add(ib.ngram as usize),
+                host.add(ib.ngram as usize).cast_const(),
                 bytes,
             )?;
             self.mark(stream, Phase::Exchange)?;

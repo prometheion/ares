@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 use ares_runtime::expert_store::{WideCpu, WidePick};
 
+use ares_cuda::{Device, Event, PinnedBuffer};
+
 use super::Error;
 use super::board::Board;
 use super::feed::Feed;
@@ -108,6 +110,45 @@ enum Stage {
     Done,
 }
 
+/// The picks of a layer of a prompt read layer by layer, as the host reads them for the
+/// rounds of its experts: a header of 16 bytes, then the ids of every row's picks in the order
+/// of the rows (the form the router's board has them in, without the weights).
+pub(super) struct SpanPicks {
+    host: PinnedBuffer,
+    len: usize,
+    copied: Event,
+}
+
+impl SpanPicks {
+    /// Room for the picks of `rows` rows of `top_k` picks each.
+    pub(super) fn new(device: &Device, rows: u32, top_k: u32) -> Result<Self, Error> {
+        let len = 16 + 4 * rows as usize * top_k as usize;
+        let host = PinnedBuffer::new(device, len).map_err(ares_runtime::ModelError::from)?;
+        let copied = Event::new(device).map_err(ares_runtime::ModelError::from)?;
+        Ok(Self { host, len, copied })
+    }
+
+    /// Whether `rows` rows of `top_k` picks fit.
+    pub(super) fn holds(&self, rows: u32, top_k: u32) -> bool {
+        16 + 4 * rows as usize * top_k as usize <= self.len
+    }
+
+    /// Where the copies write, and the event recorded behind them.
+    pub(super) fn target(&self) -> (*mut u8, &Event) {
+        (self.host.as_ptr().cast_mut(), &self.copied)
+    }
+
+    fn arrived(&self) -> Result<bool, Error> {
+        Ok(self.copied.is_done().map_err(ares_runtime::ModelError::from)?)
+    }
+
+    fn record(&self) -> &[u8] {
+        // SAFETY: the copies behind `copied` have run, and nothing writes the buffer before
+        // the next layer's copies are enqueued, after this layer is done.
+        unsafe { std::slice::from_raw_parts(self.host.as_ptr(), self.len) }
+    }
+}
+
 /// Whether a layer is finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Progress {
@@ -124,9 +165,11 @@ pub(super) struct Misses {
     at: usize,
     rows: u32,
     /// The board that has the layer's picks: the part's own, or the mixer's for a worker,
-    /// which does not route. `relay` says the first round waits for them.
+    /// which does not route. `relay` says the first round waits for them. In a pass, the
+    /// picks of all its rows instead (`span`).
     source: Arc<Board>,
     relay: bool,
+    span: Option<Arc<SpanPicks>>,
     stage: Stage,
     since: Instant,
     /// The first round's table: the address of every expert that had a slot.
@@ -164,6 +207,34 @@ impl Misses {
         source: Option<Arc<Board>>,
         owned: &dyn Fn(u32) -> bool,
     ) -> Result<Self, Error> {
+        Self::begin_with(part, env, feed, index, layer, source, None, owned)
+    }
+
+    /// [`Misses::begin`] for a layer of a pass: the picks of all its rows reach the host in
+    /// `span` (`env` is the step of all the rows).
+    pub(super) fn begin_pass(
+        part: &mut Part,
+        env: &StepEnv<'_>,
+        feed: &Feed,
+        index: usize,
+        layer: usize,
+        span: Arc<SpanPicks>,
+        owned: &dyn Fn(u32) -> bool,
+    ) -> Result<Self, Error> {
+        Self::begin_with(part, env, feed, index, layer, None, Some(span), owned)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_with(
+        part: &mut Part,
+        env: &StepEnv<'_>,
+        feed: &Feed,
+        index: usize,
+        layer: usize,
+        source: Option<Arc<Board>>,
+        span: Option<Arc<SpanPicks>>,
+        owned: &dyn Fn(u32) -> bool,
+    ) -> Result<Self, Error> {
         let at = feed.layout().store_layer(index, part.layer_range().start + layer);
         let n_experts = feed.layout().shapes[at].n_experts;
         let resident: Vec<u64> = (0..n_experts)
@@ -179,6 +250,7 @@ impl Misses {
         Ok(Self {
             source: source.unwrap_or_else(|| part.board()),
             relay,
+            span,
             part: index,
             layer,
             at,
@@ -220,12 +292,20 @@ impl Misses {
                 Stage::Done => return Ok(Progress::Done),
                 Stage::Cpu => return self.finish(part, env, feed),
                 Stage::Record => {
-                    if !routed || !self.source.arrived(self.layer)? {
+                    let arrived = match &self.span {
+                        Some(span) => span.arrived()?,
+                        None => routed && self.source.arrived(self.layer)?,
+                    };
+                    if !arrived {
                         return Ok(Progress::Waiting);
                     }
                     self.stats.record_wait += self.since.elapsed();
                     let source = Arc::clone(&self.source);
-                    let record = source.record(self.layer);
+                    let span = self.span.clone();
+                    let record = match &span {
+                        Some(span) => span.record(),
+                        None => source.record(self.layer),
+                    };
                     if std::mem::take(&mut self.relay) {
                         part.experts_round(env, self.layer, &self.resident, Some(record))?;
                     }

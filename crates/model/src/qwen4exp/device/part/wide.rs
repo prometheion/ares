@@ -81,7 +81,7 @@ struct Layer {
 
 /// What a part needs for wide steps.
 pub(super) struct State {
-    kernels: ExpertRowKernels,
+    pub(super) kernels: ExpertRowKernels,
     precision: Precision,
     /// The form of the activations each quantized dense type reads, and whether any reads
     /// f16 and any int8.
@@ -479,12 +479,30 @@ impl Part {
                 range: w.router_range,
             };
             self.wide_float(stream, &router, m, self.at(s.logits), rows)?;
-            self.experts.pick_rows(stream, &w.shape, self.at(s.logits), record, rows)?;
-            self.routed[i].record(stream)?;
-            self.side.wait_event(&self.routed[i])?;
-            self.side.copy_to_host(self.board.record_dst(i), record, bytes as usize)?;
-            self.board.copies_enqueued(i, &self.side)?;
-            self.enqueue_wide_prediction(stream, i, m, rows)?;
+            if let Some((chunk, row0, chunk_rows)) = self.pass_record() {
+                // A micro-batch of a pass: its picks go into its chunk's record, and the
+                // experts' input into the chunk's, for the round that runs every chunk.
+                let logits = self.at(s.logits);
+                self.experts
+                    .pick_rows_into(stream, &w.shape, logits, chunk, rows, row0, chunk_rows)?;
+                self.routed[i].record(stream)?;
+                self.kernels.prepare_prefill_activations(
+                    stream,
+                    ares_cuda::PrefillPath::F16,
+                    self.act_values(s.m, self.n, rows),
+                    self.at(s.experts_f16),
+                    self.n,
+                    rows,
+                )?;
+                self.pass_keep_input(stream, self.at(s.experts_f16), rows)?;
+            } else {
+                self.experts.pick_rows(stream, &w.shape, self.at(s.logits), record, rows)?;
+                self.routed[i].record(stream)?;
+                self.side.wait_event(&self.routed[i])?;
+                self.side.copy_to_host(self.board.record_dst(i), record, bytes as usize)?;
+                self.board.copies_enqueued(i, &self.side)?;
+                self.enqueue_wide_prediction(stream, i, m, rows)?;
+            }
             self.mark(stream, Phase::Experts)?;
             if let Some(shared) = &w.shared {
                 self.product(stream, &shared.inp, m, self.at(s.s), rows)?;
@@ -520,9 +538,11 @@ impl Part {
     unsafe fn copy_cpu_act(&mut self, stream: &Stream, rows: u32) -> Result<(), ModelError> {
         let m = self.at(self.f.s.m);
         let n = self.n as usize;
+        let in_pass = self.pass_record().is_some();
         let wide = self.wide_state.as_mut().ok_or_else(|| invalid("no wide state"))?;
         wide.act_pending = false;
-        if rows > wide.cpu_rows {
+        // A pass computes no expert on the CPU: its layers' experts run for all its rows.
+        if rows > wide.cpu_rows || in_pass {
             return Ok(());
         }
         let bytes = ares_runtime::expert_store::cpu::act_bytes(n, rows as usize);
@@ -653,6 +673,13 @@ impl Part {
         unsafe {
             std::ptr::copy_nonoverlapping(addresses.as_ptr().cast::<u8>(), staging, bytes);
             stream.copy_from_host(device_table, staging, bytes)?;
+            if self.in_pass() {
+                // The rows of a pass are in its chunks: the round runs each of them.
+                self.pass_round(stream, i, device_table, first, env.token)?;
+                let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
+                wide.done.record(stream)?;
+                return self.mark(stream, Phase::Experts);
+            }
             let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
             if first {
                 let record_at = self.at(s.rec_full);

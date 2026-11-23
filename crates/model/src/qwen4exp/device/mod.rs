@@ -51,7 +51,9 @@ pub use placement::{
 };
 pub use prune::{PruneMask, PruneSetup, PruneStats};
 pub use roles::{RoleTime, RoleTrial};
-pub use runtime::{ExpertCosts, OpenError, Qwen4Exp, batch_rows, place, step_rows};
+pub use runtime::{
+    ExpertCosts, OpenError, Qwen4Exp, batch_rows, place, reads_layer_by_layer, step_rows,
+};
 pub use session::{
     Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
     read_time,
