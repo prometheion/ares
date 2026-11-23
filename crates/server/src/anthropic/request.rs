@@ -10,19 +10,10 @@
 use ares_api::Json;
 
 use super::edits::{Edit, Keep, ToolUses, Trigger, Turns};
+use crate::chat_body::{self, Chat, Purpose, known, object, refuse, string, text_member};
 use crate::error::ApiError;
 use crate::reasoning::DEFAULT_EFFORT;
 use crate::wire::{Fields, members, wrong_type};
-
-/// What a body is read for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Purpose {
-    /// `/v1/messages`: a reply is generated.
-    Reply,
-    /// `/v1/messages/count_tokens`: the prompt is counted, so `max_tokens`
-    /// may be missing and `stream` says nothing.
-    Count,
-}
 
 /// The members of a body that are served.
 const SERVED: &[&str] = &[
@@ -52,21 +43,6 @@ const BETWEEN_BLOCKS: &str = "\n";
 
 /// What comes before the text of a tool's result that says `is_error`.
 const ERROR_PREFIX: &str = "Error";
-
-fn refuse(param: impl Into<String>, message: impl Into<String>) -> ApiError {
-    ApiError::invalid_param(param, message)
-}
-
-fn object(members: Vec<(&str, Json)>) -> Json {
-    Json::Object(members.into_iter().map(|(name, value)| (name.to_owned(), value)).collect())
-}
-
-/// The members of the chat body as they are written.
-type Chat = Vec<(&'static str, Json)>;
-
-fn string(text: impl Into<String>) -> Json {
-    Json::String(text.into())
-}
 
 /// What a Messages request asks for beyond its chat body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -172,22 +148,12 @@ fn unserved(name: &str) -> &'static str {
 /// The members of a block (or of another object of the body), which may
 /// have the members `known` and no others. `cache_control` is checked here
 /// wherever it is known.
-fn block<'a>(at: &str, value: &'a Json, known: &[&str]) -> Result<Fields<'a>, ApiError> {
-    let Json::Object(members) = value else {
-        return Err(refuse(at, format!("{at} must be an object, got {}", value.kind())));
-    };
-    for (name, member) in members {
-        if member.is_null() {
-            continue;
-        }
-        if !known.contains(&name.as_str()) {
-            return Err(refuse(at, format!("{at}.{name} is not supported")));
-        }
-        if name == "cache_control" {
-            cache_control(&format!("{at}.cache_control"), member)?;
-        }
+fn block<'a>(at: &str, value: &'a Json, names: &[&str]) -> Result<Fields<'a>, ApiError> {
+    let fields = known(at, value, names)?;
+    if let Some(marker) = fields.get("cache_control") {
+        cache_control(&format!("{at}.cache_control"), marker)?;
     }
-    Ok(Fields(members))
+    Ok(fields)
 }
 
 /// A cache marker: `{"type": "ephemeral"}`, with a `ttl` of `5m` or `1h`.
@@ -209,26 +175,9 @@ fn cache_control(at: &str, value: &Json) -> Result<(), ApiError> {
     }
 }
 
-/// A member of a block that must be a string.
-fn text_member<'a>(at: &str, fields: &Fields<'a>, name: &str) -> Result<&'a str, ApiError> {
-    match fields.get(name) {
-        Some(Json::String(text)) => Ok(text),
-        Some(other) => {
-            Err(refuse(at, format!("{at}.{name} must be a string, got {}", other.kind())))
-        }
-        None => Err(refuse(at, format!("{at}.{name} is required"))),
-    }
-}
-
-/// The kind of a block.
+/// The kind of a block, which every block names.
 fn kind<'a>(at: &str, value: &'a Json) -> Result<&'a str, ApiError> {
-    match value.get("type") {
-        Some(Json::String(kind)) => Ok(kind),
-        _ if matches!(value, Json::Object(_)) => {
-            Err(refuse(at, format!("{at}.type must be a string")))
-        }
-        _ => Err(refuse(at, format!("{at} must be an object, got {}", value.kind()))),
-    }
+    chat_body::kind(at, value)?.ok_or_else(|| refuse(at, format!("{at}.type must be a string")))
 }
 
 /// The text of a text block. Citations are not served: a block may say that
@@ -314,13 +263,7 @@ fn text_part(text: &str) -> Json {
 /// Appends `text` to the text of a message, after a line break if there is
 /// text already.
 fn join(whole: &mut Option<String>, text: &str) {
-    match whole {
-        Some(whole) => {
-            whole.push_str(BETWEEN_BLOCKS);
-            whole.push_str(text);
-        }
-        None => *whole = Some(text.to_owned()),
-    }
+    chat_body::join(whole, BETWEEN_BLOCKS, text);
 }
 
 /// `system`: a string, or text blocks, which are joined with a line break.
@@ -1116,13 +1059,12 @@ fn output_config(fields: &Fields<'_>, callable: bool, chat: &mut Chat) -> Result
 
 /// An error of the reader of the chat body, under the name the field has in
 /// this API.
-pub(crate) fn renamed(mut error: ApiError) -> ApiError {
-    const NAMES: [(&str, &str); 2] =
-        [("reasoning_effort", "output_config.effort"), ("response_format", "output_config.format")];
-    if let Some((chat, here)) = NAMES.iter().find(|(chat, _)| error.param.as_deref() == Some(*chat))
-    {
-        error.message = error.message.replace(chat, here);
-        error.param = Some((*here).to_owned());
-    }
-    error
+pub(crate) fn renamed(error: ApiError) -> ApiError {
+    chat_body::renamed(
+        error,
+        &[
+            ("reasoning_effort", "output_config.effort"),
+            ("response_format", "output_config.format"),
+        ],
+    )
 }

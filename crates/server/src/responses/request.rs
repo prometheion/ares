@@ -9,19 +9,12 @@
 
 use ares_api::{GenerateRequest, Json};
 
+use crate::chat_body::{
+    self, Chat, Purpose, join, kind, known, object, optional_text, refuse, string, text_member,
+};
 use crate::defaults::decimal;
 use crate::error::ApiError;
 use crate::wire::{Fields, members, wrong_type};
-
-/// What a body is read for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Purpose {
-    /// `/v1/responses`: a reply is generated.
-    Reply,
-    /// `/v1/responses/input_tokens`: the prompt is counted, so `stream` says
-    /// nothing.
-    Count,
-}
 
 /// The members of a body that are served.
 const SERVED: &[&str] = &[
@@ -110,21 +103,6 @@ impl Echo {
             request.max_tokens.map_or(Json::Null, |limit| Json::Int(i64::from(limit)));
     }
 }
-
-fn refuse(param: impl Into<String>, message: impl Into<String>) -> ApiError {
-    ApiError::invalid_param(param, message)
-}
-
-fn object(members: Vec<(&str, Json)>) -> Json {
-    Json::Object(members.into_iter().map(|(name, value)| (name.to_owned(), value)).collect())
-}
-
-fn string(text: impl Into<String>) -> Json {
-    Json::String(text.into())
-}
-
-/// The members of the chat body as they are written.
-type Chat = Vec<(&'static str, Json)>;
 
 /// Writes the body of a Responses request over into the body of a chat
 /// request, and keeps what the response says back.
@@ -306,70 +284,11 @@ fn included(value: &str) -> Result<(), ApiError> {
     Err(refuse("include", format!("include \"{value}\" is not supported: {why}")))
 }
 
-/// The members of an object of the body, which may have the members `names`
-/// and no others. A `null` is a member that is not set.
-fn known<'a>(at: &str, value: &'a Json, names: &[&str]) -> Result<Fields<'a>, ApiError> {
-    let Json::Object(members) = value else {
-        return Err(refuse(at, format!("{at} must be an object, got {}", value.kind())));
-    };
-    for (name, member) in members {
-        if !member.is_null() && !names.contains(&name.as_str()) {
-            return Err(refuse(at, format!("{at}.{name} is not supported")));
-        }
-    }
-    Ok(Fields(members))
-}
-
-/// A member of an object that must be a string, if it is there.
-fn optional_text<'a>(
-    at: &str,
-    fields: &Fields<'a>,
-    name: &str,
-) -> Result<Option<&'a str>, ApiError> {
-    match fields.get(name) {
-        None => Ok(None),
-        Some(Json::String(text)) => Ok(Some(text)),
-        Some(other) => {
-            Err(refuse(at, format!("{at}.{name} must be a string, got {}", other.kind())))
-        }
-    }
-}
-
-/// A member of an object that must be a string.
-fn text_member<'a>(at: &str, fields: &Fields<'a>, name: &str) -> Result<&'a str, ApiError> {
-    optional_text(at, fields, name)?.ok_or_else(|| refuse(at, format!("{at}.{name} is required")))
-}
-
 /// The same, and not empty.
 fn name_member<'a>(at: &str, fields: &Fields<'a>, name: &str) -> Result<&'a str, ApiError> {
     match text_member(at, fields, name)? {
         "" => Err(refuse(at, format!("{at}.{name} must not be empty"))),
         text => Ok(text),
-    }
-}
-
-/// The `type` of an item, of a part or of a tool, if it says one.
-fn kind<'a>(at: &str, value: &'a Json) -> Result<Option<&'a str>, ApiError> {
-    match value {
-        Json::Object(_) => match value.get("type") {
-            None | Some(Json::Null) => Ok(None),
-            Some(Json::String(kind)) => Ok(Some(kind)),
-            Some(other) => {
-                Err(refuse(at, format!("{at}.type must be a string, got {}", other.kind())))
-            }
-        },
-        other => Err(refuse(at, format!("{at} must be an object, got {}", other.kind()))),
-    }
-}
-
-/// Appends `text` to `whole`, after `between` if there is text already.
-fn join(whole: &mut Option<String>, between: &str, text: &str) {
-    match whole {
-        Some(whole) => {
-            whole.push_str(between);
-            whole.push_str(text);
-        }
-        None => *whole = Some(text.to_owned()),
     }
 }
 
@@ -990,17 +909,13 @@ fn text(fields: &Fields<'_>, callable: bool, chat: &mut Chat) -> Result<Json, Ap
 
 /// An error of the reader of the chat body, under the name the field has in
 /// this API.
-pub(crate) fn renamed(mut error: ApiError) -> ApiError {
-    const NAMES: [(&str, &str); 3] = [
-        ("reasoning_effort", "reasoning.effort"),
-        ("response_format", "text.format"),
-        ("max_tokens", "max_output_tokens"),
-    ];
-    for (chat, here) in NAMES {
-        if error.param.as_deref().is_some_and(|param| param.starts_with(chat)) {
-            error.message = error.message.replace(chat, here);
-            error.param = error.param.take().map(|param| param.replacen(chat, here, 1));
-        }
-    }
-    error
+pub(crate) fn renamed(error: ApiError) -> ApiError {
+    chat_body::renamed(
+        error,
+        &[
+            ("reasoning_effort", "reasoning.effort"),
+            ("response_format", "text.format"),
+            ("max_tokens", "max_output_tokens"),
+        ],
+    )
 }

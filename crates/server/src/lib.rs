@@ -48,6 +48,7 @@ mod access;
 mod anthropic;
 mod base64;
 mod bridge;
+mod chat_body;
 pub mod defaults;
 mod error;
 mod images;

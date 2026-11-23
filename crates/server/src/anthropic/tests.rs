@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 
 use super::edits::{Edit, Keep, ToolUses, Trigger, Turns};
 use super::reply::{Block, BlockEvent, Blocks, Content, Head, SIGNATURE, block_event, stop_reason};
-use super::request::{Asked, Purpose, to_chat};
+use super::request::{Asked, to_chat};
+use crate::chat_body::Purpose;
 use crate::reasoning::Split;
 use crate::reply::Piece;
 

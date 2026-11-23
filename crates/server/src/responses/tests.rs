@@ -4,8 +4,9 @@ use ares_api::{Json, Usage};
 use serde_json::{Value, json};
 
 use super::reply::{Change, Ending, Head, Output, Written, change_events};
-use super::request::{Echo, Purpose, renamed, to_chat};
+use super::request::{Echo, renamed, to_chat};
 use crate::bridge::Timings;
+use crate::chat_body::Purpose;
 use crate::error::ApiError;
 use crate::reasoning::Split;
 use crate::reply::Piece;

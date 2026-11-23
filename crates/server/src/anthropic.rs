@@ -130,8 +130,8 @@ use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{IntoResponse, Response};
 
 use self::reply::{Blocks, Content, Head, Written, block_event, stop_reason};
-use self::request::Purpose;
 use crate::ReasoningFormat;
+use crate::chat_body::Purpose;
 use crate::error::{Anthropic, ApiError};
 use crate::models::Lease;
 use crate::reply::Sorter;
