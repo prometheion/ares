@@ -1308,3 +1308,35 @@ fn checkpoints_inside_a_step_serve_a_later_prompt() {
         assert_consistent(&e);
     }
 }
+
+/// An agent's next turn right after the last (a short turn, then the whole conversation and a
+/// long tool result): the end state of the short turn is saved with the next record, into the
+/// one place there is, and the next turn restores it in that same record. Its rows are read in
+/// one wide step whose checkpoints inside take places before the record is written, which
+/// gives up the end state to make room: its save must still run before its restore. (Dropped
+/// with the checkpoint, the restore read what the place held before, and on Flash-Next the
+/// step failed: "the rows of slot 0 start at cell 650 and its sequence is at cell 512".)
+#[test]
+fn a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state() {
+    let mut rng = Rng(31);
+    let shape = |c: &mut SyntheticConfig| {
+        c.max_rows = 256;
+        c.own_rows = 16;
+        c.inner_saves = true;
+    };
+    let model = model(Some(CHECKPOINT), shape);
+    let e = engine(&model, config(256, 1));
+    // Less than a page with the reply: no checkpoint but the end state's.
+    let first = text_of(&mut rng, 10);
+    let done = e.ask(&first, 6);
+    assert_eq!(done.run.text, fresh(shape, &first, 6).text);
+    let saved = e.snapshot().counters;
+    assert_eq!(saved.checkpoints_saved, 1, "the end state is the one checkpoint");
+    let second = format!("{first}{}{}", done.run.text, text_of(&mut rng, 150));
+    let again = e.ask(&second, 6);
+    let after = e.snapshot().counters;
+    assert_eq!(after.checkpoints_restored - saved.checkpoints_restored, 1);
+    assert_eq!(again.report.replayed_rows, 0, "{:?}", again.report);
+    assert_eq!(again.run.text, fresh(shape, &second, 6).text);
+    assert_consistent(&e);
+}

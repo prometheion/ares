@@ -720,9 +720,16 @@ impl Cache {
     fn give_up(&mut self, place: u32, out: Option<StateOut>) {
         self.placed.remove(&place);
         // A save of it that still waits for its record has nothing to save,
-        // and the level on SSD nothing to write from the place.
+        // and the level on SSD nothing to write from the place. Unless a
+        // restore of that record reads the place: the save runs before it, so
+        // the restore gets the state the checkpoint was taken of (a request's
+        // end state that the next turn of its conversation starts from, given
+        // up for the places of that turn's saves inside its first step).
         let unsaved = self.saves.iter().any(|copy| copy.place == place);
-        self.saves.retain(|copy| copy.place != place);
+        let restored = self.restores.iter().any(|copy| copy.place == place);
+        if !restored {
+            self.saves.retain(|copy| copy.place != place);
+        }
         if let (Some(ssd), Some(out)) = (&mut self.ssd, out) {
             if unsaved {
                 ssd.counters.states_skipped += 1;
@@ -731,7 +738,7 @@ impl Cache {
                 self.states_out.push(out);
             }
         }
-        if self.restores.iter().any(|copy| copy.place == place) {
+        if restored {
             self.deferred.push(place);
         } else {
             self.free(place);
@@ -893,11 +900,13 @@ impl Cache {
         if self.restores.len() == before {
             return false;
         }
-        // Places that were waiting for it are free if nothing else reads them.
+        // Places that were waiting for it are free if nothing else reads them,
+        // and a save into one that was kept for the restore has nothing to save.
         let restores = &self.restores;
         let (free, waiting): (Vec<u32>, Vec<u32>) = std::mem::take(&mut self.deferred)
             .into_iter()
             .partition(|place| !restores.iter().any(|copy| copy.place == *place));
+        self.saves.retain(|copy| !free.contains(&copy.place));
         self.settling.extend(&free);
         self.free_places.extend(free);
         self.deferred = waiting;
