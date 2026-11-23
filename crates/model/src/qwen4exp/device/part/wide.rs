@@ -214,7 +214,7 @@ impl State {
             w.layers.iter().filter_map(|l| l.mixers.map(|(attn, _)| attn.down.n_in)).max();
         let float_width =
             float_width(streams.is_some(), u64::from(streams.unwrap_or(0)), u64::from(n));
-        let cpu_rows = opts.cpu_rows.min(opts.max_rows);
+        let cpu_rows = opts.wide_cpu_rows();
         let act_bytes = ares_runtime::expert_store::cpu::act_bytes(n as usize, cpu_rows as usize);
         Ok(Self {
             precision: opts.precision,

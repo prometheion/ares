@@ -177,6 +177,13 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The most rows of a wide step in which the CPU takes part ([`Options::cpu_rows`]): none
+    /// with [`Precision::Exact`], whose wide steps multiply the experts' f16 rows, where the
+    /// CPU's are 8-bit.
+    pub fn wide_cpu_rows(&self) -> u32 {
+        if self.precision == Precision::Exact { 0 } else { self.cpu_rows.min(self.max_rows) }
+    }
+
     /// The most rows of a step on the part's own scratch.
     pub fn own_rows(&self) -> u32 {
         if self.own_rows == 0 { self.max_rows } else { self.own_rows.min(self.max_rows) }
@@ -961,7 +968,7 @@ impl Frame {
             s.plan_rows = take!(wide::plan_bytes(&expert_shape, opts.max_rows));
             s.hidden_rows = take!(expert_shape.rows_hidden_bytes(opts.max_rows));
             s.experts_f16 = take!(expert_shape.rows_activation_bytes(opts.max_rows));
-            s.cpu_sums = take!(u64::from(opts.cpu_rows.min(opts.max_rows)) * n * 4);
+            s.cpu_sums = take!(u64::from(opts.wide_cpu_rows()) * n * 4);
         }
         s.len = len;
         let lent_pieces = (!pieces.is_empty() && fits).then_some(held);
@@ -1059,7 +1066,7 @@ impl Frame {
                 * (4 * u64::from(expert_shape.top_k) * u64::from(opts.max_rows))
                     .next_multiple_of(64),
             wide_cpu_host: if opts.max_rows > MAX_BATCH {
-                wide::cpu_host_bytes(n, opts.cpu_rows.min(opts.max_rows))
+                wide::cpu_host_bytes(n, opts.wide_cpu_rows())
             } else {
                 0
             },
