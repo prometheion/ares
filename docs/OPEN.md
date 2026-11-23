@@ -56,20 +56,18 @@ tree is accepted than a chain), then built; started when the pieces in work leav
 piece at a time.
 
 ## In work now
+Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every expert type, image input pieces 4 to 8, request priorities and the server items, the slot-number crash fix.
 Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix/mtp-and-slots`,
 `moe/prompt-chunks`, `cache/checkpoints`, `devices/roles`); what needs two cards is owed below
 ("Owed on two cards").
 
 | Piece | State |
 | --- | --- |
-| Flash-Next decodes UD-Q3_K_XL at least as fast as Strata on the test machine (the owner, 2026-11-22): CPU kernels for every expert type, then the next lever by measurement | handed back, being verified (`flash/cpu-experts`): with drafts 26 -> 34 to 36 tokens/s at 40G, ahead of Strata 0.1.60 (29.9); Strata 0.1.65 not measured yet |
 | Flash-Next prompts at least as fast as Strata (176 / 250 / 281 against 198 / 787 / 1192 tokens/s at 2k / 8k / 32k), and a nearly cached turn read as if uncached (31 s for 6832 tokens with 6784 cached; Strata 0.4 s) | agent stopped (context full), work committed (`flash/prompt`): the CPU takes a wide step's misses, forms per type, loans in pieces, the anchor fix for cached turns, slots refilled after a loan; locally a 17k prompt 335 against 130 tokens/s, the tokens after it slower; to be verified |
 | The layer-major prompt pass (TokenWing's order; the owner moved it forward), interruptible between layers | agent working (`flash/layer-major`, on `flash/prompt`) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | agent working on the test machine (`flash/ssd-stream`) |
 | 6: K/V beyond VRAM into RAM (Flash-Next) | handed back, continuing: finished requests' far pages as prompt cache (the owner), the control run for decode after a long prompt (`kv/overflow`) |
-| 7 and the server part of 8: priorities of requests, system messages and efforts on the chat and Responses routes, Messages items, thinking budget, special tokens, truncation, small ones | handed back, being verified (`server/priorities`) |
-| Image input, pieces 4 to 8 (the owner, 2026-11-22: next, for production): the tower as a conductor job, the splices in both models, the routes, caching | handed back; with the CPU kernels and the priorities in one line of commits (`server/priorities`), being verified on the local cards |
-| Flash-Next's second card measured at load (experts only or a dense share), capped cards measuring their prefill path per type, the MTP test that fails split by layers | agent working on the local cards (`devices/load-choice`) |
+| Flash-Next's second card timed at load (experts only kept on these cards, +3.2 to 3.7 s at load), capped cards measuring their prefill path, the 196-row MTP test, and the 27B at the owner's production settings planned within free memory (it did not load before) | handed back, being verified on the local cards (`devices/load-choice`) |
 | DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 (the owner, 2026-11-22: pulled forward if it brings a lot): acceptance of trees against chains, the extra experts a tree costs, how well draft tokens predict their experts, the estimate | agent measuring (`flash/trees-study`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
