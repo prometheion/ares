@@ -429,17 +429,15 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       to 58 s (ARCHITECTURE.md). Built with it: the CPU's share of a pass of up to 2048 rows;
       the next layer's experts that no tier holds read into staging while a layer's
       micro-batches run.
-- [ ] Passes, what is left: **owner's decision:** a checkpoint every 16 384 fresh tokens cuts a
-      prompt, and the anchor cuts its last page off: the rows after a cut are a step that reads
-      nearly every expert again (32k: two passes; 17k: a pass and two steps). Either the pass
-      copies each layer's state into the checkpoint as it goes past the position (to build:
-      a save inside a step in the record, per-layer copies of the slot, the MTP block's and the
-      n-gram history's state there), or the 16 384-token checkpoints go to the end of the pass
-      that passes them (replays from them up to a pass long). Also left: uploads of the next
-      layer's RAM-held experts while a layer's micro-batches run (only file reads go ahead now);
-      a pause inside a layer's experts (a request waits for at most one layer's experts);
-      the lent wide steps are still there for tile-mean K/V and DFlash, which passes do not
-      take. TokenWing's form, read 2026-11-22
+      Checkpoints due inside a pass are saved there layer by layer (the step is no longer cut
+      at every 16 384 tokens and at the anchor).
+- [ ] Passes, what is left: with both devices on every layer the MTP block's chains after a
+      pass agree with the reference's for 1 to 3 links where after steps of the own rows 5 to 7
+      (the trunk's tokens are the reference's): not found. Uploads of the next layer's
+      RAM-held experts while a layer's micro-batches run (only file reads go ahead now); a
+      pause inside a layer's experts (a request waits for at most one layer's experts); the
+      lent wide steps are still there for tile-mean K/V and DFlash, which passes do not take.
+      TokenWing's form, read 2026-11-22
       (`src/llama-context.cpp` `lm_layer_major_ok`, `src/llama-moe-stream.cpp`
       `lm_lend_place`): only for a call of one sequence and more than one micro-batch; each
       micro-batch runs a layer's attention and router (its picks, weights and the normed

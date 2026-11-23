@@ -6191,13 +6191,22 @@ wider than the parts' own scratch runs as a **pass**:
   rows' mixed input to the host where they lie among the pass's rows, the misses are split
   between the CPU and the link from the pass's picks as a wide step's are, and the CPU's sums
   go into their chunks' rows (`a_prompt_read_layer_by_layer_has_the_cpu_compute_its_misses`).
-- *Where the conductor cuts a pass.* A step ends where a checkpoint is due: every 16 384 fresh
-  tokens and at the anchor (the last page boundary before a prompt's end, or its last
-  `<|im_start|>`). The rows after a cut are a step of their own that picks nearly every expert
-  again: a prompt of 17 000 tokens is a pass of 16 384 rows, a step of 512 and one of 104, and
-  one of 32 768 two passes. A checkpoint inside a pass (each layer's state copied as the pass
-  goes past the position) or checkpoints at the end of a pass instead of every 16 384 tokens
-  would read the experts once for such prompts (see OPEN.md).
+- *Checkpoints inside a pass.* A step ends where a checkpoint of the prefix cache is due (every
+  16 384 fresh tokens, at the anchor: the last page boundary before a prompt's end or its last
+  `<|im_start|>`, at the roots), and the rows after such a cut were a step of their own that
+  picked nearly every expert again. A model that saves inside its steps
+  (`Model::saves_inside_steps`, at least 16 rows from either end) gets those checkpoints named
+  in the record instead (saves inside the step: slot, place, position; the conductor takes the
+  places before the step and names their pages at its commit, `Cache::reserve`/`attach`), and the
+  step goes on. The pass cuts its micro-batches at those rows and, as each layer goes past one,
+  copies that layer's part of the slot (`Frame::layer_slot`: its recurrent state, its indexer's
+  carried keys, the n-gram history at its layer) into the place (`Places::save_part`); the MTP
+  block's state goes there once the block has followed the rows up to the position, and what
+  the n-gram feed keeps of the sequence there is written at once. The place holds, when the pass
+  is done, what a save at the end of a step at that position would hold.
+  (`a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it`, `tests/prefix.rs`
+  `checkpoints_inside_a_step_serve_a_later_prompt`.) The tail behind the last checkpoint that
+  is too close to the end is a step of its own as before.
 
 *Measured* (2026-11-23, local, the IQ2_XS file through the server, `--ram 8G`, `--context
 40960`, a fresh cache and no usage profile; a prompt of 17 000 tokens of this document with 64
