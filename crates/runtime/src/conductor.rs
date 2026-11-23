@@ -2285,6 +2285,9 @@ impl Conductor {
             return;
         }
 
+        // The places of the checkpoints due inside the step's rows: taking them may give
+        // other checkpoints up, which leave the devices below.
+        self.reserve_inner();
         // What left the devices while the step was planned is copied into
         // RAM before a step writes its pages again: the step that only drafts
         // writes the cells of the MTP block's chains.
@@ -2301,7 +2304,6 @@ impl Conductor {
         } else {
             0.0
         };
-        self.reserve_inner();
         let used = match self.write_record(false) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
