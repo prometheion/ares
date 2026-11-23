@@ -1034,6 +1034,43 @@ fn a_prompt_read_layer_by_layer_reads_k_and_v_beyond_vram_from_a_copy() {
     }
 }
 
+/// A request that starts on a page beyond VRAM: the prompt cache holds the pages of a prompt
+/// of three pages, so the next request's sequence begins on the pool's lowest free page, which
+/// is far when only the first page is near; and one that shares the first 50 cells of that
+/// prompt, whose first page the cache copies into a far page. Their answers are the ones they
+/// give with every page in VRAM, in every placement.
+#[test]
+fn a_sequence_that_starts_beyond_vram_answers_as_in_vram() {
+    if !enabled() {
+        return;
+    }
+    let (first, next) = (prompt(300, 7), prompt(40, 11));
+    let shared: Vec<u32> = first[..50].iter().copied().chain(prompt(30, 13)).collect();
+    for placement in placements() {
+        let mut answers = Vec::new();
+        for near in [None, Some(1)] {
+            let (runtime, model) = start_passing_near(&gguf_path(1), placement, 0, MAX_ROWS, near);
+            let _ = ask(&runtime, 1, &first, 8);
+            let exact = fill_every_slot(&model);
+            let mut got = ask(&runtime, 2, &next, 16);
+            got.extend(ask(&runtime, 3, &shared, 16));
+            runtime.shutdown();
+            answers.push((got, exact));
+        }
+        let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        eprintln!(
+            "FAR START {placement:?}: {} of {} tokens as with every page in VRAM",
+            leading(&answers[1].0, &answers[0].0),
+            answers[0].0.len()
+        );
+        if answers.iter().all(|(_, exact)| *exact) {
+            assert_eq!(answers[1].0, answers[0].0, "{placement:?}");
+        } else {
+            assert!(leading(&answers[1].0, &answers[0].0) >= 2, "{placement:?}");
+        }
+    }
+}
+
 /// [`start_passing`] on 16 pages with the K and V of the pages from `near` on in host memory.
 fn start_passing_near(
     path: &std::path::Path,
