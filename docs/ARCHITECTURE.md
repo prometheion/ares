@@ -3820,19 +3820,21 @@ the tiles of a step as equal as they can be), and each tile into the same number
 count that fills the waves of the prompt kernel best (one block per multiprocessor, its
 registers fill one; `PlanConfig::prompt_blocks`), within the tiles' share of the budget of pieces.
 The items run piece by piece and KV head, so the blocks that run at once read the same cells and
-the L2 cache serves them all. A block has 8 warps of 16 vectors and walks its range in chunks of
-32 cells; the queries stay in shared memory, the accumulator in registers (f32), and the stored
-rows of the next chunk are loaded into registers while the tensor cores work on this one.
+the L2 cache serves them all. (Sharing the cells out evenly over one wave instead, blocks reading
+several pieces one after the other, was built and measured: 15 % slower on both cards, because the
+blocks that run at once then read different cells.) A block has 8 warps of 16 vectors and walks
+its range in chunks of 32 cells; the queries stay in shared memory, the accumulator in registers
+(f32), and the stored rows of the next chunk are loaded into registers while the tensor cores
+work on this one.
 
 - *Scores in integers* (converted entries with K in `q8` to `q4`, `ares_attn_d*_p128i`). The
   codes of K are integers: the query becomes a 15-bit integer per value (rotated, scaled, one
   scale per vector) split into a signed high byte and an unsigned low one, two int8 products
   (`m16n8k32`) per group of 32 values sum it exactly in int32, and the group's scale of K is
-  applied in f32. The tile mean's dot products come from the same products: the mean as a 15-bit
-  integer per value (a scale per group) in two rows of a mean tile. On GeForce cards f16 products
-  with f32 sums run at half rate; the int8 ones run at four times that, so the scores cost what
-  f16 sums would, and they are closer to the reference than f16 operands (the wide window of 300
-  rows: `q8`/`q8` 5e-4 to 8e-4 of the largest output against 1.9e-3 to 3.3e-3).
+  applied in f32. On GeForce cards f16 products with f32 sums run at half rate; the int8 ones
+  run at four times that, so the scores cost what f16 sums would, and they are closer to the
+  reference than f16 operands (the wide window of 300 rows: `q8`/`q8` 5e-4 to 8e-4 of the largest
+  output against 1.9e-3 to 3.3e-3).
 - *P V* in f16 with f16 sums over the 32 cells of a chunk, added to the f32 accumulator after each
   chunk (one rounding of a sum of 32 products, the size of the weights' own f16 rounding; summing
   in f16 over the whole range, as llama.cpp does, would grow with the length).

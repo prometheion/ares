@@ -1033,6 +1033,9 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       which blocks read K/V tiles so that blocks sharing K/V hit L2 together: prompts of the 27B
       on an RTX 5090 at 131072 cells 1290 -> 1822 tokens/s (1.41x), 1.25x at 65536, 1.07x at
       32768, nothing below. Ares' attention for prompts and wide windows at long contexts.
+      Prompts: the new prompt kernel (see "Against the owner's production") is bound by its
+      instructions, not by K/V traffic (about 50 GB/s of the RTX 3060's 360 at 98k), so the order
+      of reads is not its lever; wide windows (drafts) still run on the decode shapes.
 - [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
       `--kv-grow`), the MTP block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
@@ -1091,6 +1094,17 @@ access, greedy, the bench of `/var/tmp/ares-tools/prod-ab/` (fork 2 rounds, Ares
       3060; the fork puts 75 % there and still reads 98k at 752 tokens/s, so Ares' attention over
       long contexts on that card is the gap (its flash attention against ours; llama.cpp PR 32407 is
       in "Optimising").
+      Built (`attn/long-context`): a prompt kernel of 128 vectors (`kernels/attn_prompt.cuh`) with
+      integer scores over quantized K, P V summed in f16 per chunk of 32 cells, the tile mean's dot
+      products by the same int8 products, phases in which decode and the tensor cores overlap, and
+      the converted cells shared out over one wave of blocks. One attention layer, a step of 256
+      rows at the end of 98 304 cells, K and V in `q5` (the fork `q5_1`): RTX 3060 with 3 KV heads
+      79.9 ms before, about 24 ms now, the fork 13.5 ms; RTX 4070 with 1 head 11.3 ms, 3.4 ms, the
+      fork 2.1 ms. At 32 768 cells 26.6, 8.3 and 4.6 ms on the 3060. Output closer to the
+      reference than before (integer scores). What is left: the kernel reaches about 40 % of the
+      int8/f16 tensor rate of the capped cards, the fork about 67 % (its O in f16 over the whole
+      range and the query in registers; Ares keeps O in f32 and so 128 of 255 registers, two warps
+      per scheduler with latencies that do not overlap); end-to-end numbers below.
 - [ ] Images on these settings, and a day of the owner's own use as a second llama-swap entry.
 
 ## Parallel requests against the owner's production (2026-11-23, `bench/parallel`)
