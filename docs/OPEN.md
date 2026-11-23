@@ -1093,6 +1093,55 @@ access, greedy, the bench of `/var/tmp/ares-tools/prod-ab/` (fork 2 rounds, Ares
       in "Optimising").
 - [ ] Images on these settings, and a day of the owner's own use as a second llama-swap entry.
 
+## Parallel requests against the owner's production (2026-11-23, `bench/parallel`)
+The owner (2026-11-23): "How does Ares compare with my fork in parallel calls? That is really the
+whole reason I am making the engine." Same settings as the section above (the fork's preset run
+as the router's child with its own port and cache; Ares `--parallel 2`, and 4 and 8 at the same
+262144 cells), greedy, MTP on, each request its own topic (Ares' n-gram drafter copies from every
+sequence it has seen). Client `/var/tmp/ares-tools/prod-ab/parallel.py`, sessions
+`psession.sh`, notes and every number `/var/tmp/ares-parallel/notes.md`. Fork and Ares
+alternated, two rounds each, machine load 2 to 5 unless named.
+| | fork | Ares |
+| --- | --- | --- |
+| One request alone, de / en / code, tokens/s | 58-65 / 60-64 / 73-76 | 72-73 / 63-75 / 91-98 |
+| Two at once, sum while both run, de / en / code | 98 / 104-108 / 127-129 | 105-111 / 93-111 / 106-134 |
+| Two at once, the two requests | even (48 + 50) | uneven (40 + 71, 42 + 92) |
+| 3 / 4 / 8 requests at once, sum tokens/s (`--parallel 2`) | 86-87 / 100-109 / 95-97 | 115 / 107 / 110 |
+| the same with `--parallel 4` / `8` (Ares) | | 120-149-150 / 115-154-206 |
+| 8 at once, slowest first token | 19.3 s | 17.6 s (p2), 11.1 s (p4), 0.48 s (p8) |
+| 8k prompt beside a generating request: first token (alone) | 15.2-15.5 s (9.1-9.3) | 20.4 s (7.9) |
+| the generating request's rate meanwhile (alone) | 21-23 tokens/s (60-65) | 34-35 (67-72) |
+| 32k prompt beside it: first token (alone) | 59.8-59.9 s (34.1) | 124.1-124.4 s (49.0-49.1) |
+| 98k prompt beside it: first token (alone) | 208.9-219.1 s (127.8-134.8) | 754-763 s (296) |
+| longest gap of the generating request at 8k / 32k / 98k | 0.54-0.66 / 0.51-0.60 / 0.81-1.01 s | 0.37 / 0.47-0.67 / 1.15-1.41 s |
+| Two agents (16.6k-token system prompt and tools), cold, first turns | 22.3 / 47.7 s | 19.9 / 19.9 s |
+| a turn with a 5.8k tool result at 17k depth, alone / both agents at once | 6.6-7.6 s / 9-17 s | 10.0-10.2 s / 12.1 and 26-29 s |
+| small cached turns | 0.23-1.1 s | 0.15-0.25 s |
+| session walls, cold pair / warm pair | 70 + 80 s / 38-40 s | 69-71 s / 31-37 s |
+| A short request beside two generations (both places busy) | 24.5-25.8 s | priority 0: 0.15 s, same priority: 18-21 s |
+| the same beside a generation and a 32k prompt | 54.9-56.9 s | priority 0: 0.28-0.41 s, same priority: 39-54 s |
+| VRAM peak (p2; p8) | 11.5 / 11.6 GiB | 11.2 / 9.9 GiB; 11.3 / 11.2 GiB |
+What Ares does better: three or more requests (a place each, at the same context), priorities, the
+system prompt two agents send at once (the second waits for the first's announced pages and shares
+them), cached turns, one request alone. What it does worse, and why:
+- [ ] A long prompt next to a generating sequence takes 2.5 times its time alone (the fork 1.6 to
+      1.8): `Share` gives generation half of the time (the slowdown of 2, not an option) and the
+      prompt runs in pieces of 256 rows; the fork runs the prompt in a second context at the same
+      time and the generating slot on high-priority streams, and its generation drops to 35-40 %
+      (Ares 50 %). Both use about the same share of the cards (fork 0.96-0.97 of the two rates
+      alone, Ares 0.87-0.93). With the slower attention at depth (the long-context piece) the 98k
+      prompt waits 12.6 min against 3.5. Levers: the split (a smaller slowdown, or one by the
+      prompt's length), then the attention.
+- [ ] Two prompts at once are read one after the other (shortest first); the first then generates
+      and the second takes turns with it: the second agent's 5.8k turn waits 26-29 s (fork 9-17,
+      both prompts in the same batches). The rows of two prompts could share a piece.
+- [ ] A turn that continues at 17-23k reads 576 tokens/s (fork 880; Ares 1020 from the start of a
+      prompt): the attention at depth (the long-context piece).
+- [ ] Two generating sequences share a step's draft rows by their chance (`window::choose`) up to
+      the 8-row edge of the price table (8 rows 31.0 ms, 9 rows 37.1, 16 rows 47.8): the sum is as
+      good as the fork's or better, but one request gets 1.5 tokens a step and the other 2.1 to 3.3.
+      A cheaper 9-to-16-row step, or a fairness term.
+
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
 the agents' builds):
