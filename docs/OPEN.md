@@ -1037,6 +1037,11 @@ the agents' builds):
       the budget): a prompt that reads its prefix with another sequence, or past its first tiles
       with K and V in `q7` to `q4`, can take more (the 27B's failure of 2026-11-23). To size it
       with `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs.
+- [ ] `qwen4exp_device` with both cards on every layer (`ARES_TEST_SPREAD=tensor`, the share 0.5
+      and experts only alike), 2026-11-23 on main e33779a: `every_layer_of_wide_steps_matches_the_reference`
+      (attention core 5.16e-2 against a bound of 3e-2 for the shipped types) and
+      `experts_of_every_weight_type_on_the_cpu_change_nothing_4` (f32 and q2_K: 4 of 480 misses
+      not computed on the CPU) fail; they passed on the evening's main (c5d27e9).
 - [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
       qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
