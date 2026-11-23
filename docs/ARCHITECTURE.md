@@ -4501,7 +4501,10 @@ roles hold about equally (experts only gives the worker the bytes of its dense
 share for slots, and the mixer as many fewer). The trial runs in the first
 placement of a load (`place`, `Session::open`); later placements of the same load
 pin its choice, and with `--cache` the server keeps it next to the stores as
-before. The server's log says what each role took and which was kept;
+before. A worker that holds experts only holds no state that a draft window
+changes, so it keeps nothing for windows and their commit does nothing there (it
+had refused windows, which took Flash-Next down with its MTP block once the trial
+chose that role; `qwen4exp_runtime` `a_worker_of_experts_only_runs_draft_windows`). The server's log says what each role took and which was kept;
 `qwen4exp_run` prints it.
 
 *Measured* on the two development cards (2026-11-23, `qwen4exp_run`, the IQ2_XS file,

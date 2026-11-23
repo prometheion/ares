@@ -427,6 +427,67 @@ fn start_with(
     (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
 }
 
+/// [`start_drafting`] on two devices that share every layer, the second holding experts
+/// only (`core_share` 1, the shared expert on the mixer): the role the trial at load keeps
+/// on the two development cards.
+fn start_drafting_experts_only(seed: u64) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(Placement::Shared);
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let mut opts = options(Placement::Shared, n_layer, 16, MAX_ROWS, MAX_ROWS);
+    opts.spread =
+        Spread::Tensor { mixer: Some(0), core_share: Some(1.0), shared_on_mixer: Some(true) };
+    let mut inner =
+        Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap();
+    inner = inner.with_mtp(Gguf::open(draft_path(seed)).unwrap()).expect("the MTP block fits");
+    let inner = Arc::new(inner);
+    let config = RuntimeConfig {
+        pages: 16,
+        cells_per_page: 128,
+        max_slots: SLOTS,
+        window_rows: 8,
+        ..RuntimeConfig::default()
+    };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    gpu.ram_limit += 256 << 20;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+}
+
+/// A second device that holds experts only runs draft windows: it keeps nothing for them
+/// and their commit has nothing to do there (it refused them, which took the model down
+/// once the trial at load chose that role, 2026-11-23). Drafts change no greedy token.
+#[test]
+fn a_worker_of_experts_only_runs_draft_windows() {
+    if !enabled() || device_count().expect("the CUDA driver") < 2 {
+        return;
+    }
+    let mut repeats = prompt(12, 5);
+    repeats.extend_from_within(..);
+    let (runtime, model) = start_drafting_experts_only(2);
+    warm(&model);
+    let drafted = ask(&runtime, 1, &repeats, 60);
+    let again = ask(&runtime, 2, &repeats, 60);
+    let (undrafted, _) = ask_sampled(
+        &runtime,
+        3,
+        &repeats,
+        60,
+        Sampling { temperature: Some(0.0), ..Sampling::default() },
+        false,
+    );
+    let counters = runtime.snapshot().expect("the runtime is running").counters;
+    runtime.shutdown();
+    eprintln!(
+        "RES experts only: draft rows {}, accepted {}, rejected {}",
+        counters.draft_rows, counters.drafts_accepted, counters.drafts_rejected
+    );
+    assert!(counters.draft_rows > 0, "no draft window ran");
+    assert_eq!(drafted, undrafted, "drafts changed a greedy reply");
+    assert_eq!(again, undrafted, "accepted drafts changed a greedy reply");
+}
+
 /// The tokens of the text `t5 t9 ...` a request wrote.
 fn tokens_of(text: &str) -> Vec<u32> {
     text.split_whitespace().map(|w| w[1..].parse().unwrap()).collect()

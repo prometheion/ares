@@ -2020,7 +2020,8 @@ impl Part {
                     stride * ENTRY_CELLS
                 )));
             }
-            if !s.direct && (!self.keeps_windows() || s.n_rows > self.opts.window_rows) {
+            let unkept = self.holds_state() && !self.keeps_windows();
+            if !s.direct && (unkept || s.n_rows > self.opts.window_rows) {
                 return Err(invalid(format!(
                     "a draft window of {} rows; {} were reserved",
                     s.n_rows, self.opts.window_rows
@@ -3343,6 +3344,14 @@ impl Part {
         self.rec.kept_bytes() > 0 || self.kept_raw.is_some()
     }
 
+    /// Whether a step changes state of the part that a draft window's commit
+    /// settles: recurrent heads, attention layers, the n-gram history. A worker
+    /// that holds experts only has none; its windows need nothing kept, and their
+    /// commit nothing done.
+    fn holds_state(&self) -> bool {
+        self.w.layers.iter().any(|l| l.ngram.is_some() || !matches!(l.core, CoreW::None))
+    }
+
     /// Whether the last step left draft windows that wait for their commit.
     pub fn has_deferred(&self) -> bool {
         self.deferred.is_some()
@@ -3377,6 +3386,9 @@ impl Part {
         }
         let ib = self.f.inbox;
         let bytes = record.as_bytes();
+        if !self.holds_state() {
+            return Ok(());
+        }
         if !self.keeps_windows() {
             return Err(invalid("no draft windows were reserved"));
         }
