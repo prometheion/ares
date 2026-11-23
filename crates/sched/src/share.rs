@@ -176,12 +176,15 @@ impl Share {
     /// prompts, or the image tower's units for one), while `generating`
     /// sequences generated, each of which got `riding` tokens meanwhile (the
     /// newest token that rides along in a piece): nobody to pay means no debt.
-    pub fn prompts_ran(&mut self, ms: f64, riding: f64, generating: u32) {
+    /// `crowded` says that a request waits in line for a place: the generating
+    /// sequences, which give places back, then get half of the time whatever
+    /// the floor, as a prompt's own request does not end before its reply.
+    pub fn prompts_ran(&mut self, ms: f64, riding: f64, generating: u32, crowded: bool) {
         if generating == 0 {
             self.owed_ms = 0.0;
             return;
         }
-        self.owed_ms += self.rounds_for(ms, riding);
+        self.owed_ms += if crowded { ms } else { self.rounds_for(ms, riding) };
     }
 
     /// Books a round that took `ms` milliseconds (its drafts' step included)
@@ -250,7 +253,7 @@ mod tests {
                         left -= take;
                     }
                     let ms = price(rows - left + 1);
-                    share.prompts_ran(ms, 1.0, 1);
+                    share.prompts_ran(ms, 1.0, 1, false);
                     time += ms;
                     got += 1.0;
                     pieces += 1;
@@ -290,7 +293,7 @@ mod tests {
         // more, which rounds bring in 100 ms beyond the floor's own share.
         let mut share = measured(20.0);
         assert!((share.rate().unwrap() - 0.07).abs() < 1e-9);
-        share.prompts_ran(300.0, 1.0, 1);
+        share.prompts_ran(300.0, 1.0, 1, false);
         assert!((share.owed_ms() - 100.0).abs() < 1e-6, "{}", share.owed_ms());
         let long = pending(1, &[5000]);
         assert_eq!(share.next(&long, price), Turn::Round);
@@ -302,26 +305,37 @@ mod tests {
 
         // A higher floor owes more; a floor the rounds cannot reach, half.
         let mut thirty = measured(30.0);
-        thirty.prompts_ran(300.0, 1.0, 1);
+        thirty.prompts_ran(300.0, 1.0, 1, false);
         assert!((thirty.owed_ms() - 200.0).abs() < 1e-6, "{}", thirty.owed_ms());
         let mut unreachable = measured(80.0);
-        unreachable.prompts_ran(300.0, 1.0, 1);
+        unreachable.prompts_ran(300.0, 1.0, 1, false);
         assert_eq!(unreachable.owed_ms(), 300.0);
         // So does a piece before any round was measured.
         let mut fresh = Share::new(20.0);
-        fresh.prompts_ran(300.0, 1.0, 1);
+        fresh.prompts_ran(300.0, 1.0, 1, false);
         assert_eq!(fresh.owed_ms(), 300.0);
+    }
+
+    #[test]
+    fn a_request_waiting_for_a_place_gives_generation_half_whatever_the_floor() {
+        // The generating sequences give places back: while a request waits for
+        // one, a piece leaves its own time owed, at a floor of 20 as of none.
+        for floor in [0.0, 20.0] {
+            let mut share = measured(floor);
+            share.prompts_ran(300.0, 1.0, 1, true);
+            assert_eq!(share.owed_ms(), 300.0, "floor {floor}");
+        }
     }
 
     #[test]
     fn a_floor_of_nothing_or_one_the_riding_tokens_keep_owes_nothing() {
         let mut none = measured(0.0);
-        none.prompts_ran(300.0, 1.0, 2);
+        none.prompts_ran(300.0, 1.0, 2, false);
         assert_eq!(none.owed_ms(), 0.0);
         assert_eq!(none.next(&pending(1, &[5000]), price), Turn::Piece { rows: 255 });
         // One token in a piece of 100 ms is 10 tokens a second.
         let mut low = measured(10.0);
-        low.prompts_ran(100.0, 1.0, 1);
+        low.prompts_ran(100.0, 1.0, 1, false);
         assert_eq!(low.owed_ms(), 0.0);
     }
 
@@ -330,28 +344,28 @@ mod tests {
         let mut share = measured(20.0);
         let piece = Turn::Piece { rows: 254 };
         // One whole piece's debt.
-        share.prompts_ran(price(256), 1.0, 2);
+        share.prompts_ran(price(256), 1.0, 2, false);
         let both = pending(2, &[5000, 60]);
         assert_eq!(share.next(&both, price), piece, "the short prompt jumps the line");
         // Its own debt is added: the next short prompt waits.
-        share.prompts_ran(price(60), 1.0, 2);
+        share.prompts_ran(price(60), 1.0, 2, false);
         assert_eq!(share.next(&pending(2, &[5000, 60]), price), Turn::Round);
         // And a long prompt alone always waits for the debt.
         let mut share = measured(20.0);
-        share.prompts_ran(price(256), 1.0, 2);
+        share.prompts_ran(price(256), 1.0, 2, false);
         assert_eq!(share.next(&pending(2, &[5000]), price), Turn::Round);
     }
 
     #[test]
     fn a_prompt_that_outranks_every_generating_sequence_does_not_wait_for_the_debt() {
         let mut share = Share::new(20.0);
-        share.prompts_ran(900.0, 1.0, 2);
+        share.prompts_ran(900.0, 1.0, 2, false);
         let long = pending(2, &[5000]);
         assert_eq!(share.next(&long, price), Turn::Round);
         let ahead = Pending { ahead: true, ..long };
         assert_eq!(share.next(&ahead, price), Turn::Piece { rows: 254 });
         // Its pieces are owed all the same, to the prompts that come after it.
-        share.prompts_ran(300.0, 1.0, 2);
+        share.prompts_ran(300.0, 1.0, 2, false);
         assert_eq!(share.owed_ms(), 1200.0);
     }
 
@@ -363,17 +377,17 @@ mod tests {
         }
         assert_eq!(share.owed_ms(), 0.0);
         // A prompt that comes then is not read ahead of the debt it makes.
-        share.prompts_ran(300.0, 1.0, 2);
+        share.prompts_ran(300.0, 1.0, 2, false);
         assert_eq!(share.next(&pending(2, &[5000]), price), Turn::Round);
     }
 
     #[test]
     fn nobody_generating_means_nobody_is_owed() {
         let mut share = Share::new(20.0);
-        share.prompts_ran(300.0, 1.0, 2);
-        share.prompts_ran(600.0, 0.0, 0);
+        share.prompts_ran(300.0, 1.0, 2, false);
+        share.prompts_ran(600.0, 0.0, 0, false);
         assert_eq!(share.owed_ms(), 0.0);
-        share.prompts_ran(300.0, 1.0, 2);
+        share.prompts_ran(300.0, 1.0, 2, false);
         share.round_ran(30.0, 2.0, 0, true);
         assert_eq!(share.owed_ms(), 0.0);
     }
@@ -403,7 +417,7 @@ mod tests {
         // three pieces, with the generating sequence owed one piece's rounds.
         let mut share = measured(20.0);
         let mut prompts = [6000u32 - 3 * 256, 50];
-        share.prompts_ran(price(256), 1.0, 1);
+        share.prompts_ran(price(256), 1.0, 1, false);
         let mut waited = 0.0;
         loop {
             match share.next(&pending(1, &prompts), price) {

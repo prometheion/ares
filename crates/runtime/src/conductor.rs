@@ -2123,7 +2123,10 @@ impl Conductor {
             && self.vision.is_some()
         {
             match self.run_tower(generating) {
-                Ok(ms) if ms > 0.0 => self.share.prompts_ran(ms, 0.0, generating),
+                Ok(ms) if ms > 0.0 => {
+                    let crowded = !self.waiting.is_empty();
+                    self.share.prompts_ran(ms, 0.0, generating, crowded);
+                }
                 Ok(_) => {}
                 Err(message) => return self.fail(message),
             }
@@ -2444,7 +2447,9 @@ impl Conductor {
             // The generating sequences that rode along got a token each.
             let riders = self.parts.iter().filter(|p| matches!(p.kind, PartKind::Window)).count();
             let riding = if generating > 0 { riders as f64 / f64::from(generating) } else { 0.0 };
-            self.share.prompts_ran(step_ms, riding, generating);
+            // A request in line waits for a place that a generating one gives back.
+            let crowded = !self.waiting.is_empty();
+            self.share.prompts_ran(step_ms, riding, generating, crowded);
         }
         let last_done = self.last_done_ns.unwrap_or(0);
         for (device, times) in self.output.devices.iter().enumerate() {
