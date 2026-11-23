@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 36 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), 3 unused |
+//! | runtime header | 36 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), what the engine had been asked when the conductor last took its commands (the low 32 bits), 2 unused |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), the drafter of a window whose drafts the model makes, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | the rotary position: time, height, width, extra; `(p, p, p, 0)` for text at rotary position `p` (see [Images](#images)) |
@@ -196,6 +196,7 @@ const H_OFF_WORTH: usize = 37;
 const H_IMAGES: usize = 38;
 const H_OFF_IMAGES: usize = 39;
 const H_PAUSE_MS: usize = 40;
+const H_ASKED: usize = 41;
 /// The record's step makes the chains of its own-draft windows and nothing
 /// else.
 const RECORD_DRAFTS_ONLY: u32 = 1;
@@ -457,6 +458,13 @@ impl<'a> RecordWriter<'a> {
     /// sequence ended), and what the model keeps for it goes.
     pub fn give_up_paused(&mut self) {
         self.header[H_FLAGS] |= RECORD_GIVE_UP;
+    }
+
+    /// What the engine had been asked when the conductor last took its commands (the count
+    /// of [`StepContext::asks`](crate::StepContext), its low 32 bits): a model that pauses
+    /// a step does so when the count has moved past it.
+    pub fn asked(&mut self, asked: u32) {
+        self.header[H_ASKED] = asked;
     }
 
     /// Marks the segment written last as a replay: its rows rebuild recurrent
@@ -907,6 +915,12 @@ impl<'a> RecordView<'a> {
     /// Whether the step the model paused last is given up.
     pub fn gives_up_paused(&self) -> bool {
         self.header[H_FLAGS] & RECORD_GIVE_UP != 0
+    }
+
+    /// What the engine had been asked when the conductor took its commands for the step
+    /// (the low 32 bits of [`StepContext::asks`](crate::StepContext)).
+    pub fn asked(&self) -> u32 {
+        self.header[H_ASKED]
     }
 
     /// Whether segment `i` is a replay: its rows rebuild recurrent state from

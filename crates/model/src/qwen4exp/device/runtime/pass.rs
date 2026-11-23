@@ -49,6 +49,9 @@ pub(super) struct PassLoan {
     done: bool,
 }
 
+/// The parcels a split by layers hands the residual over in (`Model::links`).
+pub(super) const PARCELS: usize = 2;
+
 /// The rows of a pass of `rows` rows on parts whose own scratch holds `own` rows: its
 /// micro-batches and the rows of each of its chunks.
 fn shape_of(rows: u32, own: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
@@ -114,6 +117,9 @@ impl Flow {
             loan.key = key;
             loan.at = at;
             loan.done = false;
+            self.pass_sent.store(0, Ordering::Release);
+            self.pass_released.store(0, Ordering::Release);
+            self.pass_go.store(0, Ordering::Release);
             return Ok(());
         }
         if current.as_ref().is_some_and(|loan| loan.done || pass.is_some()) {
@@ -123,6 +129,9 @@ impl Flow {
             *current = None;
         }
         let Some(key) = pass else { return Ok(()) };
+        self.pass_sent.store(0, Ordering::Release);
+        self.pass_released.store(0, Ordering::Release);
+        self.pass_go.store(0, Ordering::Release);
         let lendable: Vec<Vec<u64>> =
             (0..self.pass_sizes.len()).map(|d| feed.store.lendable_pieces(d)).collect();
         let at = self.place_pass(feed, key, &lendable, true)?.ok_or_else(|| {
@@ -213,6 +222,78 @@ impl Flow {
             .ok_or_else(|| invalid(format!("no rows of the pass on part {index}")))
     }
 
+    /// Whether the pass `key` holds its loan and has not read all its rows.
+    pub(super) fn pass_live(&self, key: PassKey) -> bool {
+        self.pass
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|loan| loan.key == key && !loan.done)
+    }
+
+    /// Both devices on every layer: the picks of the pass `key` that the mixer's thread made
+    /// room for, once it has.
+    fn await_picks(&self, key: PassKey) -> Result<Arc<SpanPicks>, ModelError> {
+        let started = Instant::now();
+        loop {
+            if let Some((at, picks)) =
+                self.pass_picks.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                && *at == key
+            {
+                return Ok(picks.clone());
+            }
+            self.check(started, "the mixer opened a pass")?;
+            self.pump()?;
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Both devices on every layer: waits, serving the store, until the mixer has decided
+    /// whether piece `piece` of the pass runs (`true`) or the pass pauses before it.
+    fn await_go(&self, piece: u64) -> Result<bool, ModelError> {
+        let started = Instant::now();
+        loop {
+            if self.pass_go.load(Ordering::Acquire) > piece {
+                return Ok(true);
+            }
+            if self.pass_paused.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            self.check(started, "the mixer decided a piece of a pass")?;
+            self.pump()?;
+            std::hint::spin_loop();
+        }
+    }
+
+    /// By layers: waits, serving the store, until the device before has handed over the
+    /// residual of micro-batch `m` (`true`) or paused the pass (`false`).
+    fn await_parcel(&self, m: usize) -> Result<bool, ModelError> {
+        let started = Instant::now();
+        loop {
+            if self.pass_sent.load(Ordering::Acquire) > m {
+                return Ok(true);
+            }
+            if self.pass_paused.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            self.check(started, "the device before handed a pass's rows over")?;
+            self.pump()?;
+            std::hint::spin_loop();
+        }
+    }
+
+    /// By layers: waits, serving the store, until a parcel slot is free for micro-batch `m`:
+    /// the next device has released all but one of the parcels before it.
+    fn await_room(&self, m: usize) -> Result<(), ModelError> {
+        let started = Instant::now();
+        while m >= self.pass_released.load(Ordering::Acquire) + PARCELS {
+            self.check(started, "the next device took a pass's rows")?;
+            self.pump()?;
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
     /// The pass of the step has read its rows (by the last part to end the step).
     pub(super) fn pass_done(&self) {
         if let Some(loan) = self.pass.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -254,6 +335,12 @@ pub(super) struct PassRun {
     /// Where the pass goes on: the layer of the part and the micro-batch of it.
     layer: usize,
     next: usize,
+    /// By layers: the micro-batches whose residual this part has received from the device
+    /// before, and those it has handed over to the next.
+    received: usize,
+    sent: usize,
+    /// This part's share of the pass is done (a part before the last waits for the others).
+    done: bool,
 }
 
 impl PassRun {
@@ -289,6 +376,26 @@ impl Qwen4ExpDevice {
         Ok(Some(PassKey { slot: segment.slot, pos0: segment.pos0, rows }))
     }
 
+    /// Pauses the pass `run` (between two micro-batches, or before this part's first when the
+    /// device before paused it): it goes on where it stopped in a later step.
+    fn pause_pass(&mut self, run: PassRun) -> Option<Logits> {
+        self.part.pass_pause();
+        self.pass_run = Some(run);
+        self.paused = true;
+        self.flow.pass_paused.store(true, Ordering::Release);
+        None
+    }
+
+    /// Drops what this part keeps of a pass that has ended or was given up meanwhile.
+    pub(super) fn forget_ended_pass(&mut self) {
+        if let Some(run) = &self.pass_run
+            && !self.flow.pass_live(run.key)
+        {
+            self.pass_run = None;
+            self.part.pass_close();
+        }
+    }
+
     /// Whether the step goes on with the pass this part paused (the same rows).
     pub(super) fn resumes(&self, key: Option<PassKey>) -> bool {
         matches!((&self.pass_run, key), (Some(run), Some(key)) if run.is(key))
@@ -314,10 +421,15 @@ impl Qwen4ExpDevice {
         token: u32,
     ) -> Result<Option<Logits>, ModelError> {
         let begun = Instant::now();
-        let asked = step.asks.load(Ordering::Acquire);
+        let asked = step.record.asked();
         let budget = step.record.pause_after();
         let stream = step.stream;
         let mut run = match self.pass_run.take().filter(|run| run.is(key)) {
+            // A part before the last that has handed its rows over waits for the others.
+            Some(run) if run.done => {
+                self.pass_run = Some(run);
+                return Ok(None);
+            }
             Some(run) => {
                 self.part.pass_resume(stream)?;
                 run
@@ -327,22 +439,62 @@ impl Qwen4ExpDevice {
                 self.open_pass(step, key, at)?
             }
         };
+        // By layers: the residual of every micro-batch comes from the device before, once it
+        // has run its layers (unless it paused the pass).
+        if self.by_layers && self.index > 0 {
+            while run.received < run.micro.len() {
+                let m = run.received;
+                if !self.flow.await_parcel(m)? {
+                    return Ok(self.pause_pass(run));
+                }
+                let from = step.links.receive(self.index - 1, stream)?;
+                let bytes = run.micro[m].rows as usize * self.wide as usize * 4;
+                // SAFETY: the parcel holds the residual of the micro-batch's rows, and its
+                // kept rows have room for them.
+                unsafe { stream.copy(self.part.pass_residual(m)?, from, bytes)? };
+                step.links.release(self.index - 1, stream)?;
+                self.flow.pass_released.fetch_add(1, Ordering::AcqRel);
+                run.received += 1;
+            }
+        }
         let n_layers = self.part.n_layers();
         let ngram_at = self.part.ngram_layer();
         let row_bytes = run.fetched.as_ref().map(|f| f.len() / key.rows as usize);
         let mut ran = 0usize;
+        // Both devices on every layer: the exchanges of a piece with the peer are numbered by
+        // the pieces in the order they run, a block of eight each (the output of a layer's
+        // experts crosses in the next layer's piece of the same micro-batch, first), and the
+        // mixer decides for both whether a piece runs.
+        let shared = self.routing.owned.is_some();
+        let follows = self.routing.mixer.is_some();
+        let micro_n = run.micro.len() as u64;
+        let base = token.wrapping_mul(self.per_step).wrapping_add(1);
+        let block =
+            |i: usize, m: usize| base.wrapping_add(((i as u64 * micro_n + m as u64) * 8) as u32);
         while run.layer < n_layers {
             let i = run.layer;
             while run.next < run.micro.len() {
-                let pause = (budget > 0 && begun.elapsed().as_millis() >= u128::from(budget))
-                    || step.asks.load(Ordering::Acquire) != asked;
-                if ran > 0 && pause {
-                    self.part.pass_pause();
-                    self.pass_run = Some(run);
-                    self.paused = true;
-                    return Ok(None);
-                }
                 let m = run.next;
+                let piece = i as u64 * micro_n + m as u64;
+                if follows {
+                    if !self.flow.await_go(piece)? {
+                        return Ok(self.pause_pass(run));
+                    }
+                } else {
+                    let pause = (budget > 0 && begun.elapsed().as_millis() >= u128::from(budget))
+                        || step.asks.load(Ordering::Acquire) as u32 != asked;
+                    if ran > 0 && pause {
+                        return Ok(self.pause_pass(run));
+                    }
+                    self.flow.pass_go.store(piece + 1, Ordering::Release);
+                }
+                let layer_no = self.part.layer_range().start + i;
+                let xbase = if shared {
+                    self.part.pass_renumber(m, block(i, m));
+                    block(i, m).wrapping_add(1).wrapping_sub(8 * layer_no as u32)
+                } else {
+                    0
+                };
                 let micro = &mut run.micro[m];
                 let ngram = match (&run.fetched, row_bytes) {
                     (Some(rows), Some(each)) if ngram_at == Some(i) => {
@@ -359,7 +511,7 @@ impl Qwen4ExpDevice {
                     tokens: &micro.tokens,
                     ngram,
                     inbound: None,
-                    xbase: 0,
+                    xbase,
                     pools: step.pages,
                     replay: &micro.replay,
                 };
@@ -371,12 +523,13 @@ impl Qwen4ExpDevice {
             // Every micro-batch has routed: the picks of all rows go to the host, and the
             // layer's experts run for all of them.
             self.part.pass_routed(stream, i)?;
-            {
+            if !follows {
                 let (host, copied) = run.picks.target();
                 // SAFETY: the buffer holds the picks of the pass's rows and the host reads it
                 // only after `copied`, until the next layer's copies are enqueued (after this
                 // layer is done).
                 unsafe { self.part.pass_record_to_host(i, host, copied)? };
+                run.picks.mark(i);
             }
             self.flow.enqueued[self.index].store(i + 1, Ordering::Release);
             let env = StepEnv {
@@ -408,6 +561,9 @@ impl Qwen4ExpDevice {
         // rows that are wanted.
         let mut n_out = 0;
         for (m, micro) in run.micro.iter_mut().enumerate() {
+            if shared {
+                self.part.pass_renumber(m, block(n_layers, m));
+            }
             let env = StepEnv {
                 stream,
                 record: &micro.record,
@@ -439,6 +595,22 @@ impl Qwen4ExpDevice {
             self.residual =
                 Some(self.part.keep_residual(stream, residual, run.micro[last].rows)?);
         }
+        // By layers: the residual of every micro-batch goes to the next device, two parcels
+        // at a time; this part's share is then done until the pass is.
+        if self.by_layers && self.index + 1 < self.devices {
+            while run.sent < run.micro.len() {
+                let m = run.sent;
+                self.flow.await_room(m)?;
+                let values = run.micro[m].rows * self.wide;
+                step.links.send(self.index, stream, self.part.pass_residual(m)?, values)?;
+                self.flow.pass_sent.fetch_add(1, Ordering::AcqRel);
+                run.sent += 1;
+            }
+            self.part.pass_pause();
+            run.done = true;
+            self.pass_run = Some(run);
+            return Ok(None);
+        }
         self.part.pass_close();
         self.flow.pass_completed.store(true, Ordering::Release);
         Ok((n_out > 0 && self.part.has_head()).then(|| Logits {
@@ -458,7 +630,7 @@ impl Qwen4ExpDevice {
     ) -> Result<PassRun, ModelError> {
         let stream = step.stream;
         let micro = micro_batches(key.rows, self.flow.own_rows);
-        self.part.pass_open(stream, &self.segments, at, &micro)?;
+        self.part.pass_open(stream, &self.segments, &self.replay, step.pages, at, &micro)?;
         let replay = !self.replay.is_empty();
         let segment = self.segments[0];
         let mut steps = Vec::with_capacity(micro.len());
@@ -501,13 +673,24 @@ impl Qwen4ExpDevice {
             span.mark_replay(0)?;
         }
         let top_k = self.flow.top_k;
-        let picks = match self.picks.take() {
-            Some(picks) if picks.holds(key.rows, top_k) => picks,
-            _ => {
-                Arc::new(SpanPicks::new(self.part.device(), key.rows, top_k).map_err(model_error)?)
+        let picks = match self.routing.mixer {
+            // A worker reads the picks the mixer's router made, which the mixer's thread
+            // makes room for when it opens the pass.
+            Some(_) => self.flow.await_picks(key)?,
+            None => {
+                let picks = match self.picks.take() {
+                    Some(picks) if picks.holds(key.rows, top_k) => picks,
+                    _ => Arc::new(
+                        SpanPicks::new(self.part.device(), key.rows, top_k).map_err(model_error)?,
+                    ),
+                };
+                self.picks = Some(picks.clone());
+                picks.reset();
+                *self.flow.pass_picks.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((key, picks.clone()));
+                picks
             }
         };
-        self.picks = Some(picks.clone());
         // The rows of the n-gram table of every row, before a step between the pieces asks
         // for its own.
         let fetched = match self.part.ngram_layer() {
@@ -524,6 +707,9 @@ impl Qwen4ExpDevice {
             fetched,
             layer: 0,
             next: 0,
+            received: 0,
+            sent: 0,
+            done: false,
         })
     }
 }
@@ -542,9 +728,11 @@ fn pass_experts(
 ) -> Result<(), ModelError> {
     let owned = |expert: u32| routing.owned.as_ref().is_none_or(|o| o[layer][expert as usize]);
     let (mut started, mut seen) = (Instant::now(), flow.progress());
+    // A worker computes its experts of the picks the mixer's router made.
+    let relay = routing.mixer.is_some();
     let mut misses = {
         let feed = flow.lock_feed();
-        Misses::begin_pass(part, env, &feed, index, layer, picks.clone(), &owned)
+        Misses::begin_pass(part, env, &feed, index, layer, picks.clone(), relay, &owned)
             .map_err(model_error)?
     };
     loop {

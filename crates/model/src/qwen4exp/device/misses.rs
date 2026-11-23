@@ -112,25 +112,30 @@ enum Stage {
 
 /// The picks of a layer of a prompt read layer by layer, as the host reads them for the
 /// rounds of its experts: a header of 16 bytes, then the ids of every row's picks in the order
-/// of the rows (the form the router's board has them in, without the weights).
+/// of the rows, then their weights (the form the router's board has them in), which a worker
+/// that does not route takes for its own rounds.
 pub(super) struct SpanPicks {
     host: PinnedBuffer,
     len: usize,
     copied: Event,
+    /// The layer whose copies `copied` was last recorded behind, plus one (0: none yet): a
+    /// worker's thread reads the picks the mixer's thread copies, and must not take the
+    /// event of the layer before for its layer's.
+    layer: std::sync::atomic::AtomicUsize,
 }
 
 impl SpanPicks {
     /// Room for the picks of `rows` rows of `top_k` picks each.
     pub(super) fn new(device: &Device, rows: u32, top_k: u32) -> Result<Self, Error> {
-        let len = 16 + 4 * rows as usize * top_k as usize;
-        let host = PinnedBuffer::new(device, len).map_err(ares_runtime::ModelError::from)?;
-        let copied = Event::new(device).map_err(ares_runtime::ModelError::from)?;
-        Ok(Self { host, len, copied })
+        let len = 16 + 8 * rows as usize * top_k as usize;
+        let host = PinnedBuffer::new(device, len)?;
+        let copied = Event::new(device)?;
+        Ok(Self { host, len, copied, layer: std::sync::atomic::AtomicUsize::new(0) })
     }
 
     /// Whether `rows` rows of `top_k` picks fit.
     pub(super) fn holds(&self, rows: u32, top_k: u32) -> bool {
-        16 + 4 * rows as usize * top_k as usize <= self.len
+        16 + 8 * rows as usize * top_k as usize == self.len
     }
 
     /// Where the copies write, and the event recorded behind them.
@@ -138,8 +143,20 @@ impl SpanPicks {
         (self.host.as_ptr().cast_mut(), &self.copied)
     }
 
-    fn arrived(&self) -> Result<bool, Error> {
-        Ok(self.copied.is_done().map_err(ares_runtime::ModelError::from)?)
+    /// The copies of layer `layer`'s picks are enqueued behind the event (after
+    /// [`SpanPicks::target`]'s copies were).
+    pub(super) fn mark(&self, layer: usize) {
+        self.layer.store(layer + 1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A new pass begins: no layer's copies are enqueued yet.
+    pub(super) fn reset(&self) {
+        self.layer.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    fn arrived(&self, layer: usize) -> Result<bool, Error> {
+        Ok(self.layer.load(std::sync::atomic::Ordering::Acquire) == layer + 1
+            && self.copied.is_done()?)
     }
 
     fn record(&self) -> &[u8] {
@@ -211,7 +228,9 @@ impl Misses {
     }
 
     /// [`Misses::begin`] for a layer of a pass: the picks of all its rows reach the host in
-    /// `span` (`env` is the step of all the rows).
+    /// `span` (`env` is the step of all the rows), from this part's router or, with `relay`,
+    /// from the part that routes, whose picks the first round waits for.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_pass(
         part: &mut Part,
         env: &StepEnv<'_>,
@@ -219,9 +238,11 @@ impl Misses {
         index: usize,
         layer: usize,
         span: Arc<SpanPicks>,
+        relay: bool,
         owned: &dyn Fn(u32) -> bool,
     ) -> Result<Self, Error> {
-        Self::begin_with(part, env, feed, index, layer, None, Some(span), owned)
+        let board = relay.then(|| part.board());
+        Self::begin_with(part, env, feed, index, layer, board, Some(span), owned)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -293,7 +314,7 @@ impl Misses {
                 Stage::Cpu => return self.finish(part, env, feed),
                 Stage::Record => {
                     let arrived = match &self.span {
-                        Some(span) => span.arrived()?,
+                        Some(span) => span.arrived(self.layer)?,
                         None => routed && self.source.arrived(self.layer)?,
                     };
                     if !arrived {

@@ -324,7 +324,9 @@ pub struct StepContext<'a> {
     pub image_stage: *const f32,
     /// A count the engine raises whenever it is asked something (a request, a
     /// cancellation): a model that runs a long step in pieces pauses it between
-    /// two pieces when the count has changed since the step began, so that the
+    /// two pieces when the count (its low 32 bits) has moved past what the
+    /// record says the conductor had seen
+    /// ([`RecordView::asked`](crate::record::RecordView::asked)), so that the
     /// conductor can answer ([`DeviceModel::paused`]).
     pub asks: &'a std::sync::atomic::AtomicU64,
 }

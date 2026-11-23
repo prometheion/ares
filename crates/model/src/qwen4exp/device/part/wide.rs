@@ -459,10 +459,28 @@ impl Part {
             self.copy_cpu_act(stream, rows)?;
             if self.role == Role::Worker {
                 // The mixer routes. The worker's output starts from zeros (its exchange
-                // cleared it) and the shared expert's is sent on its own, with the gate.
+                // cleared it) and the shared expert's is sent on its own, with the gate. In
+                // a pass the output waits for the layer's experts, so the shared expert's,
+                // scaled by its gate, is in it already, and the experts' input is kept.
+                let in_pass = self.pass_record().is_some();
                 if let Some(shared) = &w.shared {
                     self.shared(stream, shared, m, rows)?;
+                    if in_pass {
+                        let (ysh, gate, out) = (self.at(s.ysh), self.at(s.s), self.at(s.out));
+                        self.q4.gate_scale(stream, ysh, gate, out, rows, self.n)?;
+                    }
                     self.mark(stream, Phase::Dense)?;
+                }
+                if in_pass {
+                    self.kernels.prepare_prefill_activations(
+                        stream,
+                        ares_cuda::PrefillPath::F16,
+                        self.act_values(s.m, self.n, rows),
+                        self.at(s.experts_f16),
+                        self.n,
+                        rows,
+                    )?;
+                    self.pass_keep_input(stream, self.at(s.experts_f16), rows)?;
                 }
                 return self.mark(stream, Phase::Experts);
             }
@@ -675,7 +693,7 @@ impl Part {
             stream.copy_from_host(device_table, staging, bytes)?;
             if self.in_pass() {
                 // The rows of a pass are in its chunks: the round runs each of them.
-                self.pass_round(stream, i, device_table, first, env.token)?;
+                self.pass_round(stream, i, device_table, first, env.token, record)?;
                 let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
                 wide.done.record(stream)?;
                 return self.mark(stream, Phase::Experts);

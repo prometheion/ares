@@ -316,6 +316,15 @@ pub(super) struct Flow {
     top_k: u32,
     pass: Mutex<Option<PassLoan>>,
     pass_completed: AtomicBool,
+    /// In a step of a pass: a part paused it; and by layers, the residuals of micro-batches
+    /// the device before has handed over and the next has released.
+    pass_paused: AtomicBool,
+    pass_sent: AtomicUsize,
+    pass_released: AtomicUsize,
+    /// Both devices on every layer: the pieces of the pass the mixer has let run, and the
+    /// picks its router made, which the worker takes.
+    pass_go: AtomicU64,
+    pass_picks: Mutex<Option<(PassKey, Arc<SpanPicks>)>>,
 }
 
 impl Flow {
@@ -411,6 +420,7 @@ impl Flow {
                 self.lend_pass(&mut feed, pass)?;
             }
             self.pass_completed.store(false, Ordering::Release);
+            self.pass_paused.store(false, Ordering::Release);
             let wide = rows > self.own_rows && windows.is_some() && pass.is_none();
             if wide {
                 self.lend(&mut feed)?;
@@ -636,11 +646,10 @@ pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32,
 /// have no exact pool (whose tiles convert per step for every layer at once), no DFlash
 /// drafter reads the residual of a step's rows at some layers, and the placement is one the
 /// pass is built for.
-pub fn reads_layer_by_layer(opts: &Options, devices: usize, dflash: bool) -> bool {
+pub fn reads_layer_by_layer(opts: &Options, dflash: bool) -> bool {
     opts.own_rows() >= 2 * MAX_BATCH
         && crate::blocks::kv::Group::window_limit(opts.kv.0, opts.kv.1).is_none()
         && !dflash
-        && devices == 1
 }
 
 /// The most rows of a step the model is opened with.
@@ -1335,7 +1344,7 @@ impl Qwen4Exp {
             || cx.pages != o.pages()
             || cx.table_stride != o.table_stride()
             || cx.cells_per_page != ENTRY_CELLS
-            || cx.max_rows != o.max_rows
+            || cx.max_rows != o.max_rows.max(self.opts.pass_rows)
         {
             return Err(invalid(format!(
                 "the runtime was set up for {} slots, {} pages of {} cells, tables of {} \
@@ -1348,7 +1357,7 @@ impl Qwen4Exp {
                 o.max_slots,
                 o.pages(),
                 o.table_stride(),
-                o.max_rows
+                o.max_rows.max(self.opts.pass_rows)
             )));
         }
         // The image tower, on the part that runs it, before the part and its
@@ -1600,7 +1609,7 @@ impl Qwen4Exp {
                 // slots can lend.
                 let pass_sizes: Vec<PassSizes> =
                     (0..n).map(|d| PassSizes::of(c, self.placement.part(c, d).role)).collect();
-                build.pass_rows = if self.reads_layer_by_layer(n) {
+                build.pass_rows = if self.reads_layer_by_layer() {
                     pass::pass_span(own, self.opts.pass_rows, |rows| {
                         pass::pass_fits(&pass_sizes, &build.lendable, own, rows)
                     })
@@ -1705,6 +1714,11 @@ impl Qwen4Exp {
                     top_k: c.experts.used as u32,
                     pass: Mutex::new(None),
                     pass_completed: AtomicBool::new(false),
+                    pass_paused: AtomicBool::new(false),
+                    pass_sent: AtomicUsize::new(0),
+                    pass_released: AtomicUsize::new(0),
+                    pass_go: AtomicU64::new(0),
+                    pass_picks: Mutex::new(None),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
                         ..Default::default()
@@ -1809,7 +1823,11 @@ impl Qwen4Exp {
             by_layers: self.placement.tensor.is_none(),
             n_vocab: c.n_vocab as u32,
             wide: c.wide() as u32,
-            per_step: 8 * (c.n_layer as u32 + 1),
+            // A pass numbers the exchanges of its pieces from the step's base: a block of
+            // eight per layer and micro-batch, and one layer more for its end.
+            per_step: 8
+                * (c.n_layer as u32 + 1)
+                * (flow.pass_rows.div_ceil(o.own_rows().max(1)) + 2),
             mtp: block,
             drafts: self.mtp.is_some() || self.dflash.is_some(),
             mtp_id: self.mtp.as_ref().map(|_| 1),
@@ -1855,9 +1873,9 @@ impl Qwen4Exp {
     /// V without an exact pool (whose tiles convert per step for every layer at once), no
     /// DFlash drafter (which reads the residual of a step's rows at some layers), and a
     /// placement the pass is built for.
-    fn reads_layer_by_layer(&self, devices: usize) -> bool {
+    fn reads_layer_by_layer(&self) -> bool {
         self.opts.pass_rows > self.opts.part.own_rows()
-            && reads_layer_by_layer(&self.opts.part, devices, self.dflash.is_some())
+            && reads_layer_by_layer(&self.opts.part, self.dflash.is_some())
     }
 
     /// Everything besides the tokens that changes the bytes of a page or of a
@@ -1972,7 +1990,7 @@ impl Model for Qwen4Exp {
         match self.split() {
             Split::Layer => LinkSpec {
                 sum_values: 0,
-                lane_slots: 2,
+                lane_slots: pass::PARCELS as u32,
                 lane_values: self.opts.part.max_rows * self.config.wide() as u32,
             },
             _ => LinkSpec::default(),
@@ -2311,6 +2329,7 @@ impl Qwen4ExpDevice {
         if record.gives_up_paused() {
             self.give_up_pass();
         }
+        self.forget_ended_pass();
         let pass = self.pass_of(step)?;
         let resumes = self.resumes(pass);
         self.flow.begin(number, rows, windows, self.index, stream, pass)?;

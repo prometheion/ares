@@ -329,14 +329,18 @@ impl Part {
         Ok(MicroPlan(self.attention.is_some().then(|| self.build_plan(env)).transpose()?))
     }
 
-    /// Starts a pass of the prompt rows `segments` (one segment) whose rows lie at `at`, in
-    /// the micro-batches `micro` (first row in the span and rows each), which fill the chunks
-    /// in order: the scratch is the own one, a sequence that starts in its slot starts from
-    /// zero state, and what the step before predicted from the scratch is done with it.
+    /// Starts a pass of the prompt rows `segments` (one segment; `replay` its rows that are a
+    /// replay, `pools` the pools of K/V and keys) whose rows lie at `at`, in the micro-batches
+    /// `micro` (first row in the span and rows each), which fill the chunks in order: the
+    /// scratch is the own one, the K/V group's entries of every cell the pass reaches are in
+    /// place (as a step's are), a sequence that starts in its slot starts from zero state,
+    /// and what the step before predicted from the scratch is done with it.
     pub fn pass_open(
         &mut self,
         stream: &ares_cuda::Stream,
         segments: &[ares_cuda::Segment],
+        replay: &[Range<u32>],
+        pools: DevicePtr,
         at: PassAt,
         micro: &[(u32, u32)],
     ) -> Result<(), ModelError> {
@@ -344,6 +348,12 @@ impl Part {
             return Err(invalid("the part reads no prompt layer by layer"));
         }
         self.lay_out(stream, self.opts.own_rows())?;
+        let status = self.at(self.f.s.status);
+        if let Some(kv) = &mut self.kv {
+            let reaches = crate::blocks::kv::reaches(segments, replay);
+            let (tables, kernels) = (self.tables.ptr(), self.attention.as_ref());
+            kv.prepare(kernels, stream, &reaches, &self.entries, tables, pools, status, true)?;
+        }
         if let Some(marks) = &mut self.marks {
             marks.phases.clear();
             marks.on = !marks.profile.paused.load(std::sync::atomic::Ordering::Relaxed);
@@ -426,6 +436,18 @@ impl Part {
         // `from` the caller's rows.
         unsafe { stream.copy(to, from, (u64::from(rows) * u64::from(self.wide) * 4) as usize)? };
         Ok(to)
+    }
+
+    /// Gives the output of micro-batch `m`'s last half block that is still to be written
+    /// (or, on a worker, sent) the exchange number `no`: a pass numbers its exchanges with
+    /// the peer by its pieces, in the order they run, and the pending output of a layer
+    /// crosses in the piece of the next layer that writes it.
+    pub fn pass_renumber(&mut self, m: usize, no: u32) {
+        if let Some(Some(Pending::Moe { exchange: Some(at), .. })) =
+            self.pass.as_mut().and_then(|p| p.pending.get_mut(m))
+        {
+            *at = no;
+        }
     }
 
     /// Whether a pass runs on the part (it is open and not paused).
@@ -719,7 +741,10 @@ impl Part {
     }
 
     /// In a pass: a round of experts for every chunk, with the table at `table` (see
-    /// [`Part::experts_round`]); the first round of a layer makes each chunk's plan.
+    /// [`Part::experts_round`]); the first round of a layer makes each chunk's plan, from the
+    /// picks the part's router left in the chunk's record or, on a part that does not route,
+    /// from `record` (the picks of every row of the span as [`Part::pass_record_to_host`]
+    /// leaves them), which it copies there first.
     pub(super) fn pass_round(
         &mut self,
         stream: &ares_cuda::Stream,
@@ -727,10 +752,31 @@ impl Part {
         table: DevicePtr,
         first: bool,
         token: u32,
+        record: Option<&[u8]>,
     ) -> Result<(), ModelError> {
         let shape = self.w.layers[i].moe.shape;
         let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
         let state = self.pass.as_mut().ok_or_else(|| invalid("no pass is open"))?;
+        let k_picks = shape.top_k as usize;
+        let rows: usize = state.at.chunks.iter().map(|c| c.rows as usize).sum();
+        if let Some(record) = record.filter(|_| first) {
+            if record.len() < 16 + 8 * k_picks * rows {
+                return Err(invalid("the picks of a pass are short"));
+            }
+            for c in &state.at.chunks {
+                let (at, n) = (c.first as usize * k_picks * 4, c.rows as usize * k_picks * 4);
+                // SAFETY: the chunk's record holds its rows' ids and weights after its header;
+                // the host's record stays unchanged until this layer is done.
+                unsafe {
+                    stream.copy_from_host(c.record.offset(16), record[16 + at..].as_ptr(), n)?;
+                    stream.copy_from_host(
+                        c.record.offset(16 + n as u64),
+                        record[16 + 4 * k_picks * rows + at..].as_ptr(),
+                        n,
+                    )?;
+                }
+            }
+        }
         for (k, c) in state.at.chunks.iter().enumerate() {
             if first {
                 state.tiles[k] = ExpertRowKernels::tile_for(&shape, c.rows);
@@ -772,14 +818,14 @@ impl Part {
         Ok(())
     }
 
-    /// In a pass: copies the ids of the picks of every chunk of layer `i` (behind what is
-    /// enqueued on `stream`) to `host`, as the record of all rows of the span reads to the
-    /// host: a header of 16 bytes, then the ids of the rows in order. Records `copied` behind
-    /// the copies.
+    /// In a pass: copies the picks of every chunk of layer `i` (behind what is enqueued on
+    /// `stream`) to `host`, as the record of all rows of the span reads to the host: a header
+    /// of 16 bytes, then the ids of the rows in order, then their weights. Records `copied`
+    /// behind the copies.
     ///
     /// # Safety
     ///
-    /// `host` must be page-locked memory of `16 + 4 * top_k * rows` bytes for the rows of
+    /// `host` must be page-locked memory of `16 + 8 * top_k * rows` bytes for the rows of
     /// the pass, untouched until `copied` has passed.
     pub(crate) unsafe fn pass_record_to_host(
         &self,
@@ -789,17 +835,23 @@ impl Part {
     ) -> Result<(), ModelError> {
         let state = self.pass.as_ref().ok_or_else(|| invalid("no pass is open"))?;
         let k = self.w.layers[i].moe.shape.top_k as u64;
+        let rows: u64 = state.at.chunks.iter().map(|c| u64::from(c.rows)).sum();
         let side = &self.side;
         side.wait_event(&self.routed[i])?;
         for c in &state.at.chunks {
-            let bytes = 4 * k * u64::from(c.rows);
+            let (first, n) = (u64::from(c.first), u64::from(c.rows));
             // SAFETY: the caller's guarantee; the chunk's record holds its ids after its
-            // header.
+            // header and their weights after them.
             unsafe {
                 side.copy_to_host(
-                    host.add((16 + 4 * k * u64::from(c.first)) as usize),
+                    host.add((16 + 4 * k * first) as usize),
                     c.record.offset(16),
-                    bytes as usize,
+                    (4 * k * n) as usize,
+                )?;
+                side.copy_to_host(
+                    host.add((16 + 4 * k * (rows + first)) as usize),
+                    c.record.offset(16 + 4 * k * n),
+                    (4 * k * n) as usize,
                 )?;
             }
         }

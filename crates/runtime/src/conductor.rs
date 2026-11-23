@@ -756,6 +756,11 @@ pub(crate) struct Conductor {
     /// The rows of the images among the paused step's rows, held for it so that the
     /// image store cannot let them go before it goes on: its record stages them again.
     paused_images: Vec<(ImageName, Arc<ImageRows>)>,
+    /// What the engine has been asked so far ([`Executor::asks`]), and what of it had been
+    /// when the conductor last took its commands: a model that pauses long steps pauses
+    /// one when it has been asked more since.
+    asks: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    asked: u32,
     // Scratch that lives across steps so that a step allocates nothing for it.
     requests: Vec<Request>,
     parts: Vec<StepPart>,
@@ -797,6 +802,7 @@ impl Conductor {
         mut exec: Box<dyn Executor>,
         rx: Receiver<Command>,
     ) -> Self {
+        let asks = exec.asks();
         let max_rows = match config.max_rows {
             0 => model.max_rows(),
             n => n.min(model.max_rows()),
@@ -899,6 +905,8 @@ impl Conductor {
             give_up: false,
             pause_ms: 0,
             resuming: false,
+            asks,
+            asked: 0,
             step_no: 0,
             after_idle: true,
             last_done_ns: None,
@@ -1089,6 +1097,11 @@ impl Conductor {
                 }
             }
             let began = Instant::now();
+            // What was asked before the commands are taken: a request that comes after
+            // this makes a step that pauses pause.
+            if let Some(asks) = &self.asks {
+                self.asked = asks.load(std::sync::atomic::Ordering::Acquire) as u32;
+            }
             while let Ok(command) = self.rx.try_recv() {
                 self.handle(command);
             }
@@ -2694,6 +2707,7 @@ impl Conductor {
         if std::mem::take(&mut self.give_up) {
             writer.give_up_paused();
         }
+        writer.asked(self.asked);
         self.runs.clear();
         self.samplers.clear();
         self.step_rows.clear();

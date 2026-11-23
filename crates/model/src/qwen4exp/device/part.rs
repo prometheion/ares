@@ -2867,9 +2867,11 @@ impl Part {
         self.swap(env, Some(wait), gate, Some(self.at(s.out)))?;
         self.prepare_arrival(env.stream, rows)?;
         self.moe(env, i, &layer.moe)?;
+        // In a pass the shared expert's gated output is in the experts' output already.
+        let in_pass = self.pass_record().is_some();
         self.pending = Some(Pending::Moe {
             exchange: Some(self.exchange_no(env, i, X_MOE_PARTIAL)),
-            shared: layer.moe.shared.is_some(),
+            shared: layer.moe.shared.is_some() && !in_pass,
         });
         Ok(())
     }

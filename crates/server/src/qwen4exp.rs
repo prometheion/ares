@@ -389,11 +389,8 @@ pub(crate) fn load(
     // expert slots lend for the rows they keep, and the parts' steps never take more than
     // their own scratch. Elsewhere it takes steps as many rows wide as asked or the default,
     // as far as the expert slots can lend the scratch for them.
-    let passes = reads_layer_by_layer(
-        &session(longest, pages, spread, own_rows).part,
-        devices.len(),
-        dflash.is_some(),
-    );
+    let passes =
+        reads_layer_by_layer(&session(longest, pages, spread, own_rows).part, dflash.is_some());
     let (max_rows, pass_rows) = if passes {
         (own_rows, options.batch.unwrap_or(DEFAULT_PASS).max(own_rows))
     } else {

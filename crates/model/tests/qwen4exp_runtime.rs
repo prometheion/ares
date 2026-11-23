@@ -880,7 +880,7 @@ fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
     let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
     let reference = reference_answer_at(&path, &prompt, 16);
     let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
-    for placement in placements().into_iter().filter(|p| *p == Placement::One) {
+    for placement in placements() {
         for own in [32, 16] {
             let (runtime, _) = start_passing(&path, placement, 16, 0, own);
             let steps = ask(&runtime, 1, &prompt, 16);
@@ -907,6 +907,113 @@ fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
             assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the pass");
         }
     }
+}
+
+/// A request that comes while a long prompt is read layer by layer gets its first token
+/// before that prompt's: the pass pauses between two micro-batches when the engine is asked
+/// something, the new request's prompt runs, and the pass goes on where it stopped. Both
+/// answer as they do alone.
+#[test]
+fn a_request_cuts_in_between_the_pieces_of_a_long_prompt() {
+    if !enabled() {
+        return;
+    }
+    let long = prompt(480, 7);
+    let short = prompt(12, 8);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let short_reference = reference_answer_at(&path, &short, 8);
+    let long_reference = reference_answer_at(&path, &long, 8);
+    for placement in placements() {
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let long_alone = ask(&runtime, 1, &long, 8);
+        let short_alone = ask(&runtime, 2, &short, 8);
+        runtime.shutdown();
+        // The same prompt in steps of the own scratch, which in this placement may part
+        // from the reference at a near tie.
+        let (runtime, _) = start_passing(&path, placement, 16, 0, 16);
+        let long_steps = ask(&runtime, 1, &long, 8);
+        runtime.shutdown();
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let begun = std::time::Instant::now();
+        let (long_rx, long_first) = submit_timed(&runtime, 3, &long, 8);
+        std::thread::sleep(Duration::from_millis(5));
+        let asked = begun.elapsed();
+        let (short_rx, short_first) = submit_timed(&runtime, 4, &short, 8);
+        let short_got = short_rx.recv_timeout(Duration::from_secs(300)).unwrap().unwrap();
+        let long_got = long_rx.recv_timeout(Duration::from_secs(300)).unwrap().unwrap();
+        let paused = runtime.snapshot().expect("the runtime is running").counters.steps_paused;
+        runtime.shutdown();
+        let (short_at, long_at) =
+            (short_first.lock().unwrap().unwrap(), long_first.lock().unwrap().unwrap());
+        eprintln!(
+            "CUT {placement:?}: short asked after {asked:?}, its first token after {:?}; the long \
+             prompt's after {:?}; {paused} steps paused",
+            short_at.duration_since(begun),
+            long_at.duration_since(begun),
+        );
+        let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        eprintln!(
+            "CUT {placement:?}: short {short_got:?} (alone {short_alone:?}, reference \
+             {short_reference:?}); long {long_got:?} (alone {long_alone:?}, reference \
+             {long_reference:?}, in steps {long_steps:?})"
+        );
+        assert!(paused >= 1, "{placement:?}: the long prompt's pass never paused");
+        assert!(short_at < long_at, "{placement:?}: the short request waited for the long one");
+        assert!(leading(&short_got, &short_reference) >= 2, "{placement:?}: {short_got:?}");
+        assert!(
+            leading(&long_got, &long_reference).max(leading(&long_got, &long_steps)) >= 2,
+            "{placement:?}: {long_got:?}"
+        );
+    }
+}
+
+/// [`submit`], which also notes when the request's first text arrived.
+fn submit_timed(
+    runtime: &Runtime,
+    id: u64,
+    prompt: &[u32],
+    max_tokens: u32,
+) -> (mpsc::Receiver<Result<Vec<u32>, String>>, Arc<Mutex<Option<std::time::Instant>>>) {
+    let (tx, rx) = mpsc::channel();
+    let first = Arc::new(Mutex::new(None));
+    let text = Arc::new(Mutex::new(String::new()));
+    let sink = {
+        let (text, first) = (text.clone(), first.clone());
+        EventSink::new(move |event| {
+            match event {
+                Event::Text(piece) => {
+                    first.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+                    text.lock().unwrap().push_str(&piece);
+                }
+                Event::Done { .. } => {
+                    let _ = tx.send(Ok(tokens_of(&text.lock().unwrap())));
+                }
+                Event::Error(error) => {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+                Event::Logprobs(_) => {}
+            }
+            true
+        })
+    };
+    let words: Vec<String> = prompt.iter().map(|t| format!("t{t}")).collect();
+    runtime
+        .submit(
+            GenerateRequest {
+                model: "made".into(),
+                prompt: Prompt::Text(words.join(" ")),
+                sampling: Sampling::default(),
+                max_tokens: Some(max_tokens),
+                stop: Vec::new(),
+                draft: true,
+                structure: None,
+                id: RequestId(id),
+                priority: 0,
+            },
+            sink,
+        )
+        .unwrap();
+    (rx, first)
 }
 
 /// [`start_at`] whose prompts read alone run layer by layer in steps of up to `pass_rows`
