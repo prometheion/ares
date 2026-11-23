@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 32 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only), the rows of the row worth and its offset, the image runs and their offset |
+//! | runtime header | 36 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), 3 unused |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), the drafter of a window whose drafts the model makes, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | the rotary position: time, height, width, extra; `(p, p, p, 0)` for text at rotary position `p` (see [Images](#images)) |
@@ -152,7 +152,7 @@ const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
 const KERNEL_HEADER: usize = 32;
 /// Words of both headers, a multiple of four so the segments start at a multiple of 16 bytes.
-const HEADER_WORDS: usize = 40;
+const HEADER_WORDS: usize = 44;
 /// Bytes of both headers.
 const HEADERS: usize = HEADER_WORDS * 4;
 const SEG_BYTES: usize = 32;
@@ -195,9 +195,12 @@ const H_WORTH: usize = 36;
 const H_OFF_WORTH: usize = 37;
 const H_IMAGES: usize = 38;
 const H_OFF_IMAGES: usize = 39;
+const H_PAUSE_MS: usize = 40;
 /// The record's step makes the chains of its own-draft windows and nothing
 /// else.
 const RECORD_DRAFTS_ONLY: u32 = 1;
+/// The step a model paused before this record is given up.
+const RECORD_GIVE_UP: u32 = 2;
 /// The ranges of the table of chances at the head of the draft bars.
 const BAR_CHANCES: usize = ares_sched::CONFIDENCE_BINS;
 
@@ -441,6 +444,19 @@ impl<'a> RecordWriter<'a> {
     /// its windows whose drafts it makes itself, and runs no row.
     pub fn drafts_only(&mut self) {
         self.header[H_FLAGS] |= RECORD_DRAFTS_ONLY;
+    }
+
+    /// The step may run for `ms` milliseconds before a model that runs it in pieces pauses
+    /// it between two of them ([`StepOutput::paused`](crate::StepOutput)); 0: as long as it
+    /// takes. A model pauses it in any case when the engine is asked something meanwhile.
+    pub fn pause_after(&mut self, ms: u32) {
+        self.header[H_PAUSE_MS] = ms;
+    }
+
+    /// Says that the step the model paused last is given up: it will not be run again (its
+    /// sequence ended), and what the model keeps for it goes.
+    pub fn give_up_paused(&mut self) {
+        self.header[H_FLAGS] |= RECORD_GIVE_UP;
     }
 
     /// Marks the segment written last as a replay: its rows rebuild recurrent
@@ -880,6 +896,17 @@ impl<'a> RecordView<'a> {
     /// drafts the model makes itself, and no row runs (see the module).
     pub fn drafts_only(&self) -> bool {
         self.header[H_FLAGS] & RECORD_DRAFTS_ONLY != 0
+    }
+
+    /// The milliseconds the step may run before a model that runs it in pieces pauses it;
+    /// 0 for no bound.
+    pub fn pause_after(&self) -> u32 {
+        self.header[H_PAUSE_MS]
+    }
+
+    /// Whether the step the model paused last is given up.
+    pub fn gives_up_paused(&self) -> bool {
+        self.header[H_FLAGS] & RECORD_GIVE_UP != 0
     }
 
     /// Whether segment `i` is a replay: its rows rebuild recurrent state from

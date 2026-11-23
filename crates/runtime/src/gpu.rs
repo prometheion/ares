@@ -179,6 +179,8 @@ struct DeviceResult {
     /// The probabilities of the wanted rows, when any row asked for them.
     logprobs: Vec<LogprobOut>,
     has_picks: bool,
+    /// The model paused the step ([`DeviceModel::paused`]).
+    paused: bool,
     drafts: Vec<u32>,
     draft_probs: Vec<f32>,
     draft_ms: f64,
@@ -205,6 +207,8 @@ struct Shared {
     done: Bell,
     remaining: AtomicUsize,
     clock: Clock,
+    /// What the engine was asked so far ([`StepContext::asks`]).
+    asks: Arc<AtomicU64>,
 }
 
 struct Handle {
@@ -326,6 +330,7 @@ impl GpuExecutor {
             done: Bell::new(),
             remaining: AtomicUsize::new(0),
             clock: Clock::new(),
+            asks: Arc::new(AtomicU64::new(0)),
         });
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -489,6 +494,7 @@ impl Executor for GpuExecutor {
         out.draft_ms = 0.0;
         out.inexact.clear();
         out.devices.clear();
+        out.paused = false;
         let mut have_picks = false;
         // The device that failed is the one to name: the others only report
         // that they were left waiting for it.
@@ -521,6 +527,7 @@ impl Executor for GpuExecutor {
             }
             out.draft_ms += result.draft_ms;
             out.inexact.extend_from_slice(&result.inexact);
+            out.paused |= result.paused;
         }
         out.inexact.sort_unstable();
         out.inexact.dedup();
@@ -529,6 +536,10 @@ impl Executor for GpuExecutor {
 
     fn checkpoint_ram(&self) -> u64 {
         self.ram.checkpoints()
+    }
+
+    fn asks(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.shared.asks.clone())
     }
 
     fn transfer(&mut self, batch: &mut [Transfer]) -> Result<(), ExecError> {
@@ -774,6 +785,7 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             result.error = None;
                             result.times = times;
                             result.has_picks = produced;
+                            result.paused = worker.model.paused();
                             std::mem::swap(&mut result.picks, &mut worker.picks);
                             std::mem::swap(&mut result.logprobs, &mut worker.logprobs);
                             std::mem::swap(&mut result.drafts, &mut worker.drafts);
@@ -1064,6 +1076,7 @@ impl Worker {
             } else {
                 std::ptr::null()
             },
+            asks: &self.shared.asks,
         })?;
 
         // The picks of the rows whose logits are wanted, made on the device,

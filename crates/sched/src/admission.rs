@@ -48,6 +48,9 @@
 //!   where here any gap is enough). They are spilled as for a shortage, so
 //!   that what they computed stays in the prefix cache, and come back when
 //!   there is room for them again.
+//! - **A sequence in the middle of a paused step gives way to nobody**
+//!   ([`Claims::keep`]): its state is neither before nor after its rows, so
+//!   neither a shortage nor a better priority spills it.
 //!
 //! This object decides and reports. It moves no page, and it reads the pool
 //! only through the numbers it is given: the free pages at the start of a
@@ -417,7 +420,7 @@ impl Admission {
     pub fn begin(&mut self, free_pages: u32) -> Claims<'_> {
         self.claims.clear();
         self.passes += 1;
-        Claims { admission: self, free: free_pages }
+        Claims { admission: self, free: free_pages, kept: None }
     }
 
     /// Takes the running request at index `i` off the pool: it waits at the
@@ -550,7 +553,10 @@ impl Admission {
         use std::cmp::Reverse;
         let w = self.waiting[i];
         let mut victims: Vec<usize> = (0..self.running.len())
-            .filter(|&r| self.running[r].priority > w.arrival.priority)
+            .filter(|&r| {
+                self.running[r].priority > w.arrival.priority
+                    && Some(self.running[r].seq) != tally.kept
+            })
             .collect();
         if victims.is_empty() {
             return false;
@@ -718,6 +724,8 @@ struct Tally {
     evictable: Option<u32>,
     /// Pages that requests made to give way in this pass let go of.
     released: u32,
+    /// A sequence that does not give way ([`Claims::keep`]).
+    kept: Option<SeqId>,
 }
 
 /// The accounting of one step: the claims of the running sequences, then the
@@ -726,9 +734,19 @@ struct Tally {
 pub struct Claims<'a> {
     admission: &'a mut Admission,
     free: u32,
+    /// A sequence that does not give way.
+    kept: Option<SeqId>,
 }
 
 impl Claims<'_> {
+    /// Keeps `seq` running whatever the others need: it is not made to give way,
+    /// for a shortage nor for a request of a better priority (a sequence in the
+    /// middle of a step the model paused, whose state is neither before nor
+    /// after its rows).
+    pub fn keep(&mut self, seq: SeqId) {
+        self.kept = Some(seq);
+    }
+
     /// A running sequence's claim for this step: `required` pages for the
     /// rows it must get (its newest token, decision rows, prompt rows) and
     /// `optional` pages more for rows it can do without (drafts), of which
@@ -743,7 +761,7 @@ impl Claims<'_> {
     /// Decides the step and the admissions after it.
     pub fn settle(self, view: &mut dyn PoolView) -> Outcome {
         let a = self.admission;
-        let free = self.free;
+        let (free, kept) = (self.free, self.kept);
         let mut out = Outcome::default();
         let mut evictable: Option<u32> = None;
         // Free pages, plus the evictable ones once they were asked for.
@@ -763,7 +781,7 @@ impl Claims<'_> {
                 let victim = a
                     .running
                     .iter()
-                    .filter(|r| !victims.iter().any(|v| v.0 == r.seq))
+                    .filter(|r| !victims.iter().any(|v| v.0 == r.seq) && Some(r.seq) != kept)
                     .min_by_key(|r| {
                         let Running { priority, generated, prompt_cells, seq, .. } = **r;
                         use std::cmp::Reverse;
@@ -842,6 +860,7 @@ impl Claims<'_> {
                 taken: 0,
                 evictable,
                 released: 0,
+                kept,
             };
             a.admit(&mut tally, view, &mut out);
             out.evict = tally.granted.saturating_sub(free);
@@ -1096,6 +1115,34 @@ mod tests {
             (out.resume.as_slice(), out.admit.as_slice()),
             ([SeqId(2)].as_slice(), [].as_slice())
         );
+    }
+
+    #[test]
+    fn a_kept_sequence_gives_way_to_no_better_priority() {
+        // Both places are taken, the worse one by a sequence in the middle of a
+        // paused step: a request of a better priority makes the other give way,
+        // or waits when the kept one is the only one of a worse priority.
+        let mut a = Admission::new(AdmissionConfig { max_running: 2, ..config(1000) });
+        a.enqueue(ranked(3, arrival(1, PER_PAGE, 0, 256))).unwrap();
+        a.enqueue(ranked(5, arrival(2, PER_PAGE, 0, 256))).unwrap();
+        assert_eq!(pass(&mut a, 1000, 0).admit, [SeqId(1), SeqId(2)]);
+        a.generated(SeqId(1), 100);
+        a.enqueue(ranked(0, arrival(3, PER_PAGE, 0, 256))).unwrap();
+        let mut claims = a.begin(1000);
+        claims.keep(SeqId(2));
+        let out = claims.settle(&mut View::new(0));
+        assert_eq!(
+            (out.spill.as_slice(), out.admit.as_slice()),
+            ([SeqId(1)].as_slice(), [SeqId(3)].as_slice())
+        );
+        assert!(a.is_running(SeqId(2)));
+
+        a.enqueue(ranked(0, arrival(4, PER_PAGE, 0, 256))).unwrap();
+        let mut claims = a.begin(1000);
+        claims.keep(SeqId(2));
+        let out = claims.settle(&mut View::new(0));
+        assert!(out.spill.is_empty() && out.admit.is_empty(), "{out:?}");
+        assert!(a.is_running(SeqId(2)));
     }
 
     #[test]

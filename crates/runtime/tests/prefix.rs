@@ -1145,3 +1145,88 @@ fn the_same_prompt_asked_again_resumes_at_its_anchor_while_the_roots_keep_their_
         assert_consistent(&e);
     }
 }
+
+/// The runtime's settings for the tests of paused steps: checkpoints of a prompt far apart,
+/// so that a prompt read alone takes steps wider than the pieces of one read beside others.
+fn paused_config() -> RuntimeConfig {
+    RuntimeConfig { checkpoint_prompt_interval: 4 * PAGE * 4, ..config(256, 16) }
+}
+
+/// A model that reads a prompt alone in pieces may pause the step between two of them
+/// (a long prompt read layer by layer, `StepOutput::paused`): the conductor runs the same
+/// rows again, alone, until they are done; the answer and the cache are as without pauses.
+#[test]
+fn a_paused_step_runs_again_until_its_rows_are_done() {
+    let mut rng = Rng(11);
+    let prompt = text_of(&mut rng, 200);
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let e = engine_with(&model, paused_config(), |host| host.with_pauses(16, 4));
+    let first = e.ask(&prompt, 40);
+    assert_eq!(first.run.text, fresh(shape, &prompt, 40).text, "as without pauses");
+    let paused = e.snapshot().counters.steps_paused;
+    assert!(paused >= 3, "{paused} steps paused");
+    let second = e.ask(&prompt, 40);
+    assert_eq!(second.run.text, first.run.text, "from the cache, as the first time");
+    assert_consistent(&e);
+}
+
+/// A request that comes while a step of another prompt is paused runs before that step
+/// is done: the paused step waits for its turn, the new request's prompt is read in pieces
+/// of its own, and both answer as they do alone.
+#[test]
+fn a_request_runs_between_the_pieces_of_a_paused_step() {
+    let mut rng = Rng(12);
+    let long = text_of(&mut rng, 240);
+    let short = text_of(&mut rng, 10);
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let pieces = 40;
+    let e = engine_with(&model, paused_config(), |host| {
+        host.with_pauses(16, pieces).with_delay(Duration::from_millis(2))
+    });
+    let long_run = start(&e.rt, request(&long, Some(20))).unwrap();
+    let deadline = Instant::now() + LIMIT;
+    while e.snapshot().counters.steps_paused < 1 {
+        assert!(Instant::now() < deadline, "the step never paused");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let at_start = e.snapshot().counters.steps_paused;
+    let short_run = start(&e.rt, request(&short, Some(5))).unwrap();
+    let short_done = short_run.finish();
+    // A step of the long prompt pauses `pieces - 1` times before its rows are done; the
+    // short request ran between its pieces, a round of its own for a piece of the long one.
+    let paused = e.snapshot().counters.steps_paused - at_start;
+    let long_done = long_run.finish();
+    assert!(paused < u64::from(pieces) / 2, "{paused} pauses while the short request ran");
+    assert_eq!(short_done.text, fresh(shape, &short, 5).text);
+    assert_eq!(long_done.text, fresh(shape, &long, 20).text);
+    assert_consistent(&e);
+}
+
+/// A request whose step is paused can be cancelled: what it computed is not kept, the
+/// model is told to give the step up, and the next request runs as it would alone.
+#[test]
+fn a_cancelled_request_gives_its_paused_step_up() {
+    let mut rng = Rng(13);
+    let long = text_of(&mut rng, 240);
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let e = engine_with(&model, paused_config(), |host| {
+        host.with_pauses(16, 1000).with_delay(Duration::from_millis(1))
+    });
+    let handle = start(&e.rt, request(&long, Some(20))).unwrap();
+    let deadline = Instant::now() + LIMIT;
+    while e.snapshot().counters.steps_paused < 3 {
+        assert!(Instant::now() < deadline, "the step never paused");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    e.rt.cancel(handle.id);
+    let run = handle.finish();
+    assert_eq!(run.finish, ares_api::FinishReason::Cancelled);
+    // The same prompt again: nothing of the cancelled one is cached past what it had
+    // before its paused step.
+    let again = e.ask(&long, 20);
+    assert_eq!(again.run.text, fresh(shape, &long, 20).text);
+    assert_consistent(&e);
+}

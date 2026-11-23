@@ -81,6 +81,11 @@ pub struct StepOutput {
     pub inexact: Vec<u32>,
     /// What each device measured.
     pub devices: Vec<DeviceTimes>,
+    /// Whether the model paused the step between two of its pieces
+    /// ([`DeviceModel::paused`](crate::DeviceModel::paused)): nothing of it is
+    /// done yet, and the same rows run again in a later step, which goes on where
+    /// this one stopped. No pick comes back.
+    pub paused: bool,
     /// The milliseconds the step took, the drafter's included, from an executor
     /// that knows them without a clock: the conductor takes them for the time
     /// of the step in place of what it measured. Devices leave it `None`; the
@@ -228,6 +233,14 @@ pub trait Executor: Send {
     /// ends its pass). The default is an executor without a tower.
     fn tower(&mut self, _job: &mut crate::model::TowerJob) -> Result<(), ExecError> {
         Err(ExecError::Device { device: 0, message: "the executor runs no image tower".into() })
+    }
+
+    /// The count the engine raises whenever it is asked something (a request,
+    /// a cancellation), which a model that runs a step in pieces watches to
+    /// pause it for the conductor ([`StepContext::asks`](crate::StepContext));
+    /// `None` for an executor whose models never pause.
+    fn asks(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        None
     }
 
     /// The books of the page-locked RAM the checkpoints lie in, which say

@@ -168,6 +168,21 @@ pub struct HostExecutor {
     /// was dispatched that are not exact for it.
     leaving: Option<Box<dyn Fn(u64, u32) -> bool + Send>>,
     inexact: Vec<u32>,
+    /// The steps a model of long prompts runs in pieces ([`HostExecutor::with_pauses`]),
+    /// and whether the step that was dispatched was paused.
+    pauses: Option<Pauses>,
+    paused: bool,
+}
+
+/// Which steps the executor pauses as a model that reads long prompts in pieces does: a
+/// step of one prompt wider than `rows` rows runs in `pieces` dispatches, of which every one
+/// but the last is paused; the rows of the one it runs (`at`: slot, first position, rows) and
+/// the dispatches it has had.
+#[derive(Clone, Copy, Debug)]
+struct Pauses {
+    rows: u32,
+    pieces: u32,
+    at: Option<((u32, u32, u32), u32)>,
 }
 
 impl std::fmt::Debug for HostExecutor {
@@ -222,6 +237,8 @@ impl HostExecutor {
             ram: None,
             leaving: None,
             inexact: Vec::new(),
+            pauses: None,
+            paused: false,
         }
     }
 
@@ -318,6 +335,18 @@ impl HostExecutor {
     /// Calls `observer` with the record of every step, before it runs.
     pub fn with_observer(mut self, observer: impl FnMut(&RecordView<'_>) + Send + 'static) -> Self {
         self.observer = Some(Box::new(observer));
+        self
+    }
+
+    /// Plays a model that runs a step of one prompt wider than `rows` rows in `pieces`
+    /// pieces and pauses it after every piece but the last
+    /// ([`StepOutput::paused`]): the conductor has to run the same rows again until
+    /// they are done, and may run other steps in between. The rows of a paused step
+    /// change nothing; the oracle complains when a step between reads or saves the
+    /// paused sequence's state.
+    pub fn with_pauses(mut self, rows: u32, pieces: u32) -> Self {
+        assert!(pieces >= 1, "a step is at least one piece");
+        self.pauses = Some(Pauses { rows, pieces, at: None });
         self
     }
 
@@ -426,6 +455,28 @@ impl Executor for HostExecutor {
                 (None, false) => self.delay,
             };
         self.picks.clear();
+        // A step the model runs in pieces: every piece but the last pauses it.
+        self.paused = false;
+        let mut rows_run = true;
+        if let Some(pauses) = &mut self.pauses {
+            if view.gives_up_paused() {
+                pauses.at = None;
+            }
+            let pass = (!view.drafts_only() && view.segments() == 1)
+                .then(|| view.segment(0))
+                .filter(|s| s.direct && s.n_rows > pauses.rows)
+                .map(|s| (s.slot, s.pos0 as u32, s.n_rows));
+            if let Some(key) = pass {
+                let done = match pauses.at {
+                    Some((at, done)) if at == key => done + 1,
+                    _ => 1,
+                };
+                self.paused = done < pauses.pieces;
+                pauses.at = self.paused.then_some((key, done));
+                rows_run = !self.paused;
+            }
+        }
+        let paused_slot = self.pauses.and_then(|p| p.at).map(|((slot, ..), _)| slot);
         let mut tables = self.tables.lock().expect("tables");
         // The page-table updates, as the device copies them.
         let mut taken = 0;
@@ -448,9 +499,10 @@ impl Executor for HostExecutor {
                     &mut self.picks,
                     self.ram.as_ref(),
                     &self.problems,
+                    (rows_run, paused_slot),
                 )
             }
-            None if view.drafts_only() => {}
+            None if view.drafts_only() || !rows_run => {}
             None => {
                 if self.model.config().prefix_cache.is_some() {
                     return Err(ExecError::Device {
@@ -528,6 +580,7 @@ impl Executor for HostExecutor {
         out.draft_ms = self.draft_ms;
         out.inexact.clear();
         out.inexact.extend_from_slice(&self.inexact);
+        out.paused = self.paused;
         // A step that was given a cost took exactly that, whatever the clock
         // says; one that was given none is the conductor's to measure.
         let priced = self.step_cost.is_some() || !self.delay.is_zero();
@@ -886,8 +939,23 @@ impl Oracle {
         picks: &mut Vec<Pick>,
         ram: Option<&PinnedRam>,
         problems: &Problems,
+        (rows, paused): (bool, Option<u32>),
     ) {
         let complain = |what: String| note(problems, what);
+        // The sequence of a paused step has a state the step's rows have half
+        // changed: a step between must not save it, restore over it or run its rows.
+        if let Some(slot) = paused.filter(|_| rows) {
+            for i in 0..view.state_copies() {
+                if view.state_copy(i).slot == slot {
+                    complain(format!("slot {slot} is copied while its step is paused"));
+                }
+            }
+            for i in 0..view.segments() {
+                if view.segment(i).slot == slot {
+                    complain(format!("slot {slot} runs rows while its step is paused"));
+                }
+            }
+        }
 
         // The commit of the step before.
         for i in 0..view.commits() {
@@ -962,8 +1030,9 @@ impl Oracle {
             }
         }
 
-        // A step that only drafts runs no row and leaves no window.
-        if view.drafts_only() {
+        // A step that only drafts runs no row and leaves no window; nor does a
+        // step that is paused.
+        if view.drafts_only() || !rows {
             return;
         }
 

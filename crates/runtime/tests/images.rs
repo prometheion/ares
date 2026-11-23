@@ -6,7 +6,9 @@
 //! executor checks that the rows of every image cell are staged, in order, and
 //! that every row has the rotary position llama.cpp's `mtmd` gives it: text one
 //! after the other, an image's rows `(p, p + j / nx, p + j % nx)`, the text
-//! after an image `max(nx, ny)` on.
+//! after an image `max(nx, ny)` on. It can also play a model that pauses a long step of one
+//! prompt between its pieces (a prompt read layer by layer): every record that goes on with
+//! the step must stage the same rows again.
 
 mod common;
 
@@ -145,6 +147,8 @@ struct Seen {
     /// Passes of the tower that ended, and the jobs it took.
     passes: u32,
     jobs: u32,
+    /// Steps paused between their pieces.
+    paused: u32,
 }
 
 /// Per slot: the rotary position the next cell must have, and where.
@@ -162,6 +166,11 @@ struct Checker {
     next: HashMap<u32, Next>,
     /// The pass under way: the image's seed and the next unit.
     pass: Option<(u8, u32)>,
+    /// A step of one prompt wider than `.0` rows runs in `.1` pieces, each paused but the
+    /// last; the step being run and the pieces it has had; the time a piece takes.
+    pauses: Option<(u32, u32)>,
+    pausing: Option<((u32, u32, u32), u32)>,
+    piece: Duration,
     seen: Arc<Mutex<Seen>>,
 }
 
@@ -174,6 +183,9 @@ impl Checker {
             clock: Clock::new(),
             next: HashMap::new(),
             pass: None,
+            pauses: None,
+            pausing: None,
+            piece: Duration::ZERO,
             seen,
         }
     }
@@ -231,6 +243,28 @@ impl Executor for Checker {
 
     fn collect(&mut self, _spin: Duration, out: &mut StepOutput) -> Result<Woke, ExecError> {
         let view = RecordView::new(&self.record[..self.used]).unwrap();
+        std::thread::sleep(self.piece);
+        // A step of one prompt wider than the pauses' rows runs in pieces.
+        out.paused = false;
+        if let Some((rows, pieces)) = self.pauses {
+            if view.gives_up_paused() {
+                self.pausing = None;
+            }
+            let key = (view.segments() == 1)
+                .then(|| view.segment(0))
+                .filter(|s| s.direct && s.n_rows > rows)
+                .map(|s| (s.slot, s.pos0 as u32, s.n_rows));
+            if let Some(key) = key {
+                let done = match self.pausing {
+                    Some((at, done)) if at == key => done + 1,
+                    _ => 1,
+                };
+                out.paused = done < pieces;
+                self.pausing = out.paused.then_some((key, done));
+            }
+        }
+        // The rows are checked in every piece; only the last one moves the positions on.
+        let kept = self.next.clone();
         let mut seen = self.seen.lock().unwrap();
         // Which rows take staged rows.
         let mut staged: HashMap<u32, [f32; 4]> = HashMap::new();
@@ -292,7 +326,16 @@ impl Executor for Checker {
             }
         }
         out.picks.clear();
-        out.picks.extend((0..view.picked_rows()).map(|_| Pick { token: 7, logit: 0.0, aux: 0.0 }));
+        if out.paused {
+            self.next = kept;
+            seen.paused += 1;
+        } else {
+            out.picks.extend((0..view.picked_rows()).map(|_| Pick {
+                token: 7,
+                logit: 0.0,
+                aux: 0.0,
+            }));
+        }
         out.logprobs.clear();
         out.drafts.clear();
         out.draft_probs.clear();
@@ -310,16 +353,25 @@ impl Executor for Checker {
 }
 
 fn runtime(stage_rows: usize) -> (Runtime, Arc<Mutex<Seen>>) {
+    runtime_with(stage_rows, |config| config, |checker| checker)
+}
+
+/// [`runtime`] with the config and the executor changed.
+fn runtime_with(
+    stage_rows: usize,
+    config: impl FnOnce(RuntimeConfig) -> RuntimeConfig,
+    checker: impl FnOnce(Checker) -> Checker,
+) -> (Runtime, Arc<Mutex<Seen>>) {
     let seen = Arc::new(Mutex::new(Seen::default()));
-    let config = RuntimeConfig {
+    let config = config(RuntimeConfig {
         pages: 256,
         cells_per_page: 16,
         max_slots: 4,
         window_rows: 1,
         warm_up: false,
         ..RuntimeConfig::default()
-    };
-    let executor = Checker::new(stage_rows, seen.clone());
+    });
+    let executor = checker(Checker::new(stage_rows, seen.clone()));
     (Runtime::start(Arc::new(Pictures), Box::new(executor), config).unwrap(), seen)
 }
 
@@ -378,6 +430,52 @@ fn prompts_with_images_next_to_each_other_each_get_their_own_rows() {
     assert!(seen.complaints.is_empty(), "{:#?}", seen.complaints);
     assert_eq!(seen.image_rows, 6 + 9 + 12);
     assert_eq!(seen.passes, 3);
+    drop(seen);
+    runtime.shutdown();
+}
+
+/// A step of a prompt with an image that the model pauses between its pieces stages the
+/// image's rows again in every record that goes on with it, also when the image store let
+/// them go meanwhile for another request's image (the store holds one image here).
+#[test]
+fn a_paused_step_stages_its_image_rows_again_after_the_store_let_them_go() {
+    let (runtime, seen) = runtime_with(
+        64,
+        // One image of 12 rows of 4 values.
+        |config| RuntimeConfig { image_rows: 12 * 16, ..config },
+        |mut checker| {
+            checker.pauses = Some((20, 40));
+            checker.piece = Duration::from_millis(2);
+            checker
+        },
+    );
+    // The first image's rows come into the store with a short prompt; the long one then
+    // reads them in its first step, which pauses.
+    assert_eq!(ask(&runtime, "w [1,4,3] w", 2).usage.completion_tokens, 2);
+    let words = |n: usize| vec!["w"; n].join(" ");
+    let long = format!("{} [1,4,3] {}", words(10), words(30));
+    let request = |prompt: String, tokens: u32| GenerateRequest {
+        model: "pictures".into(),
+        prompt: Prompt::Text(prompt),
+        sampling: Sampling::default(),
+        max_tokens: Some(tokens),
+        ..common::request("", None)
+    };
+    let long_run = start(&runtime, request(long, 4)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while seen.lock().unwrap().paused < 1 {
+        assert!(std::time::Instant::now() < deadline, "the step never paused");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    // Another image while the long prompt's step is paused: the store keeps it in place of
+    // the first.
+    let short = start(&runtime, request("w [2,2,3] w".into(), 3)).unwrap();
+    assert_eq!(short.finish().usage.completion_tokens, 3);
+    assert_eq!(long_run.finish().usage.completion_tokens, 4);
+    let seen = seen.lock().unwrap();
+    assert!(seen.complaints.is_empty(), "{:#?}", seen.complaints);
+    assert!(seen.paused >= 2, "{} pauses", seen.paused);
+    assert_eq!(seen.passes, 2, "the paused step's rows were held for it, not computed again");
     drop(seen);
     runtime.shutdown();
 }

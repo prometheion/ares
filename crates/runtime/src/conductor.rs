@@ -112,7 +112,7 @@ use ares_state::{
 use crate::cache::Cache;
 use crate::config::RuntimeConfig;
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
-use crate::image::{ImageInput, ImageRows, ImageSpan, ImageStore, Spans, cell_name};
+use crate::image::{ImageInput, ImageName, ImageRows, ImageSpan, ImageStore, Spans, cell_name};
 use crate::model::{ContextSpec, Drafter, DrafterKind, Model, TowerJob, Vision};
 use crate::record::{self, Commit, ImageRun, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
@@ -429,10 +429,9 @@ impl Active {
         self.known.saturating_sub(self.cells.len() as u32) + self.replay_left
     }
 
-    /// The first image of the prompt from where the state is on whose rows
-    /// `store` does not have.
-    fn missing_image(&self, store: &ImageStore) -> Option<Arc<ImageInput>> {
-        let from = self.state_pos() as u32;
+    /// The first image of the prompt from cell `from` on whose rows `store`
+    /// does not have.
+    fn missing_image(&self, store: &ImageStore, from: u32) -> Option<Arc<ImageInput>> {
         let i = self.spans.from(from)?;
         self.spans.spans()[i..]
             .iter()
@@ -744,6 +743,19 @@ pub(crate) struct Conductor {
     stalled: bool,
     /// When the step in flight began, for the watchdog.
     heartbeat: Arc<Heartbeat>,
+    /// The step the model paused between two of its pieces (a long prompt read layer by
+    /// layer, [`StepOutput::paused`]): its one part, which runs again, alone, when it is its
+    /// turn; its sequence's cells are claimed and its state is the model's until it ends.
+    paused: Option<StepPart>,
+    /// The paused step's sequence ended: the next record says so.
+    give_up: bool,
+    /// The milliseconds the next step may run before the model pauses it, and whether the
+    /// record being written goes on with a paused step (its rows were counted).
+    pause_ms: u32,
+    resuming: bool,
+    /// The rows of the images among the paused step's rows, held for it so that the
+    /// image store cannot let them go before it goes on: its record stages them again.
+    paused_images: Vec<(ImageName, Arc<ImageRows>)>,
     // Scratch that lives across steps so that a step allocates nothing for it.
     requests: Vec<Request>,
     parts: Vec<StepPart>,
@@ -841,6 +853,7 @@ impl Conductor {
             corpus: NgramCorpus::new(config.ngram),
             stats: Stats::new(exec.devices(), config.stats_window),
             output: StepOutput {
+                paused: false,
                 picks: Vec::with_capacity(max_rows as usize),
                 logprobs: Vec::new(),
                 drafts: Vec::with_capacity(max_rows as usize),
@@ -881,6 +894,11 @@ impl Conductor {
             needs,
             share,
             prompt_rows: Vec::with_capacity(slots),
+            paused: None,
+            paused_images: Vec::new(),
+            give_up: false,
+            pause_ms: 0,
+            resuming: false,
             step_no: 0,
             after_idle: true,
             last_done_ns: None,
@@ -1532,6 +1550,18 @@ impl Conductor {
     /// state in the cache: not when the engine is going down or a device
     /// failed, and the state is not there.
     fn retire_with(&mut self, slot: u32, finish: FinishReason, keep: bool) {
+        // A sequence in the middle of a paused step has a state that is neither
+        // before nor after its rows: nothing of it is kept, and the model is told
+        // to give the step up.
+        let keep = match self.paused {
+            Some(p) if p.slot == slot => {
+                self.paused = None;
+                self.paused_images.clear();
+                self.give_up = true;
+                false
+            }
+            _ => keep,
+        };
         let Some(mut a) = self.slots[slot as usize].take() else { return };
         self.by_id.remove(&a.id);
         if !a.sink.is_closed() {
@@ -1626,6 +1656,10 @@ impl Conductor {
     /// `self.parts` claim, then who starts.
     fn settle(&mut self) -> Outcome {
         let mut claims = self.admission.begin(self.pool.free_pages());
+        // The sequence of a paused step is in the middle of its rows.
+        if let Some(p) = self.paused {
+            claims.keep(p.seq);
+        }
         for part in &self.parts {
             let Some(a) = &self.slots[part.slot as usize] else { continue };
             // A replay writes no cell, so it claims no page.
@@ -1748,8 +1782,13 @@ impl Conductor {
         // The windows that offer nothing are rows of the step all the same:
         // the price of the step counts them in.
         let (mut quiet, mut quiet_cells) = (0u32, 0u64);
+        let paused = self.paused.map(|p| p.slot as usize);
         for (slot, a) in self.slots.iter_mut().enumerate() {
             let Some(a) = a else { continue };
+            // The paused step's sequence runs only that step, alone.
+            if Some(slot) == paused {
+                continue;
+            }
             if !a.generating() {
                 // Prompts wait for their piece, and for the rows of an image
                 // the tower has not computed yet.
@@ -1963,13 +2002,31 @@ impl Conductor {
         if self.stalled {
             return;
         }
+        // A step the model paused goes on alone when nobody else runs.
+        let paused = self.paused;
+        if paused.is_some() && self.active == 1 {
+            return self.resume(began, 0);
+        }
+        let paused_slot = paused.map(|p| p.slot as usize);
         // Whose turn it is. The price of a piece for the share is a step of
-        // that many rows at the depth of the deepest prompt.
+        // that many rows at the depth of the deepest prompt. The paused step's
+        // rows are a prompt's, still to read.
         self.prompt_rows.clear();
-        self.prompt_rows.extend(
-            self.slots.iter().flatten().filter(|a| !a.generating()).map(Active::prefill_left),
-        );
-        let generating = self.slots.iter().flatten().filter(|a| a.generating()).count() as u32;
+        self.prompt_rows.extend(self.slots.iter().enumerate().filter_map(|(slot, a)| {
+            let a = a.as_ref()?;
+            match paused {
+                Some(p) if Some(slot) == paused_slot => Some(p.rows),
+                _ => (!a.generating()).then(|| a.prefill_left()),
+            }
+        }));
+        let generating = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(slot, a)| {
+                Some(*slot) != paused_slot && a.as_ref().is_some_and(|a| a.generating())
+            })
+            .count() as u32;
         let deepest = self
             .slots
             .iter()
@@ -2015,6 +2072,17 @@ impl Conductor {
                 Ok(ms) if ms > 0.0 => self.share.spent(turn, ms, generating, true),
                 Ok(_) => {}
                 Err(message) => return self.fail(message),
+            }
+        }
+        // The paused step's turn for prompts, when no other prompt waits for a
+        // piece: it goes on for about the time of a piece.
+        if let (Some(p), Turn::Piece { .. }) = (paused, turn) {
+            let others = self.slots.iter().enumerate().any(|(slot, a)| {
+                slot != p.slot as usize
+                    && a.as_ref().is_some_and(|a| !a.generating() && a.prefill_left() > 0)
+            });
+            if !others {
+                return self.resume(began, self.config.piece_ms.max(1.0) as u32);
             }
         }
         self.want(turn);
@@ -2154,6 +2222,10 @@ impl Conductor {
         }
         self.parts.truncate(kept);
         if self.parts.is_empty() {
+            // Nothing else could run: the paused step goes on.
+            if self.paused.is_some() {
+                self.resume(began, self.config.piece_ms.max(1.0) as u32);
+            }
             return;
         }
 
@@ -2178,7 +2250,22 @@ impl Conductor {
             Err(message) => return self.fail(message),
         };
         self.stats.record(Phase::Write, t_write.elapsed().as_nanos() as u64);
+        self.run_record(began, used, turn, generating, chain_ms, true);
+    }
 
+    /// Runs the step whose record (`used` bytes) is written, for `turn`, with
+    /// `generating` sequences generating and `chain_ms` milliseconds of the
+    /// drafters' step before it; `observe` lets its time teach the prices. A
+    /// step the model paused keeps its part for later and commits nothing.
+    fn run_record(
+        &mut self,
+        began: Instant,
+        used: usize,
+        turn: Turn,
+        generating: u32,
+        chain_ms: f64,
+        observe: bool,
+    ) {
         // The devices.
         let t_dispatch = Instant::now();
         self.step_no += 1;
@@ -2210,7 +2297,11 @@ impl Conductor {
         let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
         // An executor that knows the time of its steps without a clock says so.
         let step_ms = self.output.step_ms.take().unwrap_or(step_ms);
-        self.prices.observe(load, step_ms);
+        // A step the model paused, or one that went on where it was paused, did
+        // part of its rows' work.
+        if observe && !self.output.paused {
+            self.prices.observe(load, step_ms);
+        }
         // The round took its chains and its rows.
         let step_ms = step_ms + chain_ms;
         self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
@@ -2224,7 +2315,27 @@ impl Conductor {
             };
             self.stats.record_device(device, times, notice);
         }
+        if self.output.paused {
+            // The model stopped between two pieces of the step: its rows run again
+            // later, alone, and go on there. What the record carried for the step
+            // before (its windows' commits) has been done.
+            if self.parts.len() != 1 {
+                return self.fail("the model paused a step of several sequences".into());
+            }
+            let part = self.parts[0];
+            self.paused = Some(part);
+            self.hold_images(part);
+            self.commits.clear();
+            self.stats.counters.steps_paused += 1;
+            self.stats.record(Phase::Step, began.elapsed().as_nanos() as u64);
+            self.stats.counters.steps += 1;
+            return;
+        }
 
+        // The paused step has run to its end (or another step ran while it waits).
+        if self.paused.is_none() {
+            self.paused_images.clear();
+        }
         let t_commit = Instant::now();
         self.commit();
         self.stats.record(Phase::Commit, t_commit.elapsed().as_nanos() as u64);
@@ -2249,7 +2360,15 @@ impl Conductor {
             let mut waiting: Vec<&Active> =
                 self.slots.iter().flatten().filter(|a| !a.generating()).collect();
             waiting.sort_by_key(|a| a.prefill_left());
-            let Some(image) = waiting.iter().find_map(|a| a.missing_image(&self.images)) else {
+            // From where the state is; for the paused step's sequence after its
+            // rows, whose images it holds.
+            let paused = self.paused;
+            let from = |a: &Active| match paused {
+                Some(p) if p.seq == a.seq => (p.from + u64::from(p.rows)) as u32,
+                _ => a.state_pos() as u32,
+            };
+            let Some(image) = waiting.iter().find_map(|a| a.missing_image(&self.images, from(a)))
+            else {
                 return Ok(0.0);
             };
             self.pass = Some(TowerPass { image, next: 0, rows: Vec::new(), ms: 0.0 });
@@ -2320,6 +2439,68 @@ impl Conductor {
             stage[at..at + values.len()].copy_from_slice(values);
             at += values.len();
         }
+    }
+
+    /// Holds the rows of the images among `part`'s rows (the step the model paused)
+    /// until the step has run to its end: those it held when it paused before (the store
+    /// may have let them go since), else the store's.
+    fn hold_images(&mut self, part: StepPart) {
+        let held = std::mem::take(&mut self.paused_images);
+        let Some(a) = &self.slots[part.slot as usize] else { return };
+        let (from, end) = (part.from as u32, part.from as u32 + part.rows);
+        let Some(first) = a.spans.from(from) else { return };
+        for span in a.spans.spans()[first..].iter().take_while(|s| s.first < end) {
+            let name = span.image.name;
+            if self.paused_images.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            let rows = match held.iter().find(|(n, _)| *n == name) {
+                Some((_, rows)) => Some(rows.clone()),
+                None => self.images.get(&name),
+            };
+            if let Some(rows) = rows {
+                self.paused_images.push((name, rows));
+            }
+        }
+    }
+
+    /// Runs the step the model paused again, alone, for at most `budget_ms`
+    /// milliseconds before the model may pause it again (0: as long as it takes):
+    /// the same rows, whose cells are claimed already; the model goes on where it
+    /// stopped.
+    fn resume(&mut self, began: Instant, budget_ms: u32) {
+        let Some(part) = self.paused.take() else { return };
+        if !self.slots[part.slot as usize].as_ref().is_some_and(|a| a.seq == part.seq) {
+            self.paused_images.clear();
+            self.give_up = true;
+            return;
+        }
+        let t_write = Instant::now();
+        self.parts.clear();
+        self.parts.push(part);
+        if let Some(cache) = &mut self.cache {
+            cache.settle_leaving(&mut self.pool, &mut *self.exec);
+        }
+        self.pause_ms = budget_ms;
+        self.resuming = true;
+        let used = self.write_record(false);
+        self.pause_ms = 0;
+        self.resuming = false;
+        let used = match used {
+            Ok(used) => used,
+            Err(message) => return self.fail(message),
+        };
+        self.stats.record(Phase::Write, t_write.elapsed().as_nanos() as u64);
+        let generating = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(slot, a)| {
+                *slot != part.slot as usize && a.as_ref().is_some_and(|a| a.generating())
+            })
+            .count() as u32;
+        let turn = Turn::Piece { rows: part.rows };
+        self.run_record(began, used, turn, generating, 0.0, false);
     }
 
     /// Whether `part` is a window whose drafts one of the model's drafters
@@ -2507,6 +2688,11 @@ impl Conductor {
             RecordWriter::new(buffer, self.step_no + 1, segments, rows).map_err(full)?;
         if drafts_only {
             writer.drafts_only();
+        } else {
+            writer.pause_after(self.pause_ms);
+        }
+        if std::mem::take(&mut self.give_up) {
+            writer.give_up_paused();
         }
         self.runs.clear();
         self.samplers.clear();
@@ -2540,7 +2726,9 @@ impl Conductor {
             match part.kind {
                 PartKind::Prefill { completes } => {
                     has_prompt = true;
-                    if part.replay {
+                    if self.resuming {
+                        // Counted when the step was first written.
+                    } else if part.replay {
                         counters.replay_rows += u64::from(part.rows);
                     } else {
                         counters.prefill_rows += u64::from(part.rows);
@@ -2576,7 +2764,15 @@ impl Conductor {
                                 break;
                             }
                             let (lo, hi) = (span.first.max(first_cell), span.end().min(end));
-                            let Some(rows) = self.images.get(&span.image.name) else {
+                            // A paused step's own rows first: the store may have let
+                            // them go meanwhile.
+                            let held =
+                                self.paused_images.iter().find(|(n, _)| *n == span.image.name);
+                            let rows = match held {
+                                Some((_, rows)) => Some(rows.clone()),
+                                None => self.images.get(&span.image.name),
+                            };
+                            let Some(rows) = rows else {
                                 return Err(format!(
                                     "the rows of an image of request {} are not in the store",
                                     a.id

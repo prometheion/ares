@@ -244,6 +244,9 @@ pub const DRAFT_SOURCES: usize = 3;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     pub steps: u64,
+    /// Steps the model paused between two of their pieces (a long prompt read layer by
+    /// layer), to run again where they stopped.
+    pub steps_paused: u64,
     pub rows: u64,
     /// Rows of prompt tokens.
     pub prefill_rows: u64,

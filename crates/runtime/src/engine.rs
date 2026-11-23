@@ -1,6 +1,6 @@
 //! The front of the runtime: an [`Engine`] over a conductor thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, ThreadId};
@@ -46,6 +46,9 @@ pub struct Runtime {
     /// `None` after shutdown. Sending happens under the lock, so a request
     /// is either in the channel before the shutdown command or refused.
     commands: Mutex<Option<Sender<Command>>>,
+    /// What the engine was asked so far, for models that pause long steps
+    /// ([`Executor::asks`]).
+    asks: Option<Arc<AtomicU64>>,
     conductor: Mutex<Option<JoinHandle<()>>>,
     conductor_id: ThreadId,
     /// Cleared when the conductor thread has ended, and with it the device
@@ -141,6 +144,7 @@ impl Runtime {
                 let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(Command::Trim);
             });
         }
+        let asks = executor.asks();
         let mut conductor = Conductor::new(model.clone(), config, executor, rx);
         let failure = conductor.failure();
         let heartbeat = conductor.heartbeat();
@@ -187,6 +191,7 @@ impl Runtime {
             grammars,
             stuck,
             commands: Mutex::new(Some(tx)),
+            asks,
             conductor_id: thread.thread().id(),
             conductor: Mutex::new(Some(thread)),
             running,
@@ -196,6 +201,14 @@ impl Runtime {
             slots,
             template: None,
         })
+    }
+
+    /// Counts a request or cancellation sent to the conductor, for a model that
+    /// pauses a long step so that the conductor can answer it.
+    fn asked(&self) {
+        if let Some(asks) = &self.asks {
+            asks.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// The runtime, which says that conversations are rendered with the
@@ -340,6 +353,7 @@ impl Runtime {
             Some(sender) => sender.send(Command::Submit(submission)).is_ok(),
             None => false,
         };
+        self.asked();
         if !sent {
             return Err(EngineError::Internal("the engine has shut down".into()));
         }
@@ -501,6 +515,7 @@ impl Engine for Runtime {
         if let Some(sender) = self.commands.lock().expect("commands").as_ref() {
             let _ = sender.send(Command::Cancel(id));
         }
+        self.asked();
     }
 
     fn failure(&self) -> Option<String> {

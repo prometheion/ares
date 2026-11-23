@@ -322,6 +322,11 @@ pub struct StepContext<'a> {
     /// image runs name ([`RecordView::image_run`](crate::RecordView)). Null
     /// for a model without images. Unchanged until the step has ended.
     pub image_stage: *const f32,
+    /// A count the engine raises whenever it is asked something (a request, a
+    /// cancellation): a model that runs a long step in pieces pauses it between
+    /// two pieces when the count has changed since the step began, so that the
+    /// conductor can answer ([`DeviceModel::paused`]).
+    pub asks: &'a std::sync::atomic::AtomicU64,
 }
 
 /// What a model that reads images tells the runtime ([`Model::vision`]).
@@ -477,6 +482,21 @@ pub trait DeviceModel: Send {
     /// but the file) says so, and the conductor accepts no draft from that row
     /// on. Asked after the step has ended, on every device.
     fn rows_not_exact(&mut self, _out: &mut Vec<u32>) {}
+
+    /// Whether the step that ended last was paused between two of its pieces:
+    /// the model runs some steps in pieces (a long prompt layer by layer) and may
+    /// stop one between two of them, when the engine was asked something
+    /// ([`StepContext::asks`]) or the record's time for it has passed
+    /// ([`RecordView::pause_after`](crate::record::RecordView::pause_after)).
+    /// Nothing of a paused step is done, and no logits are made; the conductor
+    /// runs its rows again in a later record, alone, and the model goes on where
+    /// it stopped, or says in a record that the step is given up
+    /// ([`RecordView::gives_up_paused`](crate::record::RecordView::gives_up_paused)).
+    /// Every device part of a model pauses the same steps. The default never
+    /// pauses.
+    fn paused(&self) -> bool {
+        false
+    }
 }
 
 /// An architecture.

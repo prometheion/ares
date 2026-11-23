@@ -88,6 +88,10 @@ pub struct SyntheticConfig {
     pub context_length: u32,
     /// The most rows of a step.
     pub max_rows: u32,
+    /// The most rows of a step in the memory the model keeps for good
+    /// ([`Model::own_rows`]); 0: `max_rows`. A prompt read alone takes up to
+    /// `max_rows`, a piece of prompt while others run up to this.
+    pub own_rows: u32,
     /// For a layer split: how many layers each device holds. Empty: even.
     pub layers_per_device: Vec<u32>,
     /// For a tensor split: each device's share of the rows of every block, as
@@ -159,6 +163,7 @@ impl SyntheticConfig {
             context: ContextSpec { window: 0, epoch: 0, buckets: 4096 },
             context_length: 4096,
             max_rows: 64,
+            own_rows: 0,
             layers_per_device: Vec::new(),
             tensor_shares: Vec::new(),
             state_bytes_per_cell: 0,
@@ -611,6 +616,17 @@ impl Model for SyntheticModel {
 
     fn max_rows(&self) -> u32 {
         self.config.max_rows
+    }
+
+    fn own_rows(&self) -> u32 {
+        match self.config.own_rows {
+            0 => self.config.max_rows,
+            own => own.min(self.config.max_rows),
+        }
+    }
+
+    fn prompt_rows(&self) -> u32 {
+        self.own_rows()
     }
 
     fn logit_rows(&self) -> u32 {
