@@ -213,6 +213,40 @@ impl PlanConfig {
     pub fn for_multiprocessors(sm: u32) -> Self {
         Self { target_blocks: 3 * sm, min_piece_cells: 256, max_pieces: 64, min_shared_cells: 512 }
     }
+
+    /// The most state slots ([`Plan::state_slots`]) a plan of [`Planner::finish`] takes for
+    /// `kv_heads` KV heads of `q_per_kv` query heads each, in steps of at most `rows` rows
+    /// of at most `sequences` sequences, of which at most `alone` rows are planned as alone
+    /// ([`Planner::window`]: a generated row, the rows of draft windows). `mean` says that
+    /// the formats keep exact and converted entries (a tile mean): a piece is of one kind,
+    /// and a row reads the exact first tile, converted tiles and the exact newest ones.
+    ///
+    /// A row with more than one piece takes a slot per piece. The rows of a prompt are cut
+    /// into tiles of `per` rows ([`rows_per_tile`]), and a tile gets pieces in proportion
+    /// to its cells, at least one: over all tiles at most the budget (`target_blocks` over
+    /// the heads) and one per tile. A tile whose cells are of two or three runs of kinds
+    /// has a piece more for every run after the first (one more for the cells of a prefix
+    /// that sequences read together, whose tiles are full and whose newest are converted),
+    /// and a row whose sequence reads a prefix with others has the pieces of both its
+    /// tiles: so `per` times the budget and two tiles per sequence, and two (with a tile
+    /// mean five) slots a row. A row alone has the budget (at most `max_pieces`) and two
+    /// more with a tile mean. Measured against random steps in `tests::the_state_slots_stay_in_their_bound`.
+    pub fn state_slots_bound(
+        &self,
+        kv_heads: u32,
+        q_per_kv: u32,
+        rows: u32,
+        alone: u32,
+        sequences: u32,
+        mean: bool,
+    ) -> u64 {
+        let budget = u64::from((self.target_blocks / kv_heads.max(1)).max(1));
+        let per = u64::from((64 / q_per_kv.max(1)).max(1)).min(u64::from(rows.max(1)));
+        let (row_pieces, extra) = if mean { (5, 2) } else { (2, 0) };
+        let prompts = per * (budget + 2 * u64::from(sequences)) + row_pieces * u64::from(rows);
+        let alone_pieces = budget.min(u64::from(self.max_pieces)) + extra;
+        prompts + u64::from(alone) * alone_pieces
+    }
 }
 
 /// A window of consecutive rows of one sequence that attend causally: row `i`
@@ -1048,5 +1082,123 @@ mod tests {
             plan.items.iter().filter(|i| i.table == 80 && i.kv_head == 0).map(|i| i.total).sum();
         assert_eq!(cells, 240);
         assert_eq!(plan.rows[8].pos, 2500);
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use crate::attention::CacheFormat;
+
+    /// The entries of a sequence of `cells` cells: page ids from `base`, the first `shared`
+    /// of them from a prefix other sequences have too; with a tile mean the first tile and
+    /// the tiles from `exact_from` on are exact.
+    fn entries(cells: u32, base: u32, shared: u32, mean: bool, exact_from: u32) -> Vec<u32> {
+        (0..cells.div_ceil(ENTRY_CELLS))
+            .map(|e| {
+                let id = if e < shared { 5_000_000 + e } else { base + e };
+                let exact = mean && (e == 0 || e * ENTRY_CELLS >= exact_from);
+                if exact { id } else { id | CONVERTED_BIT }
+            })
+            .collect()
+    }
+
+    /// Random steps of prompts of one or two sequences (apart or reading a common
+    /// prefix), with and without rows alone next to them, and of rows alone only, for
+    /// devices of several sizes and head counts, with and without a tile mean: no plan
+    /// takes more state slots than [`PlanConfig::state_slots_bound`]. (The bound of
+    /// before, twenty tiles of the budget, was passed by a prompt that read its prefix
+    /// with another sequence, and by any prompt past its first tile with a tile mean:
+    /// three pieces a row, the step of 256 rows that the 27B failed on in `q5`.)
+    #[test]
+    fn the_state_slots_stay_in_their_bound() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = |n: u32| -> u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(n.max(1))) as u32
+        };
+        let (max_rows, sequences, alone_rows) = (512u32, 2u32, 16u32);
+        for (kv_heads, q_per_kv, sms) in
+            [(1, 6, 28), (3, 6, 28), (4, 6, 46), (2, 8, 34), (1, 4, 46)]
+        {
+            for mean in [false, true] {
+                let format = if mean { CacheFormat::Q5 } else { CacheFormat::Q8 };
+                let geo = CacheGeometry {
+                    k: format,
+                    v: format,
+                    head_dim: 256,
+                    kv_heads,
+                    kv_total: kv_heads,
+                    first_kv_head: 0,
+                    q_per_kv,
+                };
+                let cfg = PlanConfig::for_multiprocessors(sms);
+                let bound = cfg
+                    .state_slots_bound(kv_heads, q_per_kv, max_rows, alone_rows, sequences, mean);
+                let mut worst = 0;
+                for _ in 0..1500 {
+                    // 0: prompts; 1: prompts and rows alone; 2: rows alone.
+                    let kind = random(3);
+                    let alone = if kind == 0 { 0 } else { 1 + random(alone_rows / 2) };
+                    let mut dense = Vec::new();
+                    let mut row = 0;
+                    let shared = random(2) == 1;
+                    let prefix = 1 + random(40);
+                    for s in 0..if kind == 2 { 0 } else { 1 + random(sequences) } {
+                        let left = max_rows - 2 * alone - row;
+                        if left < 2 {
+                            break;
+                        }
+                        let n = 2 + random(left - 1);
+                        let pos0 = if shared {
+                            prefix * ENTRY_CELLS + random(4000)
+                        } else {
+                            random(60000)
+                        };
+                        let newest = pos0.saturating_sub(ENTRY_CELLS) / ENTRY_CELLS * ENTRY_CELLS;
+                        let cells = entries(
+                            pos0 + n,
+                            100_000 * (s + 1),
+                            if shared { prefix } else { 0 },
+                            mean,
+                            newest,
+                        );
+                        dense.push((1000 * s, cells, row, n, pos0));
+                        row += n;
+                    }
+                    let mut windows = Vec::new();
+                    for w in 0..if kind == 0 { 0 } else { 2 } {
+                        let n = 1 + random(alone_rows / 2);
+                        let pos = 8 + random(60000);
+                        let newest = pos.saturating_sub(ENTRY_CELLS) / ENTRY_CELLS * ENTRY_CELLS;
+                        windows.push((
+                            10_000 + 1000 * w,
+                            entries(pos + n, 300_000 * (w + 1), 0, mean, newest),
+                            row,
+                            n,
+                            pos,
+                        ));
+                        row += n;
+                    }
+                    let mut planner = Planner::new(geo, cfg, row.max(1));
+                    for (table, cells, first, n, pos0) in &dense {
+                        planner.dense(*table, cells, *first, *n, *pos0);
+                    }
+                    for (table, cells, first, n, pos) in &windows {
+                        planner.window(*table, cells, *first, *n, *pos, None);
+                    }
+                    worst = worst.max(planner.finish().state_slots);
+                }
+                eprintln!(
+                    "{kv_heads} KV heads of {q_per_kv}, {sms} SMs, tile mean {mean}: worst {worst} of {bound}"
+                );
+                assert!(
+                    u64::from(worst) <= bound,
+                    "{kv_heads} heads, mean {mean}: {worst} > {bound}"
+                );
+            }
+        }
     }
 }

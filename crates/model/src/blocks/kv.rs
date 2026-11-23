@@ -650,7 +650,22 @@ impl Group {
             if state > state_bytes {
                 return Err(invalid(format!(
                     "the attention plan needs {state} bytes of partial states, {state_bytes} are \
-                     reserved"
+                     reserved (a step of {n_rows} rows, {} KV heads, {} slots; segments (rows at \
+                     cell, direct): {:?}; kinds {:?})",
+                    layer.geo.kv_heads,
+                    plan.state_slots,
+                    segments.iter().map(|s| (s.n_rows, s.pos0, s.direct)).collect::<Vec<_>>(),
+                    segments
+                        .iter()
+                        .map(|s| {
+                            let table = (s.slot * stride) as usize;
+                            let need = (s.pos0 as u32 + s.n_rows).div_ceil(ENTRY_CELLS) as usize;
+                            self.entries(conductor)[table..table + need]
+                                .iter()
+                                .map(|e| if e & PAGE_ENTRY != 0 { 'C' } else { 'E' })
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>(),
                 )));
             }
             plans.push((layer.geo.kv_heads, plan));

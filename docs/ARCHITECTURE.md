@@ -4416,7 +4416,25 @@ over until none is. (The owner's production settings, `--shares 0.625,0.375
 4070 20 MiB above its free memory with 0.363 of the heads before, and the load
 died; the plan now gives it 0.320 and 11 491 of its 11 796 MiB free,
 `load.rs` `the_27b_at_the_owners_settings_plans_within_free_memory`.) Shares
-given (`AttentionShares::Given`) are for tests and measurements. `tests/real_devices.rs` loads the 27B three
+given (`AttentionShares::Given`) are for tests and measurements.
+
+**The partial states of the attention plans** (`PlanConfig::state_slots_bound`). A
+row whose cells are cut into several pieces takes a state slot per piece, and a
+device reserves the slots its plans can take. The bound kept since the first
+version (twenty tiles of rows times the budget of pieces, and the rows alone)
+was passed in two ways: with a tile mean (`q7` to `q4`) a prompt row past the
+first tiles reads the exact first tile, converted tiles and exact newest ones,
+three pieces at least, since a piece is of one kind; and a row of a sequence
+that reads its prefix together with another one has the pieces of both its
+tiles. The owner's settings (`q5`) failed at the first long prompt: a step of 256
+rows at cell 512 needed 768 slots on the RTX 3060, 680 were reserved. The bound
+now follows the planner (a tile's rows per piece of the budget, two tiles per
+sequence, two slots a row, five with a tile mean, and the rows alone with two
+more each with one), and a test checks it against random steps of prompts,
+shared prefixes and rows alone (`plan.rs`). It costs the devices tens of MiB
+of scratch (the 3060 of the owner's settings 62 MiB where it reserved 12); the
+server's estimate counts it (`attention_state_bytes`), and a device that is
+over gives up at least a whole head. `tests/real_devices.rs` loads the 27B three
 ways and compares the planned pages and the text: two sequences, K and V in
 `q8`, no drafters, 890 pages with the heads following the weights, 1770 with a
 quarter of them on the 4070, and 1946 (248 832 tokens: the model's 262 144 do

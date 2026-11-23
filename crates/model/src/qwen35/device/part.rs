@@ -622,6 +622,55 @@ pub fn exact_bytes(
         + kv::exact_pool_bytes(&draft, kv::slots_for(MTP_KV.0, MTP_KV.1, sizing))
 }
 
+/// The bytes of partial states the attention plans of an attention block with geometry
+/// `geo` can take on a device with `opts` and `slots` sequences
+/// ([`PlanConfig::state_slots_bound`]): a step of up to `max_rows` rows, of which the
+/// generated rows (one per sequence) or the rows of draft windows (`window_rows`) are
+/// planned alone. A state is, per query head, the weighted V and the log of the sum.
+pub fn partial_state_bytes(
+    config: PlanConfig,
+    geo: &CacheGeometry,
+    opts: &Options,
+    slots: u32,
+) -> u64 {
+    let alone = opts.window_rows.max(slots);
+    let mean = opts.kv.0.has_mean() || opts.kv.1.has_mean();
+    let state_slots =
+        config.state_slots_bound(geo.kv_heads, geo.q_per_kv, opts.max_rows, alone, slots, mean);
+    state_slots * u64::from(geo.kv_heads * geo.q_per_kv) * (u64::from(geo.head_dim) + 1) * 4
+}
+
+/// The most bytes of partial states any attention block of device `index` of
+/// `placement` can take ([`partial_state_bytes`]), for a device of
+/// `multiprocessors` multiprocessors.
+pub fn attention_state_bytes(
+    c: &Config,
+    placement: &Placement,
+    index: usize,
+    opts: &Options,
+    slots: u32,
+    multiprocessors: u32,
+) -> u64 {
+    let config = PlanConfig::for_multiprocessors(multiprocessors);
+    placement.devices[index]
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, slice)| {
+            let slice = slice.as_ref()?;
+            (c.is_attention(layer) && !slice.heads.is_empty()).then(|| {
+                partial_state_bytes(
+                    config,
+                    &geometry(c, opts.kv, slice.heads.len() as u32),
+                    opts,
+                    slots,
+                )
+            })
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn geometry(c: &Config, kv: (CacheFormat, CacheFormat), kv_heads: u32) -> CacheGeometry {
     let a = &c.attention;
     CacheGeometry {
@@ -726,7 +775,6 @@ impl Part {
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
         let exact_slots = kv::slots_for(opts.kv.0, opts.kv.1, sizing);
         let mut exact_at = 0u64;
-        let window = u64::from(opts.window_rows);
         let mut state_slots = 0u64;
         let plan_config = PlanConfig::for_multiprocessors(device.info().multiprocessors);
         for block in &w.blocks {
@@ -747,20 +795,8 @@ impl Part {
                     a_at = Some(AttentionAt { geo, pool, exact: exact_at });
                     pool += u64::from(pages) * geo.converted_entry_bytes();
                     exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
-                    // The most partial states a plan makes: see `Planner::finish`.
-                    // A generated row has the pieces of a row that is alone in
-                    // its step (`Planner::window`), each with a state: a step
-                    // that verifies drafts has at most `window_rows` such rows
-                    // and nothing else, any other step one per sequence next
-                    // to the rows of prompts.
-                    let alone = u64::from(
-                        (plan_config.target_blocks / a.n_kv).clamp(1, plan_config.max_pieces),
-                    );
-                    let prompts =
-                        20 * u64::from(plan_config.target_blocks) / u64::from(a.n_kv) + 64;
-                    let slots = (window * alone).max(prompts + u64::from(max_slots) * alone);
-                    state_slots = state_slots
-                        .max(slots * u64::from(a.n_head) * (u64::from(geo.head_dim) + 1) * 4);
+                    state_slots =
+                        state_slots.max(partial_state_bytes(plan_config, &geo, opts, max_slots));
                 }
                 MixerW::Empty => {}
             }

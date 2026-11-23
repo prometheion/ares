@@ -27,7 +27,8 @@ use ares_core::units::{Bytes, MIB};
 use ares_cuda::{Device, DeviceInfo, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{
-    EmbeddingReport, Options, Placement, Qwen35, Spread, exact_bytes, page_bytes,
+    EmbeddingReport, Options, Placement, Qwen35, Spread, attention_state_bytes, exact_bytes,
+    page_bytes,
 };
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
@@ -407,15 +408,18 @@ fn block_bytes(w: &Weights<'_>, layer: usize) -> (u64, u64) {
 /// every block, the embedding rows the draft chain picks, its rows of the head,
 /// the MTP block.
 /// The scratch of a step follows `Part::open` with the widths of the whole
-/// model, which a slice does not exceed. Both are estimates: the loader
-/// aligns and rearranges, and the part has more small buffers than are
-/// counted here, for which a margin is added.
+/// model, which a slice does not exceed, and the partial states of the attention
+/// plans that the device's heads and its `multiprocessors` take
+/// (`attention_state_bytes`). Both are estimates: the loader aligns and
+/// rearranges, and the part has more small buffers than are counted here, for
+/// which a margin is added.
 fn footprint(
     c: &Config,
     w: &Weights<'_>,
     placement: &Placement,
     options: &Options,
     parallel: u32,
+    multiprocessors: &[u32],
 ) -> Vec<Footprint> {
     let r = &c.recurrent;
     let a = &c.attention;
@@ -507,6 +511,8 @@ fn footprint(
                 step_extra += one.scratch + one.records;
             }
             let logits = u64::from(options.logit_rows) * 4 * (d + plan.head.len() as u64);
+            let sms = multiprocessors.get(index).or(multiprocessors.last()).copied().unwrap_or(1);
+            step_extra += attention_state_bytes(c, placement, index, options, parallel, sms);
             Footprint {
                 weights,
                 // The margin: alignment of the arena, the sampler, records,
@@ -755,18 +761,19 @@ fn attention_for_context(
     options: &Options,
     parallel: u32,
     free: &[u64],
+    multiprocessors: &[u32],
     shares: &[f64],
     headroom: u64,
     pages: u32,
 ) -> Result<Vec<f64>, LoadError> {
     /// Rounds of checking the shares against the footprint they make: one
-    /// moves the heads a device is over by, and rounding to whole heads may
-    /// leave it over by one.
+    /// moves the heads a device is over by, at least one, and the scratch of
+    /// the partial states grows with the most heads a block of the device has.
     const ROUNDS: usize = 8;
     let n = free.len();
     let footprint_of = |attention: Vec<f64>| -> Result<Vec<Footprint>, LoadError> {
         let spread = Spread::TensorWithAttention(shares.to_vec(), attention);
-        Ok(footprint(c, w, &place(c, w, &spread, options)?, options, parallel))
+        Ok(footprint(c, w, &place(c, w, &spread, options)?, options, parallel, multiprocessors))
     };
     let alone_on =
         |on: usize| -> Vec<f64> { (0..n).map(|i| f64::from(u8::from(i == on))).collect() };
@@ -795,6 +802,11 @@ fn attention_for_context(
         return by_room();
     };
     let per_share = (heads as f64 + page as f64 * f64::from(pages)).max(1.0);
+    // A device that is over gives up what it is over by, and at least a head: the heads of a
+    // block are whole, so less may move none.
+    let all_heads =
+        (0..c.n_layer).filter(|layer| c.is_attention(*layer)).count() * c.attention.n_head_kv;
+    let head = 1.0 / all_heads.max(1) as f64;
     let mut most: Vec<f64> =
         room_for_pages.iter().map(|r| (*r as f64 / per_share).min(1.0)).collect();
     for _ in 0..ROUNDS {
@@ -809,7 +821,7 @@ fn attention_for_context(
         }
         for ((most, over), share) in most.iter_mut().zip(&over).zip(&attention) {
             if *over > 0 {
-                *most = most.min(share - *over as f64 / per_share);
+                *most = most.min(share - (*over as f64 / per_share).max(head));
             }
         }
         match plan::fit_shares(shares, &most) {
@@ -1200,7 +1212,8 @@ fn load_qwen35(
     // Which devices, and how the model is spread over them.
     let holds = |held: &[Held], spread: &Spread| -> Result<bool, LoadError> {
         let placement = place(&config, &weights, spread, &part_options)?;
-        let footprint = footprint(&config, &weights, &placement, &part_options, parallel);
+        let sms: Vec<u32> = held.iter().map(|h| h.device.info().multiprocessors).collect();
+        let footprint = footprint(&config, &weights, &placement, &part_options, parallel, &sms);
         let free: Vec<u64> = held.iter().map(|h| h.free).collect();
         let pages = plan::pages_that_fit(&rooms(&free, &footprint, headroom), parallel);
         Ok(pages >= plan::pool_pages(smallest, parallel))
@@ -1290,7 +1303,15 @@ fn load_qwen35(
                     );
                     // What a device can take of a model that is shared out
                     // evenly in everything: weights, state and context.
-                    let whole = whole(&config, &weights, &part_options, parallel, smallest);
+                    let most_sms = held.iter().map(|h| h.device.info().multiprocessors).max();
+                    let whole = whole(
+                        &config,
+                        &weights,
+                        &part_options,
+                        parallel,
+                        smallest,
+                        most_sms.unwrap_or(1),
+                    );
                     let most: Vec<f64> = held
                         .iter()
                         .map(|h| {
@@ -1340,6 +1361,7 @@ fn load_qwen35(
                         &part_options,
                         parallel,
                         &held.iter().map(|h| h.free).collect::<Vec<_>>(),
+                        &held.iter().map(|h| h.device.info().multiprocessors).collect::<Vec<_>>(),
                         &shares,
                         headroom,
                         plan::pool_pages(wanted, parallel),
@@ -1358,7 +1380,8 @@ fn load_qwen35(
              split",
         ));
     }
-    let footprint = footprint(&config, &weights, &placement, &part_options, parallel);
+    let sms: Vec<u32> = held.iter().map(|h| h.device.info().multiprocessors).collect();
+    let footprint = footprint(&config, &weights, &placement, &part_options, parallel, &sms);
     let free: Vec<u64> = held.iter().map(|h| h.free).collect();
     let fit = plan::pages_that_fit(&rooms(&free, &footprint, headroom), parallel);
 
@@ -1833,11 +1856,18 @@ struct Whole {
     per_device: u64,
 }
 
-fn whole(c: &Config, w: &Weights<'_>, options: &Options, parallel: u32, context: u32) -> Whole {
+fn whole(
+    c: &Config,
+    w: &Weights<'_>,
+    options: &Options,
+    parallel: u32,
+    context: u32,
+    multiprocessors: u32,
+) -> Whole {
     // One device with everything gives the totals. A split divides weights,
     // recurrent state and K/V by the shares, near enough, and repeats the
     // scratch of a step on every device.
-    let all = footprint(c, w, &Placement::single(c), options, parallel)[0];
+    let all = footprint(c, w, &Placement::single(c), options, parallel, &[multiprocessors])[0];
     let margin = all.weights / 64;
     Whole {
         shared: all.weights
@@ -1887,6 +1917,8 @@ mod tests {
             ..Options::default()
         };
         let free = [11_796 * MIB, 11_847 * MIB];
+        // The RTX 4070 and the RTX 3060.
+        let multiprocessors = [46, 28];
         let shares = [0.625, 0.375];
         let context = 262_144;
         let pages = plan::pool_pages(context, parallel);
@@ -1898,6 +1930,7 @@ mod tests {
                 &options,
                 parallel,
                 &free,
+                &multiprocessors,
                 &shares,
                 VRAM_HEADROOM,
                 pages,
@@ -1905,7 +1938,8 @@ mod tests {
             .unwrap();
             let spread = Spread::TensorWithAttention(shares.to_vec(), attention.clone());
             let placement = place(&config, &weights, &spread, &options).unwrap();
-            let footprint = footprint(&config, &weights, &placement, &options, parallel);
+            let footprint =
+                footprint(&config, &weights, &placement, &options, parallel, &multiprocessors);
             let fit = plan::pages_that_fit(&rooms(&free, &footprint, VRAM_HEADROOM), parallel);
             for (device, f) in footprint.iter().enumerate() {
                 let planned = f.weights
@@ -1925,6 +1959,88 @@ mod tests {
                 }
             }
             assert_eq!(fit >= pages, fits, "{kv:?}: {fit} pages fit, {pages} asked");
+            if fits {
+                plans_fit_their_states(&config, &placement, &options, parallel, &multiprocessors);
+            }
+        }
+    }
+
+    /// The attention plans of prompts on each device of `placement` take no more partial
+    /// states than the device reserves for them (`attention_state_bytes`, which the part
+    /// reserves as well): with every number of KV heads its attention blocks hold, a step
+    /// of 256 rows at cell 512 that reads the exact first tile, converted tiles and exact
+    /// newest ones (the step of the owner's settings that needed 768 slots where 680 were
+    /// reserved, 2026-11-23), a full step past the first tiles, and two sequences that
+    /// read a common prefix.
+    fn plans_fit_their_states(
+        c: &Config,
+        placement: &Placement,
+        options: &Options,
+        parallel: u32,
+        multiprocessors: &[u32],
+    ) {
+        use ares_model::qwen35::device::PAGE_ENTRY;
+        let a = &c.attention;
+        let entries = |cells: u32, base: u32, shared: u32, exact_from: u32| -> Vec<u32> {
+            (0..cells.div_ceil(ares_cuda::ENTRY_CELLS))
+                .map(|e| {
+                    let id = if e < shared { 900_000 + e } else { base + e };
+                    let exact = e == 0 || e * ares_cuda::ENTRY_CELLS >= exact_from;
+                    if exact { id } else { id | PAGE_ENTRY }
+                })
+                .collect()
+        };
+        for (index, plan) in placement.devices.iter().enumerate() {
+            let reserved = attention_state_bytes(
+                c,
+                placement,
+                index,
+                options,
+                parallel,
+                multiprocessors[index],
+            );
+            let mut heads: Vec<u32> = (0..c.n_layer)
+                .filter(|layer| c.is_attention(*layer))
+                .filter_map(|layer| plan.blocks[layer].as_ref())
+                .map(|slice| slice.heads.len() as u32)
+                .filter(|h| *h > 0)
+                .collect();
+            heads.sort_unstable();
+            heads.dedup();
+            for kv_heads in heads {
+                let geo = ares_cuda::CacheGeometry {
+                    k: options.kv.0,
+                    v: options.kv.1,
+                    head_dim: a.head_dim as u32,
+                    kv_heads,
+                    kv_total: a.n_head_kv as u32,
+                    first_kv_head: 0,
+                    q_per_kv: (a.n_head / a.n_head_kv) as u32,
+                };
+                let config = ares_cuda::PlanConfig::for_multiprocessors(multiprocessors[index]);
+                let steps: [&[(u32, u32, u32, u32)]; 3] = [
+                    &[(256, 512, 0, 384)],
+                    &[(512, 3584, 0, 3456)],
+                    &[(300, 9000, 40, 8832), (212, 7000, 40, 6912)],
+                ];
+                for step in steps {
+                    let rows: u32 = step.iter().map(|s| s.0).sum();
+                    let mut planner = ares_cuda::Planner::new(geo, config, rows);
+                    let mut row = 0;
+                    for (i, &(n, pos0, shared, exact_from)) in step.iter().enumerate() {
+                        let table = 10_000 * i as u32;
+                        let cells = entries(pos0 + n, 100_000 * (i as u32 + 1), shared, exact_from);
+                        planner.dense(table, &cells, row, n, pos0);
+                        row += n;
+                    }
+                    let needed = planner.finish().state_bytes(&geo);
+                    assert!(
+                        needed <= reserved,
+                        "device {index}, {kv_heads} KV heads, {step:?}: {needed} bytes of partial \
+                         states, {reserved} reserved"
+                    );
+                }
+            }
         }
     }
 }

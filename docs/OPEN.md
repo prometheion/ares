@@ -1033,6 +1033,10 @@ the agents' builds):
       kept role handed to the load, or the choice remembered per model and cards without
       `--cache` as with it (the owner to decide whether a remembered choice is still "measured
       at load").
+- [ ] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
+      the budget): a prompt that reads its prefix with another sequence, or past its first tiles
+      with K and V in `q7` to `q4`, can take more (the 27B's failure of 2026-11-23). To size it
+      with `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs.
 - [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
       qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
