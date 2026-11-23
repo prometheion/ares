@@ -116,10 +116,11 @@ static __device__ __forceinline__ void prompt_realign(uint32_t (&w)[PROMPT_RAW_W
     }
 }
 
-// Four signed codes (one per byte) of the quadruple `i4` (codes 4 i4 .. 4 i4 + 3) of a group
-// of `bits`-bit codes whose bytes start at word 0 of `w` (byte 0 and 1 the scale).
+// The codes of the quadruple `i4` (codes 4 i4 .. 4 i4 + 3, one per byte) of a group of
+// `BITS`-bit codes whose bytes start at word 0 of `w` (bytes 0 and 1 the scale), as the
+// two's complement number of BITS bits in the low bits of each byte, the others zero.
 template <int BITS>
-static __device__ __forceinline__ uint32_t prompt_codes4(const uint32_t (&w)[PROMPT_RAW_WORDS], int i4) {
+static __device__ __forceinline__ uint32_t prompt_raw4(const uint32_t (&w)[PROMPT_RAW_WORDS], int i4) {
     if constexpr (BITS == 8) {
         return __funnelshift_r(w[i4], w[i4 + 1], 16);
     } else {
@@ -140,18 +141,39 @@ static __device__ __forceinline__ uint32_t prompt_codes4(const uint32_t (&w)[PRO
             const uint32_t tb = (plane >> (4 * i4)) & 0xfu;
             x |= ((tb * 0x00204081u) & 0x01010101u) << (BITS - 1);
         }
-        constexpr uint32_t s = (1u << (BITS - 1)) * 0x01010101u;
-        return __vsub4(x ^ s, s);
+        return x;
     }
 }
 
-// Four signed codes times the scale as four halves (two half2 words): each an exact
-// product rounded once, as `decode_unit` gives them.
-static __device__ __forceinline__ uint2 prompt_codes_to_halves(uint32_t codes, __half2 scale) {
-    const uint32_t u = codes ^ 0x80808080u;
+// The same as signed bytes: the sign bit copied into the bits above it (no carry leaves a byte).
+template <int BITS>
+static __device__ __forceinline__ uint32_t prompt_signed4(const uint32_t (&w)[PROMPT_RAW_WORDS], int i4) {
+    const uint32_t x = prompt_raw4<BITS>(w, i4);
+    if constexpr (BITS == 8) {
+        return x;
+    } else {
+        constexpr uint32_t sign = (1u << (BITS - 1)) * 0x01010101u;
+        constexpr uint32_t fill = (256u - (2u << (BITS - 1))) >> (BITS - 1);  // 0xf0 / 0x10 for q5
+        return x | ((x & sign) * fill);
+    }
+}
+
+// The same in offset binary: code + 2^(BITS-1), which `prompt_halves4` takes.
+template <int BITS>
+static __device__ __forceinline__ uint32_t prompt_offset4(const uint32_t (&w)[PROMPT_RAW_WORDS], int i4) {
+    return prompt_raw4<BITS>(w, i4) ^ ((1u << (BITS - 1)) * 0x01010101u);
+}
+
+// Four codes in offset binary times the scale as four halves (two half2 words): each an
+// exact product rounded once, as `decode_unit` gives them. A byte b in the low byte of a half
+// whose high byte is 0x64 is 1024 + b, an exact integer, so the bias 1024 + 2^(BITS-1) leaves
+// the code.
+template <int BITS>
+static __device__ __forceinline__ uint2 prompt_halves4(uint32_t u, __half2 scale) {
     const uint32_t lo = __byte_perm(u, 0x64646464u, 0x5140);
     const uint32_t hi = __byte_perm(u, 0x64646464u, 0x5342);
-    const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
+    constexpr unsigned short bias_bits = (unsigned short)(0x6400 + (1 << (BITS - 1)));
+    const __half2 bias = __halves2half2(__ushort_as_half(bias_bits), __ushort_as_half(bias_bits));
     const __half2 a = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&lo), bias), scale);
     const __half2 b = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), bias), scale);
     return make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
@@ -165,8 +187,8 @@ static __device__ __forceinline__ void prompt_decode_halves(
     const __half2 sc = __half2half2(__ushort_as_half((unsigned short)(w[0] & 0xffffu)));
 #pragma unroll
     for (int p = 0; p < 4; ++p) {
-        const uint2 a = prompt_codes_to_halves(prompt_codes4<BITS>(w, 2 * p), sc);
-        const uint2 b = prompt_codes_to_halves(prompt_codes4<BITS>(w, 2 * p + 1), sc);
+        const uint2 a = prompt_halves4<BITS>(prompt_offset4<BITS>(w, 2 * p), sc);
+        const uint2 b = prompt_halves4<BITS>(prompt_offset4<BITS>(w, 2 * p + 1), sc);
         *reinterpret_cast<uint4*>(tile + swz<D>(row, 32 * g + 8 * p)) = make_uint4(a.x, a.y, b.x, b.y);
     }
 }
@@ -179,8 +201,8 @@ static __device__ __forceinline__ void prompt_decode_codes(
     *scale = h2f_bits(w[0] & 0xffffu);
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
-        const uint4 c = make_uint4(prompt_codes4<BITS>(w, 4 * p), prompt_codes4<BITS>(w, 4 * p + 1),
-                                   prompt_codes4<BITS>(w, 4 * p + 2), prompt_codes4<BITS>(w, 4 * p + 3));
+        const uint4 c = make_uint4(prompt_signed4<BITS>(w, 4 * p), prompt_signed4<BITS>(w, 4 * p + 1),
+                                   prompt_signed4<BITS>(w, 4 * p + 2), prompt_signed4<BITS>(w, 4 * p + 3));
         *reinterpret_cast<uint4*>(tile + swzb<D>(row, 32 * g + 16 * p)) = c;
     }
 }
@@ -209,10 +231,37 @@ static __device__ __forceinline__ void prompt_decode_codes_any(
     }
 }
 
+// Four 8x8 b16 matrices from a shared-memory address (as ldmatrix_x4).
+static __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr)
+                 : "memory");
+}
+
+static __device__ __forceinline__ void ldsm_x4_trans(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr)
+                 : "memory");
+}
+
+// Shared memory of the prompt kernel, in bytes (src/attention/plan.rs repeats it): the
+// queries (f16, or the high and low bytes of the integers), the tiles of a chunk (K twice for
+// the integer scores, whose next tile is decoded while the tensor cores read this one), the
+// scales of K and of the queries, the limits of the vectors.
+__host__ __device__ constexpr int prompt_smem_bytes(int d, bool i8) {
+    return i8 ? 128 * d * 2 + 2 * PROMPT_CHUNK * d + PROMPT_CHUNK * d * 2 + 2 * (d / 32) * PROMPT_CHUNK * 4 + 128 * 4 + 128 * 4
+              : 128 * d * 2 + 2 * PROMPT_CHUNK * d * 2 + 128 * 4;
+}
+
 // I8: the scores in integers (converted entries with K in q8 to q4): the codes of K against
 // the query as 15-bit integers with one scale per vector, split into a signed high byte and
 // an unsigned low one, two int8 products per group of 32 values, summed exactly in int32 and
-// then scaled by the group's scale of K (f32). Otherwise K is an f16 tile and the query f16.
+// then scaled by the group's scale of K (f32). K is decoded into one of two tiles while the
+// tensor cores read the other: a chunk's first phase computes its scores and decodes its V
+// and the next chunk's K, the second its weights and P V. Otherwise K is an f16 tile, the
+// query f16, and a chunk's tiles are complete before it starts.
 template <int D, bool I8>
 static __device__ void attn_prompt_body(
     const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids,
@@ -227,20 +276,16 @@ static __device__ void attn_prompt_body(
     constexpr int UNITS = 2 * C * GROUPS;
     constexpr int PER = UNITS / NT;
     static_assert(PER >= 1 && UNITS % NT == 0, "units per thread");
+    constexpr int KTILE = I8 ? C * D : C * D * 2;  // bytes of a K tile
     extern __shared__ __align__(16) uint8_t smem[];
-    // f16 queries [128][D] or their high and low bytes [128][D] each, then the K tile (f16 or
-    // codes) and the V tile of a chunk, the scales, limits and mean dot products
     __half* Qs = reinterpret_cast<__half*>(smem);
     int8_t* Qh = reinterpret_cast<int8_t*>(smem);
     uint8_t* Ql = smem + PROMPT_VECS * D;
-    uint8_t* after_q = smem + PROMPT_VECS * D * 2;
-    __half* Kt = reinterpret_cast<__half*>(after_q);
-    int8_t* Kb = reinterpret_cast<int8_t*>(after_q);
-    __half* Vt = reinterpret_cast<__half*>(after_q + C * D * (I8 ? 1 : 2));
-    float* ksc = reinterpret_cast<float*>(Vt + C * D);           // [GROUPS][C] (I8)
-    float* qsc = ksc + (I8 ? GROUPS * C : 0);                    // [128] (I8)
+    uint8_t* Kraw = smem + PROMPT_VECS * D * 2;               // K tile(s)
+    __half* Vt = reinterpret_cast<__half*>(Kraw + (I8 ? 2 : 1) * KTILE);
+    float* ksc = reinterpret_cast<float*>(Vt + C * D);           // [2][GROUPS][C] (I8)
+    float* qsc = ksc + (I8 ? 2 * GROUPS * C : 0);                // [128] (I8)
     uint32_t* vec_lim = reinterpret_cast<uint32_t*>(qsc + (I8 ? PROMPT_VECS : 0));  // [128]
-    float* mdot = reinterpret_cast<float*>(vec_lim + PROMPT_VECS);  // [128]
 
     const AttnItem it = items[blockIdx.x];
     const AttnGeo g = attn_geo(cfg);
@@ -298,6 +343,25 @@ static __device__ void attn_prompt_body(
 #pragma unroll
     for (int h = 16; h > 0; h >>= 1) lim_min = min(lim_min, __shfl_xor_sync(0xffffffffu, lim_min, h));
 
+    // ---- the addresses of the ldmatrix reads: piece pair t (16 halves or 32 bytes) of a
+    // row is at bytes 128 (t / 4) + off[t % 4] of it, the swizzle of the lane's rows
+    // (row & 7 = lane & 7) folded into off
+    const int x7 = lane & 7;
+    const uint32_t sbase = smem_addr(smem);
+    constexpr int QROW = I8 ? D : 2 * D;  // bytes per row of the queries and the K tile
+    const uint32_t qrow = (uint32_t)(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * QROW;
+    const uint32_t krow = (uint32_t)(((lane >> 4) & 1) * 8 + (lane & 7)) * QROW;
+    const uint32_t vrow = (uint32_t)(((lane >> 3) & 1) * 8 + (lane & 7)) * (2 * D);
+    uint32_t qa[4], ka[4], va[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t offa = (uint32_t)(((2 * j + (lane >> 4)) ^ x7) * 16);
+        const uint32_t offb = (uint32_t)(((2 * j + ((lane >> 3) & 1)) ^ x7) * 16);
+        qa[j] = sbase + qrow + offa;
+        ka[j] = sbase + (uint32_t)(PROMPT_VECS * D * 2) + krow + offb;
+        va[j] = smem_addr(Vt) + vrow + offa;
+    }
+
     // ---- the stored rows of a chunk: which group of which side and row a thread takes
     const int n_chunks = (int)((it.total + C - 1) / C);
     auto entry_of = [&](uint32_t cell) -> uint32_t { return tables[it.table + cell / ATTN_TILE_CELLS]; };
@@ -318,20 +382,53 @@ static __device__ void attn_prompt_body(
         return side == 0 ? head + g.k_rows_off + (size_t)r * rbk + grp * fmt_group_bytes(kf)
                          : head + g.v_rows_off + (size_t)r * rbv + grp * fmt_group_bytes(vf);
     };
-    auto prefetch = [&](int c) {
-        const uint32_t c0 = start + (uint32_t)c * C;
-        const uint32_t ent = entry_of(c0);
-#pragma unroll
-        for (int i = 0; i < PER; ++i) {
-            int side, row, grp;
-            unit_of(i, side, row, grp);
-            const int f = side == 0 ? kf : vf;
-            const uint32_t cell = c0 + row;
-            if (f != FMT_F16 && cell < end) {
-                const uint8_t* p = conv_group(ent, cell, side, grp);
-                raw_odd[i] = (reinterpret_cast<uintptr_t>(p) & 2) != 0;
-                prompt_load_any(f, p, raw[i]);
+    // the stored group of unit i of chunk c into its registers (quantized sides)
+    auto prefetch = [&](int i, int c) {
+        int side, row, grp;
+        unit_of(i, side, row, grp);
+        const int f = side == 0 ? kf : vf;
+        const uint32_t cell = start + (uint32_t)c * C + row;
+        if (f != FMT_F16 && cell < end) {
+            const uint8_t* p = conv_group(entry_of(cell), cell, side, grp);
+            raw_odd[i] = (reinterpret_cast<uintptr_t>(p) & 2) != 0;
+            prompt_load_any(f, p, raw[i]);
+        }
+    };
+    // unit i of chunk c into its tile: decoded from its registers, copied when f16 (cp.async,
+    // committed by the caller), zero past the range; K as codes into tile `kbuf` with I8
+    auto fill = [&](int i, int c, int kbuf) {
+        int side, row, grp;
+        unit_of(i, side, row, grp);
+        const int f = side == 0 ? kf : vf;
+        const uint32_t cell = start + (uint32_t)c * C + row;
+        if (I8 && side == 0) {
+            int8_t* kt = reinterpret_cast<int8_t*>(Kraw + kbuf * KTILE);
+            float* sc = ksc + (kbuf * GROUPS + grp) * C + row;
+            if (cell >= end) {
+                *reinterpret_cast<uint4*>(kt + swzb<D>(row, 32 * grp)) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(kt + swzb<D>(row, 32 * grp + 16)) = make_uint4(0, 0, 0, 0);
+                *sc = 0.0f;
+            } else {
+                prompt_realign(raw[i], raw_odd[i]);
+                prompt_decode_codes_any<D>(f, raw[i], kt, sc, row, grp);
             }
+            return;
+        }
+        __half* tile = side == 0 ? reinterpret_cast<__half*>(Kraw) : Vt;
+        if (cell >= end) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p)
+                *reinterpret_cast<uint4*>(tile + swz<D>(row, 32 * grp + 8 * p)) = make_uint4(0, 0, 0, 0);
+        } else if (f != FMT_F16) {
+            prompt_realign(raw[i], raw_odd[i]);
+            prompt_decode_halves_any<D>(f, raw[i], tile, row, grp);
+        } else {
+            const uint32_t ent = entry_of(cell), r = cell % ATTN_TILE_CELLS;
+            const uint8_t* src = conv ? conv_group(ent, cell, side, grp)
+                                      : exact_pool + (size_t)ent * g.entry_e + head_e +
+                                            (size_t)side * ATTN_TILE_CELLS * 2 * D + (size_t)r * 2 * D + grp * 64;
+#pragma unroll
+            for (int p = 0; p < 4; ++p) cp_async16(tile + swz<D>(row, 32 * grp + 8 * p), src + 16 * p);
         }
     };
 
@@ -346,6 +443,12 @@ static __device__ void attn_prompt_body(
     const int vA = warp * 16 + gq, vB = vA + 8;
     const uint32_t limA = vec_lim[vA], limB = vec_lim[vB];
     const bool warp_active = warp * 16 < nvec;
+    float qsA = 1.0f, qsB = 1.0f;  // the scales of the integer queries (I8)
+    if constexpr (I8) {
+        qsA = qsc[vA];
+        qsB = qsc[vB];
+    }
+    const bool f16_sides = kf == FMT_F16 || vf == FMT_F16;
 
     // adds the weighted V mean of the tile `ent` to the accumulator
     auto flush_mean = [&](uint32_t ent) {
@@ -366,129 +469,69 @@ static __device__ void attn_prompt_body(
         }
         wA = wB = 0.0f;
     };
-
-    float qsA = 1.0f, qsB = 1.0f;  // the scales of the integer queries (I8)
-    if constexpr (I8) {
-        qsA = qsc[vA];
-        qsB = qsc[vB];
-    }
-    const bool f16_sides = kf == FMT_F16 || vf == FMT_F16;
-
-    prefetch(0);
-    for (int c = 0; c < n_chunks; ++c) {
-        const uint32_t c0 = start + (uint32_t)c * C;
-        const uint32_t ent = entry_of(c0);
-        __syncthreads();  // every warp is done with the tiles of the previous chunk
-        // ---- the tiles of this chunk: decoded from registers, or copied when f16
+    // a new tile at chunk c: the V mean of the one before, the K mean's dot products of this one
+    auto new_tile = [&](uint32_t ent) {
+        if (v_mean && cur_ent != 0xffffffffu) flush_mean(cur_ent);
+        if (k_mean) {
+            const __half2* mk = reinterpret_cast<const __half2*>(
+                conv_pool + (size_t)(ent & ~ATTN_CONVERTED_BIT) * g.entry_c + head_c);
+            // lane l takes values 8 l .. 8 l + 7 (D / 8 lanes)
+            float2 mean[4];
+            if (lane * 8 < D) {
 #pragma unroll
-        for (int i = 0; i < PER; ++i) {
-            int side, row, grp;
-            unit_of(i, side, row, grp);
-            const int f = side == 0 ? kf : vf;
-            const uint32_t cell = c0 + row;
-            if (I8 && side == 0) {
-                // K as codes: zero past the range, I8 has quantized K only
-                if (cell >= end) {
-                    *reinterpret_cast<uint4*>(Kb + swzb<D>(row, 32 * grp)) = make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(Kb + swzb<D>(row, 32 * grp + 16)) = make_uint4(0, 0, 0, 0);
-                    ksc[grp * C + row] = 0.0f;
-                } else {
-                    prompt_realign(raw[i], raw_odd[i]);
-                    prompt_decode_codes_any<D>(f, raw[i], Kb, ksc + grp * C + row, row, grp);
-                }
-                continue;
+                for (int i = 0; i < 4; ++i) mean[i] = __half22float2(mk[lane * 4 + i]);
             }
-            __half* tile = side == 0 ? Kt : Vt;
-            if (cell >= end) {
-#pragma unroll
-                for (int p = 0; p < 4; ++p)
-                    *reinterpret_cast<uint4*>(tile + swz<D>(row, 32 * grp + 8 * p)) = make_uint4(0, 0, 0, 0);
-            } else if (f != FMT_F16) {
-                prompt_realign(raw[i], raw_odd[i]);
-                prompt_decode_halves_any<D>(f, raw[i], tile, row, grp);
-            } else {
-                const uint8_t* src;
-                const uint32_t r = cell % ATTN_TILE_CELLS;
-                if (conv) {
-                    src = conv_group(ent, cell, side, grp);
-                } else {
-                    src = exact_pool + (size_t)ent * g.entry_e + head_e + (size_t)side * ATTN_TILE_CELLS * 2 * D +
-                          (size_t)r * 2 * D + grp * 64;
-                }
-#pragma unroll
-                for (int p = 0; p < 4; ++p) cp_async16(tile + swz<D>(row, 32 * grp + 8 * p), src + 16 * p);
-            }
-        }
-        if (f16_sides) cp_async_commit();
-        // ---- a new tile: the V mean of the one before, the K mean of this one
-        if (ent != cur_ent) {
-            if (v_mean && cur_ent != 0xffffffffu) flush_mean(cur_ent);
-            if (k_mean) {
-                const __half2* mk = reinterpret_cast<const __half2*>(
-                    conv_pool + (size_t)(ent & ~ATTN_CONVERTED_BIT) * g.entry_c + head_c);
-                // lane l takes values 8 l .. 8 l + 7 (D / 8 lanes)
-                float2 mean[4];
+            for (int v = 0; v < 16; ++v) {
+                float acc = 0.0f;
                 if (lane * 8 < D) {
+                    float qv[8];
+                    if constexpr (I8) {
+                        // the integer query of the scores, times its scale
+                        const uint2 hb = *reinterpret_cast<const uint2*>(Qh + swzb<D>(warp * 16 + v, lane * 8));
+                        const uint2 lb = *reinterpret_cast<const uint2*>(Ql + swzb<D>(warp * 16 + v, lane * 8));
+                        const float sc = qsc[warp * 16 + v];
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) mean[i] = __half22float2(mk[lane * 4 + i]);
-                }
-                for (int v = 0; v < 16; ++v) {
-                    float acc = 0.0f;
-                    if (lane * 8 < D) {
-                        float qv[8];
-                        if constexpr (I8) {
-                            // the integer query of the scores, times its scale
-                            const uint2 hb = *reinterpret_cast<const uint2*>(Qh + swzb<D>(warp * 16 + v, lane * 8));
-                            const uint2 lb = *reinterpret_cast<const uint2*>(Ql + swzb<D>(warp * 16 + v, lane * 8));
-                            const float sc = qsc[warp * 16 + v];
-#pragma unroll
-                            for (int i = 0; i < 8; ++i) {
-                                const uint32_t hw = i < 4 ? hb.x : hb.y, lw = i < 4 ? lb.x : lb.y;
-                                const int hi = (int)(int8_t)((hw >> (8 * (i & 3))) & 0xffu);
-                                const int lo = (int)((lw >> (8 * (i & 3))) & 0xffu);
-                                qv[i] = (float)(hi * 128 + lo) * sc;
-                            }
-                        } else {
-                            const uint4 hv = *reinterpret_cast<const uint4*>(Qs + swz<D>(warp * 16 + v, lane * 8));
-                            const __half2* qh = reinterpret_cast<const __half2*>(&hv);
-#pragma unroll
-                            for (int i = 0; i < 4; ++i) {
-                                const float2 b = __half22float2(qh[i]);
-                                qv[2 * i] = b.x;
-                                qv[2 * i + 1] = b.y;
-                            }
+                        for (int i = 0; i < 8; ++i) {
+                            const uint32_t hw = i < 4 ? hb.x : hb.y, lw = i < 4 ? lb.x : lb.y;
+                            const int hi = (int)(int8_t)((hw >> (8 * (i & 3))) & 0xffu);
+                            const int lo = (int)((lw >> (8 * (i & 3))) & 0xffu);
+                            qv[i] = (float)(hi * 128 + lo) * sc;
                         }
+                    } else {
+                        const uint4 hv = *reinterpret_cast<const uint4*>(Qs + swz<D>(warp * 16 + v, lane * 8));
+                        const __half2* qh = reinterpret_cast<const __half2*>(&hv);
 #pragma unroll
-                        for (int i = 0; i < 4; ++i) acc = fmaf(mean[i].x, qv[2 * i], fmaf(mean[i].y, qv[2 * i + 1], acc));
+                        for (int i = 0; i < 4; ++i) {
+                            const float2 b = __half22float2(qh[i]);
+                            qv[2 * i] = b.x;
+                            qv[2 * i + 1] = b.y;
+                        }
                     }
-                    acc = ares_warp_sum(acc);
-                    if (lane == 0) mdot[warp * 16 + v] = acc;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) acc = fmaf(mean[i].x, qv[2 * i], fmaf(mean[i].y, qv[2 * i + 1], acc));
                 }
-                __syncwarp();
-                mdA = mdot[vA];
-                mdB = mdot[vB];
+                acc = ares_warp_sum(acc);
+                if (v == gq) mdA = acc;
+                if (v == gq + 8) mdB = acc;
             }
-            cur_ent = ent;
         }
-        if (c + 1 < n_chunks) prefetch(c + 1);
-        if (f16_sides) cp_async_wait<0>();
-        __syncthreads();  // the tiles are complete
-
-        if (!warp_active) continue;
-        // ---- S = Q K^T: 16 vectors x 32 cells, four tiles of 8 cells
-        float s[4][4];
+        cur_ent = ent;
+    };
+    // S = Q K^T for 16 vectors x 32 cells (four tiles of 8), from K tile `kbuf`
+    auto scores = [&](float (&s)[4][4], int kbuf) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
+        const uint32_t kb = (uint32_t)(kbuf * KTILE);
         if constexpr (I8) {
 #pragma unroll
             for (int gi = 0; gi < GROUPS; ++gi) {
                 uint32_t ah[4], al[4], b[4], b2[4];
-                const int qrow = warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, qcol = gi * 32 + (lane >> 4) * 16;
-                ldmatrix_x4(ah, Qh + swzb<D>(qrow, qcol));
-                ldmatrix_x4(al, Ql + swzb<D>(qrow, qcol));
-                const int krow = ((lane >> 4) & 1) * 8 + (lane & 7), kcol = gi * 32 + ((lane >> 3) & 1) * 16;
-                ldmatrix_x4(b, Kb + swzb<D>(krow, kcol));
-                ldmatrix_x4(b2, Kb + swzb<D>(16 + krow, kcol));
+                const uint32_t at = (uint32_t)(128 * (gi / 4));
+                ldsm_x4(ah, qa[gi % 4] + at);
+                ldsm_x4(al, qa[gi % 4] + at + PROMPT_VECS * D);
+                ldsm_x4(b, ka[gi % 4] + kb + at);
+                ldsm_x4(b2, ka[gi % 4] + kb + at + 16 * D);
+                const float* sc = ksc + (kbuf * GROUPS + gi) * C + 2 * tq;
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const uint32_t b0 = nt < 2 ? b[2 * nt] : b2[2 * nt - 4];
@@ -498,7 +541,7 @@ static __device__ void attn_prompt_body(
 #pragma unroll
                     for (int e = 0; e < 4; ++e) acc[e] <<= 7;
                     mma_u8s8(acc, al, b0, b1);
-                    const float2 ks = *reinterpret_cast<const float2*>(ksc + gi * C + nt * 8 + 2 * tq);
+                    const float2 ks = *reinterpret_cast<const float2*>(sc + nt * 8);
                     s[nt][0] = fmaf((float)acc[0], ks.x, s[nt][0]);
                     s[nt][1] = fmaf((float)acc[1], ks.y, s[nt][1]);
                     s[nt][2] = fmaf((float)acc[2], ks.x, s[nt][2]);
@@ -516,16 +559,20 @@ static __device__ void attn_prompt_body(
 #pragma unroll
             for (int ks = 0; ks < D / 16; ++ks) {
                 uint32_t a[4], b[4], b2[4];
-                ldmatrix_x4(a, Qs + swz<D>(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ks * 16 + (lane >> 4) * 8));
-                ldmatrix_x4(b, Kt + swz<D>(((lane >> 4) & 1) * 8 + (lane & 7), ks * 16 + ((lane >> 3) & 1) * 8));
-                ldmatrix_x4(b2, Kt + swz<D>(16 + ((lane >> 4) & 1) * 8 + (lane & 7), ks * 16 + ((lane >> 3) & 1) * 8));
+                const uint32_t at = (uint32_t)(128 * (ks / 4));
+                ldsm_x4(a, qa[ks % 4] + at);
+                ldsm_x4(b, ka[ks % 4] + at);
+                ldsm_x4(b2, ka[ks % 4] + at + 16 * 2 * D);
                 mma_f32(s[0], a, b[0], b[1]);
                 mma_f32(s[1], a, b[2], b[3]);
                 mma_f32(s[2], a, b2[0], b2[1]);
                 mma_f32(s[3], a, b2[2], b2[3]);
             }
         }
-        // ---- scores: the mean term, the mask where some cell may be past a row or the range
+    };
+    // the mean term, the mask, the online softmax over the 32 cells of chunk c0 (rows A and B
+    // of this thread), then O += P V with P V of the chunk summed in f16
+    auto weights_and_pv = [&](float (&s)[4][4], uint32_t c0) {
         const bool mask = c0 + C - 1 > lim_min || c0 + C > end;
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
@@ -541,7 +588,6 @@ static __device__ void attn_prompt_body(
                 s[nt][2 + j] = b;
             }
         }
-        // ---- online softmax over the 32 cells, rows A and B of this thread
         float cA = fmaxf(fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])),
                          fmaxf(fmaxf(s[2][0], s[2][1]), fmaxf(s[3][0], s[3][1])));
         float cB = fmaxf(fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3])),
@@ -588,12 +634,12 @@ static __device__ void attn_prompt_body(
             pa[k][2] = pack_half2(s[2 * k + 1][0], s[2 * k + 1][1]);
             pa[k][3] = pack_half2(s[2 * k + 1][2], s[2 * k + 1][3]);
         }
-        // ---- O += P V: per 16 values, the 32 cells summed in f16, then added in f32
 #pragma unroll
         for (int dt = 0; dt < D / 16; ++dt) {
             uint32_t b[4], b2[4];
-            ldmatrix_x4_trans(b, Vt + swz<D>(((lane >> 3) & 1) * 8 + (lane & 7), dt * 16 + (lane >> 4) * 8));
-            ldmatrix_x4_trans(b2, Vt + swz<D>(16 + ((lane >> 3) & 1) * 8 + (lane & 7), dt * 16 + (lane >> 4) * 8));
+            const uint32_t at = (uint32_t)(128 * (dt / 4));
+            ldsm_x4_trans(b, va[dt % 4] + at);
+            ldsm_x4_trans(b2, va[dt % 4] + at + 16 * 2 * D);
             uint32_t t0[2] = {0u, 0u}, t1[2] = {0u, 0u};
             mma_f16_f16(t0, pa[0], b[0], b[1]);
             mma_f16_f16(t1, pa[0], b[2], b[3]);
@@ -611,6 +657,67 @@ static __device__ void attn_prompt_body(
             o[2 * dt + 1][1] += x1.y;
             o[2 * dt + 1][2] += y1.x;
             o[2 * dt + 1][3] += y1.y;
+        }
+    };
+
+    if constexpr (I8) {
+        // unit 0 .. PER-1: side 0 units decode K one chunk ahead (into tile (c + 1) & 1), side 1
+        // units decode V of their chunk; each prefetches the chunk after the one it decodes
+#pragma unroll
+        for (int i = 0; i < PER; ++i) prefetch(i, 0);
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            int side, row, grp;
+            unit_of(i, side, row, grp);
+            if (side == 0) {
+                fill(i, 0, 0);
+                if (n_chunks > 1) prefetch(i, 1);
+            }
+        }
+        for (int c = 0; c < n_chunks; ++c) {
+            const uint32_t c0 = start + (uint32_t)c * C;
+            __syncthreads();  // K tile c & 1 is complete; every warp is done with the V tile
+#pragma unroll
+            for (int i = 0; i < PER; ++i) {
+                int side, row, grp;
+                unit_of(i, side, row, grp);
+                if (side == 0) {
+                    if (c + 1 < n_chunks) {
+                        fill(i, c + 1, (c + 1) & 1);
+                        if (c + 2 < n_chunks) prefetch(i, c + 2);
+                    }
+                } else {
+                    fill(i, c, 0);
+                    if (c + 1 < n_chunks) prefetch(i, c + 1);
+                }
+            }
+            if (vf == FMT_F16) cp_async_commit();
+            if (c == 0 || c0 % ATTN_TILE_CELLS == 0) new_tile(entry_of(c0));
+            float s[4][4];
+            if (warp_active) scores(s, c & 1);
+            if (vf == FMT_F16) cp_async_wait<0>();
+            __syncthreads();  // the V tile is complete, and the next K tile
+            if (warp_active) weights_and_pv(s, c0);
+        }
+    } else {
+        for (int i = 0; i < PER; ++i) prefetch(i, 0);
+        for (int c = 0; c < n_chunks; ++c) {
+            const uint32_t c0 = start + (uint32_t)c * C;
+            __syncthreads();  // every warp is done with the tiles of the previous chunk
+#pragma unroll
+            for (int i = 0; i < PER; ++i) fill(i, c, 0);
+            if (f16_sides) cp_async_commit();
+            if (c == 0 || c0 % ATTN_TILE_CELLS == 0) new_tile(entry_of(c0));
+#pragma unroll
+            for (int i = 0; i < PER; ++i)
+                if (c + 1 < n_chunks) prefetch(i, c + 1);
+            if (f16_sides) cp_async_wait<0>();
+            __syncthreads();  // the tiles are complete
+            if (warp_active) {
+                float s[4][4];
+                scores(s, 0);
+                weights_and_pv(s, c0);
+            }
         }
     }
     if (v_mean && cur_ent != 0xffffffffu) flush_mean(cur_ent);
