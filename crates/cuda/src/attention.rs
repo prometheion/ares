@@ -78,7 +78,7 @@
 //! blocks than the device holds at once: a few blocks too many wait for a second wave that
 //! runs almost alone, which cost the first version of these kernels a fifth of its time.
 //!
-//! There are two kernel families, chosen per launch inside `attend`:
+//! There are three kernel families, chosen per launch inside `attend`:
 //!
 //! - **Direct** (`kernels/attn_direct.cuh`), for items of up to 8 vectors (one row of a
 //!   decode step) in converted entries with K and V both quantized. No tensor cores and no
@@ -98,6 +98,13 @@
 //!   f32 accumulation. A decode step has few vectors, so the cells are the rows of the
 //!   product (16 of them) and the vectors the columns (tiles of 8); a wide step has the
 //!   vectors as rows. The queries are rotated once per block.
+//! - **Prompt** (`kernels/attn_prompt.cuh`, [`AttnShape::Prompt128`]), for the rows of a
+//!   prompt: items of up to 128 vectors over one range of cells, 8 warps of 16 vectors, chunks
+//!   of 32 cells, the stored rows of the next chunk prefetched into registers. These are bound
+//!   by the tensor cores, so with K in `q8` to `q4` the scores are integer products (the
+//!   query as 15-bit integers, high and low bytes, against the codes of K, exact in int32, then
+//!   the group's scale; closer to the reference than f16 operands) and P V sums the 32 cells of
+//!   a chunk in f16 before adding them to the f32 accumulator.
 //!
 //! **Error**, against `KvHead::attend` on the same stored bytes, relative to the largest
 //! output element. The direct kernel: 2e-5 to 1e-4 (its only inexact operand is the query,
@@ -108,9 +115,9 @@
 //! the format: the formats' own errors are in the stored bytes, which the kernels read
 //! exactly. A row of a policy with exact entries (`q7` to `q4`) is a merge of both.
 //! Accumulating the products in f16 with a flush to f32, which doubles the rate of the
-//! tensor cores on capped GeForce cards, was built and measured: for the scores it costs up
-//! to 3e-2, and for the output it is slower than f32 accumulation (the kernels are not
-//! bound by the tensor cores), so there is no such path.
+//! tensor cores on capped GeForce cards, was built and measured for decode: for the scores it
+//! costs up to 3e-2, and for the output it is slower than f32 accumulation (those kernels are
+//! not bound by the tensor cores), so they have no such path.
 
 mod plan;
 

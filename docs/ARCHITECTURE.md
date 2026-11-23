@@ -3777,7 +3777,8 @@ first tile and the newest tiles are exact entries, and a full tile is
 converted with its mean when the policy says so. One kernel template serves
 all 36 pairs of K and V formats (a switch per chunk), in shapes for up to 8,
 16, 48 and 64 query vectors, over dense windows and over lists of ranges,
-for several sequences in a step. A planner cuts a step into items of one
+for several sequences in a step; the rows of a prompt have a kernel of their
+own of up to 128 vectors (below). A planner cuts a step into items of one
 block each, and their results are merged as log-sum-exp states, so a head
 can be computed over any split of its cells.
 
@@ -3813,8 +3814,34 @@ for these rows each is fixed by the row alone:
   the position at which a tile leaves the newest cells read it converted (see
   "Where the tile formats keep their exact cells").
 
-The rows of a prompt are planned as before (tiles of up to 64 vectors, pieces
-by the step), and are not the rows a single step computes.
+*Rows of a prompt* (`AttnShape::Prompt128`, `kernels/attn_prompt.cuh`, 2026-11-23). A prompt's
+rows are cut into tiles of up to 128 vectors (21 rows of the 27B's 6 query heads per KV head,
+the tiles of a step as equal as they can be), and each tile into the same number of pieces: the
+count that fills the waves of the prompt kernel best (one block per multiprocessor, its
+registers fill one; `PlanConfig::prompt_blocks`), within the tiles' share of the budget of pieces.
+The items run piece by piece and KV head, so the blocks that run at once read the same cells and
+the L2 cache serves them all. A block has 8 warps of 16 vectors and walks its range in chunks of
+32 cells; the queries stay in shared memory, the accumulator in registers (f32), and the stored
+rows of the next chunk are loaded into registers while the tensor cores work on this one.
+
+- *Scores in integers* (converted entries with K in `q8` to `q4`, `ares_attn_d*_p128i`). The
+  codes of K are integers: the query becomes a 15-bit integer per value (rotated, scaled, one
+  scale per vector) split into a signed high byte and an unsigned low one, two int8 products
+  (`m16n8k32`) per group of 32 values sum it exactly in int32, and the group's scale of K is
+  applied in f32. The tile mean's dot products come from the same products: the mean as a 15-bit
+  integer per value (a scale per group) in two rows of a mean tile. On GeForce cards f16 products
+  with f32 sums run at half rate; the int8 ones run at four times that, so the scores cost what
+  f16 sums would, and they are closer to the reference than f16 operands (the wide window of 300
+  rows: `q8`/`q8` 5e-4 to 8e-4 of the largest output against 1.9e-3 to 3.3e-3).
+- *P V* in f16 with f16 sums over the 32 cells of a chunk, added to the f32 accumulator after each
+  chunk (one rounding of a sum of 32 products, the size of the weights' own f16 rounding; summing
+  in f16 over the whole range, as llama.cpp does, would grow with the length).
+- *Phases.* A chunk has two phases between barriers, each with work for the tensor cores and work
+  for the other pipes: the scores with the decode of V, then the weights and P V with the decode
+  of the next chunk's K; warps 4 to 7 compute first and warps 0 to 3 decode first, so the two
+  warps of a scheduler overlap.
+- Exact entries and `f16` K run on the same kernel with f16 scores (`ares_attn_d*_p128`); the
+  wide kernel (64 vectors) is left for items of a list of ranges.
 
 It costs nothing that was measured. 2026-11-15, the build before against the
 build after, back to back, without the profile, K and V in `q8`, the machine

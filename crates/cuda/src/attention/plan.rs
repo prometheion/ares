@@ -189,13 +189,18 @@ impl AttnShape {
         let (mt, cg, chunk, _, nvw) = self.layout();
         if let AttnShape::Prompt128 = self {
             // `prompt_smem_bytes` of `kernels/attn_prompt.cuh`, the larger of its two kernels:
-            // the queries as integers (two bytes a value), two K tiles of codes, a V tile of
-            // f16, the scales of K of both tiles, the scales and the limits of the vectors
-            return 128 * head_dim * 2
-                + 2 * chunk * head_dim
+            // the queries (two bytes a value), a K and a V tile of 32 cells, and either the
+            // limits of the vectors (f16: K is f16 too), or K as codes, the scales of K and of
+            // the vectors, the limits and two mean tiles of 8 rows of codes with their scales
+            let f16 = 128 * head_dim * 2 + 2 * chunk * head_dim * 2 + 128 * 4;
+            let int = 128 * head_dim * 2
+                + chunk * head_dim
                 + chunk * head_dim * 2
-                + 2 * (head_dim / 32) * chunk * 4
-                + 128 * 4 * 2;
+                + (head_dim / 32) * chunk * 4
+                + 128 * 4 * 2
+                + 2 * 8 * head_dim
+                + 2 * (head_dim / 32) * 4;
+            return if f16 > int { f16 } else { int };
         }
         let rows = if nvw > 0 {
             let r = mt * nvw * 8;
