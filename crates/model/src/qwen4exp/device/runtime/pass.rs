@@ -222,6 +222,26 @@ impl Flow {
             .ok_or_else(|| invalid(format!("no rows of the pass on part {index}")))
     }
 
+    /// The next layer of a pass (`layer` of the model, on part `index`): the experts the part
+    /// computes and no tier holds are read ahead into staging, as far as the store's half of
+    /// it for guesses goes, while its micro-batches run.
+    pub(super) fn guess_layer(
+        &self,
+        index: usize,
+        layer: usize,
+        routing: &Routing,
+    ) -> Result<(), ModelError> {
+        let mut feed = self.lock_feed();
+        let at = feed.layout().store_layer(index, layer);
+        if !feed.has_transit(at) {
+            return Ok(());
+        }
+        let n = feed.layout().shapes[at].n_experts;
+        let owned = |e: &u32| routing.owned.as_ref().is_none_or(|o| o[layer][*e as usize]);
+        let experts: Vec<u32> = (0..n).filter(owned).collect();
+        feed.store.transit_guess(at, &experts).map_err(|e| invalid(e.to_string()))
+    }
+
     /// Whether the pass `key` holds its loan and has not read all its rows.
     pub(super) fn pass_live(&self, key: PassKey) -> bool {
         self.pass
@@ -553,6 +573,13 @@ impl Qwen4ExpDevice {
                 &self.routing,
                 &run.picks,
             )?;
+            // The rows of a pass pick nearly every expert of a layer (a row picks ten of 512),
+            // and the next layer's picks reach the host only when all its micro-batches have
+            // run: what no tier holds of it is read ahead meanwhile.
+            if i + 1 < n_layers {
+                let layer = self.part.layer_range().start + i + 1;
+                self.flow.guess_layer(self.index, layer, &self.routing)?;
+            }
             self.flow.pump()?;
             run.layer += 1;
             run.next = 0;

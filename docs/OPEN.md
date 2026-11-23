@@ -415,9 +415,21 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       Ling): the part that routes has it only when it computes the shared expert itself
       (not with `--shared worker`), and the routed experts add into the same buffer, so it
       needs a copy on the step's stream. Not built; the prediction reads the router's input.
-- [ ] Long prompts layer by layer over the whole prompt, interruptible, with read-ahead of
-      the most used experts of the next two layers. (Wide steps read the next layer's
-      predicted picks ahead now, within a step.) TokenWing's form, read 2026-11-22
+- [x] Long prompts layer by layer over the whole prompt, interruptible (branch
+      `flash/layer-major`, 2026-11-23; ARCHITECTURE.md "Long prompts layer by layer"): a step
+      of one prompt wider than the own scratch is a pass of micro-batches of the own rows per
+      layer and the layer's experts once for all rows, about 56 KiB a row kept on a loan sized
+      for the prompt, in every placement; it pauses between two micro-batches when a request
+      or a cancellation comes (or its time as a piece is up) and goes on where it stopped.
+      Tested against the reference in every placement and for a request that cuts in (its
+      first token after 16 ms where the prompt took 61 to 78 ms, made-up model).
+- [ ] Passes, what is left: read-ahead of the next layer's experts while a layer's
+      micro-batches run (TokenWing's window); a checkpoint of the prefix cache inside a pass
+      (the conductor ends a step where a checkpoint is due, so prompts longer than 16 384
+      fresh tokens are read in passes of at most that); the CPU's share of a pass's misses;
+      a pause inside a layer's experts (a request waits for at most one layer's experts);
+      the lent wide steps are still there for tile-mean K/V and DFlash, which passes do not
+      take. TokenWing's form, read 2026-11-22
       (`src/llama-context.cpp` `lm_layer_major_ok`, `src/llama-moe-stream.cpp`
       `lm_lend_place`): only for a call of one sequence and more than one micro-batch; each
       micro-batch runs a layer's attention and router (its picks, weights and the normed
@@ -1009,7 +1021,8 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       types (5400 against 5112 instructions).
 - [ ] An expert from the SSD is three reads (its matrices lie apart in the file): 2.8 to 3.6 ms
       where the drive needs 1.4 ms per read. One read per expert (a layout of the SSD level).
-- [ ] Long prompts layer by layer with read-ahead; the profile's fill in large ordered reads.
+- [x] Long prompts layer by layer (2026-11-23). [ ] Their read-ahead; the profile's fill in
+      large ordered reads.
 - [ ] Few-row kernels for windows and trees; attention for wide windows; the F32 tile kernel
       (2.5 times BF16); NVFP4 and IQ2_XXS gaps; the image tower's row kernels fused.
 - [ ] The sampler's exchange on the second card; a layout choice that is stable between loads;

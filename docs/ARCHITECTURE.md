@@ -5986,9 +5986,10 @@ What bounds the prompt now:
   (FATE reports close to all experts of a prompt's rows found that way) needs a second
   product and a second record per layer on the part that routes, and the record's way to the
   host; with it the reads of layer L+1 run while layer L computes.
-- *The pass.* A step of more rows brings each expert of a layer once for more rows, and a
-  pass (`ares_sched::Pass`: all rows up to a layer's router in chunks that fit the scratch,
-  then the layer's experts for all rows) takes the scratch out of that. A pass inside one
+- *The pass* (built 2026-11-23: "Long prompts layer by layer" below). A step of more rows
+  brings each expert of a layer once for more rows, and a pass (`ares_sched::Pass`: all rows
+  up to a layer's router in chunks that fit the scratch, then the layer's experts for all rows)
+  takes the scratch out of that. A pass inside one
   step was designed and written but never compiled (the residual, the pending output and
   the experts' input of every row kept on the device, 56 KiB a row; rounds over the chunks;
   only for both cards on every layer), and is not in the tree: a step is what a request
@@ -6111,6 +6112,81 @@ in flight, about 11 s here, and then for a piece of its own (with lone steps of 
 the long prompt read at 147 and 208 tokens/s); a step cannot be cut, so what the
 owner asked for (no request waits seconds behind a long prompt) needs the interruptible pass
 of "Long prompts layer by layer" in OPEN.md, or a lone step bounded in time.
+
+**Long prompts layer by layer** (`device/runtime/pass.rs`, `device/part/pass.rs`; 2026-11-23,
+after TokenWing's layer-major prompts). A lent step reads each expert once for its rows, so a
+long prompt in lent steps of 4096 rows still reads the file's experts once per 4096 rows, its
+scratch costs 0.5 to 0.7 MiB a row of the slots, and a request that arrives waits for the step
+in flight. Where the model can (`reads_layer_by_layer`: micro-batches the many-row kernels
+take, K/V without an exact pool, no DFlash drafter; every placement), a step of one prompt
+wider than the parts' own scratch runs as a **pass**:
+
+- *The order.* The step's rows are cut into **micro-batches** of the own rows (512 here; the
+  last two share what is left when the last would be narrower than 16 rows). For each layer,
+  every micro-batch runs the layer up to its router and shared expert, as a step of its own
+  rows would (its record and attention plan, made when the pass starts, go to the inbox from a
+  ring of four page-locked buffers; its rows read and write the scratch of the own rows); then
+  the layer's routed experts run once for every row of the step (`Misses` over all rows, its
+  rounds over the chunks below); then the next layer. Each micro-batch's K/V and recurrent
+  state of a layer is written before the next micro-batch's of that layer and after its own of
+  the layer before, so every row sees what a step of all rows would: the same kernels, the
+  sums of the dense products as in steps of the own rows; only the order in which the
+  experts' outputs add into a row (`red.add`) and the attention plan's pieces (cut by the rows
+  of a step) differ, as between any two steps of other widths.
+- *What a row keeps* between layers lies on VRAM the expert slots lend for the pass, in
+  **chunks** of up to sixteen micro-batches or 8192 rows (`chunk_rows`), each buffer of a chunk
+  in one range (the many-row kernels index their input and output by row) and in one piece of
+  the loan: the residual streams (40 KiB a row on Flash-Next), the output of the layer's mixture
+  of experts (the shared expert's, scaled by its gate, and the routed experts' added to it) and
+  its inject values, which the next read writes to the streams, the experts' f16 input, the
+  router's picks (`ExpertKernels::pick_rows_into` writes a micro-batch's into its chunk's
+  record) and the plan of the many-row kernels; the hidden values of one chunk's experts are
+  shared by the chunks. About 56 KiB a row and 100 MB with a worker's 15 KiB a row (it keeps no
+  streams), against 486 to 725 KiB a row of a lent step's scratch. While a micro-batch runs,
+  `Part::at` maps the scratch's residual, MoE output and inject values to its rows of the chunk;
+  everything else is the own scratch.
+- *The loan* is sized for the step's rows (`Flow::lend_pass`, a piece of each pool as the lent
+  steps' scratch), so a prompt of 17 000 rows lends about 0.9 GiB where a lent step of 4096 rows
+  took 2 GiB, and a short prompt little. A pass that follows one that has read its rows takes
+  its loan over when its rows fit in it; any other step gives it back before it begins. The
+  last micro-batch's residual is copied to the own scratch, where the MTP block's following
+  at the next step's start reads it, so no step after the pass reads the loan. The widest pass
+  is what every device's slots can lend for (`pass_span`, the model's `max_rows`), at most
+  `--batch-size` (32 768 by default).
+- *Two devices.* By layers, each device runs its layers for every micro-batch, and the first
+  hands the residual over per micro-batch in the lane's two parcels (the second waits on the
+  host for them, or for the first to pause). With both devices on every layer, the exchanges of
+  a piece are numbered by the pieces in the order they run, a block of eight each (the output of
+  a layer's experts crosses in the next layer's piece of the same micro-batch, first, and is
+  numbered again when a paused pass goes on), so that every flag only grows; the mixer decides
+  for both whether a piece runs; the worker folds its shared expert's gated output into its
+  experts' output, keeps its experts' input per row, and takes the mixer's picks of every row
+  (with their weights) from the host, tagged by layer so that its thread never takes the layer
+  before's.
+- *Interruptible.* Before every micro-batch but the first of a step, the pass may **pause**
+  (`DeviceModel::paused`, `StepOutput::paused`): when the engine was asked something since the
+  conductor last took its commands (`StepContext::asks`, which the runtime raises on every
+  request and cancellation; the record says what the conductor had seen), or when the record's
+  time for the step has passed (`RecordView::pause_after`). Nothing of a paused step is
+  committed. The conductor keeps its part, plans the other sequences without it, and writes its
+  rows again when it is its turn: alone when nothing else runs (no time bound), else as a piece
+  of prompt in the share's turns, after the other prompts' pieces, for about `piece_ms` (500
+  ms). The model goes on where it stopped; its sequence never gives way (`Claims::keep`), and
+  when it is cancelled nothing of it is kept and the next record gives the step up
+  (`RecordView::gives_up_paused`). A request that arrives therefore waits for at most a layer's
+  experts of the pass in flight and a micro-batch, then runs its own steps.
+- *Not in a pass:* the CPU's share of the misses (a pass is wider than `cpu_rows`), the
+  predictions of the next layer's picks of a wide step, the image tower's rows.
+- *Exact?* `a_prompt_read_layer_by_layer_gives_the_reference_answer` (`tests/qwen4exp_runtime.rs`)
+  reads a prompt of 400 rows in micro-batches of 16 and 32 rows (one chunk and several) in
+  every placement: the first tokens are the reference's and the same prompt's in steps of the
+  own rows (all 16 tokens in five of the six runs); `a_request_cuts_in_between_the_pieces_of_a_long_prompt`
+  sends a request 5 ms after a prompt of 480 rows: it gets its first token after 16 ms, the long
+  prompt after 61 to 78 ms, and both answer as alone, token for token the reference's, in every
+  placement. The conductor's side has tests of its own with a host executor that pauses
+  (`tests/prefix.rs`: a paused step runs again until its rows are done; a request runs between
+  the pieces; a cancelled request gives its paused step up), and the oracle checks that no step
+  between reads, saves or restores the paused sequence's state.
 
 ### Vulkan
 
