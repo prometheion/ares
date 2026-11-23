@@ -316,6 +316,43 @@ named: `git grep ARES_TEST_` lists the variables (`ARES_TEST_GGUF`,
 - [`docs/reference/`](docs/reference/): studies of the model architectures and
   of other engines.
 
+## Thanks
+
+Ares takes what works best from the engines that came before it. Most of it
+was learned from reading their code and measuring against them; only ggml's
+quantization code is ported (see [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES)).
+With thanks to:
+
+- [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): GGUF and its
+  weight types (`ares-quant` is a port of ggml's quantization code), the shape of
+  many kernels, the server's API shapes, and the reference every test is held to.
+- [Piggidragon/llama.cpp](https://github.com/Piggidragon/llama.cpp), the author's
+  fork: quantized flash attention, tensor split with peer-to-peer sums, MTP and
+  DSpark drafts, the drafts' price rule and the conversation cache, which Ares
+  set out to beat.
+- [Strata](https://github.com/Niko1221/Strata): the reference for mixtures of
+  experts on consumer cards: experts in VRAM, RAM and on the SSD, the CPU for
+  the misses, large prompt chunks on borrowed slots, the usage profile.
+- [TokenWing](https://github.com/runmyai/tokenwing) (Run My AI): prompts read
+  layer by layer, experts streamed from the SSD, the routers of the next layers
+  as a prediction.
+- [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang)
+  and [FlashInfer](https://github.com/flashinfer-ai/flashinfer): paged K and V,
+  the prefix cache, scheduling and preemption by priority.
+- [ktransformers](https://github.com/kvcache-ai/ktransformers),
+  [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and the MoE offload
+  papers: experts split between GPU and CPU.
+- TensorFold, [DFlash](https://huggingface.co/z-lab) and DSpark: drafting with
+  trees and block drafters; [Basalt](https://github.com/jesdga95/basalt),
+  [Flide](https://github.com/OmniJev/Flide), [beellama.cpp](https://github.com/Anbeeld/beellama.cpp)
+  (KVarN) and [TheCodacus' llama.cpp fork](https://github.com/thecodacus/llama.cpp)
+  for their ideas.
+- [Unsloth](https://huggingface.co/unsloth) for the GGUF files, and the Qwen team
+  for the models.
+
 ## License
 
 Apache-2.0; see [`LICENSE`](LICENSE).
+
+Code ported from other projects keeps its own license; see
+[`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES).
