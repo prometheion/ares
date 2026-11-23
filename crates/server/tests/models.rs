@@ -876,8 +876,6 @@ async fn a_server_over_one_engine_is_as_it_was() {
 // `ares --models-preset` as an operator runs it, as far as that needs no GPU:
 // a file that is not a model fails at its load before a device is touched.
 
-const BIN: &str = env!("CARGO_BIN_EXE_ares");
-
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("models-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -893,11 +891,9 @@ fn the_binary_refuses_a_preset_file_that_cannot_be_served_with_its_line() {
     let ini = dir.join("models.ini");
     let run = |text: &str, flags: &[&str]| {
         std::fs::write(&ini, text.replace("MODEL", model.to_str().unwrap())).unwrap();
-        let output = std::process::Command::new(BIN)
+        let output = common::process::ares()
             .args(["--port", "0", "--models-preset", ini.to_str().unwrap()])
             .args(flags)
-            .env_remove("RUST_LOG")
-            .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
         (output.status.code(), String::from_utf8_lossy(&output.stderr).into_owned())
@@ -935,10 +931,8 @@ fn the_binary_serves_a_preset_file_lists_a_failed_load_and_stops_in_order() {
     let text =
         format!("[*]\nidle-unload = 10m\n[broken]\nmodel = {}\naliases = b\n", model.display());
     std::fs::write(&ini, text).unwrap();
-    let mut child = std::process::Command::new(BIN)
+    let mut child = common::process::ares()
         .args(["--port", "0", "--models-preset", ini.to_str().unwrap()])
-        .env_remove("RUST_LOG")
-        .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();

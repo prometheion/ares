@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ares");
+mod common;
 
 /// How long anything may take before a test fails instead of hanging.
 const LIMIT: Duration = Duration::from_secs(300);
@@ -117,11 +117,9 @@ struct Said {
 impl Server {
     /// Starts `ares` with `args` on `port` and waits until it listens.
     fn start(args: &[String], port: u16) -> Self {
-        let mut child = Command::new(BIN)
+        let mut child = common::process::ares()
             .args(args)
             .args(["--port", &port.to_string()])
-            .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();

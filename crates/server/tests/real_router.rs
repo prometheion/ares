@@ -6,7 +6,7 @@
 //! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
 //! file, Qwen3.5-0.8B). `ARES_TEST_DEVICE` names the device of the small
 //! models (default 0) and `ARES_TEST_PORT` the first of the ports on
-//! 127.0.0.1 the tests listen on (default 18951). The test that replaces a
+//! 127.0.0.1 the tests listen on (default 18980). The test that replaces a
 //! model needs two devices, `ARES_TEST_QWEN35_27B` (a file both devices
 //! hold together and one alone does not, Qwen3.8-27B Q4_K_S) and
 //! `ARES_TEST_QWEN35_27B_SMALL` (a file one device holds that leaves the two
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use ares_cuda::{Device, Wait};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ares");
+mod common;
 
 /// How long anything may take before a test fails instead of hanging: the
 /// load of the large file over a busy machine included.
@@ -56,7 +56,7 @@ fn file(variable: &str, what: &str) -> Option<PathBuf> {
 }
 
 fn port(offset: u16) -> u16 {
-    let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(18951);
+    let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(18980);
     base + offset
 }
 
@@ -115,12 +115,10 @@ fn dechunk(mut raw: &[u8]) -> Vec<u8> {
 impl Server {
     /// Starts `ares` over the preset file `ini` and waits until it listens.
     fn start(ini: &Path, port: u16) -> Self {
-        let mut child = Command::new(BIN)
+        let mut child = common::process::ares()
             .arg("--models-preset")
             .arg(ini)
             .args(["--port", &port.to_string()])
-            .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();

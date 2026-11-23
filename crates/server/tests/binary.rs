@@ -5,14 +5,14 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use ares_gguf::GgufBuilder;
 
-const BIN: &str = env!("CARGO_BIN_EXE_ares");
+mod common;
 
 fn ares(args: &[&str]) -> Output {
-    Command::new(BIN).args(args).env_remove("RUST_LOG").stdin(Stdio::null()).output().unwrap()
+    common::process::ares().args(args).output().unwrap()
 }
 
 fn stderr(output: &Output) -> String {
@@ -221,11 +221,9 @@ fn a_preset_file_is_served_with_its_defaults_in_the_log_and_in_the_model_list() 
         model.display()
     );
     std::fs::write(&preset, text).unwrap();
-    let mut child = Command::new(BIN)
+    let mut child = common::process::ares()
         .args(["--port", "0", "--models-preset", preset.to_str().unwrap()])
         .args(["--max-tokens", "500"])
-        .env_remove("RUST_LOG")
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

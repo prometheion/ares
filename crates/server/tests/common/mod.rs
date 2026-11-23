@@ -15,6 +15,8 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode, header};
 use tower::ServiceExt;
 
+pub mod process;
+
 /// How long an engine thread or a test waits for the other side before it
 /// fails, so that a broken test ends instead of hanging.
 const WAIT_LIMIT: Duration = Duration::from_secs(10);

@@ -4,13 +4,13 @@
 //! `tests/real.rs` serves the real model.
 
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 use std::sync::LazyLock;
 
 use ares_core::GgmlType;
 use ares_model::qwen4exp::synthetic::{Shape, Synthetic, Types};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ares");
+mod common;
 
 /// A made-up model of the architecture at sizes the kernels take.
 fn made_up() -> Synthetic {
@@ -52,11 +52,9 @@ fn model() -> &'static PathBuf {
 }
 
 fn ares(args: &[&str]) -> Output {
-    Command::new(BIN)
+    common::process::ares()
         .args(["--port", "0", "--model", model().to_str().unwrap()])
         .args(args)
-        .env_remove("RUST_LOG")
-        .stdin(Stdio::null())
         .output()
         .unwrap()
 }

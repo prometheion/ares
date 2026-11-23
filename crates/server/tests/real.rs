@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ares");
+mod common;
 
 /// How long anything may take before a test fails instead of hanging.
 const LIMIT: Duration = Duration::from_secs(60);
@@ -50,12 +50,6 @@ fn model() -> Option<PathBuf> {
 fn port(offset: u16) -> u16 {
     let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(18951);
     base + offset
-}
-
-/// The user's cache directory as the servers of the tests see it: one of the
-/// build's, shared by the tests of one build directory.
-fn test_cache_home() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cache-home")
 }
 
 /// A running server process. Killed when dropped, so that a failing test
@@ -202,17 +196,12 @@ impl Server {
         flags: &[&str],
         limit: Duration,
     ) -> Self {
-        let mut child = Command::new(BIN)
+        let mut child = common::process::ares()
             .arg("--model")
             .arg(model)
             .args(["--port", &port.to_string()])
             .args(base)
             .args(flags)
-            .env_remove("RUST_LOG")
-            // What the servers keep in the user's cache directory (the usage
-            // profiles of the experts) stays with the tests.
-            .env("XDG_CACHE_HOME", test_cache_home())
-            .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -975,14 +964,12 @@ fn a_second_turn_starts_from_what_the_first_turn_computed_and_says_so() {
 /// server is killed.
 fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitStatus, String) {
     let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
-    let mut child = Command::new(BIN)
+    let mut child = common::process::ares()
         .arg("--model")
         .arg(model)
         .args(["--port", &port.to_string(), "--devices", &device])
         .args(["--precision", "exact", "--context", "8192", "--ram", ram])
         .args(flags)
-        .env_remove("RUST_LOG")
-        .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -1083,14 +1070,7 @@ fn a_server_with_no_ram_to_spare_keeps_one_checkpoint_and_answers_as_one_with() 
 /// The server run with `flags` on the small model, which is refused before
 /// any device is touched: its exit status and what it said.
 fn refused(model: &PathBuf, flags: &[&str]) -> (ExitStatus, String) {
-    let output = Command::new(BIN)
-        .arg("--model")
-        .arg(model)
-        .args(flags)
-        .env_remove("RUST_LOG")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = common::process::ares().arg("--model").arg(model).args(flags).output().unwrap();
     (output.status, String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
