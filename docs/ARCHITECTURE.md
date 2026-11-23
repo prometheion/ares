@@ -6171,12 +6171,30 @@ wider than the parts' own scratch runs as a **pass**:
   committed. The conductor keeps its part, plans the other sequences without it, and writes its
   rows again when it is its turn: alone when nothing else runs (no time bound), else as a piece
   of prompt in the share's turns, after the other prompts' pieces, for about `piece_ms` (500
-  ms). The model goes on where it stopped; its sequence never gives way (`Claims::keep`), and
-  when it is cancelled nothing of it is kept and the next record gives the step up
-  (`RecordView::gives_up_paused`). A request that arrives therefore waits for at most a layer's
-  experts of the pass in flight and a micro-batch, then runs its own steps.
-- *Not in a pass:* the CPU's share of the misses (a pass is wider than `cpu_rows`), the
-  predictions of the next layer's picks of a wide step, the image tower's rows.
+  ms). The model goes on where it stopped; its sequence never gives way, neither to a shortage
+  of pages nor to a request of a better priority (`Claims::keep`: its state is neither before
+  nor after its rows), and when it is cancelled nothing of it is kept and the next record gives
+  the step up (`RecordView::gives_up_paused`). A request that arrives therefore waits for at
+  most a layer's experts of the pass in flight and a micro-batch, then runs its own steps.
+- *Images.* A prompt with an image is read layer by layer as any other (see "Images in a
+  prompt"): each micro-batch's record carries its rows' rotary positions (the span's record all
+  of them), the part that embeds copies the staged rows of the micro-batch's image cells over
+  its gathered rows (`rows::splices_within` cuts the step's image runs to the micro-batch), and
+  the MTP block follows each micro-batch at its rotary positions. A micro-batch may embed
+  after the pass paused, so every record that goes on with a paused step stages the same rows
+  again; the conductor holds the rows of the images among a paused step's rows
+  (`paused_images`) so that the image store cannot let them go before the step is done, and
+  the tower looks for a paused sequence's missing images only after the paused rows. In
+  planning, a step is cut at an image whose rows are not there (and at the stage's room)
+  before the checkpoints due inside it are named, so that they lie inside the rows it keeps;
+  a checkpoint cut after them that leaves one too close to the step's end, or the step no
+  wider than the own rows, ends the step at the first of them instead.
+  (`a_prompt_with_an_image_read_layer_by_layer_gives_the_reference_answer`: a prompt of 400
+  rows with an image of 8 x 5 made-up rows against the CPU reference, whose window takes
+  input rows and rotary positions; `runtime/tests/images.rs`
+  `a_paused_step_stages_its_image_rows_again_after_the_store_let_them_go`.)
+- *Not in a pass:* the predictions of the next layer's picks of a wide step (a pass reads the
+  next layer's experts that no tier holds into staging while a layer's micro-batches run).
 - *Exact?* `a_prompt_read_layer_by_layer_gives_the_reference_answer` (`tests/qwen4exp_runtime.rs`)
   reads a prompt of 400 rows in micro-batches of 16 and 32 rows (one chunk and several) in
   every placement: the first tokens are the reference's and the same prompt's in steps of the
@@ -6675,9 +6693,11 @@ one job.
 - **The part that embeds** (`blocks::rows::splice`) copies the staged rows from
   the page-locked stage over the rows it gathered, before the first layer reads
   them: on one device, the first device of a layer split, the device that
-  embeds in a tensor split (`qwen35`), and the part that embeds of Flash-Next.
-  The records a part builds itself (the groups of a split, Flash-Next's step
-  record) carry the rows' rotary positions. The n-gram embedding of Flash-Next
+  embeds in a tensor split (`qwen35`), and the part that embeds of Flash-Next,
+  also for each micro-batch of a prompt read layer by layer (see "Long prompts
+  layer by layer"). The records a part builds itself (the groups of a split,
+  Flash-Next's step record and a pass's micro-batches) carry the rows' rotary
+  positions. The n-gram embedding of Flash-Next
   hashes the pad token of an image cell, which is `ple.image_token_id` (the
   model refuses a projector when the two differ).
 - **The prefix cache** names an image's cells by the image and the row
@@ -8144,7 +8164,9 @@ Here every place where the engine chooses between requests honours it:
   the prefix cache and their state becomes a checkpoint, so they come back as
   a prefix hit, and they do not come back in the pass that made them give
   way. A shortage of pages spills the worst priority first (vLLM's victim),
-  then by the old rule.
+  then by the old rule. The sequence of a step the model paused (a prompt read
+  layer by layer) gives way to neither (`Claims::keep`): its state is neither
+  before nor after its rows.
 - *The rows of a step* (`ares_sched::plan`): the newest tokens, the rows of
   decisions, the drafts and the prompts go to the better priority first; a
   starved prompt goes before a shorter one only of its own priority.

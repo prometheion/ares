@@ -237,8 +237,9 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
 - [x] A loan of VRAM after the tier had moved slots between layers (rebalance) could take a
       layer's given-up number for a slot's owner: the owner kept the slot inside the loan (its
       expert read lent memory) and a later loan stopped the engine ("as many slots were given
-      as are lent", the base build on the local cards, the third loan of a session). Fixed on
-      `flash/prompt` (d6acafe): a moved slot leaves no number behind.
+      as are lent", the base build on the local cards, the third loan of a session). Fixed
+      (e33779a on main; `flash/prompt`'s d6acafe is the same fix): a moved slot leaves no
+      number behind.
 - [ ] A cached prompt's replayed rows and its computed rows are steps of their own (and a
       prompt step is cut at a root): two passes over the experts where one would do; with the
       CPU's share of small steps cheaper, not built.
@@ -432,6 +433,11 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       micro-batches run.
       Checkpoints due inside a pass are saved there layer by layer (the step is no longer cut
       at every 16 384 tokens and at the anchor).
+      Rebased onto main 2026-11-23 (with images and priorities): a pass takes an image's
+      staged rows and every row's rotary position (tested against the CPU reference with a
+      made-up image in every placement), a paused pass keeps its image rows and its place
+      (it gives way neither to a shortage nor to a better priority), and the record's header
+      grew to 44 words (images 38/39, the pause 40, what was asked 41, saves inside 42/43).
 - [ ] Passes, what is left: with both devices on every layer the MTP block's chains after a
       pass agree with the reference's for 1 to 3 links where after steps of the own rows 5 to 7
       (the trunk's tokens are the reference's): not found. Uploads of the next layer's
