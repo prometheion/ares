@@ -296,6 +296,8 @@ pub struct AttentionKernels {
     encode_tile_f32: Function,
     /// The attention kernels by head size and shape.
     attend: Vec<(u32, AttnShape, Function)>,
+    /// The prompt kernels that compute the scores in integers, by head size.
+    prompt_int: Vec<(u32, Function)>,
     /// The direct kernels by head size and the vectors their registers hold.
     direct: Vec<(u32, u32, Function)>,
     merge: Vec<(u32, Function)>,
@@ -481,6 +483,7 @@ impl AttentionKernels {
         };
         let mut attend = Vec::new();
         let mut merge = Vec::new();
+        let mut prompt_int = Vec::new();
         for d in [256u32, 128] {
             for shape in AttnShape::ALL {
                 let f = module.function(&shape.kernel_name(d))?;
@@ -488,6 +491,9 @@ impl AttentionKernels {
                 attend.push((d, shape, f));
             }
             merge.push((d, module.function(&format!("ares_attn_merge_d{d}"))?));
+            let f = module.function(&format!("ares_attn_d{d}_p128i"))?;
+            f.allow_dynamic_shared(AttnShape::Prompt128.smem_bytes(d))?;
+            prompt_int.push((d, f));
         }
         let mut direct = Vec::new();
         for d in [256u32, 128] {
@@ -502,6 +508,7 @@ impl AttentionKernels {
             convert: module.function("ares_attn_convert")?,
             encode_tile_f32: module.function("ares_attn_encode_tile_f32")?,
             attend,
+            prompt_int,
             direct,
             merge,
         })
@@ -574,15 +581,17 @@ impl AttentionKernels {
                 }
                 continue;
             }
-            let function = self
-                .attend
-                .iter()
-                .find(|(dd, s, _)| *dd == d && s == shape)
-                .map(|(_, _, f)| f)
-                .ok_or_else(|| Error::Invalid {
-                    what: "attention",
-                    detail: format!("no kernel for a head size of {d}"),
-                })?;
+            // Converted entries with K quantized: the prompt kernel's scores in integers.
+            let integer = *shape == AttnShape::Prompt128 && *direct && geo.k != CacheFormat::F16;
+            let function = if integer {
+                self.prompt_int.iter().find(|(dd, _)| *dd == d).map(|(_, f)| f)
+            } else {
+                self.attend.iter().find(|(dd, s, _)| *dd == d && s == shape).map(|(_, _, f)| f)
+            }
+            .ok_or_else(|| Error::Invalid {
+                what: "attention",
+                detail: format!("no kernel for a head size of {d}"),
+            })?;
             let args = Args::new()
                 .ptr(plan.items.offset(*first as u64 * 48))
                 .ptr(plan.ranges)

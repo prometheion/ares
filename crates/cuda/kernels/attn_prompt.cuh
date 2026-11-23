@@ -28,6 +28,7 @@
 #define PROMPT_WARPS 8
 #define PROMPT_VECS 128
 #define PROMPT_CHUNK 32
+#define PROMPT_Q_MAX 16383.0f  // the largest query code of the integer scores (15 bits)
 
 // c += a * b with f16 accumulators: a 16x16 (row), b 16x8 (col), c two half2.
 static __device__ __forceinline__ void mma_f16_f16(
@@ -53,26 +54,65 @@ static __device__ __forceinline__ int swz(int row, int col) {
     return row * D + ((((col >> 3) ^ (row & 7))) << 3) + (col & 7);
 }
 
+// Byte offset of byte `col` of row `row` in a swizzled tile of rows of D bytes.
+template <int D>
+static __device__ __forceinline__ int swzb(int row, int col) {
+    return row * D + ((((col >> 4) ^ (row & 7))) << 4) + (col & 15);
+}
+
+// c += a * b in integers: a 16x32 signed bytes (row), b 32x8 signed bytes (col).
+static __device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+        "{%8, %9}, {%0, %1, %2, %3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// The same with a as unsigned bytes.
+static __device__ __forceinline__ void mma_u8s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+        "{%8, %9}, {%0, %1, %2, %3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 #define PROMPT_RAW_WORDS 9  // q8: 34 bytes, from 2 bytes before its start at most
 
-// Loads the bytes of a quantized group of `bytes` bytes starting at `p` (2-byte aligned) into
-// `w`, from the 4-byte boundary at or before `p`: whole words, and the last 2 bytes alone when
-// the group ends in the middle of a word, so nothing past the group is read.
-static __device__ __forceinline__ void prompt_load_group(
-    const uint8_t* p, int bytes, uint32_t (&w)[PROMPT_RAW_WORDS]) {
+// Loads the BYTES bytes of a quantized group that starts at `p` (2-byte aligned; every group
+// size is 2 more than a multiple of 4) into `w`, from the 4-byte boundary at or before `p`:
+// whole words, and the last 2 bytes alone when the group ends in the middle of a word, so
+// nothing past the group is read. `prompt_realign` moves the group to byte 0 later, when
+// the loads have arrived.
+template <int BYTES>
+static __device__ __forceinline__ void prompt_load(const uint8_t* p, uint32_t (&w)[PROMPT_RAW_WORDS]) {
+    static_assert(BYTES % 4 == 2 && (BYTES + 2) / 4 <= PROMPT_RAW_WORDS, "group size");
+    constexpr int F0 = (BYTES - 2) / 4;  // whole words of a group that starts at a word
     const uintptr_t at = reinterpret_cast<uintptr_t>(p);
     const uint32_t* a = reinterpret_cast<const uint32_t*>(at & ~(uintptr_t)3);
-    const int total = bytes + (int)(at & 2);
-    const int full = total >> 2;
 #pragma unroll
     for (int i = 0; i < PROMPT_RAW_WORDS; ++i) {
-        if (i < full) {
-            w[i] = __ldg(a + i);
-        } else if (i == full && (total & 2)) {
-            w[i] = __ldg(reinterpret_cast<const unsigned short*>(a + i));
-        } else {
-            w[i] = 0u;
-        }
+        if (i < F0) w[i] = __ldg(a + i);
+        else if (i > F0) w[i] = 0u;
+    }
+    w[F0] = (at & 2) ? __ldg(a + F0) : (uint32_t)__ldg(reinterpret_cast<const unsigned short*>(a + F0));
+}
+
+static __device__ __forceinline__ void prompt_load_any(int fmt, const uint8_t* p, uint32_t (&w)[PROMPT_RAW_WORDS]) {
+    switch (fmt) {
+        case FMT_Q8: prompt_load<34>(p, w); break;
+        case FMT_Q7: prompt_load<30>(p, w); break;
+        case FMT_Q6: prompt_load<26>(p, w); break;
+        case FMT_Q5: prompt_load<22>(p, w); break;
+        default: prompt_load<18>(p, w); break;
+    }
+}
+
+// Moves a group loaded from an address whose bit 1 is `odd` to byte 0 of `w`.
+static __device__ __forceinline__ void prompt_realign(uint32_t (&w)[PROMPT_RAW_WORDS], bool odd) {
+    if (odd) {
+#pragma unroll
+        for (int i = 0; i < PROMPT_RAW_WORDS; ++i)
+            w[i] = __funnelshift_r(w[i], i + 1 < PROMPT_RAW_WORDS ? w[i + 1] : 0u, 16);
     }
 }
 
@@ -117,16 +157,11 @@ static __device__ __forceinline__ uint2 prompt_codes_to_halves(uint32_t codes, _
     return make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
 }
 
-// Decodes a quantized group in `w` (loaded from an address whose bit 1 is `odd`) into 32
-// halves at row `row`, values 32 g .. 32 g + 31 of the swizzled tile.
+// Decodes a quantized group (realigned) into 32 halves at row `row`, values 32 g .. 32 g + 31
+// of the swizzled tile.
 template <int BITS, int D>
-static __device__ __forceinline__ void prompt_decode_group(
-    uint32_t (&w)[PROMPT_RAW_WORDS], bool odd, __half* tile, int row, int g) {
-    if (odd) {
-#pragma unroll
-        for (int i = 0; i < PROMPT_RAW_WORDS; ++i)
-            w[i] = __funnelshift_r(w[i], i + 1 < PROMPT_RAW_WORDS ? w[i + 1] : 0u, 16);
-    }
+static __device__ __forceinline__ void prompt_decode_halves(
+    const uint32_t (&w)[PROMPT_RAW_WORDS], __half* tile, int row, int g) {
     const __half2 sc = __half2half2(__ushort_as_half((unsigned short)(w[0] & 0xffffu)));
 #pragma unroll
     for (int p = 0; p < 4; ++p) {
@@ -136,19 +171,49 @@ static __device__ __forceinline__ void prompt_decode_group(
     }
 }
 
-template <int D>
-static __device__ __forceinline__ void prompt_decode_any(
-    int fmt, uint32_t (&w)[PROMPT_RAW_WORDS], bool odd, __half* tile, int row, int g) {
-    switch (fmt) {
-        case FMT_Q8: prompt_decode_group<8, D>(w, odd, tile, row, g); break;
-        case FMT_Q7: prompt_decode_group<7, D>(w, odd, tile, row, g); break;
-        case FMT_Q6: prompt_decode_group<6, D>(w, odd, tile, row, g); break;
-        case FMT_Q5: prompt_decode_group<5, D>(w, odd, tile, row, g); break;
-        default: prompt_decode_group<4, D>(w, odd, tile, row, g); break;
+// Decodes a quantized group (realigned) into its 32 signed codes at row `row`, bytes 32 g ..
+// 32 g + 31 of the swizzled byte tile, and its scale into `scale`.
+template <int BITS, int D>
+static __device__ __forceinline__ void prompt_decode_codes(
+    const uint32_t (&w)[PROMPT_RAW_WORDS], int8_t* tile, float* scale, int row, int g) {
+    *scale = h2f_bits(w[0] & 0xffffu);
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const uint4 c = make_uint4(prompt_codes4<BITS>(w, 4 * p), prompt_codes4<BITS>(w, 4 * p + 1),
+                                   prompt_codes4<BITS>(w, 4 * p + 2), prompt_codes4<BITS>(w, 4 * p + 3));
+        *reinterpret_cast<uint4*>(tile + swzb<D>(row, 32 * g + 16 * p)) = c;
     }
 }
 
 template <int D>
+static __device__ __forceinline__ void prompt_decode_halves_any(
+    int fmt, const uint32_t (&w)[PROMPT_RAW_WORDS], __half* tile, int row, int g) {
+    switch (fmt) {
+        case FMT_Q8: prompt_decode_halves<8, D>(w, tile, row, g); break;
+        case FMT_Q7: prompt_decode_halves<7, D>(w, tile, row, g); break;
+        case FMT_Q6: prompt_decode_halves<6, D>(w, tile, row, g); break;
+        case FMT_Q5: prompt_decode_halves<5, D>(w, tile, row, g); break;
+        default: prompt_decode_halves<4, D>(w, tile, row, g); break;
+    }
+}
+
+template <int D>
+static __device__ __forceinline__ void prompt_decode_codes_any(
+    int fmt, const uint32_t (&w)[PROMPT_RAW_WORDS], int8_t* tile, float* scale, int row, int g) {
+    switch (fmt) {
+        case FMT_Q8: prompt_decode_codes<8, D>(w, tile, scale, row, g); break;
+        case FMT_Q7: prompt_decode_codes<7, D>(w, tile, scale, row, g); break;
+        case FMT_Q6: prompt_decode_codes<6, D>(w, tile, scale, row, g); break;
+        case FMT_Q5: prompt_decode_codes<5, D>(w, tile, scale, row, g); break;
+        default: prompt_decode_codes<4, D>(w, tile, scale, row, g); break;
+    }
+}
+
+// I8: the scores in integers (converted entries with K in q8 to q4): the codes of K against
+// the query as 15-bit integers with one scale per vector, split into a signed high byte and
+// an unsigned low one, two int8 products per group of 32 values, summed exactly in int32 and
+// then scaled by the group's scale of K (f32). Otherwise K is an f16 tile and the query f16.
+template <int D, bool I8>
 static __device__ void attn_prompt_body(
     const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids,
     const uint32_t* tables, const uint8_t* exact_pool, const uint8_t* conv_pool, const float* q,
@@ -157,15 +222,24 @@ static __device__ void attn_prompt_body(
     constexpr int C = PROMPT_CHUNK;
     constexpr int GROUPS = D / 32;
     // group decodes per side and chunk: C rows of GROUPS groups; a thread takes `PER` of them
-    // over both sides (D = 256: one of K and one of V; D = 128: one of K or one of V)
+    // over both sides (D = 256: one of K and one of V; D = 128: one of K or one of V), so the
+    // side is the same for a whole warp
     constexpr int UNITS = 2 * C * GROUPS;
     constexpr int PER = UNITS / NT;
     static_assert(PER >= 1 && UNITS % NT == 0, "units per thread");
     extern __shared__ __align__(16) uint8_t smem[];
-    __half* Qs = reinterpret_cast<__half*>(smem);         // [128][D]
-    __half* Kt = Qs + PROMPT_VECS * D;                     // [C][D]
-    __half* Vt = Kt + C * D;                               // [C][D]
-    uint32_t* vec_lim = reinterpret_cast<uint32_t*>(Vt + C * D);  // [128]
+    // f16 queries [128][D] or their high and low bytes [128][D] each, then the K tile (f16 or
+    // codes) and the V tile of a chunk, the scales, limits and mean dot products
+    __half* Qs = reinterpret_cast<__half*>(smem);
+    int8_t* Qh = reinterpret_cast<int8_t*>(smem);
+    uint8_t* Ql = smem + PROMPT_VECS * D;
+    uint8_t* after_q = smem + PROMPT_VECS * D * 2;
+    __half* Kt = reinterpret_cast<__half*>(after_q);
+    int8_t* Kb = reinterpret_cast<int8_t*>(after_q);
+    __half* Vt = reinterpret_cast<__half*>(after_q + C * D * (I8 ? 1 : 2));
+    float* ksc = reinterpret_cast<float*>(Vt + C * D);           // [GROUPS][C] (I8)
+    float* qsc = ksc + (I8 ? GROUPS * C : 0);                    // [128] (I8)
+    uint32_t* vec_lim = reinterpret_cast<uint32_t*>(qsc + (I8 ? PROMPT_VECS : 0));  // [128]
     float* mdot = reinterpret_cast<float*>(vec_lim + PROMPT_VECS);  // [128]
 
     const AttnItem it = items[blockIdx.x];
@@ -181,33 +255,53 @@ static __device__ void attn_prompt_body(
     const size_t head_e = (size_t)it.kv_head * g.head_e;
     const uint32_t start = ranges[it.ranges_off], end = start + it.total;
 
-    // ---- vectors: limits and the scaled, possibly rotated, f16 queries
-    uint32_t lim_min = 0xffffffffu;
+    // ---- vectors: limits and the scaled, possibly rotated, queries
     for (int v = tid; v < PROMPT_VECS; v += NT) {
         uint32_t lim = 0xffffffffu;
         if (v < nvec && (it.flags & ITEM_CAUSAL)) lim = rows[row_ids[it.row0 + v / G]].pos;
         vec_lim[v] = lim;
     }
     for (int v = warp; v < PROMPT_VECS; v += PROMPT_WARPS) {
+        float x[GROUPS];
+#pragma unroll
         for (int gi = 0; gi < GROUPS; ++gi) {
-            float x = 0.0f;
+            x[gi] = 0.0f;
             if (v < nvec) {
                 const size_t row = row_ids[it.row0 + v / G];
                 const size_t head = (size_t)(g.head0 + it.kv_head) * G + v % G;
-                x = q[(row * g.kv_total * G + head) * D + gi * 32 + lane];
-                if (conv && fmt_rotated(g.kf)) x = rotate32(x, lane);
+                x[gi] = q[(row * g.kv_total * G + head) * D + gi * 32 + lane];
+                if (conv && fmt_rotated(g.kf)) x[gi] = rotate32(x[gi], lane);
             }
-            Qs[swz<D>(v, gi * 32 + lane)] = __float2half_rn(x * scale_log2);
+            x[gi] *= scale_log2;
+        }
+        if constexpr (I8) {
+            float amax = 0.0f;
+#pragma unroll
+            for (int gi = 0; gi < GROUPS; ++gi) amax = fmaxf(amax, fabsf(x[gi]));
+            amax = warp_max32(amax);
+            const float inv = amax > 0.0f ? PROMPT_Q_MAX / amax : 0.0f;
+#pragma unroll
+            for (int gi = 0; gi < GROUPS; ++gi) {
+                const int qi = (int)fminf(fmaxf(rintf(x[gi] * inv), -PROMPT_Q_MAX), PROMPT_Q_MAX);
+                Qh[swzb<D>(v, gi * 32 + lane)] = (int8_t)(qi >> 7);
+                Ql[swzb<D>(v, gi * 32 + lane)] = (uint8_t)(qi & 127);
+            }
+            if (lane == 0) qsc[v] = amax / PROMPT_Q_MAX;
+        } else {
+#pragma unroll
+            for (int gi = 0; gi < GROUPS; ++gi) Qs[swz<D>(v, gi * 32 + lane)] = __float2half_rn(x[gi]);
         }
     }
     __syncthreads();
-    for (int v = 0; v < nvec; ++v) lim_min = min(lim_min, vec_lim[v]);
+    uint32_t lim_min = 0xffffffffu;
+    for (int v = lane; v < nvec; v += 32) lim_min = min(lim_min, vec_lim[v]);
+#pragma unroll
+    for (int h = 16; h > 0; h >>= 1) lim_min = min(lim_min, __shfl_xor_sync(0xffffffffu, lim_min, h));
 
     // ---- the stored rows of a chunk: which group of which side and row a thread takes
     const int n_chunks = (int)((it.total + C - 1) / C);
     auto entry_of = [&](uint32_t cell) -> uint32_t { return tables[it.table + cell / ATTN_TILE_CELLS]; };
     const int rbk = GROUPS * fmt_group_bytes(kf), rbv = GROUPS * fmt_group_bytes(vf);
-    const bool k_quant = kf != FMT_F16, v_quant = vf != FMT_F16;
     uint32_t raw[PER][PROMPT_RAW_WORDS];
     bool raw_odd[PER];
     // unit u of the chunk: side u / (C * GROUPS), row (u % (C * GROUPS)) / GROUPS, group u % GROUPS
@@ -236,7 +330,7 @@ static __device__ void attn_prompt_body(
             if (f != FMT_F16 && cell < end) {
                 const uint8_t* p = conv_group(ent, cell, side, grp);
                 raw_odd[i] = (reinterpret_cast<uintptr_t>(p) & 2) != 0;
-                prompt_load_group(p, fmt_group_bytes(f), raw[i]);
+                prompt_load_any(f, p, raw[i]);
             }
         }
     };
@@ -273,6 +367,13 @@ static __device__ void attn_prompt_body(
         wA = wB = 0.0f;
     };
 
+    float qsA = 1.0f, qsB = 1.0f;  // the scales of the integer queries (I8)
+    if constexpr (I8) {
+        qsA = qsc[vA];
+        qsB = qsc[vB];
+    }
+    const bool f16_sides = kf == FMT_F16 || vf == FMT_F16;
+
     prefetch(0);
     for (int c = 0; c < n_chunks; ++c) {
         const uint32_t c0 = start + (uint32_t)c * C;
@@ -284,14 +385,27 @@ static __device__ void attn_prompt_body(
             int side, row, grp;
             unit_of(i, side, row, grp);
             const int f = side == 0 ? kf : vf;
-            __half* tile = side == 0 ? Kt : Vt;
             const uint32_t cell = c0 + row;
+            if (I8 && side == 0) {
+                // K as codes: zero past the range, I8 has quantized K only
+                if (cell >= end) {
+                    *reinterpret_cast<uint4*>(Kb + swzb<D>(row, 32 * grp)) = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(Kb + swzb<D>(row, 32 * grp + 16)) = make_uint4(0, 0, 0, 0);
+                    ksc[grp * C + row] = 0.0f;
+                } else {
+                    prompt_realign(raw[i], raw_odd[i]);
+                    prompt_decode_codes_any<D>(f, raw[i], Kb, ksc + grp * C + row, row, grp);
+                }
+                continue;
+            }
+            __half* tile = side == 0 ? Kt : Vt;
             if (cell >= end) {
 #pragma unroll
                 for (int p = 0; p < 4; ++p)
                     *reinterpret_cast<uint4*>(tile + swz<D>(row, 32 * grp + 8 * p)) = make_uint4(0, 0, 0, 0);
             } else if (f != FMT_F16) {
-                prompt_decode_any<D>(f, raw[i], raw_odd[i], tile, row, grp);
+                prompt_realign(raw[i], raw_odd[i]);
+                prompt_decode_halves_any<D>(f, raw[i], tile, row, grp);
             } else {
                 const uint8_t* src;
                 const uint32_t r = cell % ATTN_TILE_CELLS;
@@ -305,7 +419,7 @@ static __device__ void attn_prompt_body(
                 for (int p = 0; p < 4; ++p) cp_async16(tile + swz<D>(row, 32 * grp + 8 * p), src + 16 * p);
             }
         }
-        if (!k_quant || !v_quant) cp_async_commit();
+        if (f16_sides) cp_async_commit();
         // ---- a new tile: the V mean of the one before, the K mean of this one
         if (ent != cur_ent) {
             if (v_mean && cur_ent != 0xffffffffu) flush_mean(cur_ent);
@@ -321,13 +435,31 @@ static __device__ void attn_prompt_body(
                 for (int v = 0; v < 16; ++v) {
                     float acc = 0.0f;
                     if (lane * 8 < D) {
-                        const uint4 qv = *reinterpret_cast<const uint4*>(Qs + swz<D>(warp * 16 + v, lane * 8));
-                        const __half2* qh = reinterpret_cast<const __half2*>(&qv);
+                        float qv[8];
+                        if constexpr (I8) {
+                            // the integer query of the scores, times its scale
+                            const uint2 hb = *reinterpret_cast<const uint2*>(Qh + swzb<D>(warp * 16 + v, lane * 8));
+                            const uint2 lb = *reinterpret_cast<const uint2*>(Ql + swzb<D>(warp * 16 + v, lane * 8));
+                            const float sc = qsc[warp * 16 + v];
 #pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            const float2 b = __half22float2(qh[i]);
-                            acc = fmaf(mean[i].x, b.x, fmaf(mean[i].y, b.y, acc));
+                            for (int i = 0; i < 8; ++i) {
+                                const uint32_t hw = i < 4 ? hb.x : hb.y, lw = i < 4 ? lb.x : lb.y;
+                                const int hi = (int)(int8_t)((hw >> (8 * (i & 3))) & 0xffu);
+                                const int lo = (int)((lw >> (8 * (i & 3))) & 0xffu);
+                                qv[i] = (float)(hi * 128 + lo) * sc;
+                            }
+                        } else {
+                            const uint4 hv = *reinterpret_cast<const uint4*>(Qs + swz<D>(warp * 16 + v, lane * 8));
+                            const __half2* qh = reinterpret_cast<const __half2*>(&hv);
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const float2 b = __half22float2(qh[i]);
+                                qv[2 * i] = b.x;
+                                qv[2 * i + 1] = b.y;
+                            }
                         }
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) acc = fmaf(mean[i].x, qv[2 * i], fmaf(mean[i].y, qv[2 * i + 1], acc));
                     }
                     acc = ares_warp_sum(acc);
                     if (lane == 0) mdot[warp * 16 + v] = acc;
@@ -339,7 +471,7 @@ static __device__ void attn_prompt_body(
             cur_ent = ent;
         }
         if (c + 1 < n_chunks) prefetch(c + 1);
-        if (!k_quant || !v_quant) cp_async_wait<0>();
+        if (f16_sides) cp_async_wait<0>();
         __syncthreads();  // the tiles are complete
 
         if (!warp_active) continue;
@@ -347,16 +479,51 @@ static __device__ void attn_prompt_body(
         float s[4][4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
+        if constexpr (I8) {
 #pragma unroll
-        for (int ks = 0; ks < D / 16; ++ks) {
-            uint32_t a[4], b[4], b2[4];
-            ldmatrix_x4(a, Qs + swz<D>(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ks * 16 + (lane >> 4) * 8));
-            ldmatrix_x4(b, Kt + swz<D>(((lane >> 4) & 1) * 8 + (lane & 7), ks * 16 + ((lane >> 3) & 1) * 8));
-            ldmatrix_x4(b2, Kt + swz<D>(16 + ((lane >> 4) & 1) * 8 + (lane & 7), ks * 16 + ((lane >> 3) & 1) * 8));
-            mma_f32(s[0], a, b[0], b[1]);
-            mma_f32(s[1], a, b[2], b[3]);
-            mma_f32(s[2], a, b2[0], b2[1]);
-            mma_f32(s[3], a, b2[2], b2[3]);
+            for (int gi = 0; gi < GROUPS; ++gi) {
+                uint32_t ah[4], al[4], b[4], b2[4];
+                const int qrow = warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, qcol = gi * 32 + (lane >> 4) * 16;
+                ldmatrix_x4(ah, Qh + swzb<D>(qrow, qcol));
+                ldmatrix_x4(al, Ql + swzb<D>(qrow, qcol));
+                const int krow = ((lane >> 4) & 1) * 8 + (lane & 7), kcol = gi * 32 + ((lane >> 3) & 1) * 16;
+                ldmatrix_x4(b, Kb + swzb<D>(krow, kcol));
+                ldmatrix_x4(b2, Kb + swzb<D>(16 + krow, kcol));
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const uint32_t b0 = nt < 2 ? b[2 * nt] : b2[2 * nt - 4];
+                    const uint32_t b1 = nt < 2 ? b[2 * nt + 1] : b2[2 * nt - 3];
+                    int acc[4] = {0, 0, 0, 0};
+                    mma_s8(acc, ah, b0, b1);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[e] <<= 7;
+                    mma_u8s8(acc, al, b0, b1);
+                    const float2 ks = *reinterpret_cast<const float2*>(ksc + gi * C + nt * 8 + 2 * tq);
+                    s[nt][0] = fmaf((float)acc[0], ks.x, s[nt][0]);
+                    s[nt][1] = fmaf((float)acc[1], ks.y, s[nt][1]);
+                    s[nt][2] = fmaf((float)acc[2], ks.x, s[nt][2]);
+                    s[nt][3] = fmaf((float)acc[3], ks.y, s[nt][3]);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                s[nt][0] *= qsA;
+                s[nt][1] *= qsA;
+                s[nt][2] *= qsB;
+                s[nt][3] *= qsB;
+            }
+        } else {
+#pragma unroll
+            for (int ks = 0; ks < D / 16; ++ks) {
+                uint32_t a[4], b[4], b2[4];
+                ldmatrix_x4(a, Qs + swz<D>(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ks * 16 + (lane >> 4) * 8));
+                ldmatrix_x4(b, Kt + swz<D>(((lane >> 4) & 1) * 8 + (lane & 7), ks * 16 + ((lane >> 3) & 1) * 8));
+                ldmatrix_x4(b2, Kt + swz<D>(16 + ((lane >> 4) & 1) * 8 + (lane & 7), ks * 16 + ((lane >> 3) & 1) * 8));
+                mma_f32(s[0], a, b[0], b[1]);
+                mma_f32(s[1], a, b[2], b[3]);
+                mma_f32(s[2], a, b2[0], b2[1]);
+                mma_f32(s[3], a, b2[2], b2[3]);
+            }
         }
         // ---- scores: the mean term, the mask where some cell may be past a row or the range
         const bool mask = c0 + C - 1 > lim_min || c0 + C > end;
@@ -546,14 +713,14 @@ static __device__ void attn_prompt_body(
     }
 }
 
-#define ARES_ATTN_PROMPT(NAME, D)                                                                     \
+#define ARES_ATTN_PROMPT(NAME, D, I8)                                                                 \
     extern "C" __global__ void __launch_bounds__(32 * PROMPT_WARPS, 1) NAME(                          \
         const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids, \
         const uint32_t* tables, const uint8_t* exact_pool, const uint8_t* conv_pool, const float* q, \
         const float* gate, float* out, float* st_acc, float* st_lse, uint64_t cfg, float scale_log2, \
         uint32_t rawcap) {                                                                            \
         (void)rawcap;                                                                                 \
-        attn_prompt_body<D>(                                                                          \
+        attn_prompt_body<D, I8>(                                                                      \
             items, ranges, rows, row_ids, tables, exact_pool, conv_pool, q, gate, out, st_acc,        \
             st_lse, cfg, scale_log2);                                                                 \
     }

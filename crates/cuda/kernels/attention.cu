@@ -27,9 +27,12 @@ ARES_ATTN_KERNEL(ares_attn_d128_s16, 128, 1, 2, 32, 6, 2)
 ARES_ATTN_KERNEL(ares_attn_d128_s48, 128, 3, 2, 32, 2, 2)
 ARES_ATTN_KERNEL(ares_attn_d128_w64, 128, 4, 1, 16, 4, 0)
 // The prompt kernel (kernels/attn_prompt.cuh): items of up to 128 vectors over one range of
-// cells that starts at a multiple of 32, 8 warps.
-ARES_ATTN_PROMPT(ares_attn_d256_p128, 256)
-ARES_ATTN_PROMPT(ares_attn_d128_p128, 128)
+// cells that starts at a multiple of 32, 8 warps. The `i` kernels take converted entries with
+// K in q8 to q4 and compute the scores in integers; the others take every item.
+ARES_ATTN_PROMPT(ares_attn_d256_p128, 256, false)
+ARES_ATTN_PROMPT(ares_attn_d256_p128i, 256, true)
+ARES_ATTN_PROMPT(ares_attn_d128_p128, 128, false)
+ARES_ATTN_PROMPT(ares_attn_d128_p128i, 128, true)
 ARES_ATTN_MERGE(ares_attn_merge_d256, 256)
 ARES_ATTN_MERGE(ares_attn_merge_d128, 128)
 

@@ -223,11 +223,21 @@ pub struct PlanConfig {
     /// The fewest cells of a prefix that several sequences share for which their rows
     /// read it together as one item.
     pub min_shared_cells: u32,
+    /// Blocks of the prompt kernel ([`AttnShape::Prompt128`]) that run at once: one per
+    /// multiprocessor (its registers fill one). The converted cells of a prompt's tiles of
+    /// rows are cut into as many pieces as make the fewest, fullest waves of such blocks.
+    pub prompt_blocks: u32,
 }
 
 impl PlanConfig {
     pub fn for_multiprocessors(sm: u32) -> Self {
-        Self { target_blocks: 3 * sm, min_piece_cells: 256, max_pieces: 64, min_shared_cells: 512 }
+        Self {
+            target_blocks: 3 * sm,
+            min_piece_cells: 256,
+            max_pieces: 64,
+            min_shared_cells: 512,
+            prompt_blocks: sm,
+        }
     }
 
     /// The most state slots ([`Plan::state_slots`]) a plan of [`Planner::finish`] takes for
@@ -671,6 +681,30 @@ impl Planner {
                 r += n;
             }
         }
+        // The tiles of the prompt kernel (more vectors than the decode shapes hold) get the
+        // same number of pieces each: the one that runs them in the fewest, fullest waves of
+        // blocks, within the budget.
+        let (mut prompt_tiles, mut prompt_cells) = (0u32, 0u64);
+        for (i, d) in self.dense.iter().enumerate().filter(|(_, d)| !d.alone) {
+            let from = shares.iter().find(|s| s.members.contains(&i)).map_or(0, |s| s.cells);
+            let per = rows_per_tile(d.n_rows, g);
+            let mut r = 0;
+            while r < d.n_rows {
+                let n = per.min(d.n_rows - r);
+                if n * g > AttnShape::Decode48.max_vecs() {
+                    prompt_tiles += 1;
+                    prompt_cells += u64::from(d.pos0 + r + n - from);
+                }
+                r += n;
+            }
+        }
+        let prompt_pieces = prompt_pieces(
+            prompt_tiles,
+            prompt_cells,
+            h,
+            self.cfg.prompt_blocks,
+            ((budget as u32) / prompt_tiles.max(1)).clamp(1, max_pieces),
+        );
         for (i, d) in self.dense.iter().enumerate().filter(|(_, d)| !d.alone) {
             let from = shares.iter().find(|s| s.members.contains(&i)).map_or(0, |s| s.cells);
             let per = rows_per_tile(d.n_rows, g);
@@ -678,11 +712,12 @@ impl Planner {
             while r < d.n_rows {
                 let n = per.min(d.n_rows - r);
                 let last = d.pos0 + r + n - 1;
-                let pieces = Self::pieces_of_entries(
-                    &d.kinds,
-                    from..last + 1,
-                    pieces_for(u64::from(last + 1 - from)),
-                );
+                let wanted = if n * g > AttnShape::Decode48.max_vecs() {
+                    prompt_pieces
+                } else {
+                    pieces_for(u64::from(last + 1 - from))
+                };
+                let pieces = Self::pieces_of_entries(&d.kinds, from..last + 1, wanted);
                 b.tile(
                     d.table,
                     d.first_row + r,
@@ -716,8 +751,17 @@ impl Planner {
             // direct kernel, exact ones on the tensor cores) each kind is a launch of its
             // own, the converted items first; otherwise one launch takes both.
             // Items that must run on the tensor cores go with the exact ones.
-            let split = shape == AttnShape::Decode8 && geo.k.id() != 0 && geo.v.id() != 0;
-            items.sort_by_key(|i| (split && !i.direct(), std::cmp::Reverse(i.total)));
+            // The same for the prompt kernel, whose converted items compute their scores in
+            // integers when K is quantized.
+            let split = (shape == AttnShape::Decode8 && geo.k.id() != 0 && geo.v.id() != 0)
+                || (shape == AttnShape::Prompt128 && geo.k.id() != 0);
+            // The prompt kernel's items piece by piece, then KV head: the blocks that run at
+            // once read the same cells, which the L2 cache then holds for all of them.
+            if shape == AttnShape::Prompt128 {
+                items.sort_by_key(|i| (split && !i.direct(), i.slot, i.kv_head, i.row0));
+            } else {
+                items.sort_by_key(|i| (split && !i.direct(), std::cmp::Reverse(i.total)));
+            }
             let first =
                 if split { items.iter().filter(|i| i.direct()).count() } else { items.len() };
             let start = plan.items.len();
@@ -839,6 +883,27 @@ impl Builder {
             }
         }
     }
+}
+
+/// Cells a piece of the prompt kernel costs besides its cells: loading the queries, writing
+/// a partial state and merging it (a guess of the order: about two chunks).
+const PIECE_OVERHEAD_CELLS: u64 = 64;
+
+/// Pieces per tile for `tiles` tiles of the prompt kernel over `cells` cells in all, each
+/// read for `heads` KV heads by blocks of which `blocks` run at once: the count of at most
+/// `most` that takes the fewest waves times the cells of a piece (and its overhead), the
+/// smallest of equals.
+fn prompt_pieces(tiles: u32, cells: u64, heads: u32, blocks: u32, most: u32) -> u32 {
+    if tiles == 0 {
+        return 1;
+    }
+    let units = u64::from(tiles) * u64::from(heads.max(1));
+    let avg = cells.div_ceil(u64::from(tiles));
+    let cost = |p: u32| -> u64 {
+        let waves = (units * u64::from(p)).div_ceil(u64::from(blocks.max(1)));
+        waves * (avg.div_ceil(u64::from(p)) + PIECE_OVERHEAD_CELLS)
+    };
+    (1..=most.max(1)).min_by_key(|&p| (cost(p), p)).unwrap_or(1)
 }
 
 /// Rows per tile of a window: all of them while the vectors fit a decode shape (up to 48),
