@@ -54,6 +54,7 @@
 use ares_api::{Engine, GenerateRequest, Json, Prompt, Start, ThinkingFormat};
 
 use crate::error::ApiError;
+use crate::reply::{is_space, partial_suffix};
 use crate::wire::{Fields, Parsed, wrong_type};
 
 /// The members of a request body that are about thinking.
@@ -436,10 +437,6 @@ struct Layout {
     seed: String,
 }
 
-fn is_space(c: char) -> bool {
-    c.is_ascii_whitespace()
-}
-
 impl Splitter {
     /// Everything is content: a request without thinking.
     pub fn plain() -> Self {
@@ -622,16 +619,6 @@ impl Splitter {
         split.reasoning.push_str(piece);
         self.buffer.drain(..len);
     }
-}
-
-/// The length of the longest suffix of `text` that is a proper prefix of
-/// `pattern`: what may still become `pattern`.
-fn partial_suffix(text: &str, pattern: &str) -> usize {
-    (1..pattern.len().min(text.len() + 1))
-        .rev()
-        .filter(|len| pattern.is_char_boundary(*len) && text.is_char_boundary(text.len() - len))
-        .find(|len| text.ends_with(&pattern[..*len]))
-        .unwrap_or(0)
 }
 
 /// How much of the start of `text` is the white space of `layout`, which

@@ -87,5 +87,21 @@ impl Sorter {
     }
 }
 
+/// The length of the longest suffix of `text` that is a proper prefix of
+/// `pattern`: what may still become `pattern`, and what a splitter holds
+/// back for the next piece.
+pub(crate) fn partial_suffix(text: &str, pattern: &str) -> usize {
+    (1..pattern.len().min(text.len() + 1))
+        .rev()
+        .filter(|len| pattern.is_char_boundary(*len) && text.is_char_boundary(text.len() - len))
+        .find(|len| text.ends_with(&pattern[..*len]))
+        .unwrap_or(0)
+}
+
+/// The white space a template writes around its tags.
+pub(crate) fn is_space(c: char) -> bool {
+    c.is_ascii_whitespace()
+}
+
 #[cfg(test)]
 mod tests;

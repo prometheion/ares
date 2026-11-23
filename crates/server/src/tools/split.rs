@@ -30,6 +30,8 @@ use ares_api::ToolFormat;
 use ares_grammar::calls::ValueTypes;
 use serde_json::Value;
 
+use crate::reply::{is_space, partial_suffix};
+
 /// What a splitter found in a piece of the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Part {
@@ -85,20 +87,6 @@ enum State {
     Json,
     /// In a value that is a string or JSON: it is read whole, then told.
     Either(ValueTypes),
-}
-
-fn is_space(c: char) -> bool {
-    c.is_ascii_whitespace()
-}
-
-/// The length of the longest suffix of `text` that is a proper prefix of
-/// `pattern`: what may still become `pattern`.
-fn partial_suffix(text: &str, pattern: &str) -> usize {
-    (1..pattern.len().min(text.len() + 1))
-        .rev()
-        .filter(|len| pattern.is_char_boundary(*len) && text.is_char_boundary(text.len() - len))
-        .find(|len| text.ends_with(&pattern[..*len]))
-        .unwrap_or(0)
 }
 
 /// `text` as the inside of a JSON string.
