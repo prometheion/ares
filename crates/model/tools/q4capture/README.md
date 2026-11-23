@@ -18,8 +18,8 @@ with a table of 424 rows. The fork loads it as it is.
 
 ```sh
 W=/var/tmp/ares-q4capture
-T=~/Services/Engine/crates/model/tools/q4capture
-L=~/Services/llama.cpp-native    # built, read only
+T=$HOME/Services/Engine/crates/model/tools/q4capture
+L=$HOME/Services/llama.cpp-native    # built, read only
 mkdir -p $W/build $W/synth
 ```
 

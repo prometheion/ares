@@ -21,7 +21,7 @@ import re
 import subprocess
 import sys
 
-DEFAULT_HEADER = "~/Services/llama.cpp-native/ggml/src/ggml-common.h"
+DEFAULT_HEADER = os.path.expanduser("~/Services/llama.cpp-native/ggml/src/ggml-common.h")
 
 # (name in the header, name in Rust, doc comment). Order is the order in the output.
 WANTED = [

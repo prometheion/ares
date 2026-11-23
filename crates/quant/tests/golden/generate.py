@@ -76,7 +76,7 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LIB = "~/Services/llama.cpp-native/build/bin/libggml-base.so"
+DEFAULT_LIB = os.path.expanduser("~/Services/llama.cpp-native/build/bin/libggml-base.so")
 SEED = 20261109
 
 # ggml_type ids that have a fixture (decoding).

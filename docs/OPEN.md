@@ -10,7 +10,7 @@ measurements that are owed; what a feature must do in detail is in
 42 partly, 88 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out
 of date: reasoning is built, and `q7` to `q4` run in the 27B).
 
-GPU work runs on the test machine `admin@test-machine` (RTX 4060 Ti 16 GB, gpu-unlock) from
+GPU work runs on the test machine (RTX 4060 Ti 16 GB, gpu-unlock) from
 2026-11-22 on; the two local cards are production and are used only when a test needs two
 cards, with the owner told first.
 
@@ -1097,7 +1097,7 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       than CUDA today); the delta rule's f16 state rounded per row; the sampler's `-0.0`.
 
 ## Measurements owed on a quiet machine
-- [ ] On the test machine `admin@test-machine` (RTX 4060 Ti 16 GB with gpu-unlock, 62 GB RAM, a
+- [ ] On the test machine (RTX 4060 Ti 16 GB with gpu-unlock, 62 GB RAM, a
       Samsung 990, Strata 0.2.15 installed, good internet for downloads): Flash-Next against Strata
       with the same file (UD-Q3_K_XL there), a large RAM tier, one card of another class.
 - [ ] Real models with 1, 2 and 4 concurrent clients against the fork and Strata (Strata saw four

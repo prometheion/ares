@@ -11,9 +11,9 @@ found no CUDA device; that is the point.)
 
 ```sh
 W=/var/tmp/ares-model-capture                  # about 0.8 GB for all runs below
-T=~/Services/Engine/crates/model/tools/capture
-L=~/Services/llama.cpp-native  # built, read only
-M=~/Services/models/test-small/Qwen3.5-0.8B-Q4_K_M.gguf
+T=$HOME/Services/Engine/crates/model/tools/capture
+L=$HOME/Services/llama.cpp-native  # built, read only
+M=$HOME/Services/models/test-small/Qwen3.5-0.8B-Q4_K_M.gguf
 mkdir -p $W/build
 ```
 
@@ -81,7 +81,7 @@ and `FLASH_ATTN_EXT`.
 ## 4. Comparison
 
 ```sh
-export CARGO_TARGET_DIR=~/Services/Engine/target/agent-model
+export CARGO_TARGET_DIR=$HOME/Services/Engine/target/agent-model
 cargo build --release -p ares-model --example compare
 C=$CARGO_TARGET_DIR/release/examples/compare
 $C $M $W/english/base [--all-logits]         # reference against llama.cpp
@@ -92,7 +92,7 @@ The tests that use these files skip with a message unless the variables are set:
 
 ```sh
 ARES_TEST_QWEN35_MODEL=$M ARES_TEST_QWEN35_CAPTURE=$W \
-ARES_TEST_QWEN35_27B=~/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_S.gguf \
+ARES_TEST_QWEN35_27B=$HOME/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_S.gguf \
   cargo test --release -p ares-model --test real_models
 ```
 

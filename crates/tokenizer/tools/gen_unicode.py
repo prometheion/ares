@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-DEFAULT_SOURCE = "~/Services/llama.cpp-native/src/unicode-data.cpp"
+DEFAULT_SOURCE = os.path.expanduser("~/Services/llama.cpp-native/src/unicode-data.cpp")
 
 # Flag bits of llama.cpp's `unicode_cpt_flags` for the categories.
 NUMBER, LETTER, SEPARATOR, MARK, PUNCTUATION, SYMBOL, CONTROL, UNDEFINED = 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x1

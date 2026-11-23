@@ -7,8 +7,8 @@ workspace member (it has its own `[workspace]`); it builds against
 
 ```sh
 W=/var/tmp/kvreal-data                       # any directory with ~1.5 GB free
-T=~/Services/Engine/crates/quant/tools/kv_real
-L=~/Services/llama.cpp-native   # built, read only
+T=$HOME/Services/Engine/crates/quant/tools/kv_real
+L=$HOME/Services/llama.cpp-native   # built, read only
 mkdir -p $W/q08 $W/q27b $W/corpus $W/build
 ```
 
@@ -40,14 +40,14 @@ attention output, for `validate`) and `tokens.txt`.
 ```sh
 # Qwen3.5-0.8B, all 6 attention layers (~430 MB, 15 s)
 KVCAP_OUT=$W/q08 CUDA_VISIBLE_DEVICES="" nice -n 10 $W/build/kv-capture \
-  -m ~/Services/models/test-small/Qwen3.5-0.8B-Q4_K_M.gguf \
+  -m $HOME/Services/models/test-small/Qwen3.5-0.8B-Q4_K_M.gguf \
   -f $W/corpus/prompt.txt -ngl 0 -dev none -t 6 -c 4096 -b 4096 -ub 512
 
 # Qwen3.8-27B, layers 3,15,31,47,63 of 16 (~1.0 GB, 6 min; needs ~20 GiB RAM
 # available because the model is mapped)
 KVCAP_OUT=$W/q27b KVCAP_LAYERS=3,15,31,47,63 CUDA_VISIBLE_DEVICES="" nice -n 10 \
   $W/build/kv-capture \
-  -m ~/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_S.gguf \
+  -m $HOME/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_S.gguf \
   -f $W/corpus/prompt.txt -ngl 0 -dev none -t 6 -c 4096 -b 4096 -ub 512
 
 cp $T/corpus/segments.txt $W/q08/ ; cp $T/corpus/segments.txt $W/q27b/
