@@ -11,6 +11,7 @@
 use ares_api::Usage;
 use serde::Serialize;
 
+use crate::answer::Written;
 use crate::reply::Piece;
 
 /// What every thinking block of a reply carries as its signature, unless the
@@ -401,9 +402,6 @@ impl Head {
         ("message_start", data)
     }
 }
-
-/// An event of a stream as it is written: the name and the data.
-pub(crate) type Written = (&'static str, String);
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

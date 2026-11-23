@@ -15,6 +15,7 @@ use ares_api::{Json, Usage};
 use serde::{Serialize, Serializer};
 
 use super::request::Echo;
+use crate::answer::Written;
 use crate::bridge::Timings;
 use crate::error::ApiError;
 use crate::reply::Piece;
@@ -391,9 +392,6 @@ struct ResponseBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     timings: Option<TimingsBody>,
 }
-
-/// An event of a stream as it is written: the name and the data.
-pub(crate) type Written = (&'static str, String);
 
 /// What an event says, next to its type and its number.
 #[derive(Serialize)]

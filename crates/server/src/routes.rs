@@ -242,7 +242,7 @@ pub(crate) async fn chat_input_tokens(State(app): State<App>, request: Request) 
 async fn try_chat_input_tokens(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
     let mut parsed = wire::parse(Endpoint::Chat, &body, next_request_id())?;
-    let (_, lease) = prepare(&app, &mut parsed, None).await?;
+    let (_, lease) = prepare(&app, &mut parsed, None, "chat").await?;
     let tokens = count_prompt(&lease, parsed.request).await?;
     Ok(json_response(wire::input_tokens(tokens)))
 }
@@ -289,24 +289,25 @@ pub(crate) async fn method_not_allowed(request: Request) -> ApiError {
 /// template, the rule of the reply), and returns what sorts the text of its
 /// reply with the hold on the model. `format` is how the reasoning is
 /// returned when the request does not say; `None`: as the model's own
-/// options say.
+/// options say. `api` names the API the body was written for, in the log.
 pub(crate) async fn prepare(
     app: &App,
     parsed: &mut Parsed,
     format: Option<ReasoningFormat>,
+    api: &'static str,
 ) -> Result<(Sorter, Lease), ApiError> {
     let lease = model_of(app, &mut parsed.request.model).await?;
     lease.defaults().apply(parsed);
     let format = format.unwrap_or(lease.reasoning_format());
     let thinking = reasoning::apply(parsed, &**lease.engine(), format)?;
     let calls = tools::apply(parsed, &**lease.engine(), &thinking)?;
-    log_request(app, parsed);
+    log_request(app, parsed, api);
     Ok((Sorter::new(thinking.splitter, calls), lease))
 }
 
-/// The line of the log for a request that is taken: its parameters as the
-/// engine gets them, and its prompt with `--log-text`.
-fn log_request(app: &App, parsed: &Parsed) {
+/// The line of the log for a request that is taken: its API, its parameters
+/// as the engine gets them, and its prompt with `--log-text`.
+fn log_request(app: &App, parsed: &Parsed, api: &'static str) {
     let request = &parsed.request;
     let sampling = &request.sampling;
     let (tools, continues) = match &request.prompt {
@@ -318,6 +319,7 @@ fn log_request(app: &App, parsed: &Parsed) {
     tracing::info!(
         id = %request.id,
         model = %request.model,
+        api,
         stream = parsed.stream,
         n = parsed.n,
         max_tokens = ?request.max_tokens,
@@ -488,7 +490,7 @@ async fn try_completion(
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
     parsed.take_priority(priority.as_ref())?;
-    let (sorter, lease) = prepare(&app, &mut parsed, None).await?;
+    let (sorter, lease) = prepare(&app, &mut parsed, None, endpoint.api()).await?;
     let mut head = Head::new(endpoint, id, &parsed.request.model);
     head.logprobs = parsed.logprobs;
 

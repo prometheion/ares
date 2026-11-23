@@ -39,6 +39,14 @@ impl Endpoint {
             Endpoint::Completions => "cmpl",
         }
     }
+
+    /// The API, as the log names it.
+    pub(crate) fn api(self) -> &'static str {
+        match self {
+            Endpoint::Chat => "chat",
+            Endpoint::Completions => "completions",
+        }
+    }
 }
 
 /// How the probabilities a request asked for are written in the answer.

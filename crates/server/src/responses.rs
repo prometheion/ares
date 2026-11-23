@@ -125,26 +125,22 @@ mod request;
 mod tests;
 
 use std::collections::VecDeque;
-use std::convert::Infallible;
-use std::time::Duration;
 
 use ares_api::{Prompt, RequestId};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode};
-use axum::response::sse::{Event as SseEvent, KeepAlive};
+use axum::response::sse::KeepAlive;
 use axum::response::{IntoResponse, Response};
 
-use self::reply::{Ending, Head, Output, Written, change_events, error_event};
+use self::reply::{Ending, Head, Output, change_events, error_event};
 use self::request::Echo;
 use crate::ReasoningFormat;
+use crate::answer::{Writer, Written, answer};
 use crate::chat_body::Purpose;
 use crate::error::ApiError;
 use crate::models::Lease;
-use crate::reply::Sorter;
-use crate::routes::{
-    self, App, End, Reply, Step, json_response, next_request_id, read_body, sse_response,
-    with_limit,
-};
+use crate::reply::{Piece, Sorter};
+use crate::routes::{self, App, End, json_response, next_request_id, read_body};
 use crate::wire::{self, Endpoint, Parsed};
 
 /// `POST /v1/responses`.
@@ -198,9 +194,10 @@ async fn read(
     let (chat, mut echo) = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
     parsed.take_priority(priority)?;
-    let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
-        .await
-        .map_err(request::renamed)?;
+    let (sorter, lease) =
+        routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto), "responses")
+            .await
+            .map_err(request::renamed)?;
     echo.applied(&parsed.request);
     if echo.truncation == "auto" {
         truncate(&mut parsed, &lease).await?;
@@ -286,23 +283,8 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
         created_at: wire::unix_time(),
         echo,
     };
-    tracing::info!(
-        %id,
-        model = %parsed.request.model,
-        endpoint = "Responses",
-        stream = parsed.stream,
-        max_tokens = ?parsed.request.max_tokens,
-        priority = parsed.request.priority,
-        "request"
-    );
-    let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
-    let output = Output::new(id.to_string());
-    let response = if parsed.stream {
-        stream(reply, head, output, app.config.stream_wait).await
-    } else {
-        whole(reply, head, output).await
-    };
-    Ok(with_limit(response?, parsed.lowered))
+    let writer = Created { head, output: Output::new(id.to_string()), sequence: 0 };
+    answer(&app, &lease, parsed, sorter, writer, KeepAlive::default()).await
 }
 
 /// Counts the prompt of a request and generates nothing: the body is read
@@ -314,107 +296,60 @@ async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     Ok(json_response(wire::input_tokens(tokens)))
 }
 
-/// The answer that is not streamed: the response object.
-async fn whole(mut reply: Reply, head: Head, mut output: Output) -> Result<Response, ApiError> {
-    loop {
-        match reply.next().await? {
-            Step::Pieces(pieces) => {
-                output.push(pieces);
-            }
-            // The probabilities of tokens are not served on this route.
-            Step::Probs(_) => {}
-            Step::End(End { rest, finish, usage, timings, .. }) => {
-                let ending = Ending { finish, usage, timings };
-                output.push(rest);
-                output.finish(ending.cut());
-                return Ok(json_response(head.response(output.items(), &ending)));
-            }
-        }
-    }
-}
-
-/// The streamed answer: `response.created`, `response.in_progress`, the
-/// events of the items, and `response.completed` or `response.incomplete`
-/// with the response as it is returned whole.
-///
-/// As on the chat route the response starts when the engine has produced its
-/// first step, so that a request the engine refuses gets an HTTP status, or
-/// when `wait` has passed without it (`Reply::first`). A failure after the
-/// start is an `error` event, and the stream ends with it.
-async fn stream(
-    mut reply: Reply,
-    head: Head,
-    output: Output,
-    wait: Duration,
-) -> Result<Response, ApiError> {
-    let first = reply.first(wait).await?;
-    let mut sequence = 0;
-    let queue = VecDeque::from(head.begin(&mut sequence));
-    let state = Events { reply, head, output, queue, next: first, sequence, over: false };
-    let events = futures_util::stream::unfold(state, |mut state| async move {
-        let (name, data) = state.step().await?;
-        Some((Ok::<_, Infallible>(SseEvent::default().event(name).data(data)), state))
-    });
-    Ok(sse_response(events, KeepAlive::default()))
-}
-
-/// The state of a stream.
+/// A Responses reply as it is written: the events of its items, or the
+/// response whole.
 #[derive(Debug)]
-struct Events {
-    reply: Reply,
+struct Created {
     head: Head,
     output: Output,
-    /// Events that are ready and have not gone out.
-    queue: VecDeque<Written>,
-    /// A step of the reply that has come and is not written yet.
-    next: Option<Step>,
     /// The number of the next event.
     sequence: u64,
-    over: bool,
 }
 
-impl Events {
-    /// The next event, or `None` when the stream is over. Dropping the
-    /// stream half way drops the reply, which cancels the request in the
-    /// engine.
-    async fn step(&mut self) -> Option<Written> {
-        loop {
-            if let Some(event) = self.queue.pop_front() {
-                return Some(event);
-            }
-            if self.over {
-                return None;
-            }
-            let step = match self.next.take() {
-                Some(step) => Ok(step),
-                None => self.reply.next().await,
-            };
-            match step {
-                Ok(Step::Pieces(pieces)) => {
-                    let changes = self.output.push(pieces);
-                    self.write(&changes);
-                }
-                Ok(Step::Probs(_)) => {}
-                Ok(Step::End(End { rest, finish, usage, timings, .. })) => {
-                    let ending = Ending { finish, usage, timings };
-                    let mut changes = self.output.push(rest);
-                    changes.extend(self.output.finish(ending.cut()));
-                    self.write(&changes);
-                    let end = self.head.end(self.output.items(), &ending, &mut self.sequence);
-                    self.queue.push_back(end);
-                    self.over = true;
-                }
-                Err(error) => {
-                    self.over = true;
-                    return Some(error_event(&error, &mut self.sequence));
-                }
-            }
-        }
+impl Created {
+    /// Takes the end of the reply into the output: what the sorter still
+    /// held, and what the end closes.
+    fn close(&mut self, end: End) -> (Ending, Vec<reply::Change>) {
+        let End { rest, finish, usage, timings, .. } = end;
+        let ending = Ending { finish, usage, timings };
+        let mut changes = self.output.push(rest);
+        changes.extend(self.output.finish(ending.cut()));
+        (ending, changes)
     }
 
-    fn write(&mut self, changes: &[reply::Change]) {
+    fn write(&mut self, changes: &[reply::Change], out: &mut VecDeque<Written>) {
         for change in changes {
-            change_events(&self.output, change, &mut self.sequence, &mut self.queue);
+            change_events(&self.output, change, &mut self.sequence, out);
         }
+    }
+}
+
+impl Writer for Created {
+    fn begin(&mut self, out: &mut VecDeque<Written>) {
+        out.extend(self.head.begin(&mut self.sequence));
+    }
+
+    fn pieces(&mut self, pieces: Vec<Piece>, out: &mut VecDeque<Written>) {
+        let changes = self.output.push(pieces);
+        self.write(&changes, out);
+    }
+
+    fn end(&mut self, end: End, out: &mut VecDeque<Written>) {
+        let (ending, changes) = self.close(end);
+        self.write(&changes, out);
+        out.push_back(self.head.end(self.output.items(), &ending, &mut self.sequence));
+    }
+
+    fn error(&mut self, error: &ApiError) -> Written {
+        error_event(error, &mut self.sequence)
+    }
+
+    fn take(&mut self, pieces: Vec<Piece>) {
+        self.output.push(pieces);
+    }
+
+    fn whole(mut self, end: End) -> String {
+        let (ending, _) = self.close(end);
+        self.head.response(self.output.items(), &ending)
     }
 }

@@ -228,7 +228,7 @@ async fn chat_prompt(
         members.push(("model".to_owned(), Json::String(id)));
     }
     let mut parsed = wire::from_json(Endpoint::Chat, &Json::Object(members), next_request_id())?;
-    let (_, lease) = prepare(app, &mut parsed, None).await?;
+    let (_, lease) = prepare(app, &mut parsed, None, "chat").await?;
     Ok((lease, parsed.request.prompt, parsed.request.model))
 }
 

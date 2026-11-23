@@ -120,8 +120,6 @@ mod request;
 mod tests;
 
 use std::collections::VecDeque;
-use std::convert::Infallible;
-use std::time::Duration;
 
 use ares_api::RequestId;
 use axum::extract::{Request, State};
@@ -129,16 +127,14 @@ use axum::http::HeaderValue;
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{IntoResponse, Response};
 
-use self::reply::{Blocks, Content, Head, Written, block_event, stop_reason};
+use self::reply::{BlockEvent, Blocks, Content, Head, block_event, stop_reason};
 use crate::ReasoningFormat;
+use crate::answer::{Writer, Written, answer};
 use crate::chat_body::Purpose;
 use crate::error::{Anthropic, ApiError};
 use crate::models::Lease;
-use crate::reply::Sorter;
-use crate::routes::{
-    self, App, End, Reply, Step, json_response, next_request_id, read_body, sse_response,
-    with_limit,
-};
+use crate::reply::{Piece, Sorter};
+use crate::routes::{self, App, End, json_response, next_request_id, read_body};
 use crate::wire::{self, Endpoint, Parsed};
 
 /// `POST /v1/messages`.
@@ -179,9 +175,10 @@ async fn read(
     let (chat, asked) = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
     parsed.take_priority(priority)?;
-    let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
-        .await
-        .map_err(request::renamed)?;
+    let (sorter, lease) =
+        routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto), "messages")
+            .await
+            .map_err(request::renamed)?;
     let edits = match &asked.edits {
         Some(edits) => Some(edits::apply(edits, &asked.turns, &mut parsed, &lease).await?),
         None => None,
@@ -212,23 +209,9 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
         model: parsed.request.model.clone(),
         edits: edits.map(|outcome| outcome.applied),
     };
-    tracing::info!(
-        %id,
-        model = %parsed.request.model,
-        endpoint = "Messages",
-        stream = parsed.stream,
-        max_tokens = ?parsed.request.max_tokens,
-        priority = parsed.request.priority,
-        "request"
-    );
-    let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
-    let blocks = Blocks::new(omit_thinking);
-    let response = if parsed.stream {
-        stream(reply, head, blocks, app.config.stream_wait).await
-    } else {
-        whole(reply, head, blocks).await
-    };
-    Ok(with_limit(response?, parsed.lowered))
+    let writer = Message { head, blocks: Blocks::new(omit_thinking), content: Content::default() };
+    let ping = SseEvent::default().event("ping").data(reply::PING);
+    answer(&app, &lease, parsed, sorter, writer, KeepAlive::new().event(ping)).await
 }
 
 /// Counts the prompt of a request and generates nothing: the body is read
@@ -249,104 +232,58 @@ async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     }))
 }
 
-/// The answer that is not streamed: the events of the blocks, put together.
-async fn whole(mut reply: Reply, head: Head, mut blocks: Blocks) -> Result<Response, ApiError> {
-    let mut content = Content::default();
-    loop {
-        match reply.next().await? {
-            Step::Pieces(pieces) => content.take(blocks.push(pieces)),
-            // This API has no field that asks for them.
-            Step::Probs(_) => {}
-            Step::End(End { rest, finish, stop, usage, .. }) => {
-                content.take(blocks.push(rest));
-                content.take(blocks.finish());
-                let reason = stop_reason(finish, blocks.calls(), stop.as_deref());
-                return Ok(json_response(head.message(&content, reason, stop.as_deref(), usage)));
-            }
-        }
+/// A Messages reply as it is written: the events of its blocks, or the
+/// message whole.
+#[derive(Debug)]
+struct Message {
+    head: Head,
+    blocks: Blocks,
+    /// The blocks of a message that is answered whole.
+    content: Content,
+}
+
+impl Message {
+    /// The blocks the end of the reply closes, and its stop reason.
+    fn close(
+        &mut self,
+        rest: Vec<Piece>,
+        finish: &str,
+        stop: Option<&str>,
+    ) -> (Vec<BlockEvent>, &'static str) {
+        let mut events = self.blocks.push(rest);
+        events.extend(self.blocks.finish());
+        (events, stop_reason(finish, self.blocks.calls(), stop))
     }
 }
 
-/// The streamed answer: `message_start`, the events of the blocks,
-/// `message_delta` and `message_stop`.
-///
-/// As on the chat route the response starts when the engine has produced its
-/// first step, so that a request the engine refuses gets an HTTP status, or
-/// when `wait` has passed without it (`Reply::first`): then `message_start`
-/// and the pings go out while the prompt is computed. A failure after the
-/// start is an `error` event, and the stream ends without `message_stop`.
-async fn stream(
-    mut reply: Reply,
-    head: Head,
-    blocks: Blocks,
-    wait: Duration,
-) -> Result<Response, ApiError> {
-    let first = reply.first(wait).await?;
-    let state = Events {
-        reply,
-        blocks,
-        queue: VecDeque::from([head.message_start()]),
-        head,
-        next: first,
-        over: false,
-    };
-    let events = futures_util::stream::unfold(state, |mut state| async move {
-        let (name, data) = state.step().await?;
-        Some((Ok::<_, Infallible>(SseEvent::default().event(name).data(data)), state))
-    });
-    let ping = SseEvent::default().event("ping").data(reply::PING);
-    Ok(sse_response(events, KeepAlive::new().event(ping)))
-}
+impl Writer for Message {
+    fn begin(&mut self, out: &mut VecDeque<Written>) {
+        out.push_back(self.head.message_start());
+    }
 
-/// The state of a stream.
-#[derive(Debug)]
-struct Events {
-    reply: Reply,
-    blocks: Blocks,
-    head: Head,
-    /// Events that are ready and have not gone out.
-    queue: VecDeque<Written>,
-    /// A step of the reply that has come and is not written yet.
-    next: Option<Step>,
-    over: bool,
-}
+    fn pieces(&mut self, pieces: Vec<Piece>, out: &mut VecDeque<Written>) {
+        out.extend(self.blocks.push(pieces).iter().map(block_event));
+    }
 
-impl Events {
-    /// The next event, or `None` when the stream is over. Dropping the
-    /// stream half way drops the reply, which cancels the request in the
-    /// engine.
-    async fn step(&mut self) -> Option<Written> {
-        loop {
-            if let Some(event) = self.queue.pop_front() {
-                return Some(event);
-            }
-            if self.over {
-                return None;
-            }
-            let step = match self.next.take() {
-                Some(step) => Ok(step),
-                None => self.reply.next().await,
-            };
-            match step {
-                Ok(Step::Pieces(pieces)) => {
-                    let events = self.blocks.push(pieces);
-                    self.queue.extend(events.iter().map(block_event));
-                }
-                Ok(Step::Probs(_)) => {}
-                Ok(Step::End(End { rest, finish, stop, usage, .. })) => {
-                    let mut events = self.blocks.push(rest);
-                    events.extend(self.blocks.finish());
-                    self.queue.extend(events.iter().map(block_event));
-                    let reason = stop_reason(finish, self.blocks.calls(), stop.as_deref());
-                    self.queue.extend(self.head.message_end(reason, stop.as_deref(), usage));
-                    self.over = true;
-                }
-                Err(error) => {
-                    self.over = true;
-                    let data = serde_json::to_string(&error.anthropic()).expect("errors serialize");
-                    return Some(("error", data));
-                }
-            }
-        }
+    fn end(&mut self, end: End, out: &mut VecDeque<Written>) {
+        let End { rest, finish, stop, usage, .. } = end;
+        let (events, reason) = self.close(rest, finish, stop.as_deref());
+        out.extend(events.iter().map(block_event));
+        out.extend(self.head.message_end(reason, stop.as_deref(), usage));
+    }
+
+    fn error(&mut self, error: &ApiError) -> Written {
+        ("error", serde_json::to_string(&error.anthropic()).expect("errors serialize"))
+    }
+
+    fn take(&mut self, pieces: Vec<Piece>) {
+        self.content.take(self.blocks.push(pieces));
+    }
+
+    fn whole(mut self, end: End) -> String {
+        let End { rest, finish, stop, usage, .. } = end;
+        let (events, reason) = self.close(rest, finish, stop.as_deref());
+        self.content.take(events);
+        self.head.message(&self.content, reason, stop.as_deref(), usage)
     }
 }
