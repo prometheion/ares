@@ -128,7 +128,7 @@ the row says otherwise. Two rounds each, alternating.
 | --- | --- | --- |
 | One request alone, German / English / code, tokens/s | 58-65 / 60-64 / 73-76 | 72-74 / 63-75 / 91-103 |
 | Two at once, sum while both run, tokens/s | 98 / 104-108 / 116-129 | 105-111 / 93-116 / 106-134 |
-| 3 / 4 / 8 at once, sum, tokens/s | 86-87 / 100-109 / 95-97 | 115 / 107 / 110 |
+| 3 / 4 / 8 at once, sum, tokens/s | 86-87 / 100-109 / 95-97 | 115 / 107 / 110 (the round on a quiet machine; 70 / 83 / 81 during other builds) |
 | 8 at once with `--parallel 8`, sum, tokens/s | | 204-206 |
 | 8 at once, slowest first token | 19.3 s | 17.6 s; 0.51 s with `--parallel 8` |
 | A short request beside two generations, first token | 24.5-25.8 s | 0.15-0.22 s with priority 0; 18-21 s at the same priority |
