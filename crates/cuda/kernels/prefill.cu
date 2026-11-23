@@ -1,8 +1,6 @@
 // The prefill module: the tensor-core weight kernels (mm.cuh) and what they
-// need. It is a module of its own, compiled only for compute capability 8.0 and
-// newer (see build.rs): the integer and f16 `mma` shapes and `cp.async` used
-// here start with Ampere, while the decode kernels in module.cu run on every
-// GPU the toolkit builds for.
+// need. It is a module of its own (see build.rs); the integer and f16 `mma`
+// shapes and `cp.async` used here start with Ampere.
 
 #include "common.cuh"
 #include "mm_types.cuh"

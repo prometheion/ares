@@ -1,71 +1,47 @@
-//! Compiles the CUDA kernels into two fat binaries that the crate embeds.
+//! Compiles the CUDA kernels into fat binaries that the crate embeds.
 //!
 //! The engine talks to the driver API only (`libcuda.so`, loaded at run
 //! time), so the CUDA toolkit is needed to build but not to run. `nvcc`
-//! produces machine code for the GPU generations listed in `ARCHS` (each only
-//! if the toolkit supports it) and PTX for the lowest compute capability the
-//! toolkit can target, which the driver compiles on first load for any GPU
-//! that has no exact match.
+//! produces machine code for the GPU classes the engine was tested on and for
+//! nothing else: no PTX, so no other GPU compiles the kernels on its first
+//! load and runs code nobody ran. The crate refuses a device of any other
+//! class when it opens it (`ares_cuda::BUILT_CLASSES`); such GPUs are to run
+//! through the Vulkan backend.
 //!
-//! How far down the engine reaches is decided by the toolkit that builds it:
-//! CUDA 13.4 lists `compute_75` (Turing) as its lowest target, so a build here
-//! gets PTX from 75 on, while a toolkit that still lists Pascal (`compute_61`)
-//! produces PTX that a GTX 10 card can use. Compute capability 6.1 is the
-//! floor, because the weight kernels use `__dp4a`; targets below it are not
-//! built, and there is no fallback code for GPUs the kernels cannot run on.
-//!
-//! The kernels are in two modules. `kernels/module.cu` has everything that runs
-//! on every GPU from compute capability 6.1: the small kernels and the decode
-//! weight kernels. `kernels/prefill.cu` has the tensor-core weight kernels for
-//! prompt processing, which use the `mma` shapes and `cp.async` of Ampere and
-//! are therefore built for compute capability 8.0 and newer only (PTX for the
-//! lowest such target the toolkit lists, 8.0 with CUDA 13.4). A GPU below that
-//! loads the first module and not the second; there are no prefill kernels
-//! for it and nothing stands in for them. The many-row expert kernels
-//! (`kernels/expertrows.cu` and `expertrows_{k,i,l,f}.cu`, which hold the kernels of the
-//! other weight types and are modules of their own so that they compile side by side) are
-//! built the same way and for the same reason, as is the image tower's module
-//! (`kernels/tower.cu`), whose attention uses the same instructions.
+//! The kernels are in several modules, each a fat binary of its own so that
+//! they compile side by side: `kernels/module.cu` (the small kernels and the
+//! decode weight kernels), `kernels/prefill.cu` and `prefill_more.cu` (the
+//! tensor-core weight kernels), the many-row expert kernels
+//! (`kernels/expertrows.cu` and `expertrows_{k,i,l,f}.cu`), the image tower's
+//! module (`kernels/tower.cu`) and the others below. Every module is built for
+//! the same classes.
 //!
 //! Environment:
 //! - `NVCC`: path of the compiler (default: `$CUDA_PATH/bin/nvcc`,
 //!   `$CUDA_HOME/bin/nvcc`, `nvcc` on `PATH`, `/opt/cuda/bin/nvcc`,
 //!   `/usr/local/cuda/bin/nvcc`).
 //! - `ARES_CUDA_ARCHS`: comma-separated compute capabilities to build
-//!   machine code for, for example `86,89` (default: every entry of `ARCHS`
-//!   the compiler supports). Fewer entries build faster.
+//!   machine code for, for example `86,89,120` (default: `TESTED`). A
+//!   developer names a class here to build it on purpose: every named class is
+//!   built, the build says which of them are untested, and a class the toolkit
+//!   does not list, or one below Ampere (`AMPERE`), is an error.
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Compute capabilities that get their own machine code, each only if the
-/// toolkit supports it. Machine code runs on a newer device only within the
-/// same major version, so every major version CUDA 13 knows has an entry:
-/// 75 is Turing (GTX 16, RTX 20), the oldest generation CUDA 13.4 can
-/// target; 80 is the first Ampere (A100) and runs on every 8.x; 86 (RTX 30)
-/// and 89 (RTX 40) get their own code because the kernels are tuned per
-/// class; 90 is Hopper; 100 and 110 are the data-centre Blackwell families
-/// (100 also runs on 10.3 and 10.7); 120 is RTX 50 (and runs on 12.1). Only
-/// 86 and 89 have been run; the others are compiled and untested. A build for
-/// one machine can name its own classes in `ARES_CUDA_ARCHS`.
-const ARCHS: &[u32] = &[75, 80, 86, 89, 90, 100, 110, 120];
+/// The compute capabilities the engine was run and tuned on, and the default
+/// build: 86 is Ampere (RTX 30), 89 is Ada (RTX 40). Machine code runs only on
+/// the class it was built for here: the crate refuses a device whose compute
+/// capability is not one of the built classes exactly, so 8.7 (Jetson Orin),
+/// which could run 8.6 code, is refused too.
+const TESTED: &[u32] = &[86, 89];
 
-/// The lowest compute capability the kernels are built for: the oldest
-/// generation CUDA 13 supports.
-const FLOOR: u32 = 75;
-
-/// The lowest compute capability of the prefill module: the integer
-/// `mma.m16n8k32`, the f16 `mma.m16n8k16` and `cp.async` start with Ampere.
-const TENSOR_FLOOR: u32 = 80;
-
-/// The lowest compute capability the toolkit lists that the kernels compile
-/// for as they are (`floor` and up): the PTX baseline. It is 75 for the first
-/// module and 80 for the second with CUDA 13.4, the toolkit of the development
-/// machine.
-fn baseline(supported: &[u32], floor: u32) -> Option<u32> {
-    supported.iter().copied().filter(|arch| *arch >= floor).min()
-}
+/// The lowest compute capability the kernels compile for: the tensor-core
+/// kernels use the integer and f16 `mma` shapes, `cp.async` and `ldmatrix` of
+/// Ampere.
+const AMPERE: u32 = 80;
 
 fn main() {
     println!("cargo:rerun-if-changed=kernels");
@@ -82,55 +58,40 @@ fn main() {
         )
     });
 
-    let supported = supported_archs(&nvcc);
-    let wanted: Vec<u32> = match env::var("ARES_CUDA_ARCHS") {
-        Ok(list) => list
-            .split(',')
-            .map(|a| {
-                a.trim().parse().unwrap_or_else(|_| panic!("ARES_CUDA_ARCHS: bad entry '{a}'"))
-            })
-            .collect(),
-        Err(_) => ARCHS.to_vec(),
-    };
-    // The two modules build side by side: each nvcc run is single-threaded and
-    // the prefill module is the slower one.
+    let archs = classes(&nvcc);
+    // The classes the crate runs, for `ares_cuda::BUILT_CLASSES`.
+    let list: Vec<String> =
+        archs.iter().map(|arch| format!("({}, {})", arch / 10, arch % 10)).collect();
+    fs::write(out_dir.join("classes.rs"), format!("&[{}]\n", list.join(", ")))
+        .expect("write classes.rs");
+
+    // The modules build side by side: each nvcc run is single-threaded.
     let modules = [
-        ("module.cu", "kernels.fatbin", FLOOR),
-        ("prefill.cu", "prefill.fatbin", TENSOR_FLOOR),
-        ("prefill_more.cu", "prefill_more.fatbin", TENSOR_FLOOR),
-        ("layers.cu", "layers.fatbin", FLOOR),
-        ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
-        ("experts.cu", "experts.fatbin", FLOOR),
-        ("expertrows.cu", "expertrows.fatbin", TENSOR_FLOOR),
-        ("expertrows_k.cu", "expertrows_k.fatbin", TENSOR_FLOOR),
-        ("expertrows_i.cu", "expertrows_i.fatbin", TENSOR_FLOOR),
-        ("expertrows_l.cu", "expertrows_l.fatbin", TENSOR_FLOOR),
-        ("expertrows_f.cu", "expertrows_f.fatbin", TENSOR_FLOOR),
-        ("q4.cu", "q4.fatbin", FLOOR),
-        ("q4_reads.cu", "q4_reads.fatbin", FLOOR),
-        ("mmv_exact.cu", "mmv_exact.fatbin", FLOOR),
-        ("tower.cu", "tower.fatbin", TENSOR_FLOOR),
-        ("sampler.cu", "sampler.fatbin", FLOOR),
-        ("dflash.cu", "dflash.fatbin", FLOOR),
+        ("module.cu", "kernels.fatbin"),
+        ("prefill.cu", "prefill.fatbin"),
+        ("prefill_more.cu", "prefill_more.fatbin"),
+        ("layers.cu", "layers.fatbin"),
+        ("attention.cu", "attention.fatbin"),
+        ("experts.cu", "experts.fatbin"),
+        ("expertrows.cu", "expertrows.fatbin"),
+        ("expertrows_k.cu", "expertrows_k.fatbin"),
+        ("expertrows_i.cu", "expertrows_i.fatbin"),
+        ("expertrows_l.cu", "expertrows_l.fatbin"),
+        ("expertrows_f.cu", "expertrows_f.fatbin"),
+        ("q4.cu", "q4.fatbin"),
+        ("q4_reads.cu", "q4_reads.fatbin"),
+        ("mmv_exact.cu", "mmv_exact.fatbin"),
+        ("tower.cu", "tower.fatbin"),
+        ("sampler.cu", "sampler.fatbin"),
+        ("dflash.cu", "dflash.fatbin"),
     ];
     let children: Vec<_> = modules
         .iter()
-        .map(|(source, fatbin, floor)| {
-            let Some(baseline) = baseline(&supported, *floor) else {
-                panic!(
-                    "{} lists no compute capability of {}.{} or newer for {source} (`--list-gpu-arch` \
-                     printed nothing usable); CUDA 13.0 or newer is needed",
-                    nvcc.display(),
-                    floor / 10,
-                    floor % 10
-                );
-            };
+        .map(|(source, fatbin)| {
             let mut cmd = Command::new(&nvcc);
-            cmd.args(["-fatbin", "-O3", "-std=c++17", "--no-exceptions", "-Wno-deprecated-gpu-targets"]);
+            cmd.args(["-fatbin", "-O3", "-std=c++17", "--no-exceptions"]);
             cmd.arg("-I").arg("kernels");
-            // PTX for the baseline: any GPU without exact machine code compiles it.
-            cmd.arg("-gencode").arg(format!("arch=compute_{baseline},code=compute_{baseline}"));
-            for arch in wanted.iter().filter(|a| supported.contains(a) && **a >= *floor) {
+            for arch in &archs {
                 cmd.arg("-gencode").arg(format!("arch=compute_{arch},code=sm_{arch}"));
             }
             cmd.arg("-o").arg(out_dir.join(fatbin)).arg(Path::new("kernels").join(source));
@@ -153,6 +114,54 @@ fn main() {
             );
         }
     }
+}
+
+/// The compute capabilities to build: `TESTED`, or what `ARES_CUDA_ARCHS`
+/// names. Each must be one the toolkit lists and at least `AMPERE`; each
+/// named class that is not tested gets a build warning.
+fn classes(nvcc: &Path) -> Vec<u32> {
+    let named = env::var("ARES_CUDA_ARCHS").ok();
+    let mut archs: Vec<u32> = match &named {
+        Some(list) => list
+            .split(',')
+            .map(|a| {
+                a.trim().parse().unwrap_or_else(|_| panic!("ARES_CUDA_ARCHS: bad entry '{a}'"))
+            })
+            .collect(),
+        None => TESTED.to_vec(),
+    };
+    archs.sort_unstable();
+    archs.dedup();
+    if archs.is_empty() {
+        panic!("ARES_CUDA_ARCHS names no compute capability");
+    }
+    let supported = supported_archs(nvcc);
+    let class_of = |arch: u32| format!("{}.{}", arch / 10, arch % 10);
+    let tested: Vec<String> = TESTED.iter().map(|arch| class_of(*arch)).collect();
+    for arch in &archs {
+        let class = class_of(*arch);
+        if *arch < AMPERE {
+            panic!(
+                "ARES_CUDA_ARCHS names {arch}: the kernels need Ampere (8.0) or newer; compute \
+                 capability {class} is to run through the Vulkan backend"
+            );
+        }
+        if !supported.contains(arch) {
+            panic!(
+                "{} does not list compute capability {class} (`--list-gpu-arch`); CUDA 13.0 or \
+                 newer is needed",
+                nvcc.display()
+            );
+        }
+        if !TESTED.contains(arch) {
+            println!(
+                "cargo:warning=building compute capability {class} as ARES_CUDA_ARCHS names it: \
+                 it is untested (the engine was tested on {})",
+                tested.join(", ")
+            );
+        }
+    }
+    archs
 }
 
 fn find_nvcc() -> Option<PathBuf> {

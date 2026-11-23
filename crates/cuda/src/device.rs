@@ -52,6 +52,57 @@ pub struct DeviceInfo {
     pub l2_cache_bytes: u32,
 }
 
+/// The GPU classes this build runs, as compute capabilities `(major, minor)`:
+/// those `build.rs` compiled machine code for. By default Ampere (8.6, RTX 30)
+/// and Ada (8.9, RTX 40), the classes the engine was tested on; a developer's
+/// build may name others in `ARES_CUDA_ARCHS`. A device of any other class is
+/// refused when it is opened ([`DeviceInfo::check_class`]).
+pub const BUILT_CLASSES: &[(u32, u32)] = include!(concat!(env!("OUT_DIR"), "/classes.rs"));
+
+impl DeviceInfo {
+    /// Whether this build runs the device: its compute capability is one of
+    /// [`BUILT_CLASSES`] exactly. A device of another class is refused with
+    /// [`Error::UntestedClass`], also where machine code of an older class
+    /// would run (8.6 code on an 8.7 Jetson Orin): nobody ran it there.
+    pub fn check_class(&self) -> Result<()> {
+        check_class(self, BUILT_CLASSES)
+    }
+}
+
+fn check_class(info: &DeviceInfo, built: &[(u32, u32)]) -> Result<()> {
+    if built.contains(&info.compute_capability) {
+        return Ok(());
+    }
+    let names: Vec<String> = built.iter().map(|class| class_name(*class)).collect();
+    let built = match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "no class".to_owned(),
+    };
+    Err(Error::UntestedClass {
+        ordinal: info.ordinal,
+        name: info.name.clone(),
+        major: info.compute_capability.0,
+        minor: info.compute_capability.1,
+        built,
+    })
+}
+
+/// A class in words: its generation and compute capability, and the cards of
+/// the classes the engine was or is to be tested on: "Ada (8.9, RTX 40)".
+fn class_name((major, minor): (u32, u32)) -> String {
+    let (generation, cards) = match (major, minor) {
+        (8, 6) => ("Ampere", ", RTX 30"),
+        (8, 9) => ("Ada", ", RTX 40"),
+        (12, 0) => ("Blackwell", ", RTX 50"),
+        (8, _) => ("Ampere", ""),
+        (9, _) => ("Hopper", ""),
+        (10..=12, _) => ("Blackwell", ""),
+        _ => return format!("compute capability {major}.{minor}"),
+    };
+    format!("{generation} ({major}.{minor}{cards})")
+}
+
 /// How a thread waits for the device when it synchronises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Wait {
@@ -229,9 +280,12 @@ thread_local! {
 
 impl Device {
     /// Opens device `ordinal`. `wait` chooses how threads wait for it.
+    /// Refused for a device of a class this build does not run
+    /// ([`DeviceInfo::check_class`]).
     pub fn open(ordinal: u32, wait: Wait) -> Result<Self> {
         let driver = driver()?;
         let (handle, info) = describe(driver, ordinal)?;
+        info.check_class()?;
         let flags = match wait {
             Wait::Spin => 1,
             Wait::Yield => 2,
@@ -311,5 +365,77 @@ impl Device {
             return Ok(());
         }
         driver.check("cuCtxEnablePeerAccess", code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(compute_capability: (u32, u32)) -> DeviceInfo {
+        DeviceInfo {
+            ordinal: 1,
+            name: "Test Card".to_owned(),
+            uuid: [0; 16],
+            compute_capability,
+            total_memory: 12 << 30,
+            pci: PciAddress { domain: 0, bus: 1, device: 0 },
+            multiprocessors: 46,
+            memory_bus_width_bits: 192,
+            memory_clock_khz: 10_501_000,
+            max_shared_per_block_optin: 101_376,
+            l2_cache_bytes: 36 << 20,
+        }
+    }
+
+    #[test]
+    fn only_the_built_classes_run() {
+        let built = [(8, 6), (8, 9)];
+        for runs in [(8, 6), (8, 9)] {
+            assert!(check_class(&card(runs), &built).is_ok(), "{runs:?}");
+        }
+        // 8.7 could run the 8.6 machine code, 8.0 and 12.0 are classes CUDA 13 builds for,
+        // 7.5 and 6.1 are below what the kernels compile for: none of them was tested.
+        for refused in [(8, 7), (8, 0), (8, 8), (12, 0), (12, 1), (9, 0), (7, 5), (6, 1)] {
+            let error = check_class(&card(refused), &built).unwrap_err();
+            assert!(matches!(error, Error::UntestedClass { .. }), "{refused:?}: {error:?}");
+        }
+        assert_eq!(
+            check_class(&card((8, 7)), &built).unwrap_err().to_string(),
+            "device 1 (Test Card) has compute capability 8.7, a class this build does not run: \
+             CUDA runs only on tested GPU classes, and this build has machine code for Ampere \
+             (8.6, RTX 30) and Ada (8.9, RTX 40). Other GPUs are to run through the Vulkan \
+             backend, which does not run models yet"
+        );
+    }
+
+    #[test]
+    fn a_class_named_in_the_build_runs_and_is_named_in_the_refusal() {
+        let built = [(8, 6), (8, 9), (12, 0)];
+        assert!(check_class(&card((12, 0)), &built).is_ok());
+        let message = check_class(&card((7, 5)), &built).unwrap_err().to_string();
+        assert!(
+            message.contains(
+                "machine code for Ampere (8.6, RTX 30), Ada (8.9, RTX 40) and Blackwell (12.0, \
+                 RTX 50)."
+            ),
+            "{message}"
+        );
+        let built = [(8, 0), (9, 0), (10, 3)];
+        let message = check_class(&card((8, 9)), &built).unwrap_err().to_string();
+        assert!(
+            message.contains("machine code for Ampere (8.0), Hopper (9.0) and Blackwell (10.3)."),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn this_build_runs_what_it_built() {
+        assert!(!BUILT_CLASSES.is_empty());
+        for class in BUILT_CLASSES {
+            assert!(card(*class).check_class().is_ok(), "{class:?}");
+        }
+        // Below Ampere nothing is built (`build.rs` refuses it).
+        assert!(card((7, 5)).check_class().is_err());
     }
 }

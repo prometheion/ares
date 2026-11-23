@@ -1,7 +1,7 @@
 // The attention module: writing K and V into the cache in the engine's own
-// formats, and attention that reads them natively. One fat binary (build.rs),
-// compute capability 8.0 and newer (cp.async, ldmatrix and the f16 mma of Ampere),
-// loaded by `AttentionKernels` (src/attention.rs).
+// formats, and attention that reads them natively, with cp.async, ldmatrix and the
+// f16 mma of Ampere. One fat binary (build.rs), loaded by `AttentionKernels`
+// (src/attention.rs).
 
 #include "common.cuh"
 #include "attn_codec.cuh"

@@ -1,7 +1,6 @@
 // The second prefill module: the tensor-core weight kernels (mm.cuh) of the types that
 // prefill.cu does not have, f16 and f16 with f16 accumulation only (mm_types_more.cuh).
-// Compiled for compute capability 8.0 and newer like prefill.cu; the Rust side
-// (src/kernels.rs) lists the same names.
+// The Rust side (src/kernels.rs) lists the same names.
 
 #include "common.cuh"
 #include "mm_shapes.cuh"

@@ -6,8 +6,9 @@
 //!
 //! - [`devices`] and [`peer_access`] describe the hardware without touching
 //!   device memory.
-//! - [`Device`] opens a device. [`DeviceBuffer`] and [`PinnedBuffer`] own
-//!   memory on it and next to it.
+//! - [`Device`] opens a device of a class this build runs ([`BUILT_CLASSES`]:
+//!   the tested ones; other GPUs are for the Vulkan backend). [`DeviceBuffer`]
+//!   and [`PinnedBuffer`] own memory on it and next to it.
 //! - [`Stream`] and [`Event`] order work on a device and between devices.
 //! - [`Kernels`] holds the engine's compiled kernels on a device;
 //!   [`TowerKernels`] those of the image tower besides its products.
@@ -42,7 +43,8 @@ pub use attention::{
     PlanBuffers, PlanConfig, PlanLayout, Planner,
 };
 pub use device::{
-    Device, DeviceInfo, MemInfo, PciAddress, Wait, device_count, devices, peer_access,
+    BUILT_CLASSES, Device, DeviceInfo, MemInfo, PciAddress, Wait, device_count, devices,
+    peer_access,
 };
 pub use dflash::{
     DFLASH_HEAD_DIM, DFLASH_MAX_BLOCK, DFLASH_MAX_RANK, DFLASH_MAX_TOP_K, DflashKernels,

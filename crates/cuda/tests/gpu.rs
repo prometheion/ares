@@ -82,7 +82,8 @@ fn describes_devices_without_opening_them() {
     for info in &infos {
         assert!(!info.name.is_empty());
         assert!(info.total_memory > 1 << 30, "{info:?}");
-        assert!(info.compute_capability.0 >= 7, "{info:?}");
+        // A class this build runs: the test opened every device.
+        info.check_class().unwrap();
         assert!(info.multiprocessors > 0, "{info:?}");
         assert_ne!(info.uuid, [0; 16]);
         // A device can always reach itself; the question is about peers.

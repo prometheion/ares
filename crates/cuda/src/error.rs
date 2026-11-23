@@ -13,6 +13,14 @@ pub enum Error {
     Driver { call: &'static str, code: i32, name: String, description: String },
     #[error("there is no CUDA device {ordinal} (the driver reports {count})")]
     NoSuchDevice { ordinal: u32, count: u32 },
+    /// The device is of a class this build has no machine code for
+    /// ([`crate::DeviceInfo::check_class`]); `built` names the classes it has.
+    #[error(
+        "device {ordinal} ({name}) has compute capability {major}.{minor}, a class this build \
+         does not run: CUDA runs only on tested GPU classes, and this build has machine code for \
+         {built}. Other GPUs are to run through the Vulkan backend, which does not run models yet"
+    )]
+    UntestedClass { ordinal: u32, name: String, major: u32, minor: u32, built: String },
     #[error("the kernel module has no function '{0}'")]
     NoSuchKernel(String),
     #[error("{what}: {detail}")]

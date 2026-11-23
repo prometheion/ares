@@ -45,8 +45,7 @@ static __device__ __forceinline__ float ares_half_at(const uint8_t* p) {
 }
 
 // c + the dot product of the four signed bytes of a with the four signed bytes
-// of b. `__dp4a` needs compute capability 6.1, the floor of the engine (see
-// build.rs): there is no code for older GPUs.
+// of b.
 static __device__ __forceinline__ int ares_dp4a(int a, int b, int c) {
     return __dp4a(a, b, c);
 }
