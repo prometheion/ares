@@ -6224,7 +6224,15 @@ wider than the parts' own scratch runs as a **pass**:
   is done, what a save at the end of a step at that position would hold.
   (`a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it`, `tests/prefix.rs`
   `checkpoints_inside_a_step_serve_a_later_prompt`.) The tail behind the last checkpoint that
-  is too close to the end is a step of its own as before.
+  is too close to the end is a step of its own as before. The places of the saves inside a
+  step are locked where a step's saves lock theirs, after the step's copies and before any
+  layer (`Resume::hold`): a lock of page-locked memory waits for the device's work, and between
+  two micro-batches of a pass on both devices that work spins on the other device's exchanges,
+  which wait for the thread that locks (the pass stood still, 30 s, and the engine failed).
+  Until the commit names them, the reserved places count among the locks the next record will
+  make (`Cache::pending_locks`), so that no other place is handed the same room of the limit;
+  they are taken before what leaves the devices is settled, since taking one may give other
+  checkpoints up.
 
 *Measured* (2026-11-23, local, the IQ2_XS file through the server, `--ram 8G`, `--context
 40960`, a fresh cache and no usage profile; a prompt of 17 000 tokens of this document with 64

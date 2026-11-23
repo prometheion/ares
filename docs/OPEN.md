@@ -438,6 +438,15 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       made-up image in every placement), a paused pass keeps its image rows and its place
       (it gives way neither to a shortage nor to a better priority), and the record's header
       grew to 44 words (images 38/39, the pause 40, what was asked 41, saves inside 42/43).
+      Found in the move: the GPU test of checkpoints inside a pass ran without them (its
+      model did not forward `saves_inside_steps`); with them, a pass on both devices could stand
+      still when a save locked its place's memory between two micro-batches (fixed: the places
+      are locked before the pass), and `real_cache`'s Flash-Next test at `--ram 8G` failed a
+      step when places reserved for saves inside a step were handed the same room of the limit
+      (fixed: they count as pending locks, and are taken before what leaves the devices is
+      settled). Open: in that test the second turn resumed from the cards (9827 of 9851 tokens
+      cached) takes 10.0 s against main's 2.6 s (from the drive after eviction 0.83 against
+      1.75 s, the cold turn 13.1 against 28.3 s); not looked into.
 - [ ] Passes, what is left: with both devices on every layer the MTP block's chains after a
       pass agree with the reference's for 1 to 3 links where after steps of the own rows 5 to 7
       (the trunk's tokens are the reference's): not found. Uploads of the next layer's
