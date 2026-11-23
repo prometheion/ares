@@ -495,13 +495,7 @@ impl Cache {
         let mut dropped = 0;
         while self.held() + self.bytes > self.allowance() && self.give_up_free(&mut dropped) {}
         let capacity = self.policy_now().capacity();
-        let in_ram = |cache: &Self| cache.in_ram.as_ref().map_or(0, |ram| ram.checkpoints());
-        while self.index.checkpoints() as u64 + in_ram(self) + 1 > capacity as u64 {
-            if !self.give_up_ram_checkpoint() && !self.give_up_index_checkpoint(false) {
-                break;
-            }
-            dropped += 1;
-        }
+        dropped += self.make_room_for_one();
         // No room for even one checkpoint now: none is taken.
         if capacity == 0 {
             return (None, dropped);
@@ -511,6 +505,22 @@ impl Cache {
             self.mark(place, true);
         }
         (place, dropped)
+    }
+
+    /// Gives checkpoints up until the index and RAM hold one fewer than the
+    /// budget allows, those of pages that left the devices before those of the
+    /// index; returns how many went.
+    fn make_room_for_one(&mut self) -> u32 {
+        let capacity = self.policy_now().capacity();
+        let in_ram = |cache: &Self| cache.in_ram.as_ref().map_or(0, |ram| ram.checkpoints());
+        let mut dropped = 0;
+        while self.index.checkpoints() as u64 + in_ram(self) + 1 > capacity as u64 {
+            if !self.give_up_ram_checkpoint() && !self.give_up_index_checkpoint(false) {
+                break;
+            }
+            dropped += 1;
+        }
+        dropped
     }
 
     /// A place for a checkpoint whose memory the limit of the books holds: a
@@ -535,7 +545,9 @@ impl Cache {
                 .last()
                 .copied()
                 .or_else(|| (self.next_place < self.capacity).then_some(self.next_place))?;
-            if books.unbooked() >= books.place_lock(place) + self.pending_locks() {
+            let mut places = self.pending_places();
+            places.push(place);
+            if books.unbooked() >= books.places_lock(&places) {
                 return match self.free_places.last() == Some(&place) {
                     true => self.free_places.pop(),
                     false => self.unused_place(),
@@ -548,13 +560,18 @@ impl Cache {
     }
 
     /// The bytes the devices will lock for the saves of the next record and
-    /// the saves inside a step reserved for it: the places they use whose
-    /// memory is not locked yet. Nothing else may book that room of the limit
-    /// before the record has run.
+    /// the saves inside a step reserved for it: the chunks of the places they
+    /// use whose memory is not locked yet, each once. Nothing else may book
+    /// that room of the limit before the record has run.
     fn pending_locks(&self) -> u64 {
         let Some(books) = &self.books else { return 0 };
-        let saves = self.saves.iter().map(|copy| copy.place);
-        saves.chain(self.reserved.iter().copied()).map(|place| books.place_lock(place)).sum()
+        books.places_lock(&self.pending_places())
+    }
+
+    /// The places of the next record's saves and of the saves inside a step
+    /// reserved for it.
+    fn pending_places(&self) -> Vec<u32> {
+        self.saves.iter().map(|copy| copy.place).chain(self.reserved.iter().copied()).collect()
     }
 
     /// A place never used so far, if there is one.
@@ -772,17 +789,21 @@ impl Cache {
             self.free(place);
             return Saved::default();
         }
+        // The places were taken before the step, when the index did not hold the saves
+        // inside it before this one: room is made now, as a save at a step's end makes it,
+        // so that a later save pushes an earlier one out as it would after a cut.
+        let dropped = self.make_room_for_one();
         match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
             Ok(_) => {
                 if root {
                     self.index.mark_root(hash);
                 }
                 self.placed.insert(place, hash);
-                Saved { taken: true, dropped: 0 }
+                Saved { taken: true, dropped }
             }
             Err(id) => {
                 self.free(id.0 as u32);
-                Saved::default()
+                Saved { taken: false, dropped }
             }
         }
     }

@@ -474,10 +474,16 @@ fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
     eprintln!("{plan:?}");
     let again = server.complete(&name, &first, 12);
     assert_eq!(again.text, one.text, "the first turn");
+    let replayed = server.metric("replayed_rows_total");
     let cards = server.complete(&name, &second, 12);
-    report("from the cards", &cards);
+    let replayed = server.metric("replayed_rows_total") - replayed;
+    report(&format!("from the cards ({replayed} rows replayed)"), &cards);
     assert_eq!(cards.text, cold.text, "the second turn from the cards");
     assert!(cards.cached_tokens > 4096, "{cards:?}");
+    // It goes on from the first turn's anchor (the last page boundary of its prompt), which a
+    // prompt read layer by layer saves inside its pass: at most a page and the reply are
+    // replayed, not the rows from an earlier checkpoint on.
+    assert!(replayed < 256, "{replayed} rows replayed for the second turn");
 
     // Two other conversations take the pool.
     for seed in 2..4 {

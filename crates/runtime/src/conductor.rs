@@ -768,6 +768,8 @@ pub(crate) struct Conductor {
     inner_due: Vec<(u32, u64)>,
     inner: Vec<crate::InnerSave>,
     paused_inner: Vec<crate::InnerSave>,
+    /// The checkpoints that were due inside the paused step's rows (with a place or not).
+    paused_due: Vec<(u32, u64)>,
     // Scratch that lives across steps so that a step allocates nothing for it.
     requests: Vec<Request>,
     parts: Vec<StepPart>,
@@ -917,6 +919,7 @@ impl Conductor {
             inner_due: Vec::new(),
             inner: Vec::new(),
             paused_inner: Vec::new(),
+            paused_due: Vec::new(),
             step_no: 0,
             after_idle: true,
             last_done_ns: None,
@@ -2313,10 +2316,13 @@ impl Conductor {
     }
 
     /// Takes places for the checkpoints due inside the rows of the planned parts.
+    /// The latest first: when the memory holds fewer places than are due, the
+    /// checkpoints nearest the step's end are the ones a following turn resumes
+    /// from (after steps cut at each, a later save would push an earlier out).
     fn reserve_inner(&mut self) {
         self.inner.clear();
         let Some(cache) = &mut self.cache else { return };
-        for &(slot, position) in &self.inner_due {
+        for &(slot, position) in self.inner_due.iter().rev() {
             if !self.parts.iter().any(|p| p.slot == slot) {
                 continue;
             }
@@ -2326,6 +2332,7 @@ impl Conductor {
                 self.inner.push(crate::InnerSave { slot, place, position: position as u32 });
             }
         }
+        self.inner.sort_unstable_by_key(|save| (save.slot, save.position));
     }
 
     /// Gives back the places taken for checkpoints inside a step that will not run.
@@ -2410,6 +2417,7 @@ impl Conductor {
             self.paused = Some(part);
             self.hold_images(part);
             self.paused_inner = std::mem::take(&mut self.inner);
+            self.paused_due = self.inner_due.iter().filter(|d| d.0 == part.slot).copied().collect();
             self.commits.clear();
             self.stats.counters.steps_paused += 1;
             self.stats.record(Phase::Step, began.elapsed().as_nanos() as u64);
@@ -2564,6 +2572,7 @@ impl Conductor {
         }
         // The checkpoints inside its rows were named when it began; the model keeps them.
         self.inner = std::mem::take(&mut self.paused_inner);
+        self.inner_due.extend(std::mem::take(&mut self.paused_due));
         let t_write = Instant::now();
         self.parts.clear();
         self.parts.push(part);
@@ -3227,34 +3236,48 @@ impl Conductor {
                     Priority::NORMAL,
                 );
                 cache.note(a.owner, &a.chain, settled, false);
-                // The checkpoints the model saved inside the rows, then the one at their
-                // end.
-                let (mut last, mut from) = (a.checkpoint_at, part.from);
-                while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, reached)
-                {
-                    let page = (at / u64::from(self.pool.cells_per_page())) as usize;
+                // The checkpoints the model saved inside the rows, in the order of their
+                // positions, then the one at their end. A save inside that was due and
+                // found no place is passed over (the later ones are named all the same).
+                let cells = u64::from(self.pool.cells_per_page());
+                let mut k = 0;
+                while k < self.inner.len() {
+                    let save = self.inner[k];
+                    let at = u64::from(save.position);
+                    if save.slot != part.slot || at <= part.from || at >= reached {
+                        k += 1;
+                        continue;
+                    }
+                    self.inner.remove(k);
+                    let page = (at / cells) as usize;
                     let root = cache.at_root(&a.boundaries, at);
                     let hash = a.chain.hashes()[page - 1];
-                    let saved = if at == reached {
-                        cache.save(part.slot, hash, a.owner, root)
-                    } else {
-                        let Some(k) = self
-                            .inner
-                            .iter()
-                            .position(|s| s.slot == part.slot && u64::from(s.position) == at)
-                        else {
-                            break;
-                        };
-                        let save = self.inner.swap_remove(k);
-                        cache.attach(save.place, hash, a.owner, root)
-                    };
+                    let saved = cache.attach(save.place, hash, a.owner, root);
                     self.stats.counters.checkpoints_saved += u64::from(saved.taken);
                     self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
                     a.checkpoint_at = at;
-                    if at == reached {
-                        break;
+                }
+                let (last, mut from) = (a.checkpoint_at, part.from.max(a.checkpoint_at));
+                while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, reached)
+                {
+                    if at < reached {
+                        // Due inside the rows: a save planned there that found no place is
+                        // passed over; anything else ends the search, as a step that was not
+                        // cut there takes no checkpoint at its end.
+                        if !self.inner_due.contains(&(part.slot, at)) {
+                            break;
+                        }
+                        from = at;
+                        continue;
                     }
-                    (last, from) = (at, at);
+                    let page = (at / cells) as usize;
+                    let root = cache.at_root(&a.boundaries, at);
+                    let hash = a.chain.hashes()[page - 1];
+                    let saved = cache.save(part.slot, hash, a.owner, root);
+                    self.stats.counters.checkpoints_saved += u64::from(saved.taken);
+                    self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
+                    a.checkpoint_at = at;
+                    break;
                 }
             }
         }

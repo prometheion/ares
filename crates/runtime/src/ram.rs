@@ -631,10 +631,24 @@ impl PinnedRam {
     /// device part. 0 for a place whose memory is there, and for books
     /// whose places nobody books when they are first used.
     pub(crate) fn place_lock(&self, place: u32) -> u64 {
-        if let Some((bytes, places)) =
+        self.places_lock(&[place])
+    }
+
+    /// The bytes the devices would lock when all of `places` are used next:
+    /// the chunks they lie in that are not locked now, each once however many
+    /// of the places lie in it, on every device part.
+    pub(crate) fn places_lock(&self, places: &[u32]) -> u64 {
+        if let Some((bytes, held)) =
             &*self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner())
         {
-            return if places.get(place as usize).copied().unwrap_or(false) { 0 } else { *bytes };
+            let mut new: Vec<u32> = places
+                .iter()
+                .copied()
+                .filter(|place| !held.get(*place as usize).copied().unwrap_or(false))
+                .collect();
+            new.sort_unstable();
+            new.dedup();
+            return new.len() as u64 * *bytes;
         }
         let tables: Vec<Arc<PlaceChunks>> = {
             let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
@@ -642,14 +656,19 @@ impl PinnedRam {
         };
         tables
             .iter()
-            .filter(|table| place < table.capacity)
             .map(|table| {
-                let index = table.chunk_of(place);
                 let chunks = table.chunks.lock().unwrap_or_else(|e| e.into_inner());
-                match chunks.get(index) {
-                    Some(Some(_)) => 0,
-                    _ => u64::from(table.chunk_places(index).1) * table.bytes as u64,
-                }
+                let mut new: Vec<usize> = places
+                    .iter()
+                    .filter(|place| **place < table.capacity)
+                    .map(|place| table.chunk_of(*place))
+                    .filter(|index| !matches!(chunks.get(*index), Some(Some(_))))
+                    .collect();
+                new.sort_unstable();
+                new.dedup();
+                new.iter()
+                    .map(|index| u64::from(table.chunk_places(*index).1) * table.bytes as u64)
+                    .sum::<u64>()
             })
             .sum()
     }

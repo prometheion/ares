@@ -1231,6 +1231,55 @@ fn a_cancelled_request_gives_its_paused_step_up() {
     assert_consistent(&e);
 }
 
+/// Two turns of a conversation: a prompt of 220 rows, then the prompt with the start of the
+/// reply and more, which parts from the reply before its end (as a stop string cuts a reply
+/// that the client then sends without it), so the end state lies behind the shared cells.
+/// Returns the rows the second turn replayed, its answer and the engine.
+fn two_turns(inside: bool, checkpoints: u64) -> (u64, Rig, String, Run) {
+    let mut rng = Rng(29);
+    let prompt = text_of(&mut rng, 220);
+    let model = model(Some(CHECKPOINT), move |c: &mut SyntheticConfig| {
+        c.max_rows = 256;
+        c.own_rows = 16;
+        c.inner_saves = inside;
+    });
+    let config = RuntimeConfig { checkpoint_prompt_interval: 4 * PAGE, ..config(256, checkpoints) };
+    let e = engine(&model, config);
+    let first = e.ask(&prompt, 6);
+    let saved = e.snapshot().counters;
+    let reply: String = first.run.text.chars().take(4).collect();
+    let second = format!("{prompt}{reply}{}", text_of(&mut rng, 10));
+    let again = e.ask(&second, 6);
+    let after = e.snapshot().counters;
+    assert_eq!(after.checkpoints_restored - saved.checkpoints_restored, 1);
+    (after.replay_rows - saved.replay_rows, e, second, again.run)
+}
+
+/// A prompt read in one step that saves its checkpoints inside it leaves the next turn no
+/// more to replay than steps cut at those checkpoints do, whatever number of checkpoints the
+/// memory holds: the places are taken the latest first, and a later save pushes an earlier
+/// one out as it would after a cut. (With the real model the places taken all at once kept
+/// an earlier checkpoint and lost the anchor, which `ares-server`'s `real_cache` test guards:
+/// this made-up model's budgets did not show it.)
+#[test]
+fn a_turn_after_saves_inside_a_step_replays_no_more_than_after_cut_steps() {
+    for checkpoints in 1..=4 {
+        let (cut, ..) = two_turns(false, checkpoints);
+        let (inside, e, second, run) = two_turns(true, checkpoints);
+        let shape = |c: &mut SyntheticConfig| {
+            c.max_rows = 256;
+            c.own_rows = 16;
+            c.inner_saves = true;
+        };
+        assert_eq!(run.text, fresh(shape, &second, 6).text, "{checkpoints} checkpoints");
+        assert!(
+            inside <= cut,
+            "{checkpoints} checkpoints: {inside} rows replayed after saves inside, {cut} after cuts"
+        );
+        assert_consistent(&e);
+    }
+}
+
 /// A model that saves the state inside a step wider than its own rows (a prompt read layer
 /// by layer) gets the checkpoints due inside the step's rows named in its record, and the
 /// step is not cut there: they serve a later prompt as checkpoints at the end of steps do,
