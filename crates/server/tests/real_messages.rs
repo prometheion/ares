@@ -22,10 +22,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ares_api::{
-    ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
-    GenerateRequest, ModelCard, Prompt, RequestId,
-};
 use ares_cuda::{Device, Precision, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
@@ -51,46 +47,6 @@ fn small() -> Option<PathBuf> {
         eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
     }
     path
-}
-
-/// The runtime, with the count of a prompt taken from the model's own
-/// tokenizer: what `Engine::count_tokens` of the runtime is to do.
-struct Counting {
-    runtime: Arc<Runtime>,
-    model: Arc<dyn Model>,
-}
-
-impl Engine for Counting {
-    fn models(&self) -> Vec<ModelCard> {
-        self.runtime.models()
-    }
-
-    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
-        self.runtime.chat_format(model)
-    }
-
-    fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {
-        if model != self.model.card().id {
-            return Err(EngineError::ModelNotFound(model.to_owned()));
-        }
-        Ok(self.model.encode(prompt)?.len() as u32)
-    }
-
-    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        self.runtime.submit(request, events)
-    }
-
-    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
-        self.runtime.decide(request, outcome)
-    }
-
-    fn cancel(&self, id: RequestId) {
-        self.runtime.cancel(id);
-    }
-
-    fn stats(&self) -> Option<EngineStats> {
-        self.runtime.stats()
-    }
 }
 
 /// The server, and what it serves.
@@ -146,8 +102,7 @@ fn served(path: &PathBuf) -> Router {
     let devices = vec![Device::open(ordinal, Wait::Block).unwrap()];
     let model: Arc<dyn Model> = Arc::new(model);
     let gpu = GpuConfig::new(&config, &*model);
-    let runtime = Arc::new(Runtime::start_gpu(model.clone(), devices, config, gpu).unwrap());
-    ares_server::router(Arc::new(Counting { runtime, model }))
+    ares_server::router(Arc::new(Runtime::start_gpu(model, devices, config, gpu).unwrap()))
 }
 
 async fn post(app: &Router, path: &str, body: &Value) -> (u16, String) {
