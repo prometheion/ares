@@ -119,6 +119,17 @@ impl FarPool {
         self.near
     }
 
+    /// The far slots of each layer: the pages from [`FarPool::near`] on.
+    pub fn slots(&self) -> u32 {
+        self.capacity
+    }
+
+    /// The bytes of one layer's converted entry of a page, the most of its
+    /// layers: what a copy of one layer's far slots takes per slot.
+    pub fn entry_bytes(&self) -> u64 {
+        self.entries.iter().copied().max().unwrap_or(0)
+    }
+
     /// What the group needs to address the pool.
     pub(crate) fn layers(&self) -> FarLayers {
         let base = self.region.base();

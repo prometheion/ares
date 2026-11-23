@@ -439,7 +439,8 @@ impl Flow {
             // A prompt read layer by layer keeps its rows on a loan of its own; the loan of
             // one before goes back first, or serves it.
             if windows.is_some() {
-                self.lend_pass(&mut feed, pass)?;
+                let far_reach = far_live.iter().rposition(|l| *l).map_or(0, |s| s as u32 + 1);
+                self.lend_pass(&mut feed, pass, far_reach)?;
             }
             self.pass_completed.store(false, Ordering::Release);
             self.pass_paused.store(false, Ordering::Release);
@@ -1756,11 +1757,28 @@ impl Qwen4Exp {
                 build.lone_rows = rows;
                 // The widest prompt read layer by layer: its kept rows in what every device's
                 // slots can lend.
-                let pass_sizes: Vec<PassSizes> =
-                    (0..n).map(|d| PassSizes::of(c, self.placement.part(c, d).role)).collect();
+                // Where K and V lie partly in host memory, beside a copy of every far slot of a
+                // layer: what the loan of a pass at the longest context holds of them.
+                let far_entry = |d: usize| {
+                    build.far[d].as_ref().map_or(0, |far| {
+                        far.lock().unwrap_or_else(|e| e.into_inner()).entry_bytes()
+                    })
+                };
+                let far_slots = build
+                    .far
+                    .iter()
+                    .flatten()
+                    .map(|far| far.lock().unwrap_or_else(|e| e.into_inner()).slots())
+                    .max()
+                    .unwrap_or(0);
+                let pass_sizes: Vec<PassSizes> = (0..n)
+                    .map(|d| {
+                        PassSizes::of(c, self.placement.part(c, d).role).with_far(far_entry(d))
+                    })
+                    .collect();
                 build.pass_rows = if self.reads_layer_by_layer() {
                     pass::pass_span(own, self.opts.pass_rows, |rows| {
-                        pass::pass_fits(&pass_sizes, &build.lendable, own, rows)
+                        pass::pass_fits(&pass_sizes, &build.lendable, own, rows, far_slots)
                     })
                 } else {
                     0

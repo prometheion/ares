@@ -990,6 +990,79 @@ fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
     }
 }
 
+/// A prompt read layer by layer (a pass) with the K and V of the pages beyond the first in
+/// page-locked host memory (`blocks/far.rs`): every micro-batch's attention reads a copy of
+/// the layer's far slots in the pass's loan, which it brings up to date behind its own append
+/// (`Part::pass_stage`). The answer starts as the CPU reference's, as the same pass's with
+/// every page in VRAM does, in micro-batches of one chunk and of several, in every placement;
+/// asked again, the prompt comes from the cache and its last rows, a step of their own, read
+/// the far pool in place.
+#[test]
+fn a_prompt_read_layer_by_layer_reads_k_and_v_beyond_vram_from_a_copy() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(400, 5);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let reference = reference_answer_at(&path, &prompt, 16);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    for placement in placements() {
+        for own in [32, 16] {
+            let mut answers = Vec::new();
+            for near in [None, Some(1)] {
+                let (runtime, model) = start_passing_near(&path, placement, 512, own, near);
+                assert_eq!(runtime_rows(&model), (512, own));
+                let passed = ask(&runtime, 1, &prompt, 16);
+                let again = ask(&runtime, 2, &prompt, 16);
+                let stats = model.take_store_stats().expect("the parts are open");
+                runtime.shutdown();
+                assert!(stats.scratch_loans >= 1, "{placement:?}: no pass lent VRAM");
+                answers.push((passed, again));
+            }
+            let ((vram, _), (far, again)) = (&answers[0], &answers[1]);
+            eprintln!(
+                "FAR PASS {placement:?} own {own}: {} tokens as the reference's (every page in \
+                 VRAM: {}), {} as with every page in VRAM; again from the cache {}",
+                leading(far, &reference),
+                leading(vram, &reference),
+                leading(far, vram),
+                leading(again, &reference),
+            );
+            assert!(leading(far, &reference) >= 2, "{placement:?}: {far:?} against {reference:?}");
+            assert!(leading(again, &reference) >= 2, "{placement:?}: {again:?} from the cache");
+        }
+    }
+}
+
+/// [`start_passing`] on 16 pages with the K and V of the pages from `near` on in host memory.
+fn start_passing_near(
+    path: &std::path::Path,
+    placement: Placement,
+    pass_rows: u32,
+    own: u32,
+    near: Option<u32>,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(path).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let pages = 16;
+    let mut opts = options(placement, n_layer, pages, MAX_ROWS, own);
+    opts.pass_rows = pass_rows;
+    opts.serve = Serve::Measured;
+    opts.part.near_pages = near;
+    let inner =
+        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
+    let config =
+        RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    // Room for the tier of experts and the K and V beyond VRAM next to what the
+    // executor needs.
+    gpu.ram_limit += 512 << 20;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+}
+
 /// The image of [`pictured`]: `IMAGE.0` rows across and `IMAGE.1` down, its cells the
 /// n-gram block's image token.
 const IMAGE: (u32, u32) = (8, 5);

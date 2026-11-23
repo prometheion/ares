@@ -6,7 +6,10 @@
 //!   keeps its rows in, sized for the step's rows (`Flow::lend_pass`): a piece of each pool
 //!   of expert slots, as the lent steps' scratch is. A pass that follows one that has ended
 //!   takes the loan over when its rows fit in it; any other step gives it back before it
-//!   begins.
+//!   begins. Where the K and V of the context lie partly in host memory, the loan also
+//!   holds a copy of one layer's far slots, as many as the pages in use reach, which the
+//!   micro-batches' attention reads (`part/pass.rs`); the most rows of a pass are those
+//!   that fit beside a copy of every far slot.
 //! - **The order.** On each part, layer by layer: every micro-batch through the layer up to
 //!   its router and shared expert, each as a step of its own rows (its record and attention
 //!   plan, made when the pass starts), then the layer's routed experts for all rows of the
@@ -80,10 +83,16 @@ fn shape_of(rows: u32, own: u32, cuts: &[u32]) -> (Vec<(u32, u32)>, Vec<u32>) {
 
 /// Whether a pass of `rows` rows on parts whose own scratch holds `own` rows keeps them in
 /// what each device can lend (`lendable`, per device the bytes of each piece), for parts that
-/// keep `sizes`.
-pub(super) fn pass_fits(sizes: &[PassSizes], lendable: &[Vec<u64>], own: u32, rows: u32) -> bool {
+/// keep `sizes`, beside a copy of `far_slots` far slots of a layer where a part has them.
+pub(super) fn pass_fits(
+    sizes: &[PassSizes],
+    lendable: &[Vec<u64>],
+    own: u32,
+    rows: u32,
+    far_slots: u32,
+) -> bool {
     let (_, chunks) = shape_of(rows, own, &[]);
-    sizes.iter().zip(lendable).all(|(s, l)| PassLayout::new(s, &chunks, l).is_some())
+    sizes.iter().zip(lendable).all(|(s, l)| PassLayout::new(s, &chunks, l, far_slots).is_some())
 }
 
 /// The most rows up to `asked` (and above `own`) that `fits`, which holds for fewer rows
@@ -112,11 +121,14 @@ impl Flow {
     /// Before a step begins (by the first part to begin it): the loan of the pass the step
     /// is (`pass`), or of none. A pass that is not done keeps its loan; a new pass takes the
     /// loan of the one before when its rows fit in it, else that loan goes back and the
-    /// devices lend anew; a step that is no pass gives a done pass's loan back.
+    /// devices lend anew; a step that is no pass gives a done pass's loan back. A new pass's
+    /// loan holds a copy of `far_slots` far slots of a layer (the far slots the pages in use
+    /// reach) where a part keeps K and V in host memory.
     pub(super) fn lend_pass(
         &self,
         feed: &mut Feed,
         pass: Option<&PassKey>,
+        far_slots: u32,
     ) -> Result<(), ModelError> {
         let mut current = self.pass.lock().unwrap_or_else(|e| e.into_inner());
         if let (Some(loan), Some(key)) = (current.as_ref(), pass)
@@ -127,7 +139,7 @@ impl Flow {
         }
         if let (Some(loan), Some(key)) = (current.as_mut(), pass)
             && loan.done
-            && let Some(at) = self.place_pass(feed, key, &loan.held, false)?
+            && let Some(at) = self.place_pass(feed, key, &loan.held, false, far_slots)?
         {
             loan.key = key.clone();
             loan.at = at;
@@ -150,13 +162,13 @@ impl Flow {
         self.pass_go.store(0, Ordering::Release);
         let lendable: Vec<Vec<u64>> =
             (0..self.pass_sizes.len()).map(|d| feed.store.lendable_pieces(d)).collect();
-        let at = self.place_pass(feed, key, &lendable, true)?.ok_or_else(|| {
+        let at = self.place_pass(feed, key, &lendable, true, far_slots)?.ok_or_else(|| {
             invalid(format!("the expert slots cannot lend for a prompt of {} rows", key.rows))
         })?;
         let held = (0..self.pass_sizes.len())
             .map(|d| {
                 let (_, chunks) = shape_of(key.rows, self.own_rows, &key.cuts);
-                PassLayout::new(&self.pass_sizes[d], &chunks, &lendable[d])
+                PassLayout::new(&self.pass_sizes[d], &chunks, &lendable[d], far_slots)
                     .map(|layout| layout.held)
                     .unwrap_or_default()
             })
@@ -167,19 +179,21 @@ impl Flow {
     }
 
     /// Lays the rows of the pass `key` out in `pieces` (per device, the bytes of each piece
-    /// of its loan as the store orders them) and, with `lend`, lends them; returns where
-    /// each part keeps the rows, or `None` when they do not fit.
+    /// of its loan as the store orders them), beside a copy of `far_slots` far slots of a
+    /// layer, and, with `lend`, lends them; returns where each part keeps the rows, or `None`
+    /// when they do not fit.
     fn place_pass(
         &self,
         feed: &mut Feed,
         key: &PassKey,
         pieces: &[Vec<u64>],
         lend: bool,
+        far_slots: u32,
     ) -> Result<Option<Vec<PassAt>>, ModelError> {
         let (_, chunks) = shape_of(key.rows, self.own_rows, &key.cuts);
         let mut layouts = Vec::with_capacity(self.pass_sizes.len());
         for (sizes, pieces) in self.pass_sizes.iter().zip(pieces) {
-            match PassLayout::new(sizes, &chunks, pieces) {
+            match PassLayout::new(sizes, &chunks, pieces, far_slots) {
                 Some(layout) => layouts.push(layout),
                 None => return Ok(None),
             }

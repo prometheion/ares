@@ -2374,6 +2374,27 @@ impl Part {
         reach
     }
 
+    /// The first far slot of a page the rows of the step write (the tiles of their own
+    /// cells), `u32::MAX` when they write none.
+    fn far_written(&self, env: &StepEnv<'_>) -> u32 {
+        let Some(near) = self.kv.as_ref().and_then(kv::Group::near) else { return u32::MAX };
+        let stride = self.opts.table_stride() as usize;
+        let mut first = u32::MAX;
+        for s in env.segments.iter().filter(|s| s.n_rows > 0) {
+            let from = (s.pos0 as u32 / ENTRY_CELLS) as usize;
+            let to = ((s.pos0 as u32 + s.n_rows - 1) / ENTRY_CELLS + 1) as usize;
+            let base = s.slot as usize * stride;
+            let tiles = base + from.min(stride)..base + to.min(stride);
+            for entry in self.entries.get(tiles).into_iter().flatten() {
+                let page = entry & !PAGE_ENTRY;
+                if *entry & PAGE_ENTRY != 0 && page >= near {
+                    first = first.min(page - near);
+                }
+            }
+        }
+        first
+    }
+
     /// Whether the partial states of `plan` fit the scratch.
     fn check_states(&self, plan: &Plan) -> Result<(), ModelError> {
         let state = plan.state_bytes(&self.f.geo);
@@ -3256,14 +3277,16 @@ impl Part {
                 return self.mark(stream, Phase::Attention);
             }
             // A step on lent VRAM reads the layer's K and V beyond VRAM from a
-            // copy, made behind the append that wrote this step's cells there.
+            // copy, made behind the append that wrote this step's cells there; a
+            // micro-batch of a pass reads the copy in the pass's loan, which it
+            // brings up to date behind its own append (`part/pass.rs`).
             let stage = if self.on_loan && s.far_stage_len > 0 && self.far_reach > 0 {
                 let to = self.at(s.far_stage);
                 let slots = (s.far_stage_len / geo.converted_entry_bytes()) as u32;
-                self.group()?.copy_far(stream, &layer, self.far_reach.min(slots), to)?;
+                self.group()?.copy_far(stream, &layer, 0..self.far_reach.min(slots), to)?;
                 Some(to)
             } else {
-                None
+                self.pass_stage(env, i, &layer)?
             };
             if step_plan.hands.is_some() {
                 let (ranges, items) = (base.offset(layout.ranges), base.offset(layout.items));

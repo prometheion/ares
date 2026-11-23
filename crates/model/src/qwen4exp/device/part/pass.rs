@@ -16,6 +16,10 @@
 //! the streams), the experts' f16 input and the router's picks, and the plan of the
 //! many-row kernels; the hidden values of the experts of one chunk are shared by the chunks.
 //! About 56 KiB a row on Flash-Next, against the 0.5 to 0.7 MiB of a wide step's scratch.
+//! Where the K and V of the context lie partly in host memory (`blocks/far.rs`), the loan
+//! also holds a copy of one layer's far slots, which every micro-batch's attention reads in
+//! place of the far pool ([`Part::pass_stage`]): a row reads the cells of its own pick, so
+//! reading host memory would cross the link once per row.
 //!
 //! While a micro-batch runs, the scratch's residual, MoE output and inject values are its
 //! rows of the chunk ([`Part::at`] maps those ranges), the router writes its picks into the
@@ -129,6 +133,9 @@ pub struct PassSizes {
     n: u64,
     hc: u64,
     shape: ExpertShape,
+    /// The bytes of one layer's converted entry of a page beyond VRAM on the part, 0 when
+    /// none is (`blocks/far.rs`): the copy of a layer's far slots takes this per slot.
+    far_entry: u64,
 }
 
 /// The buffers of a chunk, in the order [`PassSizes::chunk`] gives their bytes.
@@ -150,7 +157,14 @@ impl PassSizes {
                 gate_ty: ares_core::GgmlType::IQ2_S,
                 down_ty: ares_core::GgmlType::Q2_0,
             },
+            far_entry: 0,
         }
+    }
+
+    /// The sizes of a part whose attention layers keep the K and V of the pages beyond VRAM
+    /// in host memory, `entry` bytes per page and layer ([`crate::blocks::far::FarPool`]).
+    pub(crate) fn with_far(self, entry: u64) -> Self {
+        Self { far_entry: entry, ..self }
     }
 
     /// The bytes of the buffers of a chunk of `rows` rows: the residual streams, the output
@@ -185,6 +199,8 @@ pub struct PassLayout {
     /// The rows of each chunk.
     rows: Vec<u32>,
     hidden: u64,
+    /// The copy of one layer's far slots: its offset and its slots.
+    far_stage: Option<(u64, u32)>,
     /// The bytes each piece holds, without the pieces it does not reach.
     pub held: Vec<u64>,
 }
@@ -193,13 +209,24 @@ impl PassLayout {
     /// The layout of the buffers of a pass whose chunks have `rows` rows each, in `pieces`
     /// (the bytes each piece of a loan may hold, in the order of the loan's pieces): no
     /// buffer is cut by the end of a piece, each starts at a multiple of 256 bytes. Empty
-    /// `pieces`: one piece as large as it needs. `None` when the buffers do not fit.
-    pub fn new(sizes: &PassSizes, rows: &[u32], pieces: &[u64]) -> Option<Self> {
-        let mut buffers: Vec<u64> = rows.iter().flat_map(|r| sizes.chunk(*r)).collect();
+    /// `pieces`: one piece as large as it needs. `None` when the buffers do not fit. With
+    /// `far_slots` on a part whose K and V lie partly in host memory, the copy of a layer's
+    /// first `far_slots` far slots comes first (in the first piece, the largest pool's).
+    pub fn new(sizes: &PassSizes, rows: &[u32], pieces: &[u64], far_slots: u32) -> Option<Self> {
+        let stage = sizes.far_entry * u64::from(far_slots);
+        let mut buffers: Vec<u64> = Vec::with_capacity(rows.len() * BUFFERS + 2);
+        if stage > 0 {
+            buffers.push(stage);
+        }
+        buffers.extend(rows.iter().flat_map(|r| sizes.chunk(*r)));
         buffers.push(sizes.hidden(rows.iter().copied().max().unwrap_or(0)));
         let (offsets, held) = lay_out_in(pieces, &buffers)?;
+        let (far_stage, offsets) = match stage > 0 {
+            true => (Some((offsets[0], far_slots)), &offsets[1..]),
+            false => (None, &offsets[..]),
+        };
         let chunks = offsets.as_chunks::<BUFFERS>().0.to_vec();
-        Some(Self { chunks, rows: rows.to_vec(), hidden: *offsets.last()?, held })
+        Some(Self { chunks, rows: rows.to_vec(), hidden: *offsets.last()?, far_stage, held })
     }
 
     /// Where the pieces start in the layout: piece `k` where the pieces before it end, as
@@ -238,7 +265,8 @@ impl PassLayout {
                 chunk
             })
             .collect();
-        PassAt { chunks, hidden: address(self.hidden) }
+        let far_stage = self.far_stage.map(|(at, slots)| (address(at), slots));
+        PassAt { chunks, hidden: address(self.hidden), far_stage }
     }
 }
 
@@ -294,6 +322,8 @@ pub struct PassAt {
     pub chunks: Vec<ChunkAt>,
     /// The hidden values of the experts of a chunk, which the chunks share.
     pub hidden: DevicePtr,
+    /// The copy of one layer's far slots, and its slots ([`Part::pass_stage`]).
+    pub far_stage: Option<(DevicePtr, u32)>,
 }
 
 /// The attention plan of a micro-batch, made when the pass starts.
@@ -328,6 +358,9 @@ pub(super) struct State {
     /// [`Part::pass_pause`] (or [`Part::pass_close`]); the steps that run while it is paused
     /// are steps of their own.
     active: bool,
+    /// The layer (of the part) whose far slots the copy in the loan holds, and up to which
+    /// slot it is up to date ([`Part::pass_stage`]).
+    staged: Option<(usize, u32)>,
 }
 
 impl Part {
@@ -411,6 +444,7 @@ impl Part {
             host: None,
             tiles,
             active: true,
+            staged: None,
         });
         self.pending = None;
         self.flipped = false;
@@ -427,7 +461,9 @@ impl Part {
             state.pending.fill(None);
             state.micro.clear();
             state.at.chunks.clear();
+            state.at.far_stage = None;
             state.active = false;
+            state.staged = None;
         }
         self.pending = None;
     }
@@ -504,6 +540,49 @@ impl Part {
         }
         self.pending = None;
         Ok(())
+    }
+
+    /// The copy of layer `i`'s K and V beyond VRAM that the running micro-batch of a pass
+    /// (`env`) reads in place of the far pool, brought up to date behind its append: `None`
+    /// when no pass runs, its loan keeps no copy, or the micro-batch's rows reach no far
+    /// page. The first micro-batch of a layer copies every far slot its rows reach (the
+    /// cached cells before the pass's and its own); each later one the slots from the first
+    /// page its own rows wrote on (the last page of the one before holds cells of both) and
+    /// those the copy did not hold yet. Every micro-batch runs on the same layer before the
+    /// next layer begins, and the steps between two pieces of a paused pass write no cell of
+    /// its sequence, so the copy holds what the far pool holds for the pass's cells.
+    pub(super) fn pass_stage(
+        &mut self,
+        env: &StepEnv<'_>,
+        i: usize,
+        layer: &crate::blocks::kv::Layer,
+    ) -> Result<Option<DevicePtr>, ModelError> {
+        let Some(state) = self.pass.as_ref().filter(|p| p.active && p.running.is_some()) else {
+            return Ok(None);
+        };
+        let Some((to, room)) = state.at.far_stage else { return Ok(None) };
+        let staged = state.staged;
+        let reach = self.far_reach(env);
+        if reach == 0 {
+            return Ok(None);
+        }
+        if reach > room {
+            return Err(invalid(format!(
+                "a micro-batch of a pass reaches far slot {reach}; its loan copies {room}"
+            )));
+        }
+        let from = match staged {
+            Some((layer_i, upto)) if layer_i == i => self.far_written(env).min(upto),
+            _ => 0,
+        };
+        if from < reach {
+            self.group()?.copy_far(env.stream, layer, from..reach, to)?;
+        }
+        let upto = staged.filter(|(layer_i, _)| *layer_i == i).map_or(0, |(_, upto)| upto);
+        if let Some(state) = &mut self.pass {
+            state.staged = Some((i, reach.max(upto)));
+        }
+        Ok(Some(to))
     }
 
     /// The residual streams of micro-batch `m`'s rows: where they are once what was enqueued
@@ -960,5 +1039,38 @@ mod tests {
         let (offsets, held) = lay_out_in(&[], &[300, 900]).unwrap();
         assert_eq!(offsets, vec![0, 512]);
         assert!(held.is_empty());
+    }
+
+    #[test]
+    fn the_copy_of_far_slots_comes_first_in_the_loan_of_a_pass() {
+        let sizes = PassSizes {
+            streams: true,
+            wide: 4 * 1024,
+            n: 1024,
+            hc: 4,
+            shape: ExpertShape {
+                n_embd: 1024,
+                n_ff: 512,
+                n_experts: 64,
+                top_k: 8,
+                gate_ty: ares_core::GgmlType::IQ2_S,
+                down_ty: ares_core::GgmlType::Q2_0,
+            },
+            far_entry: 0,
+        };
+        let chunks = [1024, 512];
+        let plain = PassLayout::new(&sizes, &chunks, &[], 100).unwrap();
+        assert_eq!(plain.far_stage, None, "no far pool: no copy");
+        let far = sizes.with_far(1 << 20);
+        let with = PassLayout::new(&far, &chunks, &[], 100).unwrap();
+        assert_eq!(with.far_stage, Some((0, 100)));
+        assert_eq!(with.chunks[0][0], 100 << 20, "the chunks after the copy");
+        let total = |l: &PassLayout| l.hidden + sizes.hidden(1024);
+        assert_eq!(total(&with) - total(&plain), 100 << 20);
+        // In pieces: the copy takes the first piece; what it cannot hold does not fit.
+        let pieces = [(100 << 20) + total(&plain), 1 << 20];
+        assert!(PassLayout::new(&far, &chunks, &pieces, 100).is_some());
+        assert!(PassLayout::new(&far, &chunks, &[(99 << 20), 1 << 40], 100).is_some());
+        assert!(PassLayout::new(&far, &chunks, &[(99 << 20)], 100).is_none());
     }
 }

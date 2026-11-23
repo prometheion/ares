@@ -1301,7 +1301,7 @@ Qwen4 handover map as follows.
 | Handover item | In this engine |
 | --- | --- |
 | Sparse attention on index lists (the indexer's selection should be what attention reads, not a mask over all cells) | Attention reads through an id list and the page table by design. The page size is a multiple of the indexer block, and the pooled key of a block is a per-page part of the layout. The selection and attention kernels come with the model. |
-| Sparse KV offload (K/V in pinned RAM, keys and a page cache on the GPU, fetch only missing selected pages) | Built for `qwen4exp` (2026-11-22, "K and V beyond VRAM"): the pooled keys of every page stay on the GPU, the K and V of the first pages too, those of the rest lie in page-locked RAM and the attention reads the picked cells there over the link; a wide step reads a copy of a layer's far entries in lent VRAM. No page cache: a page is near or far by its number. |
+| Sparse KV offload (K/V in pinned RAM, keys and a page cache on the GPU, fetch only missing selected pages) | Built for `qwen4exp` (2026-11-22, "K and V beyond VRAM"): the pooled keys of every page stay on the GPU, the K and V of the first pages too, those of the rest lie in page-locked RAM and the attention reads the picked cells there over the link; a wide step and a pass read a copy of a layer's far entries in lent VRAM. No page cache: a page is near or far by its number. |
 | Ragged one-pass verification (drafts of unequal length in one batch) | `plan` puts windows of any lengths in one step. Recurrent kernels take per-sequence segments from the step record. |
 | Graph cache for batch shapes | Not needed: there is no per-shape graph. |
 | Adaptive draft length | `choose` maximises expected tokens per millisecond of the whole step from measured acceptance per position (or the n-gram drafter's confidence) and the measured price of a step by its rows. The same number chooses between drafters and accounts for the rows a draft costs other sequences. |
@@ -5171,8 +5171,15 @@ so nothing idle in VRAM needs lending.
   copies a layer's far entries that its sequences reach into the loan behind
   the layer's append (`Scratch::far_stage`, up to the far pool's size, which
   the slots lend with the step's scratch) and reads them there; each byte
-  crosses the link once per layer and step. Steps of the parts' own scratch
-  (pieces of prompt while another request waits, decode) read in place.
+  crosses the link once per layer and step. A prompt read layer by layer
+  (a pass, "Flash-Next's prompts layer by layer") keeps the copy in its loan,
+  first in the largest piece, sized for the far slots the pages in use reach
+  (`PassLayout::new`; the most rows of a pass are those that fit beside a copy
+  of every far slot): each micro-batch brings it up to date behind its append,
+  the first of a layer with every far slot its rows reach, each later one from
+  the first page its own rows wrote on (`Part::pass_stage`), so each byte
+  crosses the link about once per layer and pass. Steps of the parts' own
+  scratch (pieces of prompt while another request waits, decode) read in place.
 - *Scratch.* With the model's own context a row's block scores take 4 bytes
   per block of 262 144 cells, 256 KiB; the scratch held them for every row of
   the widest step, so a step on lent VRAM cost a quarter of a GiB more per

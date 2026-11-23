@@ -1088,9 +1088,9 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory`, the
         books' `far_k_and_v_of_finished_requests_counts_as_prompt_cache_and_not_against_the_tier`.
   - [ ] Steps of the parts' own scratch (pieces of a prompt while another request waits) read the
-        far entries in place, row by row; only steps on lent VRAM read a copy. A copy in the own
-        scratch would cost VRAM for good (the far pool's share of one layer, 254 MiB at 262 144
-        cells).
+        far entries in place, row by row; only steps on lent VRAM and passes (in their loan) read a
+        copy. A copy in the own scratch would cost VRAM for good (the far pool's share of one
+        layer, 254 MiB at 262 144 cells).
   - [ ] The RAM level of the prompt cache copies a far page when it leaves the devices; it could
         take over the page's memory instead.
   - [ ] The share of the room for K and V in VRAM (a thirty-second, `plan::NEAR_SHARE`) is the old
