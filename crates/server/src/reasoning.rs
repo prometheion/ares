@@ -79,12 +79,6 @@ pub enum ReasoningFormat {
     /// The reasoning goes to `reasoning_content`, in streamed deltas too.
     #[default]
     Auto,
-    /// The same as `Auto`.
-    Deepseek,
-    /// The same as `Auto`: llama-server accepts the name and parses the reply
-    /// the same way (its description says the tags stay in `content` of a
-    /// stream, its code does not do it).
-    DeepseekLegacy,
 }
 
 impl ReasoningFormat {
@@ -93,8 +87,6 @@ impl ReasoningFormat {
         Some(match name {
             "none" => Self::None,
             "auto" => Self::Auto,
-            "deepseek" => Self::Deepseek,
-            "deepseek-legacy" => Self::DeepseekLegacy,
             _ => return None,
         })
     }
@@ -126,9 +118,7 @@ pub(crate) fn asked(fields: &Fields<'_>) -> Result<Asked, ApiError> {
         Some(name) => Some(ReasoningFormat::from_name(name).ok_or_else(|| {
             ApiError::invalid_param(
                 "reasoning_format",
-                format!(
-                    "reasoning_format must be none, auto, deepseek or deepseek-legacy, got '{name}'"
-                ),
+                format!("reasoning_format must be none or auto, got '{name}'"),
             )
         })?),
     };

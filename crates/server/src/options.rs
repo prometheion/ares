@@ -400,9 +400,8 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
             _ => return Err(invalid("--reasoning", value, "on, off or auto")),
         },
         "--reasoning-format" => {
-            options.reasoning_format = ReasoningFormat::from_name(value).ok_or_else(|| {
-                invalid("--reasoning-format", value, "none, auto, deepseek or deepseek-legacy")
-            })?;
+            options.reasoning_format = ReasoningFormat::from_name(value)
+                .ok_or_else(|| invalid("--reasoning-format", value, "none or auto"))?;
         }
         "--reasoning-effort" => {
             if value.is_empty() {

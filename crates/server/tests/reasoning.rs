@@ -192,8 +192,7 @@ async fn reasoning_format_none_leaves_the_thinking_in_the_content_tags_and_all()
     let (_, app) = serve(reply(), Some(qwen()), config.clone());
     let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     assert_eq!(body["choices"][0]["message"]["content"], raw);
-    let (_, body) =
-        json(post(&app, CHAT, &chat(json!({"reasoning_format": "deepseek"}))).await).await;
+    let (_, body) = json(post(&app, CHAT, &chat(json!({"reasoning_format": "auto"}))).await).await;
     assert_eq!(body["choices"][0]["message"]["reasoning_content"], "Two and two.");
 
     // Streamed, the raw text is the content deltas.

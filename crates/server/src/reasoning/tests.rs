@@ -435,18 +435,13 @@ fn the_fields_of_llama_server_are_read() {
     assert_eq!(asked.format, Some(ReasoningFormat::None));
     assert_eq!(asked.effort.as_deref(), Some("low"));
     assert_eq!(asked.variables.len(), 2);
-    for (name, format) in [
-        ("auto", ReasoningFormat::Auto),
-        ("deepseek", ReasoningFormat::Deepseek),
-        ("deepseek-legacy", ReasoningFormat::DeepseekLegacy),
-    ] {
-        assert_eq!(asked_from(&[("reasoning_format", text(name))]).unwrap().format, Some(format));
-    }
+    let auto = asked_from(&[("reasoning_format", text("auto"))]).unwrap();
+    assert_eq!(auto.format, Some(ReasoningFormat::Auto));
 }
 
 #[test]
 fn what_is_wrong_in_the_fields_is_told_by_name() {
-    assert!(refused(&[("reasoning_format", text("think"))]).contains("none, auto, deepseek"));
+    assert!(refused(&[("reasoning_format", text("think"))]).contains("none or auto"));
     assert!(refused(&[("reasoning_format", Json::Int(1))]).contains("reasoning_format must be"));
     assert!(refused(&[("chat_template_kwargs", text("x"))]).contains("chat_template_kwargs"));
     let kwargs = |name: &str, value: Json| {
@@ -568,13 +563,13 @@ fn the_format_of_the_request_wins_over_the_one_the_server_started_with() {
     // And the other way round.
     let split = plan(&Asked::default(), Some(&format), ReasoningFormat::None).unwrap();
     assert_eq!(sorted(split, "r\n</think>\n\na"), pair("", "<think>\nr\n</think>\n\na"));
-    let request = asked_from(&[("reasoning_format", text("deepseek"))]).unwrap();
+    let request = asked_from(&[("reasoning_format", text("auto"))]).unwrap();
     let split = plan(&request, Some(&format), ReasoningFormat::None).unwrap();
     assert_eq!(sorted(split, "r\n</think>\n\na"), pair("r", "a"));
 }
 
 #[test]
 fn a_model_without_thinking_returns_its_text_whole() {
-    let plan = planned(&[("reasoning_format", text("deepseek"))], None).unwrap();
+    let plan = planned(&[("reasoning_format", text("auto"))], None).unwrap();
     assert_eq!(sorted(plan, "a\n</think>\n\nb"), pair("", "a\n</think>\n\nb"));
 }

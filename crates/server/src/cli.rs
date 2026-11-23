@@ -226,8 +226,8 @@ OPTIONS:
                                leaves it to the chat template [default: auto]
         --reasoning-format <FORMAT>
                                none: the thinking stays in content, tags and all
-                               auto, deepseek, deepseek-legacy: the thinking goes
-                               to reasoning_content, in streamed deltas too
+                               auto: the thinking goes to reasoning_content, in
+                               streamed deltas too
                                [default: auto]
         --reasoning-effort <LEVEL>
                                A level the chat template knows, such as low or
@@ -1080,13 +1080,8 @@ mod tests {
     }
 
     #[test]
-    fn the_reasoning_format_is_one_of_the_four_names() {
-        for (name, format) in [
-            ("none", ReasoningFormat::None),
-            ("auto", ReasoningFormat::Auto),
-            ("deepseek", ReasoningFormat::Deepseek),
-            ("deepseek-legacy", ReasoningFormat::DeepseekLegacy),
-        ] {
+    fn the_reasoning_format_is_one_of_the_two_names() {
+        for (name, format) in [("none", ReasoningFormat::None), ("auto", ReasoningFormat::Auto)] {
             assert_eq!(run(&["--model=m", "--reasoning-format", name]).reasoning_format, format);
         }
         for (args, flag) in [
