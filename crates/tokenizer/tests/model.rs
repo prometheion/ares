@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use ares_gguf::Gguf;
 use ares_tokenizer::{
-    ChatOptions, Content, EncodeOptions, Json, Message, TokenKind, Tokenizer, Tool, ToolCall,
+    ChatOptions, EncodeOptions, Json, Message, TokenKind, Tokenizer, Tool, ToolCall,
 };
 
 fn model() -> Option<(Gguf, Tokenizer)> {
@@ -144,17 +144,8 @@ fn request(body: &Json) -> Option<(Vec<Message>, Vec<Tool>, ChatOptions)> {
     for item in list {
         let mut message = Message { role: string(get(item, "role"))?, ..Message::default() };
         match get(item, "content") {
-            Some(Json::String(text)) => message.content = Content::Text(text.clone()),
-            Some(Json::Array(parts)) => {
-                let mut texts = Vec::new();
-                for part in parts {
-                    if string(get(part, "type")).as_deref() != Some("text") {
-                        return None;
-                    }
-                    texts.push(string(get(part, "text"))?);
-                }
-                message.content = Content::Parts(texts);
-            }
+            Some(Json::String(text)) => message.content = text.clone(),
+            Some(Json::Array(_)) => return None,
             _ => {}
         }
         if let Some(Json::Array(calls)) = get(item, "tool_calls") {

@@ -2,9 +2,7 @@
 
 mod common;
 
-use ares_tokenizer::{
-    ChatError, ChatOptions, ChatTemplate, Content, Json, Message, Tool, ToolCall,
-};
+use ares_tokenizer::{ChatError, ChatOptions, ChatTemplate, Json, Message, Tool, ToolCall};
 use common::*;
 
 /// A template in the shape of ChatML: turns introduced by `<|im_start|>role` and ended by
@@ -101,42 +99,11 @@ fn treats_the_role_developer_as_system() {
 }
 
 #[test]
-fn gives_content_as_a_string_or_as_a_list_of_text_parts() {
-    let template = "{% for m in messages %}{{ m.content is string }}:{{ m.content | length }}:{% if m.content is not string %}{{ m.content[0].type }}/{{ m.content[1].text }}{% endif %};{% endfor %}";
-    let parts = Message {
-        role: "user".into(),
-        content: Content::Parts(vec!["ab".into(), "cd".into()]),
-        ..Message::default()
-    };
-    let empty_parts =
-        Message { role: "user".into(), content: Content::Parts(vec![]), ..Message::default() };
-    assert_eq!(
-        render(
-            template,
-            &[user("abc"), parts, empty_parts, Message::new("user", "")],
-            &no_prompt()
-        )
-        .unwrap(),
-        "True:3:;False:2:text/cd;True:0:;True:0:;"
-    );
-    // The text of the parts reaches the prompt through a template that knows both.
-    let parts = Message {
-        role: "user".into(),
-        content: Content::Parts(vec!["ab".into(), "cd".into()]),
-        ..Message::default()
-    };
-    assert_eq!(
-        chatml().render(&[parts], &[], &no_prompt()).unwrap(),
-        "<|im_start|>user\nabcd<|im_end|>\n"
-    );
-}
-
-#[test]
 fn gives_the_optional_fields_only_when_they_are_there() {
     let template = "{% for m in messages %}{{ m.reasoning_content is defined }}{{ m.name is defined }}{{ m.tool_call_id is defined }}{{ m.tool_calls is defined }};{% endfor %}";
     let full = Message {
         role: "tool".into(),
-        content: Content::Text("r".into()),
+        content: "r".into(),
         reasoning_content: "why".into(),
         name: "get".into(),
         tool_call_id: "c1".into(),

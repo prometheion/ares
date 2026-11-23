@@ -224,7 +224,7 @@ fn a_reply_that_thinks_is_repeated_by_the_next_prompt() {
         let say = stops("The user asks for a sum.\n2 and 2 are 4.\n</think>\n\nThe answer is 4.");
         let trip = rig.trip(&rig.question(), &say, true);
         assert_eq!(trip.reply.reasoning_content, "The user asks for a sum.\n2 and 2 are 4.");
-        assert_eq!(trip.reply.content, ares_tokenizer::Content::Text("The answer is 4.".into()));
+        assert_eq!(trip.reply.content, "The answer is 4.");
         rig.assert_exact(&trip);
         // The prompt that follows the reply starts the next turn.
         assert!(trip.next.len() > trip.sequence.len() + 5);
@@ -263,7 +263,7 @@ fn a_reply_without_thinking_is_repeated_when_the_template_closed_the_block() {
 fn a_reply_cut_by_the_limit_inside_the_answer_is_repeated() {
     for rig in preserving() {
         let trip = rig.trip(&rig.question(), &cut("Add.\n</think>\n\nThe answer is"), true);
-        assert_eq!(trip.reply.content, ares_tokenizer::Content::Text("The answer is".into()));
+        assert_eq!(trip.reply.content, "The answer is");
         rig.assert_exact(&trip);
     }
 }
@@ -274,7 +274,7 @@ fn a_reply_cut_inside_the_thinking_is_repeated_up_to_what_the_template_adds() {
         // After a word, where nothing merges with the newline the template writes.
         let trip = rig.trip(&rig.question(), &cut("The user asks for a sum and"), true);
         assert_eq!(trip.reply.reasoning_content, "The user asks for a sum and");
-        assert_eq!(trip.reply.content, ares_tokenizer::Content::Text(String::new()));
+        assert_eq!(trip.reply.content, "");
         rig.assert_exact(&trip);
         // Also when the thinking is cut in the middle of a line.
         let trip = rig.trip(&rig.question(), &cut("Line one\nLine two is"), true);

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat, ToolFormat};
 use ares_runtime::{Boundary, EncodedPrompt, ImageInput, ImageSpan};
 use ares_tokenizer::{
-    ChatOptions, Content, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
+    ChatOptions, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
 };
 
 use crate::qwen3vl::Projector;
@@ -376,29 +376,25 @@ fn boundaries(
     tokens: &[u32],
     render: impl Fn(Vec<Message>) -> Result<String, EngineError>,
 ) -> Vec<Boundary> {
-    let content = |m: &Message| match &m.content {
-        Content::Text(text) => Some(text.clone()),
-        Content::Parts(_) => None,
-    };
-    if messages.iter().any(|m| content(m).is_none_or(|text| text.contains(BOUNDARY))) {
+    if messages.iter().any(|m| m.content.contains(BOUNDARY)) {
         return Vec::new();
     }
     // The message a reply continues ends the prompt inside its text.
     let marked_count = messages.len().saturating_sub(usize::from(continue_final));
     let mut marked = messages.to_vec();
     for (i, message) in marked.iter_mut().enumerate().take(marked_count) {
-        let Content::Text(text) = &message.content else { continue };
+        let text = &message.content;
         let core = text.trim();
         if core.is_empty() {
             continue;
         }
         let lead = &text[..text.len() - text.trim_start().len()];
         let trail = &text[text.trim_end().len()..];
-        message.content = Content::Text(format!(
+        message.content = format!(
             "{lead}{BOUNDARY}{}{BOUNDARY}{core}{BOUNDARY}{}{BOUNDARY}{trail}",
             2 * i,
             2 * i + 1
-        ));
+        );
     }
     let Ok(rendered) = render(marked) else { return Vec::new() };
     // The text without the marks, and the byte in it where each mark was.
@@ -478,27 +474,16 @@ fn continued(
             "the last message is not the assistant's: there is no message to continue",
         ));
     }
-    let text = |content: &Content| match content {
-        Content::Text(text) => text.clone(),
-        Content::Parts(parts) => parts.concat(),
-    };
-    let mentioned =
-        |m: &Message| text(&m.content).contains(MARK) || m.reasoning_content.contains(MARK);
+    let mentioned = |m: &Message| m.content.contains(MARK) || m.reasoning_content.contains(MARK);
     if messages.iter().any(mentioned) {
         return Err(invalid("a message holds characters this server marks a prompt with"));
     }
     let last = messages.last_mut().expect("there is a last message");
-    let thinking = text(&last.content).is_empty() && !last.reasoning_content.is_empty();
+    let thinking = last.content.is_empty() && !last.reasoning_content.is_empty();
     if thinking {
         last.reasoning_content.push_str(MARK);
     } else {
-        match &mut last.content {
-            Content::Text(text) => text.push_str(MARK),
-            Content::Parts(parts) => match parts.last_mut() {
-                Some(part) => part.push_str(MARK),
-                None => parts.push(MARK.to_owned()),
-            },
-        }
+        last.content.push_str(MARK);
     }
     options.add_generation_prompt = false;
     let text = tokenizer

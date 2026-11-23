@@ -82,7 +82,7 @@ mod unicode;
 mod unicode_table;
 mod vocab;
 
-pub use chat::{ChatError, ChatOptions, ChatTemplate, Content, Message, Tool, ToolCall};
+pub use chat::{ChatError, ChatOptions, ChatTemplate, Message, Tool, ToolCall};
 pub use error::{Error, Result};
 pub use json::{Json, JsonError};
 pub use reasoning::ReasoningFormat;

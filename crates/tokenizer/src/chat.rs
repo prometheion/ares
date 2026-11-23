@@ -43,22 +43,6 @@ pub enum ChatError {
     Invalid(String),
 }
 
-/// The text of a message.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Content {
-    /// A string, which is what almost all messages are.
-    Text(String),
-    /// A list of text parts, each of which the template sees as
-    /// `{"type": "text", "text": ...}`.
-    Parts(Vec<String>),
-}
-
-impl Default for Content {
-    fn default() -> Self {
-        Content::Text(String::new())
-    }
-}
-
 /// A call of a tool that the assistant made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
@@ -79,7 +63,7 @@ pub struct Message {
     /// `system`, `user`, `assistant` or `tool` (`developer` counts as `system`).
     pub role: String,
     /// What the message says. A message without content has empty content.
-    pub content: Content,
+    pub content: String,
     /// What the assistant thought before it answered.
     pub reasoning_content: String,
     /// For a message with the role `tool`: the name of the tool.
@@ -93,7 +77,7 @@ pub struct Message {
 impl Message {
     /// A message with a role and a text.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: Content::Text(content.into()), ..Self::default() }
+        Self { role: role.into(), content: content.into(), ..Self::default() }
     }
 }
 
@@ -349,24 +333,7 @@ fn message_value(message: &Message, developer_is_system: bool) -> Result<Value, 
     let role =
         if developer_is_system && message.role == "developer" { "system" } else { &message.role };
     let mut fields: Vec<(&str, Value)> = vec![("role", Value::from(role))];
-    fields.push((
-        "content",
-        match &message.content {
-            Content::Text(text) => Value::from(text.as_str()),
-            Content::Parts(parts) if parts.is_empty() => Value::from(""),
-            Content::Parts(parts) => Value::from(
-                parts
-                    .iter()
-                    .map(|text| {
-                        object([
-                            ("type", Value::from("text")),
-                            ("text", Value::from(text.as_str())),
-                        ])
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-        },
-    ));
+    fields.push(("content", Value::from(message.content.as_str())));
     if !message.reasoning_content.is_empty() {
         fields.push(("reasoning_content", Value::from(message.reasoning_content.as_str())));
     }
