@@ -456,11 +456,15 @@ impl Model for Qwen35 {
     }
 
     fn prompt_rows(&self) -> u32 {
-        // The group in which a long step is run: where the prompt kernels
-        // reach their rate (see `Options::pipeline_rows`).
-        match self.options.pipeline_rows {
-            0 => self.options.max_rows,
-            rows => rows.min(self.options.max_rows),
+        // Where a long step reaches the prompt kernels' rate. Under a split it
+        // is cut into groups (`Options::pipeline_rows`), and a step of one
+        // group runs without the overlap of a second: one device computes a
+        // group while the partial results of the other cross the link. The
+        // 27B on an RTX 4070 and an RTX 3060 reads a prompt in steps of 512
+        // rows (two groups) 1.5 times as fast as in steps of 256 (one).
+        match (self.placement.split, self.options.pipeline_rows) {
+            (Split::Single, _) | (_, 0) => self.options.max_rows,
+            (_, rows) => (2 * rows).min(self.options.max_rows),
         }
     }
 
