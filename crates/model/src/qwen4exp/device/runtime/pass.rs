@@ -30,6 +30,7 @@ use super::super::part::{
     micro_batches_at,
 };
 use super::{Feed, Flow, Qwen4ExpDevice, Routing, invalid, model_error};
+use crate::blocks::rows;
 
 /// The prompt rows a pass reads: its sequence's slot, its first position and its rows, and
 /// the rows (from its first) at which it saves the state for checkpoints inside it.
@@ -355,6 +356,11 @@ struct Micro {
     record: StepRecord,
     replay: Vec<std::ops::Range<u32>>,
     plan: MicroPlan,
+    /// Its rows' rotary positions where they are not their cells (a prompt with images;
+    /// empty otherwise), and the rows the runtime staged for its image cells, which the part
+    /// that embeds copies over the gathered ones.
+    rotary: Vec<[i32; 4]>,
+    splices: Vec<rows::Splice>,
     /// Its first row in the step, and its rows.
     first: u32,
     rows: u32,
@@ -552,6 +558,11 @@ impl Qwen4ExpDevice {
                     0
                 };
                 let micro = &mut run.micro[m];
+                // At the part's first layer the rows start from their embeddings, and an
+                // image's cells from the rows the runtime staged.
+                if i == 0 {
+                    self.part.splice_rows(micro.splices.clone());
+                }
                 let ngram = match (&run.fetched, row_bytes) {
                     (Some(rows), Some(each)) if ngram_at == Some(i) => {
                         let start = micro.first as usize * each;
@@ -664,6 +675,7 @@ impl Qwen4ExpDevice {
                         self.resume.save_block(stream, key.slot, place)?;
                     }
                 }
+                block.set_rotary(micro.rotary.clone());
                 block.step(stream, &micro.segments, &micro.tokens, &micro.replay, None, false)?;
             }
         }
@@ -710,6 +722,8 @@ impl Qwen4ExpDevice {
         self.part.pass_open(stream, &self.segments, &self.replay, step.pages, at, &micro)?;
         let replay = !self.replay.is_empty();
         let segment = self.segments[0];
+        // The rows of the step's image cells, which the micro-batch of each row embeds.
+        let splices = rows::image_splices(&step.record, step.image_stage, self.part.n_embd());
         let mut steps = Vec::with_capacity(micro.len());
         for &(first, rows) in &micro {
             let segments =
@@ -721,10 +735,16 @@ impl Qwen4ExpDevice {
                 .filter(|r| (first..first + rows).contains(r))
                 .map(|r| r - first)
                 .collect();
-            let mut record = StepRecord::new(&segments, &tokens, None, &wanted)?;
+            let rotary = match self.rotary.is_empty() {
+                true => Vec::new(),
+                false => self.rotary[first as usize..(first + rows) as usize].to_vec(),
+            };
+            let at = (!rotary.is_empty()).then_some(rotary.as_slice());
+            let mut record = StepRecord::new(&segments, &tokens, at, &wanted)?;
             if replay {
                 record.mark_replay(0)?;
             }
+            let splices = rows::splices_within(&splices, first, rows, self.part.n_embd());
             let replay: Vec<std::ops::Range<u32>> =
                 if replay { std::iter::once(0..rows).collect() } else { Vec::new() };
             let env = StepEnv {
@@ -740,13 +760,24 @@ impl Qwen4ExpDevice {
                 replay: &replay,
             };
             let plan = self.part.pass_plan(&env)?;
-            steps.push(Micro { segments, tokens, record, replay, plan, first, rows });
+            steps.push(Micro {
+                segments,
+                tokens,
+                record,
+                replay,
+                plan,
+                rotary,
+                splices,
+                first,
+                rows,
+            });
         }
         let wanted_elsewhere = self.out_rows.iter().any(|r| *r < micro[micro.len() - 1].0);
         if wanted_elsewhere {
             return Err(invalid("a prompt read layer by layer wants logits only of its last rows"));
         }
-        let mut span = StepRecord::new(&self.segments, &self.tokens, None, &self.out_rows)?;
+        let rotary = (!self.rotary.is_empty()).then_some(self.rotary.as_slice());
+        let mut span = StepRecord::new(&self.segments, &self.tokens, rotary, &self.out_rows)?;
         if replay {
             span.mark_replay(0)?;
         }

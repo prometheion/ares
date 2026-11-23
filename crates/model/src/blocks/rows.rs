@@ -330,6 +330,34 @@ pub(crate) fn image_splices(
         .collect()
 }
 
+/// The splices of a step's rows `splices` that fall in its rows `first..first + rows`, as
+/// splices of a step of those rows alone (a micro-batch of a prompt read layer by layer):
+/// cut at the two ends and counted from `first`.
+pub(crate) fn splices_within(
+    splices: &[Splice],
+    first: u32,
+    rows: u32,
+    n_embd: u32,
+) -> Vec<Splice> {
+    let end = first + rows;
+    splices
+        .iter()
+        .filter_map(|s| {
+            let (lo, hi) = (s.row.max(first), (s.row + s.rows).min(end));
+            (lo < hi).then(|| {
+                let skip = u64::from(lo - s.row) * u64::from(n_embd);
+                let from = match s.from {
+                    SpliceFrom::Device(at) => SpliceFrom::Device(at.offset(skip * 4)),
+                    SpliceFrom::Host(HostRows(at)) => {
+                        SpliceFrom::Host(HostRows(at.wrapping_add(skip as usize)))
+                    }
+                };
+                Splice { row: lo - first, rows: hi - lo, from }
+            })
+        })
+        .collect()
+}
+
 /// The second row source: copies rows that another computation made over
 /// gathered rows. `out` holds the step's rows (`n_embd` f32 each). The image
 /// tower's rows enter a step here, at the cells of an image.
@@ -365,6 +393,27 @@ pub(crate) unsafe fn splice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_splices_of_a_micro_batch_are_its_rows_of_the_step_s_splices() {
+        // Rows 3..9 of a step from the stage's row 0, rows 12..14 from a device; the
+        // micro-batch of rows 5..13 takes rows 5..9 (from stage row 2) and 12..13.
+        let stage = [0.0f32; 4];
+        let host = stage.as_ptr();
+        let splices = [
+            Splice { row: 3, rows: 6, from: SpliceFrom::Host(HostRows(host)) },
+            Splice { row: 12, rows: 2, from: SpliceFrom::Device(DevicePtr::NULL.offset(4096)) },
+        ];
+        let within = splices_within(&splices, 5, 8, 16);
+        assert_eq!(
+            within,
+            [
+                Splice { row: 0, rows: 4, from: SpliceFrom::Host(HostRows(host.wrapping_add(32))) },
+                Splice { row: 7, rows: 1, from: SpliceFrom::Device(DevicePtr::NULL.offset(4096)) },
+            ]
+        );
+        assert!(splices_within(&splices, 9, 3, 16).is_empty());
+    }
 
     #[test]
     fn a_table_of_q8_rows_has_rows_of_34_bytes_per_block() {

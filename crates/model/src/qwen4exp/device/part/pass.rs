@@ -657,7 +657,8 @@ impl Part {
     }
 
     /// The rows of the running micro-batch start from the embeddings of their tokens, staged
-    /// in the ring's buffer at `host`, in every stream (as [`Part::begin`] starts a step).
+    /// in the ring's buffer at `host`, and the rows another source computed for it
+    /// ([`Part::splice_rows`]: an image's), in every stream (as [`Part::begin`] starts a step).
     fn pass_embed(&mut self, env: &StepEnv<'_>, host: *mut u8) -> Result<(), ModelError> {
         let stream = env.stream;
         let dims = env.record.dims();
@@ -678,12 +679,16 @@ impl Part {
         };
         let bytes = table.stage(env.tokens, section)?;
         let r = self.r();
-        // SAFETY: the inbox and the kept rows hold the micro-batch's rows.
+        // SAFETY: the inbox and the kept rows hold the micro-batch's rows; the spliced rows lie
+        // in the runtime's image stage, which holds them while the step runs (a record that
+        // goes on with a paused pass stages them again).
         unsafe {
             let (at, x) = (self.inbox_at(ib.rows), self.inbox_at(ib.x));
             stream.copy_from_host(at, host.add(ib.rows as usize).cast_const(), bytes)?;
             let source = crate::blocks::rows::source(&table.shape(), ares_cuda::KeptRows::NONE, at);
             self.layers.embed_gather(stream, self.inbox_at(ib.record), dims, &source, x)?;
+            // Rows another source computed (an image's) go over theirs.
+            crate::blocks::rows::splice(stream, x, self.n, &std::mem::take(&mut self.spliced))?;
             stream.fill(r, 0, (n * self.wide * 4) as usize)?;
             self.q4.stream_write(stream, r, x, self.at(self.f.s.zeros), n, self.hc, self.n)?;
         }
