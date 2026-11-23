@@ -198,6 +198,9 @@ pub(crate) struct Cache {
     ran: Vec<u32>,
     /// The copies for the next record.
     saves: Vec<StateCopy>,
+    /// The places taken for saves inside a step ([`Cache::reserve`]) until the commit names
+    /// or frees them: their memory is locked when the step begins, as a save's.
+    reserved: Vec<u32>,
     restores: Vec<StateCopy>,
     page_copies: Vec<PageCopy>,
     scratch: Vec<StateCopy>,
@@ -309,6 +312,7 @@ impl Cache {
             settling: Vec::new(),
             ran: Vec::new(),
             saves: Vec::new(),
+            reserved: Vec::new(),
             restores: Vec::new(),
             page_copies: Vec::new(),
             scratch: Vec::new(),
@@ -543,12 +547,14 @@ impl Cache {
         }
     }
 
-    /// The bytes the devices will lock for the saves of the next record: the
-    /// places they use whose memory is not locked yet. Nothing else may book
-    /// that room of the limit before the record has run.
+    /// The bytes the devices will lock for the saves of the next record and
+    /// the saves inside a step reserved for it: the places they use whose
+    /// memory is not locked yet. Nothing else may book that room of the limit
+    /// before the record has run.
     fn pending_locks(&self) -> u64 {
         let Some(books) = &self.books else { return 0 };
-        self.saves.iter().map(|copy| books.place_lock(copy.place)).sum()
+        let saves = self.saves.iter().map(|copy| copy.place);
+        saves.chain(self.reserved.iter().copied()).map(|place| books.place_lock(place)).sum()
     }
 
     /// A place never used so far, if there is one.
@@ -743,7 +749,9 @@ impl Cache {
         if !self.recurrent || self.capacity == 0 {
             return (None, 0);
         }
-        self.new_place()
+        let (place, dropped) = self.new_place();
+        self.reserved.extend(place);
+        (place, dropped)
     }
 
     /// The checkpoint a step saved inside its rows into `place` (reserved by
@@ -756,11 +764,12 @@ impl Cache {
         owner: Owner,
         root: bool,
     ) -> Saved {
+        self.reserved.retain(|p| *p != place);
         if self.index.checkpoint(hash).is_some() {
             if root {
                 self.index.mark_root(hash);
             }
-            self.unreserve(place);
+            self.free(place);
             return Saved::default();
         }
         match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
@@ -780,6 +789,7 @@ impl Cache {
 
     /// A place reserved for a save inside a step that holds nothing after all.
     pub(crate) fn unreserve(&mut self, place: u32) {
+        self.reserved.retain(|p| *p != place);
         self.free(place);
     }
 
