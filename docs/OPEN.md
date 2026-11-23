@@ -1193,6 +1193,9 @@ them), cached turns, one request alone. What it does worse, and why:
   prefill starts only once a slot generates. Ares in the same spot: 0.15-0.75 s.
 
 ## Cleanup (the owner, 2026-11-23: the code must be clean although agents wrote it)
+The first push to GitHub comes after the whole cleanup (phase 1 and phase 2) and the restructured
+docs (the owner, 2026-11-23); then the unpushed history is scrubbed of the test machine's address
+and home paths (2 and 6 commits) and pushed without force.
 Audit of main e6d7676 by area, reports and the plan in `/var/tmp/ares-audit/` (`PLAN.md`). The core
 designs are sound (the shared blocks, one reader and core for all routes, one record writer and
 reader, an independent host oracle); the debt is where the code grew: copied bookkeeping beside
