@@ -233,6 +233,17 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       first ask lost its place to its end state where the roots held all places but one (fixed,
       `flash/prompt` ebe5061, test in `runtime/tests/prefix.rs`), and every small wide step paid
       a pass of uploads (the CPU's share of wide steps). To measure there.
+- [x] The agent suite on the test machine (main e6d7676, 2026-11-23, UD-Q3_K_XL at 40G on the 4060
+      Ti): the second turn failed every time in its first step ("the rows of slot 0 start at cell
+      650 and its sequence is at cell 512") and the model was taken down. The first turn's end
+      state was saved with the next record into the one place; the second turn restored it in
+      that record, and the places for the checkpoints inside its pass, taken before the record
+      was written, gave the end state up: its save was dropped and the restore read the first
+      turn's anchor (fixed on `fix/turn-cell`: the save stays while a restore of the record reads
+      the place; host test in `runtime/tests/prefix.rs`). Seen on the way: with one place the
+      second turn's checkpoints inside its pass find none (the place waits for the restore), so
+      the turn keeps only its end state; and the first turn's anchor at 512 was a root as well,
+      so its end state pushed it out (the end state keeps its anchor only from a plain one).
 - [x] A loan of VRAM after the tier had moved slots between layers (rebalance) could take a
       layer's given-up number for a slot's owner: the owner kept the slot inside the loan (its
       expert read lent memory) and a later loan stopped the engine ("as many slots were given

@@ -698,7 +698,19 @@ one array per part, indexed by page number.
     prefix hit.
   - When a step's claims need room, cached pages go from the ends of chains
     after the requests that start have taken what they share; checkpoints go
-    when their budget is full and with their page.
+    when their budget is full and with their page. A checkpoint that goes
+    while a restore of the next record reads it keeps its place until that
+    record has run, and a save into it that waits for the same record stays:
+    the record saves before it restores, so the restore gets the state the
+    checkpoint was taken of. (An agent's next turn restores the end state of
+    the turn before, which is saved with the same record; when that turn is
+    read in one wide step, the places of its saves inside are taken before
+    the record is written, and with one place that gives the end state up.
+    Until 2026-11-23 its save went with it, the restore read what the place
+    held before, the first turn's anchor, and Flash-Next failed the step:
+    "the rows of slot 0 start at cell 650 and its sequence is at cell 512".
+    `tests/prefix.rs`
+    `a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state`.)
   - Per request the runtime reports the prompt tokens that came from the
     cache (`Usage::cached_prompt_tokens`) and the rows it replayed and
     computed (`Snapshot::requests`); the counters add them up.
