@@ -10,8 +10,7 @@ pub enum Error {
     #[error("{0}")]
     Schema(String),
     /// The grammar engine could not build the grammar the request describes
-    /// (for example a regular expression it cannot handle, or one that is too
-    /// big).
+    /// (for example a lexeme it cannot handle, or a grammar that is too big).
     #[error("{0}")]
     Compile(String),
     /// The vocabulary cannot be used: no tokens, or an end token past its end.

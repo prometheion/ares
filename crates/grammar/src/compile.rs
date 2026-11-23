@@ -17,8 +17,6 @@ pub enum Source<'a> {
     /// A grammar in Lark syntax, as llguidance defines it (see its
     /// documentation); `start` is where it starts.
     Lark(&'a str),
-    /// A regular expression the whole reply must match.
-    Regex(&'a str),
 }
 
 /// Compiles grammars for one vocabulary. Make one for a model and keep it:
@@ -66,13 +64,12 @@ impl Compiler {
     /// [`Error::Gbnf`] for a grammar that does not parse, [`Error::Schema`]
     /// for a schema that is not JSON, and [`Error::Compile`] when the engine
     /// refuses what is left (a schema it cannot turn into a grammar, a
-    /// regular expression that is too big).
+    /// grammar that is too big).
     pub fn compile(&self, source: Source<'_>) -> Result<Grammar, Error> {
         let top = match source {
             Source::Gbnf(text) => TopLevelGrammar::from_lark(gbnf::to_lark(text, &self.vocab)?),
             Source::JsonSchema(text) => TopLevelGrammar::from_json_schema(schema::prepare(text)?),
             Source::Lark(text) => TopLevelGrammar::from_lark(text.to_owned()),
-            Source::Regex(text) => TopLevelGrammar::from_regex(text),
         };
         let matcher = Matcher::new(self.factory.create_parser(top));
         let mut grammar = Grammar { matcher, vocab: self.vocab.clone() };

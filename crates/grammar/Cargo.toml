@@ -1,6 +1,6 @@
 [package]
 name = "ares-grammar"
-description = "The grammar engine on the host: GBNF grammars, JSON schemas and regular expressions turned into the set of tokens that may come next, one token at a time"
+description = "The grammar engine on the host: GBNF grammars, JSON schemas and Lark grammars turned into the set of tokens that may come next, one token at a time"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 ares-api = { path = "../api" }
+ares-sampler.workspace = true
 llguidance.workspace = true
 toktrie.workspace = true
 # The properties of a tool's schema keep their order: it is the order of the
