@@ -6238,7 +6238,13 @@ wider than the parts' own scratch runs as a **pass**:
   Until the commit names them, the reserved places count among the locks the next record will
   make (`Cache::pending_locks`), so that no other place is handed the same room of the limit;
   they are taken before what leaves the devices is settled, since taking one may give other
-  checkpoints up.
+  checkpoints up. They are taken the latest first (when the memory holds fewer than are due,
+  the ones nearest the end, which the next turn goes on from, get them), and the commit names
+  each in order and makes room for it as a save at a step's end does, so that a later one
+  pushes an earlier one out as after cuts: taken all at once, a first turn of 9821 rows kept
+  the checkpoint at 8192 and lost its anchor, and the next turn replayed 1635 rows instead of
+  99 (`real_cache`'s Flash-Next test asserts fewer than 256; `tests/prefix.rs`
+  `a_turn_after_saves_inside_a_step_replays_no_more_than_after_cut_steps`).
 
 *Measured* (2026-11-23, local, the IQ2_XS file through the server, `--ram 8G`, `--context
 40960`, a fresh cache and no usage profile; a prompt of 17 000 tokens of this document with 64

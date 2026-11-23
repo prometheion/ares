@@ -444,9 +444,13 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       are locked before the pass), and `real_cache`'s Flash-Next test at `--ram 8G` failed a
       step when places reserved for saves inside a step were handed the same room of the limit
       (fixed: they count as pending locks, and are taken before what leaves the devices is
-      settled). Open: in that test the second turn resumed from the cards (9827 of 9851 tokens
-      cached) takes 10.0 s against main's 2.6 s (from the drive after eviction 0.83 against
-      1.75 s, the cold turn 13.1 against 28.3 s); not looked into.
+      settled). The second turn of that test, resumed from the cards (9827 of 9851 tokens
+      cached), took 10 to 12.7 s against main's 2.5 to 3.6 s: the first turn's pass reserved
+      places for the checkpoint at 8192 and the anchor at once and lost the anchor (1635 rows
+      replayed instead of 99; fixed: places the latest first, room made at each attach), and the
+      heat counted the whole pass as one step, so the tiers kept what came before the prompt
+      (fixed: a wide step counts as the steps of own rows it stands for). Now 2.9 s against
+      main's 2.5 to 3.3 s, alternating, and the test asserts fewer than 256 rows replayed.
 - [ ] Passes, what is left: with both devices on every layer the MTP block's chains after a
       pass agree with the reference's for 1 to 3 links where after steps of the own rows 5 to 7
       (the trunk's tokens are the reference's): not found. Uploads of the next layer's
