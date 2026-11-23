@@ -407,10 +407,15 @@ impl Cache {
         }
     }
 
+    /// Whether the model keeps pool page `page` in host memory.
+    fn is_far(&self, page: PageId) -> bool {
+        self.far.is_some_and(|far| page.0 >= far.first)
+    }
+
     /// Gives up a far page that only the index holds, from the end of a
-    /// chain: it leaves the devices as any evicted page does (into RAM when
-    /// the allowance has room, on to the drive with a level on SSD, or
-    /// nowhere). Whether one went.
+    /// chain: it leaves the devices as any evicted page does, into RAM when
+    /// the allowance has room, and otherwise nowhere: it never waits for the
+    /// drive ([`Cache::push_leaving`]). Whether one went.
     fn evict_far(&mut self, pool: &mut PagePool) -> bool {
         let Some(far) = self.far else { return false };
         let left_behind = self.left_behind();
@@ -1089,7 +1094,13 @@ impl Cache {
         notes: &mut Vec<Note>,
     ) {
         for leaving in std::mem::take(&mut self.leaving) {
+            // A page whose K and V lie in host memory ranks as prompt cache, the
+            // lowest user of the RAM: it goes into RAM when there is room for it
+            // and is dropped otherwise. Nothing waits for the drive to make room
+            // for it (hundreds of them leave at once after a long request, a
+            // wait for the writer each, while the next request waits).
             let precious = leaving.worth
+                && !self.is_far(leaving.page)
                 && self
                     .ssd
                     .as_ref()
@@ -2235,6 +2246,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive() {
+        // RAM holds the one place and the reserve of pages that pass through it; the
+        // model keeps the pages from page 3 on in host memory, so every text's pages
+        // are far: once only the index holds them they rank as prompt cache, the
+        // lowest user of the RAM, and leave the devices at the next trim.
+        let mut f = Following::with("far", true, STATE + RESERVE * PAGE);
+        f.cache.far = Some(FarPages { first: 3, page_bytes: PAGE });
+        let mut devices = Devices::default();
+        let texts = 12;
+        for i in 0..texts {
+            f.text(i);
+        }
+        let far = 3 * u64::from(texts);
+        assert!(far > RESERVE, "more far pages than RAM has room for");
+        f.trimmed(&mut devices);
+        // As many far pages left as the allowance needs: what RAM had room for
+        // went there, the rest was dropped at once. None of them waited for the
+        // writer to make room in RAM (a wait each, while the next request waits
+        // for the conductor), which would have taken more of them into RAM.
+        let ram = f.cache.ram_counters();
+        let still = f.ram.context_cached() / PAGE;
+        assert!(f.cache.held() <= f.cache.allowance());
+        assert_eq!(ram.pages_in + ram.pages_dropped + still, far, "{ram:?}");
+        assert!(ram.pages_in <= RESERVE, "{ram:?}");
+        assert!(ram.pages_dropped > 0, "{ram:?}");
+        assert_eq!(of(&devices.asked, TransferKind::PageOut).len() as u64, ram.pages_in);
+        assert_eq!(f.written().pages_written, 0, "nothing of them went to the drive");
     }
 
     #[test]
