@@ -5178,8 +5178,12 @@ so nothing idle in VRAM needs lending.
   of every far slot): each micro-batch brings it up to date behind its append,
   the first of a layer with every far slot its rows reach, each later one from
   the first page its own rows wrote on (`Part::pass_stage`), so each byte
-  crosses the link about once per layer and pass. Steps of the parts' own
-  scratch (pieces of prompt while another request waits, decode) read in place.
+  crosses the link about once per layer and pass. Measured on the two local
+  cards (2026-11-23, IQ2_XS, `--ram 8G`, the model's own context, 146 pages
+  near, a prompt of 80 507 tokens in passes of up to 32 768 rows, load 4 to
+  8): 97.0 s with the copy, 202.4 s reading the far pool in place. Steps of the
+  parts' own scratch (pieces of prompt while another request waits, decode)
+  read in place.
 - *Scratch.* With the model's own context a row's block scores take 4 bytes
   per block of 262 144 cells, 256 KiB; the scratch held them for every row of
   the widest step, so a step on lent VRAM cost a quarter of a GiB more per
