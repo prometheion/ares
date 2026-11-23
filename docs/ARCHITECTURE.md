@@ -4488,7 +4488,7 @@ before. The server's log says what each role took and which was kept;
 
 *Measured* on the two development cards (2026-11-23, `qwen4exp_run`, the IQ2_XS file,
 `--ram-gib 8`, 4096 cells, the peer route, as in the table above; R lets the trial choose,
-FT and FX give the roles; two rounds in turn, the load average in brackets):
+FT and FX give the roles; three rounds in turn, the load average in brackets):
 
 | Run | Trial: decode, wide step of 512 rows (the share; experts only) | Opened | Prompt, warm | Decode median / mean / fastest | In a slot |
 | --- | --- | --- | --- | --- | --- |
@@ -4498,18 +4498,21 @@ FT and FX give the roles; two rounds in turn, the load average in brackets):
 | R (8 to 6) | 16.30 ms, 704.8 ms; 17.07 ms, 486.6 ms: experts only kept | 5.9 s | 595 | 22.9 / 24.4 / 18.1 | 98.3 % |
 | FT (6 to 4) | | 4.8 s | 480 | 24.6 / 31.7 / 17.3 | 96.6 % |
 | FX (4) | | 2.2 s | 621 | 22.6 / 26.1 / 18.0 | 97.7 % |
+| R (5) | 20.53 ms, 745.3 ms; 17.11 ms, 487.0 ms: experts only kept | 5.9 s | 605 | 20.7 / 22.3 / 18.1 | 98.5 % |
+| FT (4) | | 2.7 s | 502 | 21.0 / 22.0 / 17.4 | 98.4 % |
+| FX (3) | | 2.2 s | 604 | 21.8 / 22.7 / 18.0 | 98.5 % |
 
 The trial sees what the runs show: with the share a decode step that misses nothing is 5 %
-faster (16.3 against 17.1 to 17.2 ms; the runs' fastest steps 17.3 against 18.0), and a
-wide step 22 to 45 % slower; experts only reads a warm prompt 24 to 29 % faster, and its
-decode is as fast (medians within a millisecond either way, which the misses decide), so the
-choice is right on these cards. Every trial so far kept experts only, also two at a load
-average of 20 to 28 whose times were 20 to 70 % longer. *What it costs:* 4.1 s in the
-quiet round (the first role 2.6 s, of which 1.6 s opening its parts with the paths of the
-prefill kernels measured on both cards, which the load's parts then take without measuring
-again; the second role 1.4 s), 7.0 s in the first round (with the full-width wide step
-that warmed up, since replaced by one of sixteen rows); the load opens about 3.7 s later
-than with the role given. That is more than the second or two expected: each role opens its
+faster (16.3 against 17.1 to 17.2 ms in two of the three; the runs' fastest steps 17.3
+against 18.0), and a wide step 22 to 53 % slower; experts only reads a warm prompt 20 to 29 %
+faster, and its decode is as fast (medians within a millisecond either way, which the misses
+decide), so the choice is right on these cards. Every trial so far kept experts only, also two at a load
+average of 20 to 28 whose times were 20 to 70 % longer. *What it costs:* 4.1 and 4.2 s in
+the quiet rounds (the first role 2.6 to 2.7 s, of which 1.6 s opening its parts with the
+paths of the prefill kernels measured on both cards, which the load's parts then take
+without measuring again; the second role 1.4 s), 7.0 s in the first round (with the
+full-width wide step that warmed up, since replaced by one of sixteen rows); the load opens
+3.2 to 3.7 s later than with the role given (5.9 s against 2.2 to 2.7). That is more than the second or two expected: each role opens its
 parts, uploads its dense weights (3.4 GiB on the mixer) and runs a wide step of 512 rows.
 
 The model's own context (262 144 cells, what the plan serves without

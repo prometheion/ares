@@ -1025,10 +1025,10 @@ the agents' builds):
       11.22 of 11.52 GiB there; loaded in 8 to 16 s and answered, the 4070 at 11 523 MiB with
       177 MiB free beyond the 256 MiB left unreserved, the 3060 at 9 931 MiB.
 - [x] Flash-Next's second card: the role timed at load (`devices/load-choice`): on the two cards
-      the trial keeps experts only, and the runs agree (warm prompts 24 to 29 % faster than
+      the trial keeps experts only, and the runs agree (warm prompts 20 to 29 % faster than
       with the share, decode as fast; ARCHITECTURE "The second card's role is timed at load").
-- [ ] The trial of the second card's role costs about 3.7 s at load (4.1 s of trial, of which
-      1.6 s opening the first role's parts with the prefill paths measured): each role opens its
+- [ ] The trial of the second card's role costs 3.2 to 3.7 s at load (4.1 to 4.2 s of trial, of
+      which 1.6 s opening the first role's parts with the prefill paths measured): each role opens its
       parts and runs a wide step of 512 rows. Cheaper: a narrower wide step, the parts of the
       kept role handed to the load, or the choice remembered per model and cards without
       `--cache` as with it (the owner to decide whether a remembered choice is still "measured
