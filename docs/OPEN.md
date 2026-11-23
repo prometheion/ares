@@ -25,11 +25,13 @@ cards, with the owner told first.
 6. Room for experiments: new prefetchers, drafting and prefill tricks, dynamic pruning.
 Every piece is weighed against these.
 
-Order of work the owner has set: CUDA complete for both models first, then optimising (better
-kernels, better prefetching: measured per phase on a quiet machine against the fork and Strata),
-Vulkan parity last.
+Order of work (the owner, 2026-11-23): no phases any more. Every piece is placed by the reasons
+above, in the order under "Decided by the owner" (prefill, the parallel-request fixes, large
+mixtures of experts from the SSD, Jev mode, the few-row expert kernels, then Inkling 2 Mini and
+trees). What is left of "CUDA complete" (the list below) and of "Optimising" is a store to draw
+from where it serves one of the reasons. Vulkan parity stays last.
 
-## Next, in this order (the owner, 2026-11-17, after the gap study)
+## The order of 2026-11-17 (after the gap study; items 1 to 7 done, the rest is a store)
 For "CUDA complete", the order in which the items below are taken up; each item stays in its
 section further down.
 1. [x] Pin Claude Code's billing stamp at the start of its system prompt as upstream llama.cpp does
@@ -939,7 +941,7 @@ with fewer slots in VRAM than a step picks"). Left:
       (Flash-Next's expert down projections of 640 values, the n-gram table's rows of 160, the
       image tower's `ffn_down` of 4304); the 27B's tensor split cuts in units of 256.
 
-## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
+## Optimising (a store of levers; taken by the owner's reasons, not as a phase)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
 - [x] The prefill path on a card whose tensor cores run f32 accumulation at full rate (the test
       machine's RTX 4060 Ti with gpu-unlock; `probe_full_rate` detects it, 2026-11-22): measured
