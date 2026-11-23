@@ -305,6 +305,16 @@ The blocks so far:
   "The MTP driver" in [Speculation](#speculation). A model gives it its MTP
   layer and where its hidden state is tapped.
 
+What every model reads from its files the same way is in the module `files`:
+the strict reader of an architecture's metadata keys (the architecture check,
+the refusal of a key it does not know, counts, floats and arrays), the weight
+table (each tensor by name with the dimensions the configuration gives it, a
+matrix's rows checked to be whole blocks whose first one decodes, a tensor no
+one took refused), the stored `Matrix`, and one `FileError` that names the key
+or tensor and that the errors of `qwen35`, `qwen4exp`, `qwen3vl` and `dflash`
+wrap. Each model keeps its list of keys and tensors and its own checks of how
+the values fit together.
+
 ## A step
 
 ```

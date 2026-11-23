@@ -5,6 +5,7 @@ mod common;
 
 use ares_core::GgmlType;
 use ares_gguf::Gguf;
+use ares_model::files::FileError;
 use ares_model::qwen35::weights::Mixer;
 use ares_model::qwen35::{Config, Error, LogitRows, Reference, SequenceState, Weights};
 use common::{Spec, Synth, TempDir, naive};
@@ -99,7 +100,7 @@ fn the_next_token_block_is_required_when_the_metadata_announces_it() {
     synth.tensors.retain(|t| t.name != "blk.8.nextn.eh_proj.weight");
     let e = load_error(&synth.builder());
     assert!(
-        matches!(&e, Error::MissingTensor { name } if name == "blk.8.nextn.eh_proj.weight"),
+        matches!(&e, Error::File(FileError::MissingTensor { name }) if name == "blk.8.nextn.eh_proj.weight"),
         "{e}"
     );
 }
@@ -110,7 +111,10 @@ fn another_architecture_is_refused() {
     let bytes = ares_gguf::GgufBuilder::new().str("general.architecture", "llama").build();
     let gguf = Gguf::open(dir.file("m.gguf", &bytes)).unwrap();
     let e = Config::from_gguf(&gguf).unwrap_err();
-    assert!(matches!(&e, Error::Architecture { found } if found == "llama"), "{e}");
+    assert!(
+        matches!(&e, Error::File(FileError::Architecture { found, .. }) if found == "llama"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -128,7 +132,7 @@ fn a_missing_key_is_named() {
         }
         let e = load_error(&b);
         assert!(
-            matches!(&e, Error::MissingKey { key: k } if *k == format!("qwen35.{key}")),
+            matches!(&e, Error::File(FileError::MissingKey { key: k }) if *k == format!("qwen35.{key}")),
             "{key}: {e}"
         );
     }
@@ -142,7 +146,10 @@ fn a_key_of_the_architecture_that_is_not_known_is_refused() {
         b = b.tensor_f32(&t.name, &t.dims, &t.values);
     }
     let e = load_error(&b);
-    assert!(matches!(&e, Error::UnknownKey { key } if key == "qwen35.rope.scaling.factor"), "{e}");
+    assert!(
+        matches!(&e, Error::File(FileError::UnknownKey { key, .. }) if key == "qwen35.rope.scaling.factor"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -179,7 +186,7 @@ fn a_tensor_with_other_dimensions_is_named() {
     t.values.truncate(64 * 95);
     let e = load_error(&synth.builder());
     match &e {
-        Error::TensorShape { name, found, expected } => {
+        Error::File(FileError::TensorShape { name, found, expected }) => {
             assert_eq!(name, "blk.2.ffn_up.weight");
             assert_eq!(
                 (found.as_slice(), expected.as_slice()),
@@ -195,7 +202,10 @@ fn a_missing_tensor_is_named() {
     let mut synth = Synth::new(Spec::default());
     synth.tensors.retain(|t| t.name != "blk.5.ssm_a");
     let e = load_error(&synth.builder());
-    assert!(matches!(&e, Error::MissingTensor { name } if name == "blk.5.ssm_a"), "{e}");
+    assert!(
+        matches!(&e, Error::File(FileError::MissingTensor { name }) if name == "blk.5.ssm_a"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -208,7 +218,10 @@ fn a_tensor_the_architecture_has_no_use_for_is_named() {
         ty: GgmlType::F32,
     });
     let e = load_error(&synth.builder());
-    assert!(matches!(&e, Error::UnexpectedTensor { name } if name == "blk.0.attn_q.weight"), "{e}");
+    assert!(
+        matches!(&e, Error::File(FileError::UnexpectedTensor { name, .. }) if name == "blk.0.attn_q.weight"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -219,7 +232,7 @@ fn a_vocabulary_that_disagrees_with_the_embedding_table_is_refused() {
     let gguf = Gguf::open(dir.file("m.gguf", &synth.builder().build())).unwrap();
     let e = Config::from_gguf(&gguf).unwrap_err();
     assert!(
-        matches!(e, Error::Inconsistent { .. }) && e.to_string().contains("100 entries"),
+        matches!(e, Error::File(FileError::BadKey { .. })) && e.to_string().contains("100 entries"),
         "{e}"
     );
 }

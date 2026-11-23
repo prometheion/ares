@@ -8,53 +8,12 @@
 //! (borrowed from the file); the patch kernels, the position table and the
 //! vectors are decoded to `f32` once.
 
-use std::collections::HashSet;
-
-use ares_core::GgmlType;
 use ares_gguf::Gguf;
 
+pub use crate::files::Matrix;
+use crate::files::Table;
 use crate::qwen3vl::config::Config;
-use crate::qwen3vl::error::{Error, Result};
-
-/// A weight matrix as stored: `rows` outputs, each a dot product over `cols`
-/// inputs, one row after the other. In GGUF the dimensions are `[cols, rows]`.
-#[derive(Clone, Copy, Debug)]
-pub struct Matrix<'g> {
-    ty: GgmlType,
-    rows: usize,
-    cols: usize,
-    data: &'g [u8],
-}
-
-impl<'g> Matrix<'g> {
-    /// The element type the matrix is stored in.
-    pub fn ty(&self) -> GgmlType {
-        self.ty
-    }
-
-    /// The number of outputs.
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// The number of inputs.
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-
-    /// The stored bytes, row after row: what a device loader uploads.
-    pub fn bytes(&self) -> &'g [u8] {
-        self.data
-    }
-
-    /// The whole matrix as `f32`, row after row.
-    pub fn decode(&self) -> Vec<f32> {
-        let mut out = vec![0.0; self.rows * self.cols];
-        ares_quant::dequantize(self.ty, self.data, &mut out)
-            .expect("the type was decoded when the table was built");
-        out
-    }
-}
+use crate::qwen3vl::error::Result;
 
 /// The weight and bias of a layer norm.
 #[derive(Clone, Debug)]
@@ -113,86 +72,52 @@ pub struct Weights<'g> {
     pub mm2: Linear<'g>,
 }
 
-struct Loader<'g> {
-    gguf: &'g Gguf,
-    claimed: HashSet<String>,
-}
-
 impl<'g> Weights<'g> {
     /// Builds the table of a file against its configuration.
     pub fn load(gguf: &'g Gguf, c: &Config) -> Result<Self> {
-        let mut l = Loader { gguf, claimed: HashSet::new() };
+        let mut table = Table::new(gguf);
+        let t = &mut table;
         let (side, e, group) = (c.table_side, c.n_embd, 4 * c.n_embd);
         let kernel = [c.patch as u64, c.patch as u64, 3, e as u64];
         let weights = Self {
             patch: [
-                l.floats("v.patch_embd.weight", &kernel)?,
-                l.floats("v.patch_embd.weight.1", &kernel)?,
+                t.floats("v.patch_embd.weight", &kernel)?,
+                t.floats("v.patch_embd.weight.1", &kernel)?,
             ],
-            patch_bias: l.floats("v.patch_embd.bias", &[e as u64])?,
-            position: l.floats("v.position_embd.weight", &[e as u64, (side * side) as u64])?,
+            patch_bias: t.floats("v.patch_embd.bias", &[e as u64])?,
+            position: t.floats("v.position_embd.weight", &[e as u64, (side * side) as u64])?,
             blocks: (0..c.n_layer)
                 .map(|i| {
                     let name = |part: &str| format!("v.blk.{i}.{part}");
                     Ok(Block {
-                        ln1: l.norm(&name("ln1"), e)?,
-                        qkv: l.linear(&name("attn_qkv"), e, 3 * e)?,
-                        out: l.linear(&name("attn_out"), e, e)?,
-                        ln2: l.norm(&name("ln2"), e)?,
-                        up: l.linear(&name("ffn_up"), e, c.n_ff)?,
-                        down: l.linear(&name("ffn_down"), c.n_ff, e)?,
+                        ln1: norm(t, &name("ln1"), e)?,
+                        qkv: linear(t, &name("attn_qkv"), e, 3 * e)?,
+                        out: linear(t, &name("attn_out"), e, e)?,
+                        ln2: norm(t, &name("ln2"), e)?,
+                        up: linear(t, &name("ffn_up"), e, c.n_ff)?,
+                        down: linear(t, &name("ffn_down"), c.n_ff, e)?,
                     })
                 })
                 .collect::<Result<_>>()?,
-            post_ln: l.norm("v.post_ln", e)?,
-            mm0: l.linear("mm.0", group, group)?,
-            mm2: l.linear("mm.2", group, c.n_out)?,
+            post_ln: norm(t, "v.post_ln", e)?,
+            mm0: linear(t, "mm.0", group, group)?,
+            mm2: linear(t, "mm.2", group, c.n_out)?,
         };
-        match gguf.tensors().iter().find(|t| !l.claimed.contains(&t.name)) {
-            Some(extra) => Err(Error::UnexpectedTensor { name: extra.name.clone() }),
-            None => Ok(weights),
-        }
+        table.finish("the projector", |_| true)?;
+        Ok(weights)
     }
 }
 
-impl<'g> Loader<'g> {
-    fn info(&mut self, name: &str, dims: &[u64]) -> Result<&'g ares_gguf::TensorInfo> {
-        let missing = || Error::MissingTensor { name: name.to_owned() };
-        let info = self.gguf.tensor(name).ok_or_else(missing)?;
-        if info.dims.as_slice() != dims {
-            return Err(Error::TensorShape {
-                name: name.to_owned(),
-                found: info.dims.as_slice().to_vec(),
-                expected: dims.to_vec(),
-            });
-        }
-        self.claimed.insert(name.to_owned());
-        Ok(info)
-    }
+fn norm(t: &mut Table<'_>, name: &str, len: usize) -> Result<Norm> {
+    Ok(Norm {
+        weight: t.vector(&format!("{name}.weight"), len)?,
+        bias: t.vector(&format!("{name}.bias"), len)?,
+    })
+}
 
-    fn floats(&mut self, name: &str, dims: &[u64]) -> Result<Vec<f32>> {
-        let info = self.info(name, dims)?;
-        let mut out = vec![0.0; dims.iter().product::<u64>() as usize];
-        ares_quant::dequantize(info.ty, self.gguf.data(info), &mut out)
-            .map_err(|source| Error::TensorType { name: name.to_owned(), ty: info.ty, source })?;
-        Ok(out)
-    }
-
-    fn norm(&mut self, name: &str, len: usize) -> Result<Norm> {
-        Ok(Norm {
-            weight: self.floats(&format!("{name}.weight"), &[len as u64])?,
-            bias: self.floats(&format!("{name}.bias"), &[len as u64])?,
-        })
-    }
-
-    fn linear(&mut self, name: &str, cols: usize, rows: usize) -> Result<Linear<'g>> {
-        let weight = format!("{name}.weight");
-        let info = self.info(&weight, &[cols as u64, rows as u64])?;
-        let matrix = Matrix { ty: info.ty, rows, cols, data: self.gguf.data(info) };
-        // One row decoded now, so that a type without a decoder is refused here.
-        let row = matrix.data.len() / rows;
-        ares_quant::dequantize(info.ty, &matrix.data[..row], &mut vec![0.0; cols])
-            .map_err(|source| Error::TensorType { name: weight, ty: info.ty, source })?;
-        Ok(Linear { weight: matrix, bias: self.floats(&format!("{name}.bias"), &[rows as u64])? })
-    }
+fn linear<'g>(t: &mut Table<'g>, name: &str, cols: usize, rows: usize) -> Result<Linear<'g>> {
+    Ok(Linear {
+        weight: t.matrix(&format!("{name}.weight"), cols, rows)?,
+        bias: t.vector(&format!("{name}.bias"), rows)?,
+    })
 }

@@ -6,12 +6,13 @@
 //! `qwen3vl`, the image tower and merger that both read images through, and
 //! `dflash`, the drafter both can draft with. `chat` is the way from a
 //! request's prompt to a model's tokens; the blocks (`blocks/`) are the parts
-//! of a step every model is built from.
+//! of a step every model is built from, and `files` is what every model reads
+//! from its GGUF files the same way.
 
 mod blocks;
 pub mod chat;
 pub mod dflash;
-mod files;
+pub mod files;
 pub mod qwen35;
 pub mod qwen3vl;
 pub mod qwen4exp;

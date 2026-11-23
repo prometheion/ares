@@ -1,7 +1,23 @@
-//! What a model's files are, for the fingerprints of what is kept of them on
-//! disk: the prompt cache's state, the usage profile of the experts.
+//! What every model reads from its GGUF files the same way: the metadata keys
+//! of its architecture (`Keys`, strict: a key that is missing, of the wrong
+//! kind or not known is an error), the tensors of its weight table (`Table`,
+//! exact: a tensor that is missing, of other dimensions, not decodable or not
+//! taken is an error), the stored [`Matrix`], the [`FileError`] that names the
+//! key or tensor, and what a file is for the fingerprints of what is kept of
+//! it on disk (`identity`: the prompt cache's state, the usage profile of the
+//! experts). Each model keeps its own list of keys and tensors and its own
+//! checks of how the values fit together.
+
+mod error;
+mod keys;
+mod table;
 
 use std::path::Path;
+
+pub use error::FileError;
+pub(crate) use keys::Keys;
+pub use table::Matrix;
+pub(crate) use table::{Table, vocabulary};
 
 /// What of a model file goes into a fingerprint: its size, its first bytes
 /// (the header, with the model's settings) and samples spread over the rest

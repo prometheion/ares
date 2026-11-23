@@ -4,7 +4,10 @@
 use std::borrow::Cow;
 
 use ares_core::GgmlType;
-use ares_gguf::{Gguf, TensorInfo};
+use ares_gguf::Gguf;
+
+pub use crate::files::Matrix;
+use crate::files::{FileError, Keys, Table};
 
 /// The `general.architecture` of a drafter file.
 pub const ARCHITECTURE: &str = "dflash";
@@ -12,18 +15,14 @@ pub const ARCHITECTURE: &str = "dflash";
 /// Why a drafter file could not be taken.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The file is a model of another architecture.
-    #[error("general.architecture is {found}, a DFlash drafter is {ARCHITECTURE}")]
-    Architecture { found: String },
-    /// A key the drafter needs is missing or has an impossible value.
-    #[error("metadata key '{key}' {problem}")]
-    Key { key: String, problem: String },
+    /// The file does not hold what the drafter reads: a key that is missing
+    /// or has an impossible value, a tensor that is missing or has another
+    /// shape or type than the configuration gives it.
+    #[error(transparent)]
+    File(#[from] FileError),
     /// A variant of the architecture that the DFlash kind does not run, named.
     #[error("{what}: the DFlash drafter of Ares does not run this variant")]
     Variant { what: String },
-    /// A tensor is missing or has another shape or type than the configuration gives it.
-    #[error("tensor '{name}' {problem}")]
-    Tensor { name: String, problem: String },
     /// The drafter does not fit the model it is to draft for.
     #[error("the drafter does not fit the model: {what}")]
     Target { what: String },
@@ -127,13 +126,8 @@ impl Config {
     /// Reads the shape of the drafter in `gguf`, and refuses a variant the
     /// DFlash kind cannot run by its name.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
-        let found = gguf.architecture().unwrap_or("(none)");
-        if found != ARCHITECTURE {
-            return Err(Error::Architecture { found: found.to_owned() });
-        }
-        let prefix = format!("{ARCHITECTURE}.");
-        for (key, _) in gguf.metadata() {
-            let Some(rest) = key.strip_prefix(&prefix) else { continue };
+        let keys = Keys::of(gguf, ARCHITECTURE)?;
+        for (key, rest) in keys.suffixes() {
             if let Some((_, what)) = VARIANT_KEYS.iter().find(|(k, _)| rest.starts_with(k)) {
                 return Err(Error::Variant { what: format!("{what} ({key})") });
             }
@@ -157,34 +151,19 @@ impl Config {
             return Err(Error::Variant { what: "a drafter without dynamic convolutions".into() });
         }
 
-        let key = |suffix: &str| format!("{prefix}{suffix}");
-        let missing = |suffix: &str| Error::Key { key: key(suffix), problem: "is missing".into() };
-        let uint = |suffix: &str| -> Result<usize> {
-            let n = gguf.u64(&key(suffix)).ok_or_else(|| missing(suffix))?;
-            match usize::try_from(n) {
-                Ok(n) if n > 0 => Ok(n),
-                _ => Err(Error::Key { key: key(suffix), problem: format!("is {n}") }),
-            }
-        };
-        let float = |suffix: &str| -> Result<f32> {
-            let x = gguf.f64(&key(suffix)).ok_or_else(|| missing(suffix))?;
-            if x.is_finite() && x > 0.0 {
-                Ok(x as f32)
-            } else {
-                Err(Error::Key { key: key(suffix), problem: format!("is {x}") })
-            }
-        };
-        if gguf.bool(&key("attention.causal")) != Some(false) {
+        if keys.get("attention.causal").and_then(|v| v.as_bool()) != Some(false) {
             return Err(Error::Variant {
                 what: "causal attention inside the block (attention.causal is not false)".into(),
             });
         }
-        let head_dim = uint("attention.key_length")?;
-        if uint("attention.value_length")? != head_dim {
+        let head_dim = keys.uint("attention.key_length")?;
+        if keys.uint("attention.value_length")? != head_dim {
             return Err(Error::Variant { what: "keys and values of different lengths".into() });
         }
-        let n_layer = uint("block_count")?;
-        if let Some(pattern) = gguf.array(&key("attention.sliding_window_pattern")) {
+        let n_layer = keys.uint("block_count")?;
+        if let Some(pattern) =
+            keys.get("attention.sliding_window_pattern").and_then(|v| v.as_array())
+        {
             let all = pattern.iter().all(|v| v.as_bool() == Some(true));
             if !all || pattern.len() != n_layer as u64 {
                 return Err(Error::Variant {
@@ -194,7 +173,7 @@ impl Config {
         }
         // A drafter of a model with sections of its rotary embedding carries
         // degenerate ones: every pair turns with the position.
-        if let Some(sections) = gguf.array(&key("rope.dimension_sections")) {
+        if let Some(sections) = keys.get("rope.dimension_sections").and_then(|v| v.as_array()) {
             let sections = sections.to_u32_vec().unwrap_or_default();
             let degenerate = sections.first().copied() == Some(head_dim as u32 / 2)
                 && sections.iter().skip(1).all(|s| *s == 0);
@@ -204,44 +183,40 @@ impl Config {
                 });
             }
         }
-        let target_layers = gguf
-            .array(&key("target_layers"))
+        let target_layers = keys
+            .value("target_layers")?
+            .as_array()
             .and_then(|a| a.to_u32_vec())
             .filter(|layers| !layers.is_empty())
-            .ok_or_else(|| missing("target_layers"))?;
+            .ok_or_else(|| keys.bad("target_layers", "is not a list of layers"))?;
         if target_layers.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(Error::Key {
-                key: key("target_layers"),
-                problem: format!("is {target_layers:?}, not ascending"),
-            });
+            let problem = format!("is {target_layers:?}, not ascending");
+            return Err(keys.bad("target_layers", problem).into());
         }
-        let mask_token = gguf
-            .u64("tokenizer.ggml.mask_token_id")
-            .and_then(|t| u32::try_from(t).ok())
-            .ok_or_else(|| Error::Key {
-                key: "tokenizer.ggml.mask_token_id".into(),
-                problem: "is missing".into(),
-            })?;
-        let n_vocab =
-            gguf.array("tokenizer.ggml.tokens").map(|a| a.len() as usize).ok_or_else(|| {
-                Error::Key { key: "tokenizer.ggml.tokens".into(), problem: "is missing".into() }
-            })?;
+        let tokenizer = Keys::under(gguf, "tokenizer.ggml");
+        let mask_token = u32::try_from(tokenizer.uint0("mask_token_id")?)
+            .map_err(|_| tokenizer.bad("mask_token_id", "is not a token"))?;
+        let n_vocab = tokenizer
+            .value("tokens")?
+            .as_array()
+            .map(|a| a.len() as usize)
+            .ok_or_else(|| tokenizer.bad("tokens", "is not a list of tokens"))?;
         let c = Config {
             n_layer,
-            n_embd: uint("embedding_length")?,
-            n_ff: uint("feed_forward_length")?,
-            n_head: uint("attention.head_count")?,
-            n_head_kv: uint("attention.head_count_kv")?,
+            n_embd: keys.uint("embedding_length")?,
+            n_ff: keys.uint("feed_forward_length")?,
+            n_head: keys.uint("attention.head_count")?,
+            n_head_kv: keys.uint("attention.head_count_kv")?,
             head_dim,
-            eps: float("attention.layer_norm_rms_epsilon")?,
-            rope_base: float("rope.freq_base")?,
-            block: uint("block_size")?,
-            conv_kernel: uint("conv_kernel_size")?,
-            conv_group: uint("conv_group_size")?,
-            selector_rank: uint("selector_rank")?,
-            top_k: uint("selector_top_k")?,
+            eps: keys.float("attention.layer_norm_rms_epsilon")?,
+            rope_base: keys.float("rope.freq_base")?,
+            block: keys.uint("block_size")?,
+            conv_kernel: keys.uint("conv_kernel_size")?,
+            conv_group: keys.uint("conv_group_size")?,
+            selector_rank: keys.uint("selector_rank")?,
+            top_k: keys.uint("selector_top_k")?,
             target_layers,
-            window: uint("attention.sliding_window")?,
+            window: keys.uint("attention.sliding_window")?,
             mask_token,
             n_vocab,
         };
@@ -322,16 +297,6 @@ pub const MAX_BLOCK: usize = 16;
 /// The most candidates per position the kernels take.
 pub const MAX_TOP_K: usize = 32;
 
-/// One matrix of the drafter as the file stores it.
-#[derive(Clone, Debug)]
-pub struct Matrix<'g> {
-    pub name: String,
-    pub ty: GgmlType,
-    pub n_in: usize,
-    pub n_out: usize,
-    pub data: &'g [u8],
-}
-
 /// A vector of f32 values of the drafter.
 #[derive(Clone, Debug)]
 pub struct Vector<'g> {
@@ -389,103 +354,41 @@ impl<'g> Weights<'g> {
     /// Finds every tensor of `c` in `gguf` and checks its shape; a tensor the
     /// drafter has no use for is refused by name.
     pub fn load(gguf: &'g Gguf, c: &Config) -> Result<Self> {
-        let mut used = Vec::new();
-        let mut info = |name: &str| -> Result<&'g TensorInfo> {
-            used.push(name.to_owned());
-            gguf.tensor(name)
-                .ok_or_else(|| Error::Tensor { name: name.into(), problem: "is missing".into() })
-        };
-        let mut matrix = |name: &str, n_in: usize, n_out: usize| -> Result<Matrix<'g>> {
-            let t = info(name)?;
-            let dims = t.dims.as_slice().to_vec();
-            if dims != [n_in as u64, n_out as u64] {
-                return Err(Error::Tensor {
-                    name: name.into(),
-                    problem: format!(
-                        "has dims {dims:?}, the configuration needs [{n_in}, {n_out}]"
-                    ),
-                });
-            }
-            if !n_in.is_multiple_of(t.ty.block_values() as usize) {
-                return Err(Error::Tensor {
-                    name: name.into(),
-                    problem: format!("is {} in rows of {n_in} values", t.ty),
-                });
-            }
-            Ok(Matrix { name: name.into(), ty: t.ty, n_in, n_out, data: gguf.data(t) })
-        };
+        let mut table = Table::new(gguf);
+        let t = &mut table;
         let (d, hd) = (c.n_embd, c.head_dim);
-        let fc = matrix("fc.weight", c.tap_values(), d)?;
-        let selector_hidden = matrix("selector_hidden.weight", d, c.selector_rank)?;
-        let selector_successor = matrix("selector_successor.weight", c.selector_rank, c.n_vocab)?;
+        let fc = t.matrix("fc.weight", c.tap_values(), d)?;
+        let selector_hidden = t.matrix("selector_hidden.weight", d, c.selector_rank)?;
+        let selector_successor =
+            t.matrix("selector_successor.weight", c.selector_rank, c.n_vocab)?;
         let selector_predecessor =
-            matrix("selector_predecessor.weight", c.selector_rank, c.n_vocab)?;
-        let mut mats = Vec::new();
-        for l in 0..c.n_layer {
-            let name = |s: &str| format!("blk.{l}.{s}");
-            mats.push([
-                matrix(&name("attn_conv_proj.weight"), d, c.conv_values())?,
-                matrix(&name("attn_q.weight"), d, c.n_head * hd)?,
-                matrix(&name("attn_k.weight"), d, c.n_head_kv * hd)?,
-                matrix(&name("attn_v.weight"), d, c.n_head_kv * hd)?,
-                matrix(&name("attn_output.weight"), c.n_head * hd, d)?,
-                matrix(&name("ffn_conv_proj.weight"), d, c.conv_values())?,
-                matrix(&name("ffn_gate.weight"), d, c.n_ff)?,
-                matrix(&name("ffn_up.weight"), d, c.n_ff)?,
-                matrix(&name("ffn_down.weight"), c.n_ff, d)?,
-            ]);
-        }
-        drop(matrix);
-        let mut vector = |name: &str, dims: &[u64]| -> Result<Vector<'g>> {
-            let t = info(name)?;
-            let found = t.dims.as_slice().to_vec();
-            if found != dims {
-                return Err(Error::Tensor {
-                    name: name.into(),
-                    problem: format!("has dims {found:?}, the configuration needs {dims:?}"),
-                });
-            }
-            // The kernels read these as f32: another type is decoded once, here.
-            let data = if t.ty == GgmlType::F32 {
-                Cow::Borrowed(gguf.data(t))
-            } else {
-                let mut values = vec![0f32; dims.iter().product::<u64>() as usize];
-                ares_quant::dequantize(t.ty, gguf.data(t), &mut values).map_err(|e| {
-                    Error::Tensor { name: name.into(), problem: format!("is {}: {e}", t.ty) }
-                })?;
-                Cow::Owned(values.iter().flat_map(|v| v.to_le_bytes()).collect())
-            };
-            Ok(Vector { name: name.into(), data })
-        };
+            t.matrix("selector_predecessor.weight", c.selector_rank, c.n_vocab)?;
         let (d64, hd64) = (d as u64, hd as u64);
         let conv = [d64, c.conv_kernel as u64, 2];
-        let fc_out_norm = vector("enc.output_norm.weight", &[d64])?;
-        let output_norm = vector("output_norm.weight", &[d64])?;
+        let fc_out_norm = vector(t, "enc.output_norm.weight", &[d64])?;
+        let output_norm = vector(t, "output_norm.weight", &[d64])?;
         let mut layers = Vec::with_capacity(c.n_layer);
-        for (l, [attn_conv_proj, q, k, v, out, ffn_conv_proj, gate, up, down]) in
-            mats.into_iter().enumerate()
-        {
+        for l in 0..c.n_layer {
             let name = |s: &str| format!("blk.{l}.{s}");
             layers.push(LayerWeights {
-                attn_norm: vector(&name("attn_norm.weight"), &[d64])?,
-                attn_conv_proj,
-                attn_conv_base: vector(&name("attn_conv_base"), &conv)?,
-                q,
-                k,
-                v,
-                q_norm: vector(&name("attn_q_norm.weight"), &[hd64])?,
-                k_norm: vector(&name("attn_k_norm.weight"), &[hd64])?,
-                out,
-                ffn_norm: vector(&name("ffn_norm.weight"), &[d64])?,
-                ffn_conv_proj,
-                ffn_conv_base: vector(&name("ffn_conv_base"), &conv)?,
-                gate,
-                up,
-                down,
+                attn_norm: vector(t, &name("attn_norm.weight"), &[d64])?,
+                attn_conv_proj: t.matrix(&name("attn_conv_proj.weight"), d, c.conv_values())?,
+                attn_conv_base: vector(t, &name("attn_conv_base"), &conv)?,
+                q: t.matrix(&name("attn_q.weight"), d, c.n_head * hd)?,
+                k: t.matrix(&name("attn_k.weight"), d, c.n_head_kv * hd)?,
+                v: t.matrix(&name("attn_v.weight"), d, c.n_head_kv * hd)?,
+                q_norm: vector(t, &name("attn_q_norm.weight"), &[hd64])?,
+                k_norm: vector(t, &name("attn_k_norm.weight"), &[hd64])?,
+                out: t.matrix(&name("attn_output.weight"), c.n_head * hd, d)?,
+                ffn_norm: vector(t, &name("ffn_norm.weight"), &[d64])?,
+                ffn_conv_proj: t.matrix(&name("ffn_conv_proj.weight"), d, c.conv_values())?,
+                ffn_conv_base: vector(t, &name("ffn_conv_base"), &conv)?,
+                gate: t.matrix(&name("ffn_gate.weight"), d, c.n_ff)?,
+                up: t.matrix(&name("ffn_up.weight"), d, c.n_ff)?,
+                down: t.matrix(&name("ffn_down.weight"), c.n_ff, d)?,
             });
         }
-        drop(vector);
-        if let Some(extra) = gguf.tensors().iter().find(|t| !used.contains(&t.name)) {
+        if let Some(extra) = table.unclaimed(|_| true) {
             return Err(Error::Variant {
                 what: format!("a tensor this implementation does not know ({})", extra.name),
             });
@@ -535,6 +438,18 @@ impl<'g> Weights<'g> {
                 + self.layers[0].ffn_norm.data.len()
                 + self.layers[0].ffn_conv_base.data.len()) as u64
             + (self.fc_out_norm.data.len() + self.output_norm.data.len()) as u64;
-        self.matrices().iter().map(|m| m.data.len() as u64).sum::<u64>() + vectors
+        self.matrices().iter().map(|m| m.bytes().len() as u64).sum::<u64>() + vectors
     }
+}
+
+/// The vector `name` of dimensions `dims` as `f32` values: the kernels read
+/// these as `f32`, so another type is decoded once, here.
+fn vector<'g>(t: &mut Table<'g>, name: &str, dims: &[u64]) -> Result<Vector<'g>> {
+    let info = t.info(name, dims)?;
+    let data = if info.ty == GgmlType::F32 {
+        Cow::Borrowed(t.bytes(info))
+    } else {
+        Cow::Owned(t.decode(info)?.iter().flat_map(|v| v.to_le_bytes()).collect())
+    };
+    Ok(Vector { name: name.into(), data })
 }

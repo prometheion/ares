@@ -5,6 +5,7 @@ mod common;
 
 use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
+use ares_model::files::FileError;
 use ares_model::qwen3vl::{
     Arithmetic, Config, Error, Limits, Reference, Stage, Weights, normalize, patch_position,
     patch_rows, resize_bicubic, target_size,
@@ -252,17 +253,21 @@ fn the_configuration_is_read_and_strict() {
         );
     });
     let unknown = load_error(&small().u32("clip.vision.n_wa_pattern", 8));
-    assert!(matches!(unknown, Error::UnknownKey { key } if key == "clip.vision.n_wa_pattern"));
+    assert!(
+        matches!(unknown, Error::File(FileError::UnknownKey { key, .. }) if key == "clip.vision.n_wa_pattern")
+    );
     let other = load_error(&small_with("pixtral", true, 2));
     assert!(matches!(other, Error::Kind { key: "clip.projector_type", .. }));
     let relu = load_error(&small_with("qwen3vl_merger", false, 2));
-    assert!(matches!(relu, Error::BadKey { key, .. } if key == "clip.use_gelu"));
+    assert!(matches!(relu, Error::File(FileError::BadKey { key, .. }) if key == "clip.use_gelu"));
     let merge = load_error(&small_with("qwen3vl_merger", true, 3));
     assert!(matches!(merge, Error::Inconsistent { .. }));
     let extra = load_error(&small().tensor_f32("v.blk.0.deepstack.0.weight", &[2], &[0.0; 2]));
-    assert!(matches!(extra, Error::UnexpectedTensor { name } if name.contains("deepstack")));
+    assert!(
+        matches!(extra, Error::File(FileError::UnexpectedTensor { name, .. }) if name.contains("deepstack"))
+    );
     let shape = load_error(&small().tensor_f32("v.pre_ln.weight", &[8], &[0.0; 8]));
-    assert!(matches!(shape, Error::UnexpectedTensor { .. }));
+    assert!(matches!(shape, Error::File(FileError::UnexpectedTensor { .. })));
 }
 
 #[test]

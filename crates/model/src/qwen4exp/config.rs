@@ -7,8 +7,9 @@
 //! the values must describe a model that the reference can run.
 
 use ares_core::GgmlType;
-use ares_gguf::{Gguf, Value};
+use ares_gguf::Gguf;
 
+use crate::files::{FileError, Keys, vocabulary};
 use crate::qwen4exp::error::{Error, Result};
 
 /// The architecture name in `general.architecture` and the prefix of its keys.
@@ -251,120 +252,28 @@ pub struct Config {
     pub ngram: Option<Ngram>,
 }
 
-struct Keys<'g> {
-    gguf: &'g Gguf,
-    prefix: String,
-}
-
-impl<'g> Keys<'g> {
-    fn name(&self, suffix: &str) -> String {
-        format!("{}{suffix}", self.prefix)
-    }
-
-    fn value(&self, suffix: &str) -> Result<Value<'g>> {
-        self.gguf
-            .get(&self.name(suffix))
-            .ok_or_else(|| Error::MissingKey { key: self.name(suffix) })
-    }
-
-    fn bad(&self, suffix: &str, problem: String) -> Error {
-        Error::BadKey { key: self.name(suffix), problem }
-    }
-
-    /// A count that may be zero.
-    fn uint0(&self, suffix: &str) -> Result<usize> {
-        let value = self.value(suffix)?;
-        value
-            .as_u64()
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| self.bad(suffix, format!("is {value}, not a count")))
-    }
-
-    /// A count of at least one.
-    fn uint(&self, suffix: &str) -> Result<usize> {
-        match self.uint0(suffix)? {
-            0 => Err(self.bad(suffix, "is 0, it must be at least 1".into())),
-            n => Ok(n),
-        }
-    }
-
-    fn float(&self, suffix: &str) -> Result<f32> {
-        let value = self.value(suffix)?;
-        let x =
-            value.as_f64().ok_or_else(|| self.bad(suffix, format!("is {value}, not a float")))?;
-        if !(x.is_finite() && x > 0.0) {
-            return Err(self.bad(suffix, format!("is {x}, it must be positive")));
-        }
-        Ok(x as f32)
-    }
-
-    /// An array of unsigned integers, `None` when the key is absent.
-    fn uints(&self, suffix: &str) -> Result<Option<Vec<u64>>> {
-        let Some(value) = self.gguf.get(&self.name(suffix)) else { return Ok(None) };
-        let array = value
-            .as_array()
-            .ok_or_else(|| self.bad(suffix, format!("is {value}, not an array")))?;
-        let mut out = Vec::with_capacity(array.len() as usize);
-        for item in array.iter() {
-            out.push(
-                item.as_u64()
-                    .ok_or_else(|| self.bad(suffix, format!("holds {item}, not a count")))?,
-            );
-        }
-        Ok(Some(out))
-    }
-
-    fn required_uints(&self, suffix: &str) -> Result<Vec<u64>> {
-        self.uints(suffix)?.ok_or_else(|| Error::MissingKey { key: self.name(suffix) })
-    }
-
-    /// An array of booleans, `None` when the key is absent.
-    fn bools(&self, suffix: &str) -> Result<Option<Vec<bool>>> {
-        let Some(value) = self.gguf.get(&self.name(suffix)) else { return Ok(None) };
-        let array = value
-            .as_array()
-            .ok_or_else(|| self.bad(suffix, format!("is {value}, not an array")))?;
-        let mut out = Vec::with_capacity(array.len() as usize);
-        for item in array.iter() {
-            out.push(
-                item.as_bool()
-                    .ok_or_else(|| self.bad(suffix, format!("holds {item}, not a boolean")))?,
-            );
-        }
-        Ok(Some(out))
-    }
-}
-
 impl Config {
     /// Reads and checks the configuration of the model in `gguf`.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
-        let found = gguf.architecture().unwrap_or("(none)");
-        if found != ARCHITECTURE {
-            return Err(Error::Architecture { found: found.to_owned() });
-        }
-        let keys = Keys { gguf, prefix: format!("{ARCHITECTURE}.") };
-        for (key, _) in gguf.metadata() {
-            if let Some(rest) = key.strip_prefix(&keys.prefix)
-                && !KNOWN_KEYS.contains(&rest)
-            {
-                return Err(Error::UnknownKey { key: key.to_owned() });
-            }
-        }
+        let keys = Keys::of(gguf, ARCHITECTURE)?;
+        keys.only_known(KNOWN_KEYS, "the qwen4exp architecture")?;
         let inconsistent = |what: String| Err(Error::Inconsistent { what });
 
         let n_layer = keys.uint("block_count")?;
         let n_embd = keys.uint("embedding_length")?;
         let n_stream = keys.uint("hyper_connection.count")?;
         if n_stream < 2 {
-            return Err(keys.bad(
-                "hyper_connection.count",
-                format!("is {n_stream}, the architecture needs at least 2 streams"),
-            ));
+            return Err(keys
+                .bad(
+                    "hyper_connection.count",
+                    format!("is {n_stream}, the architecture needs at least 2 streams"),
+                )
+                .into());
         }
 
         // Which layers are attention layers.
         let from_array = keys.bools("attention.recurrent_layers")?;
-        let interval = match gguf.get(&keys.name("full_attention_interval")) {
+        let interval = match keys.get("full_attention_interval") {
             Some(_) => Some(keys.uint("full_attention_interval")?),
             None => None,
         };
@@ -373,10 +282,12 @@ impl Config {
         let attention_layers: Vec<bool> = match (from_array, from_interval) {
             (Some(recurrent), other) => {
                 if recurrent.len() != n_layer {
-                    return Err(keys.bad(
-                        "attention.recurrent_layers",
-                        format!("has {} entries for {n_layer} layers", recurrent.len()),
-                    ));
+                    return Err(keys
+                        .bad(
+                            "attention.recurrent_layers",
+                            format!("has {} entries for {n_layer} layers", recurrent.len()),
+                        )
+                        .into());
                 }
                 let attention: Vec<bool> = recurrent.iter().map(|r| !r).collect();
                 if let Some(other) = other
@@ -392,17 +303,20 @@ impl Config {
             }
             (None, Some(attention)) => attention,
             (None, None) => {
-                return Err(Error::MissingKey { key: keys.name("attention.recurrent_layers") });
+                let key = keys.name("attention.recurrent_layers");
+                return Err(FileError::MissingKey { key }.into());
             }
         };
 
         // The block size of the indexer: one ratio, on exactly the attention layers.
         let ratios = keys.required_uints("attention.compress_ratios")?;
         if ratios.len() != n_layer {
-            return Err(keys.bad(
-                "attention.compress_ratios",
-                format!("has {} entries for {n_layer} layers", ratios.len()),
-            ));
+            return Err(keys
+                .bad(
+                    "attention.compress_ratios",
+                    format!("has {} entries for {n_layer} layers", ratios.len()),
+                )
+                .into());
         }
         let mut block = 0usize;
         for (layer, (&ratio, &attention)) in ratios.iter().zip(&attention_layers).enumerate() {
@@ -435,9 +349,8 @@ impl Config {
             .iter()
             .map(|&n| n as usize)
             .collect::<Vec<_>>();
-        let sections = <[usize; 4]>::try_from(sections).map_err(|_| {
-            keys.bad("rope.dimension_sections", "is not an array of 4 counts".into())
-        })?;
+        let sections = <[usize; 4]>::try_from(sections)
+            .map_err(|_| keys.bad("rope.dimension_sections", "is not an array of 4 counts"))?;
 
         let head_dim = keys.uint("attention.key_length")?;
         let value_length = keys.uint("attention.value_length")?;
@@ -530,71 +443,54 @@ impl Config {
             return inconsistent("attention layers without a compress ratio".into());
         }
 
-        let embd = gguf
-            .tensor("token_embd.weight")
-            .ok_or_else(|| Error::MissingTensor { name: "token_embd.weight".into() })?;
-        let dims = embd.dims.as_slice();
-        if dims.len() != 2 || dims[0] != n_embd as u64 {
-            return Err(Error::TensorShape {
-                name: embd.name.clone(),
-                found: dims.to_vec(),
-                expected: vec![n_embd as u64, dims.get(1).copied().unwrap_or(0)],
-            });
-        }
-        config.n_vocab = dims[1] as usize;
-        if let Some(tokens) = gguf.array("tokenizer.ggml.tokens")
-            && tokens.len() != dims[1]
-        {
-            return inconsistent(format!(
-                "tokenizer.ggml.tokens has {} entries but token_embd.weight has {} rows",
-                tokens.len(),
-                dims[1]
-            ));
-        }
-
-        config.ngram = Self::ngram(&keys, &config)?;
+        config.n_vocab = vocabulary(gguf, n_embd)?;
+        config.ngram = Self::ngram(gguf, &keys, &config)?;
         Ok(config)
     }
 
-    fn ngram(keys: &Keys<'_>, config: &Config) -> Result<Option<Ngram>> {
+    fn ngram(gguf: &Gguf, keys: &Keys<'_>, config: &Config) -> Result<Option<Ngram>> {
         let inconsistent = |what: String| Err(Error::Inconsistent { what });
         let layers = keys.uints("ple.layers")?.unwrap_or_default();
         let layer = match layers.as_slice() {
             [] => return Ok(None),
             [layer] => *layer as usize,
             more => {
-                return Err(keys.bad(
-                    "ple.layers",
-                    format!("lists {} layers, the architecture has one such layer", more.len()),
-                ));
+                return Err(keys
+                    .bad(
+                        "ple.layers",
+                        format!("lists {} layers, the architecture has one such layer", more.len()),
+                    )
+                    .into());
             }
         };
         if layer >= config.n_layer {
-            return Err(keys.bad("ple.layers", format!("names layer {layer}, past the last")));
+            return Err(keys
+                .bad("ple.layers", format!("names layer {layer}, past the last"))
+                .into());
         }
         let ngram_size = keys.uint("ple.ngram_size")?;
         if ngram_size < 2 {
-            return Err(keys.bad("ple.ngram_size", format!("is {ngram_size}, at least 2 needed")));
+            return Err(keys
+                .bad("ple.ngram_size", format!("is {ngram_size}, at least 2 needed"))
+                .into());
         }
         let token = |suffix: &str| -> Result<u32> {
             let id = keys.uint0(suffix)?;
             if id >= config.n_vocab {
-                return Err(keys.bad(
-                    suffix,
-                    format!("is {id}, outside the vocabulary of {}", config.n_vocab),
-                ));
+                return Err(keys
+                    .bad(suffix, format!("is {id}, outside the vocabulary of {}", config.n_vocab))
+                    .into());
             }
             Ok(id as u32)
         };
         let eos_token = token("ple.eos_token_id")?;
-        let image_token = match keys.gguf.get(&keys.name("ple.image_token_id")) {
+        let image_token = match keys.get("ple.image_token_id") {
             Some(_) => token("ple.image_token_id")?,
             None => eos_token,
         };
-        let table = keys
-            .gguf
-            .tensor("per_layer_token_embd.weight")
-            .ok_or_else(|| Error::MissingTensor { name: "per_layer_token_embd.weight".into() })?;
+        let name = "per_layer_token_embd.weight";
+        let table =
+            gguf.tensor(name).ok_or_else(|| FileError::MissingTensor { name: name.into() })?;
         let mut ngram = Ngram {
             layer,
             ngram_size,
@@ -617,19 +513,20 @@ impl Config {
             ));
         }
         if ngram.multipliers.len() < ngram_size {
-            return Err(keys.bad(
-                "ple.layer_multipliers",
-                format!("has {} values for a window of {ngram_size}", ngram.multipliers.len()),
-            ));
+            return Err(keys
+                .bad(
+                    "ple.layer_multipliers",
+                    format!("has {} values for a window of {ngram_size}", ngram.multipliers.len()),
+                )
+                .into());
         }
         ngram.multipliers.truncate(ngram_size);
         for (suffix, array) in
             [("ple.head_vocab_sizes", &ngram.head_vocab), ("ple.head_offsets", &ngram.head_offset)]
         {
             if array.len() != heads {
-                return Err(
-                    keys.bad(suffix, format!("has {} values for {heads} heads", array.len()))
-                );
+                let problem = format!("has {} values for {heads} heads", array.len());
+                return Err(keys.bad(suffix, problem).into());
             }
         }
         for head in 0..heads {

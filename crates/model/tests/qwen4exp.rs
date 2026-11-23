@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use ares_core::GgmlType;
 use ares_gguf::Gguf;
+use ares_model::files::FileError;
 use ares_model::qwen4exp::reference::pieces;
 use ares_model::qwen4exp::synthetic::{Shape, Synthetic, Types};
 use ares_model::qwen4exp::{
@@ -73,7 +74,7 @@ fn a_file_that_does_not_describe_the_architecture_is_refused() {
     model.shape.mixer_rank = 3;
     let err = Config::from_gguf(&open("one-stream", &model.bytes())).unwrap_err();
     assert!(
-        matches!(err, Error::BadKey { ref key, .. } if key.ends_with("hyper_connection.count"))
+        matches!(err, Error::File(FileError::BadKey { ref key, .. }) if key.ends_with("hyper_connection.count"))
     );
 
     let mut model = Synthetic::small(1);
@@ -92,7 +93,9 @@ fn a_file_that_does_not_describe_the_architecture_is_refused() {
     let mut config = Config::from_gguf(&gguf).expect("config");
     config.experts.ff += 1;
     let err = Weights::load(&gguf, &config).unwrap_err();
-    assert!(matches!(err, Error::TensorShape { ref name, .. } if name.contains("ffn_gate_exps")));
+    assert!(
+        matches!(err, Error::File(FileError::TensorShape { ref name, .. }) if name.contains("ffn_gate_exps"))
+    );
 }
 
 #[test]

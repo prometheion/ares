@@ -19,27 +19,26 @@ use std::collections::HashMap;
 
 use super::config::{Config, LayerWeights, Matrix, Weights};
 
-/// `x` (rows of `m.n_in` values) times the matrix: rows of `m.n_out` values.
-/// The weights are decoded a row at a time, on all cores.
+/// `x` (rows of `m.cols()` values) times the matrix: rows of `m.rows()`
+/// values. The weights are decoded a row at a time, on all cores.
 pub fn product(m: &Matrix<'_>, x: &[f32]) -> Vec<f32> {
-    let rows = x.len() / m.n_in;
-    assert_eq!(rows * m.n_in, x.len(), "{}: rows of {} values", m.name, m.n_in);
-    let row_bytes = m.data.len() / m.n_out;
-    let mut y = vec![0f32; rows * m.n_out];
+    let (n_in, n_out) = (m.cols(), m.rows());
+    let rows = x.len() / n_in;
+    assert_eq!(rows * n_in, x.len(), "the input is not rows of {n_in} values");
+    let mut y = vec![0f32; rows * n_out];
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-    let per = m.n_out.div_ceil(threads);
+    let per = n_out.div_ceil(threads);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let range = (t * per).min(m.n_out)..((t + 1) * per).min(m.n_out);
+                let range = (t * per).min(n_out)..((t + 1) * per).min(n_out);
                 scope.spawn(move || {
-                    let mut w = vec![0f32; m.n_in];
+                    let mut w = vec![0f32; n_in];
                     let mut out = vec![0f32; rows * range.len()];
                     for (k, o) in range.clone().enumerate() {
-                        let bytes = &m.data[o * row_bytes..(o + 1) * row_bytes];
-                        ares_quant::dequantize(m.ty, bytes, &mut w).expect("a whole row of blocks");
+                        m.decode_row(o, &mut w);
                         for r in 0..rows {
-                            let xr = &x[r * m.n_in..(r + 1) * m.n_in];
+                            let xr = &x[r * n_in..(r + 1) * n_in];
                             out[r * range.len() + k] = dot(&w, xr);
                         }
                     }
@@ -50,7 +49,7 @@ pub fn product(m: &Matrix<'_>, x: &[f32]) -> Vec<f32> {
         for handle in handles {
             let (range, out) = handle.join().expect("a product thread");
             for r in 0..rows {
-                y[r * m.n_out + range.start..r * m.n_out + range.end]
+                y[r * n_out + range.start..r * n_out + range.end]
                     .copy_from_slice(&out[r * range.len()..(r + 1) * range.len()]);
             }
         }
@@ -72,10 +71,8 @@ pub fn round_activations(x: &[f32]) -> Vec<f32> {
 
 /// Row `token` of a table of rows (the selector's), decoded.
 pub fn table_row(m: &Matrix<'_>, token: u32) -> Vec<f32> {
-    let row_bytes = m.data.len() / m.n_out;
-    let mut out = vec![0f32; m.n_in];
-    let at = token as usize * row_bytes;
-    ares_quant::dequantize(m.ty, &m.data[at..at + row_bytes], &mut out).expect("a whole row");
+    let mut out = vec![0f32; m.cols()];
+    m.decode_row(token as usize, &mut out);
     out
 }
 

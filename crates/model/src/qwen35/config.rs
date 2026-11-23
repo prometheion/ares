@@ -10,6 +10,7 @@
 
 use ares_gguf::Gguf;
 
+use crate::files::{Keys, vocabulary};
 use crate::qwen35::error::{Error, Result};
 
 /// The architecture name in `general.architecture` and the prefix of its keys.
@@ -136,53 +137,21 @@ pub struct Config {
 impl Config {
     /// Reads and checks the configuration of the model in `gguf`.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
-        let found = gguf.architecture().unwrap_or("(none)");
-        if found != ARCHITECTURE {
-            return Err(Error::Architecture { found: found.to_owned() });
-        }
-        let prefix = format!("{ARCHITECTURE}.");
-        for (key, _) in gguf.metadata() {
-            if let Some(rest) = key.strip_prefix(&prefix)
-                && !KNOWN_KEYS.contains(&rest)
-            {
-                return Err(Error::UnknownKey { key: key.to_owned() });
-            }
-        }
+        let keys = Keys::of(gguf, ARCHITECTURE)?;
+        keys.only_known(KNOWN_KEYS, "the qwen35 architecture")?;
 
-        let uint = |suffix: &str| -> Result<usize> {
-            let key = format!("{prefix}{suffix}");
-            let value = gguf.get(&key).ok_or_else(|| Error::MissingKey { key: key.clone() })?;
-            let n = value.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| {
-                Error::BadKey { key: key.clone(), problem: format!("is {value}, not a count") }
-            })?;
-            if n == 0 {
-                return Err(Error::BadKey { key, problem: "is 0, it must be at least 1".into() });
-            }
-            Ok(n)
-        };
-        let float = |suffix: &str| -> Result<f32> {
-            let key = format!("{prefix}{suffix}");
-            let value = gguf.get(&key).ok_or_else(|| Error::MissingKey { key: key.clone() })?;
-            let x = value.as_f64().ok_or_else(|| Error::BadKey {
-                key: key.clone(),
-                problem: format!("is {value}, not a float"),
-            })?;
-            if !(x.is_finite() && x > 0.0) {
-                return Err(Error::BadKey { key, problem: format!("is {x}, it must be positive") });
-            }
-            Ok(x as f32)
-        };
-
-        let block_count = uint("block_count")?;
-        let n_nextn = match gguf.get(&format!("{prefix}nextn_predict_layers")) {
+        let block_count = keys.uint("block_count")?;
+        let n_nextn = match keys.get("nextn_predict_layers") {
             None => 0,
             Some(value) => match value.as_u64() {
                 Some(n @ 0..=1) => n as usize,
                 _ => {
-                    return Err(Error::BadKey {
-                        key: format!("{prefix}nextn_predict_layers"),
-                        problem: format!("is {value}, the implementation knows 0 or 1"),
-                    });
+                    return Err(keys
+                        .bad(
+                            "nextn_predict_layers",
+                            format!("is {value}, the implementation knows 0 or 1"),
+                        )
+                        .into());
                 }
             },
         };
@@ -193,47 +162,42 @@ impl Config {
                 ),
             });
         }
-        let n_embd = uint("embedding_length")?;
+        let n_embd = keys.uint("embedding_length")?;
 
-        let sections_key = format!("{prefix}rope.dimension_sections");
-        let sections = gguf
-            .get(&sections_key)
-            .ok_or_else(|| Error::MissingKey { key: sections_key.clone() })?
-            .as_array()
-            .and_then(|a| a.to_u32_vec())
-            .and_then(|v| <[u32; 4]>::try_from(v).ok())
-            .ok_or_else(|| Error::BadKey {
-                key: sections_key.clone(),
-                problem: "is not an array of 4 counts".into(),
-            })?
-            .map(|n| n as usize);
+        let sections = keys
+            .required_uints("rope.dimension_sections")?
+            .iter()
+            .map(|&n| n as usize)
+            .collect::<Vec<_>>();
+        let sections = <[usize; 4]>::try_from(sections)
+            .map_err(|_| keys.bad("rope.dimension_sections", "is not an array of 4 counts"))?;
 
-        let head_dim = uint("attention.key_length")?;
-        let value_length = uint("attention.value_length")?;
-        let rope_dim = uint("rope.dimension_count")?;
-        let state_size = uint("ssm.state_size")?;
-        let inner_size = uint("ssm.inner_size")?;
-        let n_k_heads = uint("ssm.group_count")?;
-        let n_v_heads = uint("ssm.time_step_rank")?;
-        let n_head = uint("attention.head_count")?;
-        let n_head_kv = uint("attention.head_count_kv")?;
-        let full_attention_interval = uint("full_attention_interval")?;
-        let conv_kernel = uint("ssm.conv_kernel")?;
+        let head_dim = keys.uint("attention.key_length")?;
+        let value_length = keys.uint("attention.value_length")?;
+        let rope_dim = keys.uint("rope.dimension_count")?;
+        let state_size = keys.uint("ssm.state_size")?;
+        let inner_size = keys.uint("ssm.inner_size")?;
+        let n_k_heads = keys.uint("ssm.group_count")?;
+        let n_v_heads = keys.uint("ssm.time_step_rank")?;
+        let n_head = keys.uint("attention.head_count")?;
+        let n_head_kv = keys.uint("attention.head_count_kv")?;
+        let full_attention_interval = keys.uint("full_attention_interval")?;
+        let conv_kernel = keys.uint("ssm.conv_kernel")?;
 
         let mut config = Config {
             n_layer: block_count - n_nextn,
             n_embd,
-            n_ff: uint("feed_forward_length")?,
+            n_ff: keys.uint("feed_forward_length")?,
             n_vocab: 0,
-            n_ctx: uint("context_length")?,
-            rms_eps: float("attention.layer_norm_rms_epsilon")?,
+            n_ctx: keys.uint("context_length")?,
+            rms_eps: keys.float("attention.layer_norm_rms_epsilon")?,
             full_attention_interval,
             n_nextn,
             attention: Attention {
                 n_head,
                 n_head_kv,
                 head_dim,
-                rope: Rope { dim: rope_dim, sections, freq_base: float("rope.freq_base")? },
+                rope: Rope { dim: rope_dim, sections, freq_base: keys.float("rope.freq_base")? },
             },
             recurrent: Recurrent {
                 conv_kernel,
@@ -247,7 +211,8 @@ impl Config {
         let inconsistent = |what: String| Err(Error::Inconsistent { what });
         if value_length != head_dim {
             return inconsistent(format!(
-                "{prefix}attention.key_length is {head_dim} but value_length is {value_length}"
+                "{} is {head_dim} but value_length is {value_length}",
+                keys.name("attention.key_length")
             ));
         }
         if n_head % n_head_kv != 0 {
@@ -279,27 +244,7 @@ impl Config {
             ));
         }
 
-        let embd = gguf
-            .tensor("token_embd.weight")
-            .ok_or_else(|| Error::MissingTensor { name: "token_embd.weight".into() })?;
-        let dims = embd.dims.as_slice();
-        if dims.len() != 2 || dims[0] != n_embd as u64 {
-            return Err(Error::TensorShape {
-                name: embd.name.clone(),
-                found: dims.to_vec(),
-                expected: vec![n_embd as u64, dims.get(1).copied().unwrap_or(0)],
-            });
-        }
-        config.n_vocab = dims[1] as usize;
-        if let Some(tokens) = gguf.array("tokenizer.ggml.tokens")
-            && tokens.len() != dims[1]
-        {
-            return inconsistent(format!(
-                "tokenizer.ggml.tokens has {} entries but token_embd.weight has {} rows",
-                tokens.len(),
-                dims[1]
-            ));
-        }
+        config.n_vocab = vocabulary(gguf, n_embd)?;
         Ok(config)
     }
 

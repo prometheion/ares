@@ -8,68 +8,15 @@
 //! file) and are decoded row by row when they are used; the small vectors
 //! (norms, time-step parameters, the convolution) are decoded to `f32` once.
 
-use std::collections::HashSet;
-
-use ares_core::GgmlType;
 use ares_gguf::Gguf;
 
+pub use crate::files::Matrix;
+use crate::files::Table;
 use crate::qwen35::config::Config;
 use crate::qwen35::error::{Error, Result};
 
-/// A weight matrix as stored: `rows` output values, each a dot product over
-/// `cols` input values, one row after the other in quantized blocks.
-///
-/// In GGUF the dimensions are `[cols, rows]` (the first one is contiguous),
-/// so a matrix that maps `n_in` inputs to `n_out` outputs has `cols == n_in`.
-#[derive(Clone, Copy, Debug)]
-pub struct Matrix<'g> {
-    ty: GgmlType,
-    rows: usize,
-    cols: usize,
-    data: &'g [u8],
-}
-
-impl<'g> Matrix<'g> {
-    /// The element type the rows are stored in.
-    pub fn ty(&self) -> GgmlType {
-        self.ty
-    }
-
-    /// The number of outputs.
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// The number of inputs.
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-
-    /// The stored bytes of row `row`.
-    pub fn row_bytes(&self, row: usize) -> &'g [u8] {
-        let size = self.data.len() / self.rows;
-        &self.data[row * size..(row + 1) * size]
-    }
-
-    /// The stored bytes of the whole matrix, row after row: what a device
-    /// loader uploads.
-    pub fn bytes(&self) -> &'g [u8] {
-        self.data
-    }
-
-    /// Decodes row `row` into `out` (`cols` values).
-    ///
-    /// # Panics
-    ///
-    /// Panics when `row` or the length of `out` is out of range. The type was
-    /// checked to be decodable when the matrix was built, so decoding itself
-    /// cannot fail.
-    pub fn decode_row(&self, row: usize, out: &mut [f32]) {
-        assert_eq!(out.len(), self.cols, "a row has {} values", self.cols);
-        ares_quant::dequantize(self.ty, self.row_bytes(row), out)
-            .expect("the type and length of the rows were checked when the matrix was built");
-    }
-}
+/// What a tensor of the file that the table does not take is not part of.
+const OF: &str = "the qwen35 architecture";
 
 /// The weights shared by every block: the two norms and the feed-forward part.
 #[derive(Clone, Debug)]
@@ -203,30 +150,29 @@ pub struct Weights<'g> {
 impl<'g> Weights<'g> {
     /// Builds the table for `config` from the tensors of `gguf`.
     pub fn load(gguf: &'g Gguf, config: &Config) -> Result<Self> {
-        let mut loader = Loader { gguf, used: HashSet::new() };
+        let mut table = Table::new(gguf);
+        let t = &mut table;
         let c = config;
         let (n_embd, n_vocab) = (c.n_embd, c.n_vocab);
 
-        let token_embd = loader.matrix("token_embd.weight", n_embd, n_vocab)?;
-        let output_norm = loader.vector("output_norm.weight", n_embd)?;
-        let output = loader.optional_matrix("output.weight", n_embd, n_vocab)?;
+        let token_embd = t.matrix("token_embd.weight", n_embd, n_vocab)?;
+        let output_norm = t.vector("output_norm.weight", n_embd)?;
+        let output = t.optional_matrix("output.weight", n_embd, n_vocab)?;
 
         let mut layers = Vec::with_capacity(c.n_layer);
         for layer in 0..c.n_layer {
-            let block = loader.block(c, layer)?;
+            let block = block(t, c, layer)?;
             let mixer = if c.is_attention(layer) {
-                Mixer::Attention(loader.attention(c, layer)?)
+                Mixer::Attention(attention(t, c, layer)?)
             } else {
-                Mixer::Recurrent(loader.recurrent(c, layer)?)
+                Mixer::Recurrent(recurrent(t, c, layer)?)
             };
             layers.push(Layer { block, mixer });
         }
 
-        let nextn = if c.n_nextn == 1 { Some(loader.nextn(c, c.n_layer)?) } else { None };
+        let nextn = if c.n_nextn == 1 { Some(nextn(t, c, c.n_layer)?) } else { None };
 
-        if let Some(extra) = gguf.tensors().iter().find(|t| !loader.used.contains(&t.name)) {
-            return Err(Error::UnexpectedTensor { name: extra.name.clone() });
-        }
+        table.finish(OF, |_| true)?;
         Ok(Self { token_embd, output_norm, output, layers, nextn })
     }
 
@@ -250,11 +196,9 @@ impl<'g> Weights<'g> {
                 n_embd: c.n_embd,
             });
         }
-        let mut loader = Loader { gguf: file, used: HashSet::new() };
-        self.nextn = Some(loader.nextn(c, c.n_layer)?);
-        if let Some(extra) = file.tensors().iter().find(|t| !loader.used.contains(&t.name)) {
-            return Err(Error::UnexpectedTensor { name: extra.name.clone() });
-        }
+        let mut table = Table::new(file);
+        self.nextn = Some(nextn(&mut table, c, c.n_layer)?);
+        table.finish(OF, |_| true)?;
         Ok(self)
     }
 
@@ -264,129 +208,63 @@ impl<'g> Weights<'g> {
     }
 }
 
-struct Loader<'g> {
-    gguf: &'g Gguf,
-    used: HashSet<String>,
+fn block<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<Block<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    Ok(Block {
+        attn_norm: t.vector(&name("attn_norm.weight"), c.n_embd)?,
+        post_attention_norm: t.vector(&name("post_attention_norm.weight"), c.n_embd)?,
+        ffn_gate: t.matrix(&name("ffn_gate.weight"), c.n_embd, c.n_ff)?,
+        ffn_up: t.matrix(&name("ffn_up.weight"), c.n_embd, c.n_ff)?,
+        ffn_down: t.matrix(&name("ffn_down.weight"), c.n_ff, c.n_embd)?,
+    })
 }
 
-impl<'g> Loader<'g> {
-    fn info(&mut self, name: &str, dims: &[u64]) -> Result<Option<&'g ares_gguf::TensorInfo>> {
-        let Some(info) = self.gguf.tensor(name) else { return Ok(None) };
-        if info.dims.as_slice() != dims {
-            return Err(Error::TensorShape {
-                name: name.to_owned(),
-                found: info.dims.as_slice().to_vec(),
-                expected: dims.to_vec(),
-            });
-        }
-        self.used.insert(name.to_owned());
-        Ok(Some(info))
-    }
+fn attention<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<AttentionWeights<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let (q_dim, kv_dim) = c.attention_dims();
+    Ok(AttentionWeights {
+        q: t.matrix(&name("attn_q.weight"), c.n_embd, q_dim * 2)?,
+        k: t.matrix(&name("attn_k.weight"), c.n_embd, kv_dim)?,
+        v: t.matrix(&name("attn_v.weight"), c.n_embd, kv_dim)?,
+        out: t.matrix(&name("attn_output.weight"), q_dim, c.n_embd)?,
+        q_norm: t.vector(&name("attn_q_norm.weight"), c.attention.head_dim)?,
+        k_norm: t.vector(&name("attn_k_norm.weight"), c.attention.head_dim)?,
+    })
+}
 
-    fn optional_matrix(
-        &mut self,
-        name: &str,
-        cols: usize,
-        rows: usize,
-    ) -> Result<Option<Matrix<'g>>> {
-        let Some(info) = self.info(name, &[cols as u64, rows as u64])? else { return Ok(None) };
-        let data = self.gguf.data(info);
-        let matrix = Matrix { ty: info.ty, rows, cols, data };
-        // Decode the first row now, so that a type that cannot be decoded is an
-        // error of loading and not of the first multiplication.
-        let mut first = vec![0.0; cols];
-        ares_quant::dequantize(info.ty, matrix.row_bytes(0), &mut first)
-            .map_err(|source| Error::TensorType { name: name.to_owned(), ty: info.ty, source })?;
-        Ok(Some(matrix))
-    }
+fn recurrent<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<RecurrentWeights<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let r = &c.recurrent;
+    let n_v = r.n_v_heads;
+    Ok(RecurrentWeights {
+        qkv: t.matrix(&name("attn_qkv.weight"), c.n_embd, r.conv_dim())?,
+        gate: t.matrix(&name("attn_gate.weight"), c.n_embd, r.value_dim())?,
+        conv: t.floats(&name("ssm_conv1d.weight"), &[r.conv_kernel as u64, r.conv_dim() as u64])?,
+        dt_bias: t.vector(&name("ssm_dt.bias"), n_v)?,
+        a: t.vector(&name("ssm_a"), n_v)?,
+        beta: t.matrix(&name("ssm_beta.weight"), c.n_embd, n_v)?,
+        alpha: t.matrix(&name("ssm_alpha.weight"), c.n_embd, n_v)?,
+        norm: t.vector(&name("ssm_norm.weight"), r.head_v_dim)?,
+        out: t.matrix(&name("ssm_out.weight"), r.value_dim(), c.n_embd)?,
+    })
+}
 
-    fn matrix(&mut self, name: &str, cols: usize, rows: usize) -> Result<Matrix<'g>> {
-        self.optional_matrix(name, cols, rows)?
-            .ok_or_else(|| Error::MissingTensor { name: name.to_owned() })
-    }
-
-    fn optional_vector(&mut self, name: &str, dims: &[u64]) -> Result<Option<Vec<f32>>> {
-        let Some(info) = self.info(name, dims)? else { return Ok(None) };
-        let n = dims.iter().product::<u64>() as usize;
-        let mut out = vec![0.0; n];
-        ares_quant::dequantize(info.ty, self.gguf.data(info), &mut out)
-            .map_err(|source| Error::TensorType { name: name.to_owned(), ty: info.ty, source })?;
-        Ok(Some(out))
-    }
-
-    fn vector(&mut self, name: &str, len: usize) -> Result<Vec<f32>> {
-        self.optional_vector(name, &[len as u64])?
-            .ok_or_else(|| Error::MissingTensor { name: name.to_owned() })
-    }
-
-    fn block(&mut self, c: &Config, layer: usize) -> Result<Block<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        Ok(Block {
-            attn_norm: self.vector(&name("attn_norm.weight"), c.n_embd)?,
-            post_attention_norm: self.vector(&name("post_attention_norm.weight"), c.n_embd)?,
-            ffn_gate: self.matrix(&name("ffn_gate.weight"), c.n_embd, c.n_ff)?,
-            ffn_up: self.matrix(&name("ffn_up.weight"), c.n_embd, c.n_ff)?,
-            ffn_down: self.matrix(&name("ffn_down.weight"), c.n_ff, c.n_embd)?,
-        })
-    }
-
-    fn attention(&mut self, c: &Config, layer: usize) -> Result<AttentionWeights<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let (q_dim, kv_dim) = c.attention_dims();
-        Ok(AttentionWeights {
-            q: self.matrix(&name("attn_q.weight"), c.n_embd, q_dim * 2)?,
-            k: self.matrix(&name("attn_k.weight"), c.n_embd, kv_dim)?,
-            v: self.matrix(&name("attn_v.weight"), c.n_embd, kv_dim)?,
-            out: self.matrix(&name("attn_output.weight"), q_dim, c.n_embd)?,
-            q_norm: self.vector(&name("attn_q_norm.weight"), c.attention.head_dim)?,
-            k_norm: self.vector(&name("attn_k_norm.weight"), c.attention.head_dim)?,
-        })
-    }
-
-    fn recurrent(&mut self, c: &Config, layer: usize) -> Result<RecurrentWeights<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let r = &c.recurrent;
-        let n_v = r.n_v_heads;
-        let conv = self
-            .optional_vector(
-                &name("ssm_conv1d.weight"),
-                &[r.conv_kernel as u64, r.conv_dim() as u64],
-            )?
-            .ok_or_else(|| Error::MissingTensor { name: name("ssm_conv1d.weight") })?;
-        Ok(RecurrentWeights {
-            qkv: self.matrix(&name("attn_qkv.weight"), c.n_embd, r.conv_dim())?,
-            gate: self.matrix(&name("attn_gate.weight"), c.n_embd, r.value_dim())?,
-            conv,
-            dt_bias: self.vector(&name("ssm_dt.bias"), n_v)?,
-            a: self.vector(&name("ssm_a"), n_v)?,
-            beta: self.matrix(&name("ssm_beta.weight"), c.n_embd, n_v)?,
-            alpha: self.matrix(&name("ssm_alpha.weight"), c.n_embd, n_v)?,
-            norm: self.vector(&name("ssm_norm.weight"), r.head_v_dim)?,
-            out: self.matrix(&name("ssm_out.weight"), r.value_dim(), c.n_embd)?,
-        })
-    }
-
-    fn nextn(&mut self, c: &Config, layer: usize) -> Result<NextnWeights<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let n_embd = c.n_embd;
-        Ok(NextnWeights {
-            block: self.block(c, layer)?,
-            attention: self.attention(c, layer)?,
-            eh_proj: self.matrix(&name("nextn.eh_proj.weight"), 2 * n_embd, n_embd)?,
-            enorm: self.vector(&name("nextn.enorm.weight"), n_embd)?,
-            hnorm: self.vector(&name("nextn.hnorm.weight"), n_embd)?,
-            shared_head_norm: self
-                .optional_vector(&name("nextn.shared_head_norm.weight"), &[n_embd as u64])?,
-            embed_tokens: self.optional_matrix(
-                &name("nextn.embed_tokens.weight"),
-                n_embd,
-                c.n_vocab,
-            )?,
-            shared_head_head: self.optional_matrix(
-                &name("nextn.shared_head_head.weight"),
-                n_embd,
-                c.n_vocab,
-            )?,
-        })
-    }
+fn nextn<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<NextnWeights<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let n_embd = c.n_embd;
+    Ok(NextnWeights {
+        block: block(t, c, layer)?,
+        attention: attention(t, c, layer)?,
+        eh_proj: t.matrix(&name("nextn.eh_proj.weight"), 2 * n_embd, n_embd)?,
+        enorm: t.vector(&name("nextn.enorm.weight"), n_embd)?,
+        hnorm: t.vector(&name("nextn.hnorm.weight"), n_embd)?,
+        shared_head_norm: t
+            .optional_floats(&name("nextn.shared_head_norm.weight"), &[n_embd as u64])?,
+        embed_tokens: t.optional_matrix(&name("nextn.embed_tokens.weight"), n_embd, c.n_vocab)?,
+        shared_head_head: t.optional_matrix(
+            &name("nextn.shared_head_head.weight"),
+            n_embd,
+            c.n_vocab,
+        )?,
+    })
 }

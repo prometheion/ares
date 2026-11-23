@@ -16,78 +16,16 @@
 //! (norm weights, time-step parameters, the convolutions) are decoded to `f32`
 //! once.
 
-use std::collections::HashSet;
-
 use ares_core::GgmlType;
 use ares_gguf::Gguf;
 
+pub use crate::files::Matrix;
+use crate::files::Table;
 use crate::qwen4exp::config::Config;
 use crate::qwen4exp::error::{Error, Result};
 
-/// A weight matrix as stored: `rows` output values, each a dot product over
-/// `cols` input values, one row after the other in quantized blocks.
-///
-/// In GGUF the dimensions are `[cols, rows]` (the first one is contiguous),
-/// so a matrix that maps `n_in` inputs to `n_out` outputs has `cols == n_in`.
-#[derive(Clone, Copy, Debug)]
-pub struct Matrix<'g> {
-    ty: GgmlType,
-    rows: usize,
-    cols: usize,
-    data: &'g [u8],
-}
-
-impl<'g> Matrix<'g> {
-    /// The rows `rows` of the matrix as a matrix of their own.
-    fn slice(&self, rows: std::ops::Range<usize>) -> Self {
-        let size = self.data.len() / self.rows;
-        Self {
-            ty: self.ty,
-            rows: rows.len(),
-            cols: self.cols,
-            data: &self.data[rows.start * size..rows.end * size],
-        }
-    }
-
-    /// The element type the rows are stored in.
-    pub fn ty(&self) -> GgmlType {
-        self.ty
-    }
-
-    /// The number of outputs.
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// The number of inputs.
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-
-    /// The stored bytes of the whole matrix.
-    pub fn bytes(&self) -> &'g [u8] {
-        self.data
-    }
-
-    /// The stored bytes of row `row`.
-    pub fn row_bytes(&self, row: usize) -> &'g [u8] {
-        let size = self.data.len() / self.rows;
-        &self.data[row * size..(row + 1) * size]
-    }
-
-    /// Decodes row `row` into `out` (`cols` values).
-    ///
-    /// # Panics
-    ///
-    /// Panics when `row` or the length of `out` is out of range. The type was
-    /// checked to be decodable when the matrix was built, so decoding itself
-    /// cannot fail.
-    pub fn decode_row(&self, row: usize, out: &mut [f32]) {
-        assert_eq!(out.len(), self.cols, "a row has {} values", self.cols);
-        ares_quant::dequantize(self.ty, self.row_bytes(row), out)
-            .expect("the type and length of the rows were checked when the matrix was built");
-    }
-}
+/// What a tensor of the file that the table does not take is not part of.
+const OF: &str = "the qwen4exp architecture";
 
 /// The matrices of all routed experts of one kind in a layer, as stored:
 /// expert `e` is the `e`-th contiguous slab of `rows` rows. Nothing is read
@@ -141,12 +79,7 @@ impl<'g> ExpertStack<'g> {
     pub fn expert(&self, expert: usize) -> Matrix<'g> {
         assert!(expert < self.n_expert, "the layer has {} experts", self.n_expert);
         let at = self.skip + expert * self.stride;
-        Matrix {
-            ty: self.ty,
-            rows: self.rows,
-            cols: self.cols,
-            data: &self.data[at..at + self.size],
-        }
+        Matrix::new(self.ty, self.rows, self.cols, &self.data[at..at + self.size])
     }
 }
 
@@ -353,51 +286,47 @@ pub struct Weights<'g> {
 impl<'g> Weights<'g> {
     /// Builds the table for `config` from the tensors of `gguf`.
     pub fn load(gguf: &'g Gguf, config: &Config) -> Result<Self> {
-        let mut loader = Loader { gguf, used: HashSet::new() };
+        let mut table = Table::new(gguf);
+        let t = &mut table;
         let c = config;
         let (n, wide) = (c.n_embd, c.wide());
 
-        let token_embd = loader.matrix("token_embd.weight", n, c.n_vocab)?;
-        let output = loader.matrix("output.weight", n, c.n_vocab)?;
+        let token_embd = t.matrix("token_embd.weight", n, c.n_vocab)?;
+        let output = t.matrix("output.weight", n, c.n_vocab)?;
         let output_mixer = StreamMixer {
-            norm: loader.vector("output_hc_norm.weight", wide)?,
-            down: loader.matrix("output_hc_down.weight", wide, c.mixer_rank)?,
-            up: loader.matrix("output_hc_up.weight", c.mixer_rank, wide)?,
+            norm: t.vector("output_hc_norm.weight", wide)?,
+            down: t.matrix("output_hc_down.weight", wide, c.mixer_rank)?,
+            up: t.matrix("output_hc_up.weight", c.mixer_rank, wide)?,
             inject: None,
         };
         let ngram_table = match &c.ngram {
-            Some(ngram) => Some(loader.table(ngram.row_dim, ngram.table_rows)?),
+            Some(ngram) => Some(ngram_table(t, ngram.row_dim, ngram.table_rows)?),
             None => None,
         };
 
         let mut layers = Vec::with_capacity(c.n_layer);
         for layer in 0..c.n_layer {
             let mixer = if c.is_attention(layer) {
-                Mixer::Attention(loader.attention(c, layer)?)
+                Mixer::Attention(attention(t, c, layer)?)
             } else {
-                Mixer::Recurrent(loader.recurrent(c, layer)?)
+                Mixer::Recurrent(recurrent(t, c, layer)?)
             };
             let ngram = match &c.ngram {
-                Some(ngram) if ngram.layer == layer => Some(loader.ngram(c, layer)?),
+                Some(ngram) if ngram.layer == layer => Some(ngram_weights(t, c, layer)?),
                 _ => None,
             };
             layers.push(Layer {
-                attn_mixer: loader.stream_mixer(c, layer, "attn")?,
-                ffn_mixer: loader.stream_mixer(c, layer, "ffn")?,
+                attn_mixer: stream_mixer(t, c, layer, "attn")?,
+                ffn_mixer: stream_mixer(t, c, layer, "ffn")?,
                 mixer,
-                moe: loader.moe(c, layer)?,
+                moe: moe(t, c, layer)?,
                 ngram,
             });
         }
 
         // A file that carries the MTP block has its tensors besides the
         // model's ([`MtpWeights`]).
-        let model = |name: &str| !name.starts_with(MTP_PREFIX);
-        if let Some(extra) =
-            gguf.tensors().iter().find(|t| model(&t.name) && !loader.used.contains(&t.name))
-        {
-            return Err(Error::UnexpectedTensor { name: extra.name.clone() });
-        }
+        table.finish(OF, |name| !name.starts_with(MTP_PREFIX))?;
         Ok(Self { token_embd, output, output_mixer, ngram_table, layers })
     }
 }
@@ -449,73 +378,67 @@ impl<'g> MtpWeights<'g> {
                 expected: MTP_ARCHITECTURE,
             });
         }
-        let mut loader = Loader { gguf, used: HashSet::new() };
+        let mut table = Table::new(gguf);
+        let t = &mut table;
         let c = config;
         let (n, wide, e, ix) = (c.n_embd, c.wide(), &c.experts, &c.indexer);
         let (q_dim, kv_dim) = c.attention_dims();
         let layer = |what: &str| format!("mtp.layers.0.{what}");
-        let mixer = |loader: &mut Loader<'g>, prefix: &str, inject: bool| {
+        let mixer = |t: &mut Table<'g>, prefix: &str, inject: bool| {
             let name = |what: &str| format!("{prefix}.{what}");
             Ok::<_, Error>(StreamMixer {
-                norm: loader.norm_plus_one(&name("hc_norm.weight"), wide)?,
-                down: loader.matrix(&name("input_mix_weight_down.weight"), wide, c.mixer_rank)?,
-                up: loader.matrix(&name("input_mix_weight_up.weight"), c.mixer_rank, wide)?,
+                norm: norm_plus_one(t, &name("hc_norm.weight"), wide)?,
+                down: t.matrix(&name("input_mix_weight_down.weight"), wide, c.mixer_rank)?,
+                up: t.matrix(&name("input_mix_weight_up.weight"), c.mixer_rank, wide)?,
                 inject: if inject {
-                    Some(loader.matrix(&name("block_inject_weight.weight"), wide, c.n_stream)?)
+                    Some(t.matrix(&name("block_inject_weight.weight"), wide, c.n_stream)?)
                 } else {
                     None
                 },
             })
         };
-        let attn_mixer = mixer(&mut loader, &layer("attn_hyper_connection"), true)?;
-        let ffn_mixer = mixer(&mut loader, &layer("mlp_hyper_connection"), true)?;
-        let output_mixer = mixer(&mut loader, "mtp.hyper_connection_mixer", false)?;
+        let attn_mixer = mixer(t, &layer("attn_hyper_connection"), true)?;
+        let ffn_mixer = mixer(t, &layer("mlp_hyper_connection"), true)?;
+        let output_mixer = mixer(t, "mtp.hyper_connection_mixer", false)?;
         // Query rows first, then the rows of the raw key.
         let (iq, ik) = (ix.n_head * ix.key_dim, ix.key_dim);
-        let indexer =
-            loader.matrix(&layer("self_attn.indexer.index_qk_proj.weight"), n, iq + ik)?;
+        let indexer = t.matrix(&layer("self_attn.indexer.index_qk_proj.weight"), n, iq + ik)?;
         let attention = AttentionWeights {
-            q: loader.matrix(&layer("self_attn.q_proj.weight"), n, q_dim * 2)?,
-            k: loader.matrix(&layer("self_attn.k_proj.weight"), n, kv_dim)?,
-            v: loader.matrix(&layer("self_attn.v_proj.weight"), n, kv_dim)?,
-            out: loader.matrix(&layer("self_attn.o_proj.weight"), q_dim, n)?,
-            q_norm: loader
-                .norm_plus_one(&layer("self_attn.q_norm.weight"), c.attention.head_dim)?,
-            k_norm: loader
-                .norm_plus_one(&layer("self_attn.k_norm.weight"), c.attention.head_dim)?,
+            q: t.matrix(&layer("self_attn.q_proj.weight"), n, q_dim * 2)?,
+            k: t.matrix(&layer("self_attn.k_proj.weight"), n, kv_dim)?,
+            v: t.matrix(&layer("self_attn.v_proj.weight"), n, kv_dim)?,
+            out: t.matrix(&layer("self_attn.o_proj.weight"), q_dim, n)?,
+            q_norm: norm_plus_one(t, &layer("self_attn.q_norm.weight"), c.attention.head_dim)?,
+            k_norm: norm_plus_one(t, &layer("self_attn.k_norm.weight"), c.attention.head_dim)?,
             indexer_q: indexer.slice(0..iq),
             indexer_k: indexer.slice(iq..iq + ik),
-            indexer_q_norm: loader
-                .norm_plus_one(&layer("self_attn.indexer.q_layernorm.weight"), ix.key_dim)?,
-            indexer_k_norm: loader
-                .norm_plus_one(&layer("self_attn.indexer.k_layernorm.weight"), ix.key_dim)?,
+            indexer_q_norm: norm_plus_one(
+                t,
+                &layer("self_attn.indexer.q_layernorm.weight"),
+                ix.key_dim,
+            )?,
+            indexer_k_norm: norm_plus_one(
+                t,
+                &layer("self_attn.indexer.k_layernorm.weight"),
+                ix.key_dim,
+            )?,
         };
-        let [gate, up] =
-            loader.fused_experts(&layer("mlp.experts.gate_up_proj"), n, e.ff, e.count)?;
+        let [gate, up] = fused_experts(t, &layer("mlp.experts.gate_up_proj"), n, e.ff, e.count)?;
         let moe = Moe {
-            router: loader.matrix(&layer("mlp.gate.weight"), n, e.count)?,
+            router: t.matrix(&layer("mlp.gate.weight"), n, e.count)?,
             gate,
             up,
-            down: loader.experts(&layer("mlp.experts.down_proj"), e.ff, n, e.count)?,
-            shared_gate_inp: loader
-                .vector_of(&layer("mlp.shared_expert_gate.weight"), &[n as u64, 1])?,
-            shared_gate: loader.matrix(
-                &layer("mlp.shared_expert.gate_proj.weight"),
-                n,
-                e.shared_ff,
-            )?,
-            shared_up: loader.matrix(&layer("mlp.shared_expert.up_proj.weight"), n, e.shared_ff)?,
-            shared_down: loader.matrix(
-                &layer("mlp.shared_expert.down_proj.weight"),
-                e.shared_ff,
-                n,
-            )?,
+            down: experts(t, &layer("mlp.experts.down_proj"), e.ff, n, e.count)?,
+            shared_gate_inp: t.floats(&layer("mlp.shared_expert_gate.weight"), &[n as u64, 1])?,
+            shared_gate: t.matrix(&layer("mlp.shared_expert.gate_proj.weight"), n, e.shared_ff)?,
+            shared_up: t.matrix(&layer("mlp.shared_expert.up_proj.weight"), n, e.shared_ff)?,
+            shared_down: t.matrix(&layer("mlp.shared_expert.down_proj.weight"), e.shared_ff, n)?,
         };
         let weights = Self {
-            norm_embedding: loader.norm_plus_one("mtp.pre_fc_norm_embedding.weight", n)?,
-            norm_hidden: loader.norm_plus_one("mtp.pre_fc_norm_hidden.weight", wide)?,
-            fc_embedding: loader.matrix("mtp.fc_embedding.weight", n, n)?,
-            fc_hidden: loader.matrix("mtp.fc_hidden.weight", n, n)?,
+            norm_embedding: norm_plus_one(t, "mtp.pre_fc_norm_embedding.weight", n)?,
+            norm_hidden: norm_plus_one(t, "mtp.pre_fc_norm_hidden.weight", wide)?,
+            fc_embedding: t.matrix("mtp.fc_embedding.weight", n, n)?,
+            fc_hidden: t.matrix("mtp.fc_hidden.weight", n, n)?,
             layer: Layer {
                 attn_mixer,
                 ffn_mixer,
@@ -525,12 +448,7 @@ impl<'g> MtpWeights<'g> {
             },
             output_mixer,
         };
-        let ours = |name: &str| !in_model || name.starts_with(MTP_PREFIX);
-        if let Some(extra) =
-            gguf.tensors().iter().find(|t| ours(&t.name) && !loader.used.contains(&t.name))
-        {
-            return Err(Error::UnexpectedTensor { name: extra.name.clone() });
-        }
+        table.finish(OF, |name| !in_model || name.starts_with(MTP_PREFIX))?;
         Ok(weights)
     }
 }
@@ -575,190 +493,137 @@ impl MtpWeights<'_> {
     }
 }
 
-struct Loader<'g> {
-    gguf: &'g Gguf,
-    used: HashSet<String>,
+fn experts<'g>(
+    t: &mut Table<'g>,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    n_expert: usize,
+) -> Result<ExpertStack<'g>> {
+    let info = t.info(name, &[cols as u64, rows as u64, n_expert as u64])?;
+    let data = t.rows(info, cols, (rows * n_expert) as u64)?;
+    let size = data.len() / n_expert;
+    Ok(ExpertStack { ty: info.ty, n_expert, rows, cols, data, stride: size, skip: 0, size })
 }
 
-impl<'g> Loader<'g> {
-    fn info(&mut self, name: &str, dims: &[u64]) -> Result<&'g ares_gguf::TensorInfo> {
-        let info =
-            self.gguf.tensor(name).ok_or_else(|| Error::MissingTensor { name: name.to_owned() })?;
-        if info.dims.as_slice() != dims {
-            return Err(Error::TensorShape {
-                name: name.to_owned(),
-                found: info.dims.as_slice().to_vec(),
-                expected: dims.to_vec(),
-            });
-        }
-        self.used.insert(name.to_owned());
-        Ok(info)
-    }
+/// Two stacks stored as one tensor, each expert's `rows` rows of the first
+/// followed by its `rows` rows of the second.
+fn fused_experts<'g>(
+    t: &mut Table<'g>,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    n_expert: usize,
+) -> Result<[ExpertStack<'g>; 2]> {
+    let info = t.info(name, &[cols as u64, 2 * rows as u64, n_expert as u64])?;
+    let data = t.rows(info, cols, (2 * rows * n_expert) as u64)?;
+    let stride = data.len() / n_expert;
+    let size = stride / 2;
+    Ok([0, size].map(|skip| ExpertStack {
+        ty: info.ty,
+        n_expert,
+        rows,
+        cols,
+        data,
+        stride,
+        skip,
+        size,
+    }))
+}
 
-    /// The bytes of `rows` rows of `cols` values each, after checking that a
-    /// row is a whole number of blocks and that its first one decodes: a type
-    /// that cannot be decoded is an error of loading, not of the first
-    /// multiplication. Only that one row is read.
-    fn rows_of(&self, info: &'g ares_gguf::TensorInfo, cols: usize, rows: u64) -> Result<&'g [u8]> {
-        let data = self.gguf.data(info);
-        let row_bytes = info.ty.bytes_for(cols as u64).filter(|b| b * rows == data.len() as u64);
-        let Some(row_bytes) = row_bytes else {
-            return Err(Error::TensorRows { name: info.name.clone(), ty: info.ty, cols });
-        };
-        let mut first = vec![0.0; cols];
-        ares_quant::dequantize(info.ty, &data[..row_bytes as usize], &mut first)
-            .map_err(|source| Error::TensorType { name: info.name.clone(), ty: info.ty, source })?;
-        Ok(data)
+/// A vector whose stored values are `w` of a norm that multiplies by `1 + w`
+/// (the MTP block's file keeps the checkpoint's values).
+fn norm_plus_one(t: &mut Table<'_>, name: &str, len: usize) -> Result<Vec<f32>> {
+    let mut w = t.vector(name, len)?;
+    for v in &mut w {
+        *v += 1.0;
     }
+    Ok(w)
+}
 
-    fn matrix(&mut self, name: &str, cols: usize, rows: usize) -> Result<Matrix<'g>> {
-        let info = self.info(name, &[cols as u64, rows as u64])?;
-        let data = self.rows_of(info, cols, rows as u64)?;
-        Ok(Matrix { ty: info.ty, rows, cols, data })
-    }
+fn ngram_table<'g>(t: &mut Table<'g>, row_dim: usize, rows: u64) -> Result<NgramTable<'g>> {
+    let info = t.info("per_layer_token_embd.weight", &[row_dim as u64, rows])?;
+    let data = t.rows(info, row_dim, rows)?;
+    let row_bytes = data.len() / rows as usize;
+    Ok(NgramTable { ty: info.ty, rows, row_dim, row_bytes, data })
+}
 
-    fn experts(
-        &mut self,
-        name: &str,
-        cols: usize,
-        rows: usize,
-        n_expert: usize,
-    ) -> Result<ExpertStack<'g>> {
-        let info = self.info(name, &[cols as u64, rows as u64, n_expert as u64])?;
-        let data = self.rows_of(info, cols, (rows * n_expert) as u64)?;
-        let size = data.len() / n_expert;
-        Ok(ExpertStack { ty: info.ty, n_expert, rows, cols, data, stride: size, skip: 0, size })
-    }
+fn stream_mixer<'g>(
+    t: &mut Table<'g>,
+    c: &Config,
+    layer: usize,
+    which: &str,
+) -> Result<StreamMixer<'g>> {
+    let name = |what: &str| format!("blk.{layer}.hc_{which}_{what}.weight");
+    let wide = c.wide();
+    Ok(StreamMixer {
+        norm: t.vector(&name("norm"), wide)?,
+        down: t.matrix(&name("down"), wide, c.mixer_rank)?,
+        up: t.matrix(&name("up"), c.mixer_rank, wide)?,
+        inject: Some(t.matrix(&name("inject"), wide, c.n_stream)?),
+    })
+}
 
-    /// Two stacks stored as one tensor, each expert's `rows` rows of the first
-    /// followed by its `rows` rows of the second.
-    fn fused_experts(
-        &mut self,
-        name: &str,
-        cols: usize,
-        rows: usize,
-        n_expert: usize,
-    ) -> Result<[ExpertStack<'g>; 2]> {
-        let info = self.info(name, &[cols as u64, 2 * rows as u64, n_expert as u64])?;
-        let data = self.rows_of(info, cols, (2 * rows * n_expert) as u64)?;
-        let stride = data.len() / n_expert;
-        let size = stride / 2;
-        Ok([0, size].map(|skip| ExpertStack {
-            ty: info.ty,
-            n_expert,
-            rows,
-            cols,
-            data,
-            stride,
-            skip,
-            size,
-        }))
-    }
+fn moe<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<Moe<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let (n, e) = (c.n_embd, &c.experts);
+    Ok(Moe {
+        router: t.matrix(&name("ffn_gate_inp.weight"), n, e.count)?,
+        gate: experts(t, &name("ffn_gate_exps.weight"), n, e.ff, e.count)?,
+        up: experts(t, &name("ffn_up_exps.weight"), n, e.ff, e.count)?,
+        down: experts(t, &name("ffn_down_exps.weight"), e.ff, n, e.count)?,
+        shared_gate_inp: t.vector(&name("ffn_gate_inp_shexp.weight"), n)?,
+        shared_gate: t.matrix(&name("ffn_gate_shexp.weight"), n, e.shared_ff)?,
+        shared_up: t.matrix(&name("ffn_up_shexp.weight"), n, e.shared_ff)?,
+        shared_down: t.matrix(&name("ffn_down_shexp.weight"), e.shared_ff, n)?,
+    })
+}
 
-    /// A vector whose stored values are `w` of a norm that multiplies by
-    /// `1 + w` (the MTP block's file keeps the checkpoint's values).
-    fn norm_plus_one(&mut self, name: &str, len: usize) -> Result<Vec<f32>> {
-        let mut w = self.vector(name, len)?;
-        for v in &mut w {
-            *v += 1.0;
-        }
-        Ok(w)
-    }
+fn attention<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<AttentionWeights<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let (q_dim, kv_dim) = c.attention_dims();
+    let (n, ix) = (c.n_embd, &c.indexer);
+    Ok(AttentionWeights {
+        q: t.matrix(&name("attn_q.weight"), n, q_dim * 2)?,
+        k: t.matrix(&name("attn_k.weight"), n, kv_dim)?,
+        v: t.matrix(&name("attn_v.weight"), n, kv_dim)?,
+        out: t.matrix(&name("attn_output.weight"), q_dim, n)?,
+        q_norm: t.vector(&name("attn_q_norm.weight"), c.attention.head_dim)?,
+        k_norm: t.vector(&name("attn_k_norm.weight"), c.attention.head_dim)?,
+        indexer_q: t.matrix(&name("indexer.q_proj.weight"), n, ix.n_head * ix.key_dim)?,
+        indexer_k: t.matrix(&name("indexer.k_proj.weight"), n, ix.key_dim)?,
+        indexer_q_norm: t.vector(&name("indexer.q_norm.weight"), ix.key_dim)?,
+        indexer_k_norm: t.vector(&name("indexer.k_norm.weight"), ix.key_dim)?,
+    })
+}
 
-    fn table(&mut self, row_dim: usize, rows: u64) -> Result<NgramTable<'g>> {
-        let info = self.info("per_layer_token_embd.weight", &[row_dim as u64, rows])?;
-        let data = self.rows_of(info, row_dim, rows)?;
-        let row_bytes = data.len() / rows as usize;
-        Ok(NgramTable { ty: info.ty, rows, row_dim, row_bytes, data })
-    }
+fn recurrent<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<RecurrentWeights<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let r = &c.recurrent;
+    let (n, n_v) = (c.n_embd, r.n_v_heads);
+    Ok(RecurrentWeights {
+        qkv: t.matrix(&name("attn_qkv.weight"), n, r.conv_dim())?,
+        gate: t.matrix(&name("attn_gate.weight"), n, r.value_dim())?,
+        conv: t.floats(&name("ssm_conv1d.weight"), &[r.conv_kernel as u64, r.conv_dim() as u64])?,
+        dt_bias: t.vector(&name("ssm_dt.bias"), n_v)?,
+        a: t.vector(&name("ssm_a"), n_v)?,
+        beta: t.matrix(&name("ssm_beta.weight"), n, n_v)?,
+        alpha: t.matrix(&name("ssm_alpha.weight"), n, n_v)?,
+        norm: t.vector(&name("ssm_norm.weight"), r.head_dim)?,
+        out: t.matrix(&name("ssm_out.weight"), r.value_dim(), n)?,
+    })
+}
 
-    fn vector_of(&mut self, name: &str, dims: &[u64]) -> Result<Vec<f32>> {
-        let info = self.info(name, dims)?;
-        let mut out = vec![0.0; dims.iter().product::<u64>() as usize];
-        ares_quant::dequantize(info.ty, self.gguf.data(info), &mut out)
-            .map_err(|source| Error::TensorType { name: name.to_owned(), ty: info.ty, source })?;
-        Ok(out)
-    }
-
-    fn vector(&mut self, name: &str, len: usize) -> Result<Vec<f32>> {
-        self.vector_of(name, &[len as u64])
-    }
-
-    fn stream_mixer(&mut self, c: &Config, layer: usize, which: &str) -> Result<StreamMixer<'g>> {
-        let name = |what: &str| format!("blk.{layer}.hc_{which}_{what}.weight");
-        let wide = c.wide();
-        Ok(StreamMixer {
-            norm: self.vector(&name("norm"), wide)?,
-            down: self.matrix(&name("down"), wide, c.mixer_rank)?,
-            up: self.matrix(&name("up"), c.mixer_rank, wide)?,
-            inject: Some(self.matrix(&name("inject"), wide, c.n_stream)?),
-        })
-    }
-
-    fn moe(&mut self, c: &Config, layer: usize) -> Result<Moe<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let (n, e) = (c.n_embd, &c.experts);
-        Ok(Moe {
-            router: self.matrix(&name("ffn_gate_inp.weight"), n, e.count)?,
-            gate: self.experts(&name("ffn_gate_exps.weight"), n, e.ff, e.count)?,
-            up: self.experts(&name("ffn_up_exps.weight"), n, e.ff, e.count)?,
-            down: self.experts(&name("ffn_down_exps.weight"), e.ff, n, e.count)?,
-            shared_gate_inp: self.vector(&name("ffn_gate_inp_shexp.weight"), n)?,
-            shared_gate: self.matrix(&name("ffn_gate_shexp.weight"), n, e.shared_ff)?,
-            shared_up: self.matrix(&name("ffn_up_shexp.weight"), n, e.shared_ff)?,
-            shared_down: self.matrix(&name("ffn_down_shexp.weight"), e.shared_ff, n)?,
-        })
-    }
-
-    fn attention(&mut self, c: &Config, layer: usize) -> Result<AttentionWeights<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let (q_dim, kv_dim) = c.attention_dims();
-        let (n, ix) = (c.n_embd, &c.indexer);
-        Ok(AttentionWeights {
-            q: self.matrix(&name("attn_q.weight"), n, q_dim * 2)?,
-            k: self.matrix(&name("attn_k.weight"), n, kv_dim)?,
-            v: self.matrix(&name("attn_v.weight"), n, kv_dim)?,
-            out: self.matrix(&name("attn_output.weight"), q_dim, n)?,
-            q_norm: self.vector(&name("attn_q_norm.weight"), c.attention.head_dim)?,
-            k_norm: self.vector(&name("attn_k_norm.weight"), c.attention.head_dim)?,
-            indexer_q: self.matrix(&name("indexer.q_proj.weight"), n, ix.n_head * ix.key_dim)?,
-            indexer_k: self.matrix(&name("indexer.k_proj.weight"), n, ix.key_dim)?,
-            indexer_q_norm: self.vector(&name("indexer.q_norm.weight"), ix.key_dim)?,
-            indexer_k_norm: self.vector(&name("indexer.k_norm.weight"), ix.key_dim)?,
-        })
-    }
-
-    fn recurrent(&mut self, c: &Config, layer: usize) -> Result<RecurrentWeights<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let r = &c.recurrent;
-        let (n, n_v) = (c.n_embd, r.n_v_heads);
-        Ok(RecurrentWeights {
-            qkv: self.matrix(&name("attn_qkv.weight"), n, r.conv_dim())?,
-            gate: self.matrix(&name("attn_gate.weight"), n, r.value_dim())?,
-            conv: self.vector_of(
-                &name("ssm_conv1d.weight"),
-                &[r.conv_kernel as u64, r.conv_dim() as u64],
-            )?,
-            dt_bias: self.vector(&name("ssm_dt.bias"), n_v)?,
-            a: self.vector(&name("ssm_a"), n_v)?,
-            beta: self.matrix(&name("ssm_beta.weight"), n, n_v)?,
-            alpha: self.matrix(&name("ssm_alpha.weight"), n, n_v)?,
-            norm: self.vector(&name("ssm_norm.weight"), r.head_dim)?,
-            out: self.matrix(&name("ssm_out.weight"), r.value_dim(), n)?,
-        })
-    }
-
-    fn ngram(&mut self, c: &Config, layer: usize) -> Result<NgramWeights<'g>> {
-        let name = |what: &str| format!("blk.{layer}.{what}");
-        let (n, wide) = (c.n_embd, c.wide());
-        let kernel = c.ngram.as_ref().map_or(0, |g| g.conv_kernel);
-        Ok(NgramWeights {
-            key: self.matrix(&name("ple_key.weight"), n, wide)?,
-            value: self.matrix(&name("ple_value.weight"), n, n)?,
-            norm_key: self.vector(&name("ple_norm_key.weight"), wide)?,
-            norm_query: self.vector(&name("ple_norm_query.weight"), wide)?,
-            norm_conv: self.vector(&name("ple_norm_conv.weight"), wide)?,
-            conv: self.vector_of(&name("ple_conv1d.weight"), &[kernel as u64, wide as u64])?,
-        })
-    }
+fn ngram_weights<'g>(t: &mut Table<'g>, c: &Config, layer: usize) -> Result<NgramWeights<'g>> {
+    let name = |what: &str| format!("blk.{layer}.{what}");
+    let (n, wide) = (c.n_embd, c.wide());
+    let kernel = c.ngram.as_ref().map_or(0, |g| g.conv_kernel);
+    Ok(NgramWeights {
+        key: t.matrix(&name("ple_key.weight"), n, wide)?,
+        value: t.matrix(&name("ple_value.weight"), n, n)?,
+        norm_key: t.vector(&name("ple_norm_key.weight"), wide)?,
+        norm_query: t.vector(&name("ple_norm_query.weight"), wide)?,
+        norm_conv: t.vector(&name("ple_norm_conv.weight"), wide)?,
+        conv: t.floats(&name("ple_conv1d.weight"), &[kernel as u64, wide as u64])?,
+    })
 }

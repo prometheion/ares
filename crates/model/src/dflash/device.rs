@@ -193,8 +193,8 @@ fn arena_and_ring(c: &Config, w: &Weights<'_>, setup: &DrafterSetup) -> (u64, u6
     // Every tensor at a multiple of 256 bytes, the fusion in one part per tap.
     let round = |bytes: usize| (bytes as u64).next_multiple_of(256);
     let taps = c.target_layers.len();
-    let matrices: u64 = w.matrices().iter().skip(1).map(|m| round(m.data.len())).sum::<u64>()
-        + taps as u64 * round(w.fc.data.len() / taps);
+    let matrices: u64 = w.matrices().iter().skip(1).map(|m| round(m.bytes().len())).sum::<u64>()
+        + taps as u64 * round(w.fc.bytes().len() / taps);
     let vectors: u64 = w
         .layers
         .iter()
@@ -355,28 +355,31 @@ impl Drafter {
             Ok(at)
         };
         let mut mat = |m: &Matrix<'_>| -> Result<DMat, ModelError> {
-            Ok(DMat { ty: m.ty, n_in: m.n_in as u32, n_out: m.n_out as u32, at: put(m.data)? })
+            Ok(DMat {
+                ty: m.ty(),
+                n_in: m.cols() as u32,
+                n_out: m.rows() as u32,
+                at: put(m.bytes())?,
+            })
         };
         // The fusion in one matrix per tap: the columns of each tap are whole
         // blocks of every row.
         let fc = &w.fc;
-        let row_bytes = fc.data.len() / fc.n_out;
+        let row_bytes = fc.bytes().len() / fc.rows();
         let taps = c.target_layers.len();
         let seg = row_bytes / taps;
-        if seg * taps != row_bytes || !c.n_embd.is_multiple_of(fc.ty.block_values() as usize) {
+        if seg * taps != row_bytes || !c.n_embd.is_multiple_of(fc.ty().block_values() as usize) {
             return Err(invalid("the fusion's rows do not split into whole blocks per tap"));
         }
         let mut fc_parts = Vec::with_capacity(taps);
         for t in 0..taps {
-            let mut bytes = Vec::with_capacity(seg * fc.n_out);
-            for r in 0..fc.n_out {
+            let mut bytes = Vec::with_capacity(seg * fc.rows());
+            for r in 0..fc.rows() {
                 bytes.extend_from_slice(
-                    &fc.data[r * row_bytes + t * seg..r * row_bytes + (t + 1) * seg],
+                    &fc.bytes()[r * row_bytes + t * seg..r * row_bytes + (t + 1) * seg],
                 );
             }
-            let part =
-                Matrix { name: format!("fc tap {t}"), n_in: c.n_embd, data: &bytes, ..fc.clone() };
-            fc_parts.push(mat(&part)?);
+            fc_parts.push(mat(&Matrix::new(fc.ty(), fc.rows(), c.n_embd, &bytes))?);
         }
         let selector_hidden = mat(&w.selector_hidden)?;
         let mut layers = Vec::with_capacity(c.n_layer);
@@ -411,10 +414,10 @@ impl Drafter {
         }
         let fc_out_norm = vector(&w.fc_out_norm)?;
         let output_norm = vector(&w.output_norm)?;
-        let successor = put(w.selector_successor.data)?;
-        let predecessor = put(w.selector_predecessor.data)?;
+        let successor = put(w.selector_successor.bytes())?;
+        let predecessor = put(w.selector_predecessor.bytes())?;
         let table = &w.selector_successor;
-        if w.selector_predecessor.ty != table.ty {
+        if w.selector_predecessor.ty() != table.ty() {
             return Err(invalid("the selector's two tables are of different types"));
         }
         let dw = DWeights {
@@ -425,8 +428,8 @@ impl Drafter {
             selector_hidden,
             successor,
             predecessor,
-            table_ty: table.ty,
-            table_row_bytes: (table.data.len() / table.n_out) as u32,
+            table_ty: table.ty(),
+            table_row_bytes: (table.bytes().len() / table.rows()) as u32,
         };
         let ring = DeviceBuffer::new(device, ring_bytes)?;
         let scratch_buf = DeviceBuffer::new(device, s.len)?;

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use ares_core::GgmlType;
 use ares_gguf::Gguf;
+use ares_model::files::FileError;
 use ares_model::qwen4exp::synthetic::{Synthetic, Types};
 use ares_model::qwen4exp::{
     Config, Error, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
@@ -79,7 +80,10 @@ fn a_model_file_gives_its_block_only_when_it_carries_one_and_a_block_of_another_
     // A model file gives its MTP block (`--drafters mtp`) when it carries
     // one; one that carries none is refused by the first tensor it lacks.
     let error = MtpWeights::load(&gguf, &config).expect_err("a model without its block");
-    assert!(matches!(&error, Error::MissingTensor { name } if name.starts_with("mtp.")), "{error}");
+    assert!(
+        matches!(&error, Error::File(FileError::MissingTensor { name }) if name.starts_with("mtp.")),
+        "{error}"
+    );
     let experts = (GgmlType::F32, GgmlType::F32);
     let carries = open("model-with-block", &model.bytes_with_mtp(experts));
     let in_model = MtpWeights::load(&carries, &config).expect("the block of the model file");
@@ -92,7 +96,7 @@ fn a_model_file_gives_its_block_only_when_it_carries_one_and_a_block_of_another_
     other.shape.expert_ff *= 2;
     let file = open("refused-shape", &other.draft_bytes(None));
     let error = MtpWeights::load(&file, &config).expect_err("another shape");
-    assert!(matches!(error, Error::TensorShape { .. }), "{error}");
+    assert!(matches!(error, Error::File(FileError::TensorShape { .. })), "{error}");
 }
 
 #[test]
