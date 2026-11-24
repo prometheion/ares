@@ -9,9 +9,9 @@ use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_cuda::{DevicePtr, ENTRY_CELLS, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext, TowerJob,
-    TransferContext, Vision,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, Durable, LinkSpec, Logits,
+    Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext, TowerJob, TransferContext,
+    Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -261,11 +261,11 @@ impl Qwen35 {
     }
 
     /// The drafts of one pass of the DFlash drafter, when it drafts: a block's
-    /// less the newest token, at most a window's.
+    /// less the newest token.
     fn dflash_drafts(&self) -> Option<u32> {
         let file = self.options.dflash.as_ref()?;
         self.placement.draft.as_ref()?;
-        Some((file.config.drafts() as u32).min(self.options.window_rows.saturating_sub(1)))
+        Some(file.config.drafts() as u32)
     }
 
     /// The most rows of a sum across the devices that is pushed.
@@ -441,17 +441,8 @@ impl Model for Qwen35 {
     }
 
     fn drafters(&self) -> Vec<Drafter> {
-        let mut drafters = Vec::new();
-        if self.placement.mtp().is_some() {
-            drafters.push(Drafter {
-                kind: DrafterKind::Mtp,
-                drafts: self.options.window_rows.saturating_sub(1),
-            });
-        }
-        if let Some(drafts) = self.dflash_drafts() {
-            drafters.push(Drafter { kind: DrafterKind::Dflash, drafts });
-        }
-        drafters
+        let mtp = self.placement.mtp().is_some();
+        step::drafters(mtp, self.dflash_drafts(), self.options.window_rows)
     }
 
     fn prefix_cache(&self) -> Option<PrefixCache> {

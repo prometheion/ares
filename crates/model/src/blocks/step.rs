@@ -16,7 +16,7 @@
 use std::ops::Range;
 
 use ares_cuda::{DevicePtr, Segment};
-use ares_runtime::{ModelDrafts, ModelError, RecordView};
+use ares_runtime::{Drafter as ModelDrafter, DrafterKind, ModelDrafts, ModelError, RecordView};
 
 use super::mtp::{Driver, MtpChain};
 use crate::dflash::{Drafter, PassSeq};
@@ -35,6 +35,18 @@ impl DrafterIds {
     pub(crate) fn new(mtp: bool, dflash: bool) -> Self {
         Self { mtp: mtp.then_some(1), dflash: dflash.then_some(1 + u32::from(mtp)) }
     }
+}
+
+/// The drafters of a model whose windows have `window_rows` rows, in the
+/// order of their ids: its MTP block when it drafts with one (`mtp`), its
+/// DFlash drafter when it has one that makes `dflash` drafts a pass. Each
+/// makes at most a window's drafts, the newest token aside.
+pub(crate) fn drafters(mtp: bool, dflash: Option<u32>, window_rows: u32) -> Vec<ModelDrafter> {
+    let most = window_rows.saturating_sub(1);
+    let mtp = mtp.then_some(ModelDrafter { kind: DrafterKind::Mtp, drafts: most });
+    let dflash =
+        dflash.map(|drafts| ModelDrafter { kind: DrafterKind::Dflash, drafts: drafts.min(most) });
+    mtp.into_iter().chain(dflash).collect()
 }
 
 /// What a step record says a part's step is, read once and kept to reuse

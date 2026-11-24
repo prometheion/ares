@@ -30,8 +30,8 @@ use ares_cuda::{Device, ENTRY_CELLS, MAX_BATCH};
 use ares_gguf::Gguf;
 use ares_runtime::expert_store::{ExpertTypes, FillStats, Serve, StoreStats};
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, Drafter, DrafterKind, Durable, FarPages, LinkSpec,
-    Model, ModelError, PrefixCache, Split, Vision,
+    ContextSpec, DeviceContext, DeviceModel, Drafter, Durable, FarPages, LinkSpec, Model,
+    ModelError, PrefixCache, Split, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -50,6 +50,7 @@ use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::blocks::head::HeadView;
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
+use crate::blocks::step;
 use crate::chat::ModelText;
 use crate::qwen3vl::Projector;
 use crate::qwen4exp::reference::mtp_config;
@@ -784,19 +785,8 @@ impl Model for Qwen4Exp {
     }
 
     fn drafters(&self) -> Vec<Drafter> {
-        let mut drafters = Vec::new();
-        if self.mtp.is_some() {
-            drafters.push(Drafter {
-                kind: DrafterKind::Mtp,
-                drafts: self.opts.part.window_rows.saturating_sub(1),
-            });
-        }
-        if let Some(file) = &self.dflash {
-            let drafts =
-                (file.config.drafts() as u32).min(self.opts.part.window_rows.saturating_sub(1));
-            drafters.push(Drafter { kind: DrafterKind::Dflash, drafts });
-        }
-        drafters
+        let dflash = self.dflash.as_ref().map(|file| file.config.drafts() as u32);
+        step::drafters(self.mtp.is_some(), dflash, self.opts.part.window_rows)
     }
 
     fn attention_span(&self) -> u32 {
