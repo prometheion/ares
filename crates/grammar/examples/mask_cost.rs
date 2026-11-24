@@ -10,6 +10,7 @@ use ares_api::ToolFormat;
 use ares_gguf::Gguf;
 use ares_grammar::calls::{CallRule, Callable};
 use ares_grammar::{Compiler, Source, Vocabulary};
+use ares_sampler::mask_allows;
 use ares_tokenizer::Tokenizer;
 
 const SCHEMA: &str = r#"{
@@ -105,9 +106,8 @@ fn main() {
                 let t = Instant::now();
                 let mask = cursor.mask().unwrap();
                 times.push(ms(t));
-                let allowed: Vec<u32> = (0..n)
-                    .filter(|&t| mask[(t / 32) as usize] >> (t % 32) & 1 != 0 && !ends.contains(&t))
-                    .collect();
+                let allowed: Vec<u32> =
+                    (0..n).filter(|&t| mask_allows(&mask, t) && !ends.contains(&t)).collect();
                 if allowed.is_empty() {
                     break;
                 }

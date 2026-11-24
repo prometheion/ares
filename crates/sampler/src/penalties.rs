@@ -134,7 +134,8 @@ impl Breakers {
     }
 
     /// Breakers that are given as tokens, the head first.
-    pub fn of_tokens(sequences: &[&[u32]]) -> Breakers {
+    #[cfg(test)]
+    pub(crate) fn of_tokens(sequences: &[&[u32]]) -> Breakers {
         let mut map: HashMap<u32, Vec<Vec<u32>>> = HashMap::new();
         for sequence in sequences {
             if let Some((head, tail)) = sequence.split_first() {
