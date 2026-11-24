@@ -647,7 +647,24 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
 - K/V of a running sequence beyond VRAM (P16). The owner, 2026-11-22: without `--context` a
       model gets its own context always, and what of it does not fit in VRAM overflows into RAM.
       Built for Flash-Next (2026-11-22, `kv/overflow`; "K and V beyond VRAM" in `dev/architecture/flash-next.md`;
-      what was done and fixed since is in [`dev/history.md`](dev/history.md)). Open:
+      what was done and fixed since is in [`dev/history.md`](dev/history.md)).
+      A context named with `--context` overflows the same way (the owner, 2026-11-24; on
+      `fix/far-free`, the commit of the former `cleanup2/server`; the owner names it for all
+      sequences, four of 128k are `--context 524288`, a request holds at most the model's own):
+      IQ2_XS on both local cards with `--context 524288 --parallel 4 --ram 16G` loads with
+      18 176 tokens of K and V in VRAM and answers a 96k prompt and a short one, where main
+      refuses it (no VRAM left for expert slots). Open:
+  - [ ] **A deadlock in libcuda between the RAM thread and a device thread** (found 2026-11-24 by
+        the `real_cache` test `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd`,
+        whose `--context 20480` overflows since a named context does; 2 of 2 in the suite, 2 of 3 of
+        the same flow outside it, `/var/tmp/ares-c2load/hang/`): `ares-ram` frees page-locked
+        checkpoint chunks (`PinnedRam::sweep_checkpoints` from `Machine::look`) with
+        `cuMemFreeHost`, which synchronizes with the devices and holds the driver's lock, while
+        `ares-device-1` in a step waits for that lock in `cuMemcpyHtoDAsync` (`CudaSlots::set_entry`
+        from `ExpertStore::poll_cpu`), and the step waits for it: the engine stands still, and
+        does not stop on SIGINT. Very likely the hang seen twice in the merge check of item 6. To
+        fix in the runtime: free page-locked memory only between steps (the conductor drops the
+        chunks), or never while a step depends on the host. Until then that test fails.
   - [ ] The 27B: not built. Its 16 dense layers read every cell, so K and V in RAM cross the link
         once per token: 5.4 ms per 1000 cells on the test machine's x4 link, about 1.4 ms on a x16
         link (`far_attention_bench`); its context beyond VRAM would run at a few tokens per second.
@@ -903,6 +920,11 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         tool calls in `ares-api` instead of raw OpenAI JSON across the API, one JSON value type
         in the server (with the rule for integers above `i64::MAX` decided once), and the
         mirostat range checked by `Sampling::validate` and by the runtime's request sampler.
+  - [ ] Found on the way (main d15f5d90 as well): `ares-tokenizer --test model`
+        `renders_the_prompts_of_llama_cpp` fails with `ARES_TEST_QWEN35_0_8B` set (request 26,
+        a message of two text parts, renders nothing here where llama.cpp renders them joined);
+        `real_flash_next` `flash_next_answers_in_both_placements` asks for `--split tensor` on a
+        machine of one card and fails instead of saying it is skipped.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history.md).
