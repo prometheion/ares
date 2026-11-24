@@ -471,23 +471,9 @@ impl PrefixIndex {
     /// always computed: look up the prompt without its last token, and the
     /// match can never cover it.
     pub fn lookup(&mut self, root: ChainHash, tokens: &[u64], cells_per_page: u32) -> PrefixMatch {
-        let per_page = cells_per_page as usize;
-        let mut found = PrefixMatch::default();
-        let mut hash = root;
-        for page_tokens in tokens.chunks_exact(per_page) {
-            let next = hash.extend(page_tokens);
-            let Some(entry) = self.entries.get(&next) else {
-                found.computing = self.computing.get(&next).map(|owner| (next, *owner));
-                break;
-            };
-            found.pages.push(entry.page);
-            found.hashes.push(next);
-            found.checkpoints.push(entry.checkpoint);
-            self.touch(next);
-            hash = next;
-        }
-        found.tail = self.match_tail(hash, &tokens[found.pages.len() * per_page..]);
-        found
+        let mut chain = Chain::new(root, cells_per_page);
+        chain.name(tokens);
+        self.lookup_chain(&chain, tokens)
     }
 
     /// [`PrefixIndex::lookup`] for a prompt whose pages are named already
