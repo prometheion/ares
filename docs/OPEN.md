@@ -790,6 +790,9 @@ that were merged: [`dev/history.md`](dev/history.md).
 What Ares does better: three or more requests (a place each, at the same context), priorities, the
 system prompt two agents send at once (the second waits for the first's announced pages and shares
 them), cached turns, one request alone. What it does worse, and why:
+- [ ] The default `--generation-floor` of 20 tokens/s is the fork's generation beside a prompt;
+      the owner's call (the floor measured by setting: [`dev/history.md`](dev/history.md),
+      2026-11-23).
 - [ ] Two prompts at once are read one after the other (shortest first, the order that gives the
       lower mean wait); the second then takes turns with the first's generation, now at the
       floor and not at half. The agents' turn with a 5.8k tool result sent at once (main ae836d2, two
