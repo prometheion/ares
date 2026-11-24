@@ -31,7 +31,11 @@
 use ares_cuda::{ExpertShape, PrefillPath};
 use ares_quant::act;
 
-use super::*;
+use super::{
+    ActivationForm, CoreW, Device, DevicePtr, DeviceWeights, Event, ExpertRowKernels, Frame,
+    GgmlType, Kernels, MAX_BATCH, Mat, ModelError, MoeW, Options, Part, Phase, PinnedBuffer,
+    Precision, Role, StepEnv, Stream, WeightLayout, invalid,
+};
 
 /// Address tables alive at once: the round being computed and the one prepared next.
 pub(super) const ROUNDS: u64 = 2;
