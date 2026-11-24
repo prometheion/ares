@@ -358,9 +358,12 @@ pub const OPTIONS: &[Opt] = &[
         "<ROWS>",
         "Most rows of prompt in one step while a prompt is read alone. Above --ubatch-size \
          only for a mixture of experts (Qwen3.8-Flash-Next): its expert slots in VRAM lend \
-         the step's scratch for its time, and every expert is read once a step, not once per \
-         --ubatch-size rows; a request that arrives waits for the step in flight [default: \
-         8192 for a mixture of experts, as far as the slots can lend it, else --ubatch-size]",
+         the room for the step's rows for its time, and every expert is read once a step, not \
+         once per --ubatch-size rows. With K and V in f16 or q8 and no DFlash drafter such a \
+         step is read layer by layer, and a request that arrives waits for a piece of it; \
+         otherwise it waits for the step in flight [default: for a mixture of experts 32768 \
+         layer by layer, else 8192, as far as the slots can lend the room; for the 27B \
+         --ubatch-size]",
     )
     .short("-b"),
     Opt::model(
