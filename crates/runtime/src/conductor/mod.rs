@@ -1120,8 +1120,7 @@ impl Conductor {
             if a.ran {
                 // It gave way and comes back: the rows the cache does not hold.
                 let rows = probe.resume.compute.end.saturating_sub(probe.resume.compute.start);
-                self.admission.set_recompute(a.seq, rows as u32);
-                self.admission.set_restore(a.seq, 0, probe.idle);
+                self.admission.set_recompute(a.seq, rows as u32, probe.idle);
                 continue;
             }
             self.admission.refresh(a.seq, probe.resume.cached_cells as u32, probe.idle);

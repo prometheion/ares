@@ -35,9 +35,9 @@
 //! - **When the pool is short, the sequence with the fewest generated tokens
 //!   gives way** (SGLang's order; ties: the longest prompt). It is spilled:
 //!   it waits at the front of the line to come back, and the runtime says
-//!   what it then needs (the rows it computes again from what the prefix
-//!   cache kept, [`Admission::set_recompute`], and the cached pages it takes
-//!   again, [`Admission::set_restore`]).
+//!   what it then needs ([`Admission::set_recompute`]: the rows it computes
+//!   again from what the prefix cache kept, and the cached pages it takes
+//!   again). Nothing of it is kept anywhere else: its pages are given up.
 //! - **A request has a priority, a lower number first** (vLLM's numbers).
 //!   Everything above holds among the requests of one priority; the line is
 //!   taken by priority first, so a request never waits for one of a worse
@@ -206,9 +206,8 @@ struct Waiting {
     passed: u32,
     /// Waiting for a page another sequence computes; not a candidate.
     held: bool,
-    /// For a spilled sequence: what it was when it was suspended and the
-    /// pages it needs back.
-    spilled: Option<(Running, u32)>,
+    /// For a spilled sequence: what it was when it was suspended.
+    spilled: Option<Running>,
     /// The pass it was spilled in: it does not come back in the pass that
     /// made it give way.
     spilled_in: u64,
@@ -313,7 +312,7 @@ impl Admission {
     /// What admitting `w` adds to the demand on the pool.
     fn charge(&self, w: &Waiting) -> u32 {
         match &w.spilled {
-            Some((was, restore)) => restore + self.reserve(was),
+            Some(was) => self.reserve(was),
             None => {
                 let a = &w.arrival;
                 let cached = a.cached_cells.min(a.prompt_cells);
@@ -365,29 +364,19 @@ impl Admission {
         }
     }
 
-    /// Says what a spilled sequence needs to come back, when that changed
-    /// since it was spilled (pages it shared were evicted, or are cached
-    /// again): `pages` it must take from the pool, and `idle_cached_pages`
-    /// cached pages it takes again that no sequence holds now.
-    pub fn set_restore(&mut self, seq: SeqId, pages: u32, idle_cached_pages: u32) {
+    /// Says what a spilled sequence needs to come back, when it was spilled
+    /// and whenever the prefix cache changed since: the `rows` it computes
+    /// again (what the cache does not hold of its text), which are held back
+    /// for it like the rows of a prompt that are not computed yet and which
+    /// its claims name as prompt rows, and the `idle_cached_pages` it takes
+    /// again that no sequence holds now. Unknown, running and waiting
+    /// requests that were not spilled are ignored.
+    pub fn set_recompute(&mut self, seq: SeqId, rows: u32, idle_cached_pages: u32) {
         if let Some(w) = self.waiting.iter_mut().find(|w| w.arrival.seq == seq)
-            && let Some((_, restore)) = &mut w.spilled
-        {
-            *restore = pages;
-            w.arrival.idle_cached_pages = idle_cached_pages;
-        }
-    }
-
-    /// Says how many rows a spilled sequence computes again when it comes
-    /// back, for a runtime that has not kept them: they are held back for it
-    /// like the rows of a prompt that are not computed yet, and its claims
-    /// name them as prompt rows. Unknown, running and waiting requests that
-    /// were not spilled are ignored.
-    pub fn set_recompute(&mut self, seq: SeqId, rows: u32) {
-        if let Some(w) = self.waiting.iter_mut().find(|w| w.arrival.seq == seq)
-            && let Some((was, _)) = &mut w.spilled
+            && let Some(was) = &mut w.spilled
         {
             was.prompt_rows_left = rows;
+            w.arrival.idle_cached_pages = idle_cached_pages;
         }
     }
 
@@ -427,9 +416,8 @@ impl Admission {
     }
 
     /// Takes the running request at index `i` off the pool: it waits at the
-    /// front of the line of its priority with what it needs to come back,
-    /// `freed` pages (what its leaving frees).
-    fn spill(&mut self, i: usize, freed: u32) -> SeqId {
+    /// front of the line of its priority until it can come back.
+    fn spill(&mut self, i: usize) -> SeqId {
         let was = self.running.swap_remove(i);
         self.arrivals += 1;
         self.waiting.push(Waiting {
@@ -446,7 +434,7 @@ impl Admission {
             order: self.arrivals,
             passed: 0,
             held: false,
-            spilled: Some((was, freed)),
+            spilled: Some(was),
             spilled_in: self.passes,
         });
         was.seq
@@ -515,12 +503,10 @@ impl Admission {
         let w = self.waiting[i];
         tally.taken = tally.taken.saturating_add(w.arrival.idle_cached_pages);
         match w.spilled {
-            Some((was, restore)) => {
+            Some(was) => {
                 self.running.push(was);
                 out.resume.push(was.seq);
-                // The pages it brings back are taken in this pass.
-                tally.granted = tally.granted.saturating_add(restore);
-                tally.held_back = tally.held_back.saturating_add(charge - restore);
+                tally.held_back = tally.held_back.saturating_add(charge);
             }
             None => {
                 let a = &w.arrival;
@@ -602,7 +588,7 @@ impl Admission {
         // the others stay valid as each is taken out.
         chosen.sort_by_key(|&(r, ..)| Reverse(r));
         for (r, freed, granted, reserve) in chosen {
-            let seq = self.spill(r, freed);
+            let seq = self.spill(r);
             out.spill.push(seq);
             out.outranked += 1;
             tally.granted = tally.granted.saturating_sub(granted);
@@ -817,9 +803,9 @@ impl Claims<'_> {
                     victims.remove(i);
                 }
             }
-            for (victim, freed, _) in victims {
+            for (victim, ..) in victims {
                 let Some(i) = a.running.iter().position(|r| r.seq == victim) else { continue };
-                out.spill.push(a.spill(i, freed));
+                out.spill.push(a.spill(i));
             }
         }
 
@@ -1398,8 +1384,7 @@ mod tests {
         assert_eq!(p.settle(&mut view).spill, [SeqId(2)]);
         // Its runtime kept nothing of it: no page is brought back, and five
         // pages of rows are computed again.
-        a.set_restore(SeqId(2), 0, 0);
-        a.set_recompute(SeqId(2), 5 * PER_PAGE);
+        a.set_recompute(SeqId(2), 5 * PER_PAGE, 0);
         // The other is held back two pages (its prompt was never claimed and
         // a page of output); the one that comes back needs five and one.
         assert!(pass(&mut a, 7, 0).resume.is_empty());
@@ -1451,7 +1436,7 @@ mod tests {
 
         // It comes back owing 40 rows of a prompt of 4 cells: what it wrote
         // while it ran, which the runtime computes again.
-        a.set_recompute(SeqId(1), 40);
+        a.set_recompute(SeqId(1), 40, 0);
         assert_eq!(pass(&mut a, 10, 0).resume, [SeqId(1)]);
 
         // And gives way again before it has computed them.

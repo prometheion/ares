@@ -10,7 +10,7 @@
 //! pass the test checks that
 //!
 //! - nothing was granted that the pool cannot give: the evictions asked for
-//!   exist, and every granted claim and every restored page finds a free page
+//!   exist, and every granted claim finds a free page
 //!   (so the pool never holds more pages than it has);
 //! - a request that is alone is admitted at once, whatever it may grow to,
 //!   and the only refusal ever is a prompt larger than the pool;
@@ -149,9 +149,10 @@ impl World {
         }
     }
 
-    /// What a spilled request must take from the pool to come back, and the
-    /// idle cached pages it takes again.
-    fn restore(&self, r: &Req) -> (u32, u32) {
+    /// What a spilled request computes again to come back (its text that
+    /// the cache does not hold now, which it gave up when it was spilled),
+    /// and the idle cached pages it takes again.
+    fn recompute(&self, r: &Req) -> (u32, u32) {
         let (mut kept, mut idle) = (0, 0);
         for (doc, used) in &r.wanted {
             let cached = self.doc(*doc);
@@ -161,7 +162,7 @@ impl World {
                 idle += cached.pages;
             }
         }
-        (pages_for(r.cells) - kept, idle)
+        (r.cells.saturating_sub(kept * PER_PAGE) + r.rows_left, idle)
     }
 
     fn evict(&mut self, mut pages: u32) {
@@ -381,8 +382,8 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                     a.refresh(SeqId(*seq), cached * PER_PAGE, idle);
                 }
                 Phase::Spilled => {
-                    let (pages, idle) = world.restore(r);
-                    a.set_restore(SeqId(*seq), pages, idle);
+                    let (rows, idle) = world.recompute(r);
+                    a.set_recompute(SeqId(*seq), rows, idle);
                 }
                 Phase::Running => {}
             }
@@ -516,20 +517,19 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
             })
             .map(|w| w.required + if out.cut.contains(&SeqId(w.seq)) { 0 } else { w.optional })
             .sum();
-        let mut granted = step_pages;
+        let granted = step_pages;
         let mut taken_idle = 0u32;
         let mut first = alone;
-        let mut restores: Vec<(u32, u32)> = Vec::new();
         for seq in out.resume.iter().chain(&out.admit) {
             let r = world.reqs[&seq.0].clone();
             let resumed = r.phase == Phase::Spilled;
             assert_eq!(resumed, out.resume.contains(seq), "{context}");
             assert_ne!(r.phase, Phase::Running, "{context}");
-            let (charge, restore, idle) = if resumed {
-                let (pages, idle) = world.restore(&r);
-                let reserve = pages_for(r.rows_left)
+            let (charge, rows, idle) = if resumed {
+                let (rows, idle) = world.recompute(&r);
+                let reserve = pages_for(rows)
                     + output_pages(r.max_new.saturating_sub(r.generated), clip, ratio);
-                (pages + reserve, pages, idle)
+                (reserve, rows, idle)
             } else {
                 let (cached, idle) = world.cached(&r);
                 (pages_for(r.prompt) - cached + output_pages(r.max_new, clip, 1.0), 0, idle)
@@ -545,21 +545,23 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
             }
             first = false;
             taken_idle += idle;
-            granted += restore;
-            held_back += charge - restore;
+            held_back += charge;
 
             // Take the cached pages.
             let mut docs = Vec::new();
             let mut cells = r.cells;
             if resumed {
+                // What the cache kept comes back; the rest is computed again.
+                let mut kept = 0;
                 for (doc, used) in r.wanted.clone() {
                     let keep = used.min(world.doc(doc).pages);
                     if keep > 0 {
                         world.hold(doc);
                         docs.push((doc, keep));
+                        kept += keep;
                     }
                 }
-                restores.push((seq.0, restore));
+                cells = cells.min(kept * PER_PAGE);
             } else {
                 if let Some((doc, want)) = r.hit {
                     let keep = want.min(world.doc(doc).pages);
@@ -575,12 +577,8 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
             r.docs = docs;
             r.wanted.clear();
             r.cells = cells;
-            // A resumed request holds its own pages again only after the
-            // eviction and the step; until then it is not running.
-            if !resumed {
-                r.rows_left = r.prompt - cells;
-                r.phase = Phase::Running;
-            }
+            r.rows_left = if resumed { rows } else { r.prompt - cells };
+            r.phase = Phase::Running;
         }
         assert_eq!(out.evict, granted.saturating_sub(free), "{context}");
 
@@ -617,11 +615,6 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                     finished.push(w.seq);
                 }
             }
-        }
-        for (seq, restore) in restores {
-            let r = world.reqs.get_mut(&seq).expect("resumed requests exist");
-            r.phase = Phase::Running;
-            assert_eq!(r.own(), restore, "{context}: the restore of {seq} changed under the pass");
         }
         let _ = world.free();
         for seq in finished {

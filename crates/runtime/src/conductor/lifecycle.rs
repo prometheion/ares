@@ -356,8 +356,7 @@ impl Conductor {
             }
             None => (a.known, 0),
         };
-        self.admission.set_restore(seq, 0, idle);
-        self.admission.set_recompute(seq, rows);
+        self.admission.set_recompute(seq, rows, idle);
         self.by_id.insert(a.id, Place::Waiting);
         self.waiting.push(a);
         self.free_slots.push(slot as u32);
