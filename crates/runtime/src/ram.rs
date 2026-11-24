@@ -604,13 +604,11 @@ impl PinnedRam {
         bytes: usize,
     ) -> Result<LockedChunk, ModelError> {
         self.book_checkpoints(bytes as u64)?;
-        match PinnedBuffer::new(device, bytes) {
-            Ok(buffer) => Ok(LockedChunk { buffer, ram: self.clone() }),
-            Err(error) => {
-                self.release_checkpoints(bytes as u64);
-                Err(error.into())
-            }
-        }
+        // Booked from here on: a chunk that cannot be locked gives the
+        // booking back as it is dropped.
+        let booking = Booking { ram: self.clone(), user: Booked::Checkpoints, bytes: bytes as u64 };
+        let buffer = PinnedBuffer::new(device, bytes)?;
+        Ok(LockedChunk { buffer: Some(buffer), booking: Some(booking) })
     }
 
     pub(crate) fn release_checkpoints(&self, bytes: u64) {
@@ -631,7 +629,9 @@ impl PinnedRam {
         };
         // Booked from here on: a buffer that cannot be locked gives the
         // booking back as it is dropped.
-        let mut buffer = CacheBuffer { memory: CacheMemory::Plain(None), ram: self.clone(), len };
+        let booking = Booking { ram: self.clone(), user: Booked::Pages, bytes: len as u64 };
+        let mut buffer =
+            CacheBuffer { memory: CacheMemory::Plain(None), booking: Some(booking), len };
         buffer.memory = match device {
             Some(device) => {
                 CacheMemory::Locked(PinnedBuffer::new(&device, len).map_err(|e| e.to_string())?)
@@ -763,9 +763,31 @@ impl PinnedRam {
         books.limit.saturating_sub(books.used())
     }
 
+    /// Locks the chunks that checkpoint places `places` lie in on every device
+    /// part, where they are not locked: the places the copies of a step or a
+    /// transfer use, locked before it runs (page-locked memory does not change
+    /// inside a step, see [`ares_cuda::gate`]). The conductor has made room in
+    /// the limit for them.
+    pub(crate) fn hold_places(&self, places: &[u32]) -> Result<(), ModelError> {
+        if places.is_empty() {
+            return Ok(());
+        }
+        let tables: Vec<Arc<PlaceChunks>> = {
+            let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter().filter_map(Weak::upgrade).collect()
+        };
+        for table in &tables {
+            for place in places.iter().filter(|place| **place < table.capacity) {
+                table.pointer(*place)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Releases chunks of checkpoint places in which the conductor has no
     /// checkpoint, until the prompt cache holds no more than its allowance.
-    /// Returns the bytes released.
+    /// Returns the bytes released. A chunk is freed and unbooked at once when
+    /// no step runs, else when the step ends ([`LockedChunk`]).
     pub fn sweep_checkpoints(&self) -> u64 {
         let allowance = self.cache_allowance();
         let mut held = self.prompt_cache();
@@ -898,7 +920,7 @@ impl ContextRegion {
         }
         self.ram.book_context(len as u64).map_err(|short| Ok(ContextShort(short)))?;
         // From here on the booking goes back when the lock is dropped, or here.
-        let booking = ContextBooking { ram: self.ram.clone(), bytes: len as u64 };
+        let booking = Booking { ram: self.ram.clone(), user: Booked::Context, bytes: len as u64 };
         // SAFETY: the range is whole pages inside the mapping, which the lock
         // keeps alive.
         let ptr = unsafe { self.map.base.cast::<u8>().add(at) };
@@ -914,7 +936,7 @@ impl ContextRegion {
         }
         Ok(ContextLock {
             registration: Some(registration),
-            _booking: booking,
+            booking: Some(booking),
             map: self.map.clone(),
             ptr,
             len,
@@ -923,11 +945,11 @@ impl ContextRegion {
 }
 
 /// A locked piece of a [`ContextRegion`]: unlocked, returned to the system and
-/// unbooked when dropped. Unlocking waits for the device to finish what it
-/// has, so it is dropped between steps.
+/// unbooked when dropped, in that order, where no step runs (at once between
+/// steps, else when the step ends: [`ares_cuda::gate::retire`]).
 pub struct ContextLock {
     registration: Option<HostRegistration>,
-    _booking: ContextBooking,
+    booking: Option<Booking>,
     map: Arc<Mapping>,
     ptr: *mut u8,
     len: usize,
@@ -954,25 +976,58 @@ impl ContextLock {
 
 impl Drop for ContextLock {
     fn drop(&mut self) {
-        // Unlocked first: locked pages cannot be given back.
-        drop(self.registration.take());
-        // SAFETY: the range is whole pages inside the mapping, which this
-        // holds, and nothing reads the piece any more.
-        unsafe { libc::madvise(self.ptr.cast(), self.len, libc::MADV_DONTNEED) };
-        let _ = &self.map;
+        // Unlocked first (locked pages cannot be given back), then given back
+        // to the system, then unbooked: a tuple drops its fields in order.
+        let discard = Discard { _map: self.map.clone(), ptr: self.ptr, len: self.len };
+        ares_cuda::gate::retire((self.registration.take(), discard, self.booking.take()));
     }
 }
 
-/// What a piece of the context's K/V gives back to the books when it is
-/// dropped (after its lock: its field comes after the registration's).
-struct ContextBooking {
+/// Pages of a mapping that go back to the system when this is dropped (they
+/// must not be locked any more by then).
+struct Discard {
+    _map: Arc<Mapping>,
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the range is plain memory of the mapping, which this holds, and only
+// its owner gives it back.
+unsafe impl Send for Discard {}
+
+impl Drop for Discard {
+    fn drop(&mut self) {
+        // SAFETY: the range is whole pages inside the mapping, which this
+        // holds, and nothing reads the piece any more.
+        unsafe { libc::madvise(self.ptr.cast(), self.len, libc::MADV_DONTNEED) };
+    }
+}
+
+/// Who a [`Booking`] is for.
+#[derive(Clone, Copy, Debug)]
+enum Booked {
+    Context,
+    Experts,
+    Checkpoints,
+    Pages,
+}
+
+/// Bytes of the books that go back when this is dropped: after the memory
+/// they stand for is free, so that the books never count less than is locked.
+struct Booking {
     ram: PinnedRam,
+    user: Booked,
     bytes: u64,
 }
 
-impl Drop for ContextBooking {
+impl Drop for Booking {
     fn drop(&mut self) {
-        self.ram.release_context(self.bytes);
+        match self.user {
+            Booked::Context => self.ram.release_context(self.bytes),
+            Booked::Experts => self.ram.release_experts(self.bytes),
+            Booked::Checkpoints => self.ram.release_checkpoints(self.bytes),
+            Booked::Pages => self.ram.release_cache_pages(self.bytes),
+        }
     }
 }
 
@@ -985,52 +1040,61 @@ struct ExpertPieces {
 impl Locker for ExpertPieces {
     unsafe fn lock(&mut self, ptr: *mut u8, len: usize) -> Result<Box<dyn Any + Send>, StoreError> {
         self.ram.book_experts(len as u64).map_err(StoreError::Plan)?;
-        // Dropped before the registration fails or after it is dropped.
-        let booking = ExpertsBooking { ram: self.ram.clone(), bytes: len as u64 };
+        // Given back as it is dropped when the registration fails.
+        let booking = Booking { ram: self.ram.clone(), user: Booked::Experts, bytes: len as u64 };
         // SAFETY: the caller's contract is that of the registration.
         let registration = unsafe { HostRegistration::new(&self.device, ptr, len, false)? };
-        Ok(Box::new((registration, booking)))
+        Ok(Box::new(ExpertPiece(Some((registration, booking)))))
     }
 }
 
-/// What a piece of the tier of experts gives back to the books when it is
-/// dropped.
-struct ExpertsBooking {
-    ram: PinnedRam,
-    bytes: u64,
-}
+/// A locked piece of the tier of experts: unlocked and then unbooked when it is
+/// dropped, where no step runs.
+struct ExpertPiece(Option<(HostRegistration, Booking)>);
 
-impl Drop for ExpertsBooking {
+impl Drop for ExpertPiece {
     fn drop(&mut self) {
-        self.ram.release_experts(self.bytes);
+        if let Some(lock) = self.0.take() {
+            ares_cuda::gate::retire(lock);
+        }
     }
 }
 
 /// Page-locked memory booked for the checkpoint cache; the booking ends with
-/// the chunk.
-#[derive(Debug)]
+/// the chunk, once its memory is freed (where no step runs).
 pub struct LockedChunk {
-    buffer: PinnedBuffer,
-    ram: PinnedRam,
+    /// Both `Some` until the chunk is dropped.
+    buffer: Option<PinnedBuffer>,
+    booking: Option<Booking>,
+}
+
+impl std::fmt::Debug for LockedChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockedChunk").field("len", &self.len()).finish()
+    }
 }
 
 impl LockedChunk {
+    fn buffer(&self) -> &PinnedBuffer {
+        self.buffer.as_ref().expect("a chunk holds its buffer until it is dropped")
+    }
+
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.buffer.as_mut_ptr()
+        self.buffer.as_mut().expect("a chunk holds its buffer until it is dropped").as_mut_ptr()
     }
 
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        self.buffer().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.buffer().is_empty()
     }
 }
 
 impl Drop for LockedChunk {
     fn drop(&mut self) {
-        self.ram.release_checkpoints(self.buffer.len() as u64);
+        ares_cuda::gate::retire((self.buffer.take(), self.booking.take()));
     }
 }
 
@@ -1039,7 +1103,8 @@ impl Drop for LockedChunk {
 /// dropped.
 pub struct CacheBuffer {
     memory: CacheMemory,
-    ram: PinnedRam,
+    /// `Some` until the buffer is dropped.
+    booking: Option<Booking>,
     len: usize,
 }
 
@@ -1079,7 +1144,12 @@ impl std::ops::DerefMut for CacheBuffer {
 
 impl Drop for CacheBuffer {
     fn drop(&mut self) {
-        self.ram.release_cache_pages(self.len as u64);
+        let booking = self.booking.take();
+        match std::mem::replace(&mut self.memory, CacheMemory::Plain(None)) {
+            // Freed, then unbooked, where no step runs.
+            CacheMemory::Locked(buffer) => ares_cuda::gate::retire((buffer, booking)),
+            CacheMemory::Plain(_) => drop(booking),
+        }
     }
 }
 

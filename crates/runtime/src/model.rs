@@ -749,6 +749,16 @@ pub trait Model: Send + Sync + 'static {
         let _ = part;
     }
 
+    /// The step of `record` is about to be handed to the devices: the place
+    /// where the model's page-locked memory changes (pieces locked for what
+    /// the step reads, others given back). Called on the conductor's thread
+    /// while no step runs; inside a step page-locked memory does not change
+    /// (see "Host memory" in `docs/dev/architecture/host-memory.md`). An error fails the step.
+    fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
+        let _ = record;
+        Ok(())
+    }
+
     /// Builds device part `cx.index`. Called on that device's thread.
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError>;
 }

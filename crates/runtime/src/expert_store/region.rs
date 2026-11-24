@@ -8,9 +8,10 @@
 //! kernel, so nothing but this gives it back.
 //!
 //! A piece is locked once: a released piece keeps its lock until its
-//! [`Released`] is dropped, and it is not locked again before. The driver
+//! [`Released`] is dropped and its unlock done (where no step runs, see
+//! [`ares_cuda::gate`]), and it is not locked again before. The driver
 //! refuses to lock a range that a lock still covers
-//! (`CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`), and a release dropped after
+//! (`CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`), and a release done after
 //! a second lock would give back memory the tier uses again.
 
 use std::any::Any;
@@ -111,8 +112,9 @@ impl Drop for Mapping {
 }
 
 /// A piece that the tier has given up: dropping it unlocks the memory and
-/// returns it to the system. That takes time, so it is dropped where nothing
-/// waits for it. Until then the piece is not locked again.
+/// returns it to the system, at once where no step runs and else when the
+/// step ends. That takes time, so it is dropped where nothing waits for it.
+/// Until it is done the piece is not locked again.
 pub struct Released {
     lock: Option<Box<dyn Any + Send>>,
     map: Arc<Mapping>,
@@ -142,8 +144,29 @@ impl std::fmt::Debug for Released {
 
 impl Drop for Released {
     fn drop(&mut self) {
-        // Unlocked first: locked pages cannot be given back.
-        drop(self.lock.take());
+        let back = GiveBack {
+            map: self.map.clone(),
+            releasing: self.releasing.clone(),
+            at: self.at,
+            len: self.len,
+        };
+        // Unlocked first (locked pages cannot be given back), then returned:
+        // a tuple drops its fields in order.
+        ares_cuda::gate::retire((self.lock.take(), back));
+    }
+}
+
+/// Returns an unlocked piece to the system when it is dropped, and marks it
+/// free to be locked again.
+struct GiveBack {
+    map: Arc<Mapping>,
+    releasing: Arc<AtomicBool>,
+    at: usize,
+    len: usize,
+}
+
+impl Drop for GiveBack {
+    fn drop(&mut self) {
         // SAFETY: the range is whole pages inside the mapping, which this
         // holds, and no slot of the tier lies in the piece any more.
         unsafe {
@@ -173,6 +196,15 @@ pub struct HostRegion {
 // SAFETY: the region is memory that only the store uses, and the store is used
 // by one thread at a time.
 unsafe impl Send for HostRegion {}
+
+impl Drop for HostRegion {
+    fn drop(&mut self) {
+        // The locks go before the mapping, also when they are unlocked after a
+        // step that runs now.
+        let locks = std::mem::take(&mut self.locks);
+        ares_cuda::gate::retire((locks, self.map.clone()));
+    }
+}
 
 impl std::fmt::Debug for HostRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

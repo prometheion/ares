@@ -36,8 +36,8 @@ use ares_sampler::{LogprobOut, SamplePick, SampleRow};
 use crate::cache::Cache;
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
-use crate::exec::Transfer;
 use crate::exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
+use crate::exec::{Transfer, TransferKind};
 use crate::links::Links;
 use crate::model::{
     DeviceContext, DeviceModel, DeviceTransfer, Model, ModelError, Split, StepContext, TowerJob,
@@ -232,6 +232,9 @@ pub struct GpuExecutor {
     /// The books of the page-locked memory, which the device parts lock their
     /// checkpoint places in.
     ram: PinnedRam,
+    /// The model, which changes its page-locked memory before each step
+    /// ([`Model::before_step`]).
+    model: Arc<dyn Model>,
 }
 
 impl std::fmt::Debug for GpuExecutor {
@@ -382,6 +385,7 @@ impl GpuExecutor {
             seen: 0,
             in_flight: false,
             ram,
+            model,
         };
         let mut failure = None;
         for _ in 0..executor.handles.len() {
@@ -467,6 +471,25 @@ impl Executor for GpuExecutor {
 
     fn dispatch(&mut self, meta: &StepMeta) -> Result<(), ExecError> {
         assert!(!self.in_flight, "a step is already running");
+        // What the step's copies and the model need of page-locked memory is
+        // locked here, where no step runs: inside one it does not change
+        // (see "Host memory" in docs/dev/architecture/host-memory.md).
+        let failed = |message: String| ExecError::Device { device: 0, message };
+        {
+            // SAFETY: the conductor has written `record_bytes` bytes of the
+            // record and no device thread reads it before the hand-over.
+            let bytes = unsafe { std::slice::from_raw_parts(self.record.ptr, meta.record_bytes) };
+            let view = RecordView::new(bytes)
+                .map_err(|e| failed(format!("the step record is damaged: {e}")))?;
+            let places: Vec<u32> = (0..view.state_copies())
+                .map(|i| view.state_copy(i).place)
+                .chain((0..view.inner_saves()).map(|i| view.inner_save(i).place))
+                .collect();
+            self.ram
+                .hold_places(&places)
+                .map_err(|e| failed(format!("the checkpoint places of the step: {e}")))?;
+            self.model.before_step(&view).map_err(|e| failed(e.to_string()))?;
+        }
         self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
         let dispatched_ns = self.shared.clock.now_ns();
         for handle in &self.handles {
@@ -546,6 +569,18 @@ impl Executor for GpuExecutor {
         assert!(!self.in_flight, "transfers run between steps");
         if batch.is_empty() {
             return Ok(());
+        }
+        // The places checkpoints come into are locked first, as a step's are.
+        let places: Vec<u32> = batch
+            .iter()
+            .filter(|transfer| transfer.kind == TransferKind::StateIn)
+            .map(|transfer| transfer.object)
+            .collect();
+        if let Err(error) = self.ram.hold_places(&places) {
+            return Err(ExecError::Device {
+                device: 0,
+                message: format!("the checkpoint places of a transfer: {error}"),
+            });
         }
         self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
         for (device, handle) in self.handles.iter().enumerate() {
