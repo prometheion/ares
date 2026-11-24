@@ -1482,11 +1482,10 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       store's test rig and the fake executor of `tests/images.rs`.
       `ares-cuda` part done on `cleanup/cuda`: one table of weight types (`kernels/types.rs`), the
       dead kernels (draft carry, nine delta-rule shapes and the fork's design, the Q4_K reference,
-      the ordered sum of the expert rows, the break-even probe), `tests/common`, `ares_quant::act`
-      for the int8 activations, `invalid`/`check_align` once. Left, with the reason:
-  - [ ] After `kv/overflow` merges: the `ATTN_PROBE` clock instrumentation in `attn_kernel.cuh`
-        and `attn_direct.cuh`, and the copies of `gpus`, `Rng` and the byte helpers in
-        `tests/attention.rs` (all in kv's files).
+      the ordered sum of the expert rows, the break-even probe, after `kv/overflow` the attention
+      kernels' hand-build switches `ATTN_PROBE` and the like), `tests/common` (the attention test
+      included), `ares_quant::act` for the int8 activations, `invalid`/`check_align` once. Left,
+      with the reason:
   - [ ] At Vulkan parity: Vulkan's draft carry (`draft_shift`/`keep`/`commit`, which CUDA no
         longer has, and its test), its delta-rule shape sweep, and its copies of the activation
         layout (`vulkan/src/layers.rs`) and of the quantization (`vulkan/tests/mmvq.rs`): use
