@@ -223,9 +223,9 @@ pub enum AttentionShares {
     Given(Vec<f64>),
     /// Where the context finds room: the heads follow the weights as far as
     /// the context wanted (the one asked for, or the model's own) fits that
-    /// way, and move to the devices with room as far as it needs
-    /// ([`attention_for_context`]); when it cannot fit at all, the shares with
-    /// which the devices hold the most ([`attention_by_room`]).
+    /// way, and move to the devices with room as far as it needs; when it
+    /// cannot fit at all, the shares with which the devices hold the most
+    /// (`ares_model::qwen35::device::Estimate::attention_for_context`).
     ByContext,
 }
 
@@ -247,74 +247,6 @@ pub fn shares_by_bandwidth(bandwidths: &[f64]) -> Vec<f64> {
         bandwidths.iter().map(|b| if b.is_finite() && *b > 0.0 { *b } else { mean }).collect();
     let total: f64 = filled.iter().sum();
     filled.iter().map(|b| b / total).collect()
-}
-
-/// Lowers the shares of devices that cannot hold theirs and gives the rest
-/// to the others in proportion to what they asked for. `most[i]` is the
-/// largest share device `i` has memory for. `None` when the devices together
-/// cannot hold the model.
-pub fn fit_shares(wanted: &[f64], most: &[f64]) -> Option<Vec<f64>> {
-    let mut shares = wanted.to_vec();
-    let mut full = vec![false; shares.len()];
-    // Each round fills at least one device, so the loop ends.
-    for _ in 0..=shares.len() {
-        let mut over = 0.0;
-        for i in 0..shares.len() {
-            if !full[i] && shares[i] > most[i] {
-                over += shares[i] - most[i];
-                shares[i] = most[i].max(0.0);
-                full[i] = true;
-            }
-        }
-        if over <= 1e-9 {
-            return Some(shares);
-        }
-        let open: f64 = (0..shares.len()).filter(|i| !full[*i]).map(|i| shares[i]).sum();
-        if open <= 0.0 {
-            return None;
-        }
-        for i in 0..shares.len() {
-            if !full[i] {
-                shares[i] += over * shares[i] / open;
-            }
-        }
-    }
-    None
-}
-
-/// Each device's share of the attention heads that lets the devices hold the
-/// most context, from `room[i]`: the bytes device `i` has left once it holds
-/// everything of the model but the attention heads, their weights and their
-/// K and V.
-///
-/// A head's weights and its K and V take the same bytes on every device, so
-/// with `a[i]` of the heads, `w` bytes of all heads' weights and `p` of all
-/// heads' K and V per page, `n` pages fit when `a[i] * (w + p * n) <= room[i]`
-/// on every device. The most pages fit when the heads follow the rooms. `None`
-/// when no device has room.
-pub fn attention_by_room(room: &[u64]) -> Option<Vec<f64>> {
-    let total: u64 = room.iter().sum();
-    (total > 0).then(|| room.iter().map(|r| *r as f64 / total as f64).collect())
-}
-
-/// Each device's share of the attention heads for `pages` pages of context:
-/// `wanted` (the shares of the weights) lowered where a device's `room` (as
-/// for [`attention_by_room`]) cannot hold its heads' weights, `heads` bytes for
-/// all heads, and their K and V, `page` bytes a page for all heads, and the
-/// rest given to the others ([`fit_shares`]). The heads stay with the weights
-/// whenever the context fits that way: attention work on a device that is not
-/// the fastest makes a long sequence slower. `None` when the devices cannot
-/// hold that many pages.
-pub fn attention_for_context(
-    wanted: &[f64],
-    room: &[u64],
-    heads: u64,
-    page: u64,
-    pages: u32,
-) -> Option<Vec<f64>> {
-    let all = heads as f64 + page as f64 * f64::from(pages);
-    let most: Vec<f64> = room.iter().map(|r| (*r as f64 / all.max(1.0)).min(1.0)).collect();
-    fit_shares(wanted, &most)
 }
 
 /// What a device has to give and what a model takes of it, in bytes: the
@@ -346,27 +278,6 @@ pub fn pages_that_fit(rooms: &[Room], parallel: u32) -> u32 {
                 (Some(_), 0) => u32::MAX,
                 (Some(left), per_page) => u32::try_from(left / per_page).unwrap_or(u32::MAX),
             }
-        })
-        .min()
-        .unwrap_or(0)
-}
-
-/// The pages of K/V and keys that fit beside the fewest expert slots each
-/// device must keep: `slot_bytes[d]` is what device `d` has for expert slots
-/// with no context, `floor_bytes[d]` the slots its layers cannot do without,
-/// `page_bytes[d]` a page's bytes there. Every page of K and V is slots fewer
-/// for experts, and a step that misses an expert waits for RAM or the drive;
-/// the owner's rule (2026-11-22) is that the context is the model's own all
-/// the same, so a mixture of experts gives its slots up to that floor. A
-/// device without attention blocks (0 bytes a page) does not bound the pool.
-pub fn pages_beside_floors(slot_bytes: &[u64], floor_bytes: &[u64], page_bytes: &[u64]) -> u32 {
-    slot_bytes
-        .iter()
-        .zip(floor_bytes)
-        .zip(page_bytes)
-        .filter(|(_, per_page)| **per_page > 0)
-        .map(|((slots, floor), per_page)| {
-            u32::try_from(slots.saturating_sub(*floor) / per_page).unwrap_or(u32::MAX)
         })
         .min()
         .unwrap_or(0)
@@ -590,48 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn attention_heads_follow_the_room_and_that_holds_the_most_pages() {
-        // Two devices with 2 and 6 GiB left; the heads' weights take 1 GiB,
-        // their K and V 1 MiB a page.
-        let (w, p) = (1u64 << 30, 1u64 << 20);
-        let room = [2u64 << 30, 6 << 30];
-        let shares = attention_by_room(&room).unwrap();
-        assert_eq!(shares, vec![0.25, 0.75]);
-        let pages = |a: &[f64]| {
-            (0..2)
-                .map(|i| ((room[i] as f64 / a[i] - w as f64) / p as f64).floor() as u64)
-                .min()
-                .unwrap()
-        };
-        // (8 GiB - 1 GiB) / 1 MiB: every byte of both devices holds context.
-        assert_eq!(pages(&shares), 7 << 10);
-        for other in [[0.5, 0.5], [0.2, 0.8], [0.3, 0.7]] {
-            assert!(pages(&other) < pages(&shares), "{other:?}");
-        }
-        assert_eq!(attention_by_room(&[0, 0]), None);
-        assert_eq!(attention_by_room(&[0, 5]), Some(vec![0.0, 1.0]));
-    }
-
-    #[test]
-    fn attention_heads_stay_with_the_weights_until_the_context_needs_room() {
-        // Heads of 1 GiB of weights and 1 MiB of K and V a page; 2 and 6 GiB
-        // of room; the weights 0.625 and 0.375.
-        let (heads, page) = (1u64 << 30, 1u64 << 20);
-        let (room, wanted) = ([2u64 << 30, 6 << 30], [0.625, 0.375]);
-        let fit = |pages| attention_for_context(&wanted, &room, heads, page, pages);
-        // 2 GiB hold 0.625 of 1 GiB + 2048 pages: the heads stay.
-        assert_eq!(fit(2048), Some(wanted.to_vec()));
-        // 4096 pages: the first device holds 2/5 of the heads, the rest moves.
-        let moved = fit(4096).unwrap();
-        assert!((moved[0] - 0.4).abs() < 1e-9 && (moved[1] - 0.6).abs() < 1e-9, "{moved:?}");
-        // The most the devices hold, (8 - 1) GiB / 1 MiB, still fits; one
-        // page more does not.
-        let most = fit(7 << 10).unwrap();
-        assert!((most[0] - 0.25).abs() < 1e-9, "{most:?}");
-        assert_eq!(fit((7 << 10) + 1), None);
-    }
-
-    #[test]
     fn shares_follow_the_reported_bandwidth() {
         assert!(close(&shares_by_bandwidth(&[3.0, 1.0]), &[0.75, 0.25]));
         assert!(close(&shares_by_bandwidth(&[5.0]), &[1.0]));
@@ -639,21 +508,6 @@ mod tests {
         assert!(close(&shares_by_bandwidth(&[0.0, 0.0]), &[0.5, 0.5]));
         assert!(close(&shares_by_bandwidth(&[4.0, 0.0, 2.0]), &[4.0 / 9.0, 3.0 / 9.0, 2.0 / 9.0]));
         assert!(close(&shares_by_bandwidth(&[f64::NAN, 2.0]), &[0.5, 0.5]));
-    }
-
-    #[test]
-    fn a_device_that_is_too_small_gives_its_excess_to_the_others() {
-        // Everything fits: nothing changes.
-        assert!(close(&fit_shares(&[0.6, 0.4], &[0.7, 0.5]).unwrap(), &[0.6, 0.4]));
-        // The first can hold half: the second takes the rest.
-        assert!(close(&fit_shares(&[0.6, 0.4], &[0.5, 0.9]).unwrap(), &[0.5, 0.5]));
-        // The excess is split in proportion, and may fill a second device.
-        let shares = fit_shares(&[0.5, 0.3, 0.2], &[0.2, 0.4, 1.0]).unwrap();
-        assert!(close(&shares, &[0.2, 0.4, 0.4]), "{shares:?}");
-        assert!((shares.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-        // Together they are too small.
-        assert_eq!(fit_shares(&[0.5, 0.5], &[0.3, 0.3]), None);
-        assert_eq!(fit_shares(&[1.0], &[0.9]), None);
     }
 
     #[test]
@@ -668,26 +522,6 @@ mod tests {
         // A device without attention blocks does not bound the pool.
         assert_eq!(pages_that_fit(&[big, Room { per_page: 0, ..small }], 2), 80);
         assert_eq!(pages_that_fit(&[], 1), 0);
-    }
-
-    #[test]
-    fn the_context_of_a_model_with_experts_leaves_the_slots_the_store_needs() {
-        let gib = 1u64 << 30;
-        // 19 GiB of slots on two devices, a floor of 1 GiB on each, pages of
-        // 1.7 MB on one of them.
-        let floors = [gib, gib];
-        let pages = pages_beside_floors(&[8 * gib, 11 * gib], &floors, &[1_800_000, 0]);
-        assert_eq!(pages, (7 * gib / 1_800_000) as u32);
-        // The tighter device decides when both hold pages.
-        assert_eq!(
-            pages_beside_floors(&[8 * gib, 11 * gib], &floors, &[1_000_000, 4_000_000]),
-            (10 * gib / 4_000_000) as u32
-        );
-        // Slots below the floor hold no page.
-        assert_eq!(pages_beside_floors(&[gib / 2], &[gib], &[1_000]), 0);
-        // No attention anywhere, or no device: nothing bounds, nothing fits.
-        assert_eq!(pages_beside_floors(&[gib], &[0], &[0]), 0);
-        assert_eq!(pages_beside_floors(&[], &[], &[]), 0);
     }
 
     #[test]

@@ -68,7 +68,6 @@ pub mod options;
 pub mod plan;
 pub mod preset;
 mod props;
-mod qwen4exp;
 mod reasoning;
 mod responses;
 mod routes;
