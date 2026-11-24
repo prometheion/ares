@@ -1394,27 +1394,32 @@ impl<D: SlotDevice> ExpertStore<D> {
         unsafe { self.region.ptr().as_ptr().add(at) }
     }
 
-    /// Starts the read of an expert from the file into its RAM slot.
-    fn read(&mut self, layer: usize, swap: Swap, demand: bool) -> Result<(), StoreError> {
+    /// Submits the read of `expert` of `layer` from the file, as `class`: its
+    /// three matrices into `parts`. Returns the read's number, the bytes it
+    /// reads (whole blocks of the drive) and how far into each buffer its
+    /// matrix starts; `None` when the layer has no such expert.
+    ///
+    /// # Safety
+    ///
+    /// Each of `parts` holds a part of the store's slot size, and nothing
+    /// reads or writes it until the read has come back.
+    unsafe fn submit_expert_read(
+        &mut self,
+        layer: usize,
+        expert: u32,
+        class: Class,
+        parts: &[*mut u8],
+    ) -> Result<Option<(u64, u64, [u32; 3])>, StoreError> {
+        let Some(ranges) = self.map.ranges(layer, expert as usize) else { return Ok(None) };
+        let ranges: Vec<_> = ranges.collect();
         let id = self.next_read;
         self.next_read += 1;
-        let Some(ranges) = self.map.ranges(layer, swap.load as usize) else {
-            self.ram.sets[layer].abort(&swap);
-            return Err(StoreError::Plan(format!("layer {layer} has no expert {}", swap.load)));
-        };
-        let ranges: Vec<_> = ranges.collect();
-        let (pool, slot) = (self.ram.pool_of[layer], self.ram.slot(layer, swap.slot));
-        let mut bytes = 0;
+        let (mut bytes, mut skips) = (0, [0u32; 3]);
         for (part, range) in ranges.iter().enumerate() {
             let span = self.reader.span(range.file, range.offset, range.len)?;
-            self.ram_skip[pool][slot as usize][part] = span.skip as u32;
-            // SAFETY: the buffer is this slot's part of the region, which
-            // nobody else touches while the slot is loading: no upload reads
-            // a slot that is not held, and a held slot is never given to a
-            // read.
-            let buffer =
-                unsafe { Buffer::from_raw(self.ram_part(layer, swap.slot, part), span.len) };
-            let class = if demand { Class::Demand } else { Class::Prefetch };
+            skips[part] = span.skip as u32;
+            // SAFETY: the caller's contract.
+            let buffer = unsafe { Buffer::from_raw(parts[part], span.len) };
             let read = Read {
                 key: part_key(id, part),
                 file: range.file,
@@ -1426,6 +1431,25 @@ impl<D: SlotDevice> ExpertStore<D> {
             self.reader.submit(read).map_err(|rejected| StoreError::Io(rejected.error))?;
             bytes += span.len as u64;
         }
+        Ok(Some((id, bytes, skips)))
+    }
+
+    /// Starts the read of an expert from the file into its RAM slot.
+    fn read(&mut self, layer: usize, swap: Swap, demand: bool) -> Result<(), StoreError> {
+        let class = if demand { Class::Demand } else { Class::Prefetch };
+        let parts: Vec<*mut u8> =
+            (0..3).map(|part| self.ram_part(layer, swap.slot, part)).collect();
+        // SAFETY: the buffers are this slot's parts of the region, which
+        // nobody else touches while the slot is loading: no upload reads a
+        // slot that is not held, and a held slot is never given to a read.
+        let Some((id, bytes, skips)) =
+            (unsafe { self.submit_expert_read(layer, swap.load, class, &parts)? })
+        else {
+            self.ram.sets[layer].abort(&swap);
+            return Err(StoreError::Plan(format!("layer {layer} has no expert {}", swap.load)));
+        };
+        let (pool, slot) = (self.ram.pool_of[layer], self.ram.slot(layer, swap.slot));
+        self.ram_skip[pool][slot as usize] = skips;
         if demand {
             self.stats.demand_reads += 1;
             self.stats.demand_read_bytes += bytes;

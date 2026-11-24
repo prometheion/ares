@@ -47,10 +47,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use ares_io::{Buffer, Class, Read};
+use ares_io::Class;
 use ares_weights::{Start, Swap, SwapRule, Want};
 
-use super::{ExpertStore, Phase, SlotDevice, Source, StoreError, part_key, ram_source, read_of};
+use super::{ExpertStore, Phase, SlotDevice, Source, StoreError, ram_source, read_of};
 
 /// The transit and staging slots of a store: what [`super::StorePlan`] works
 /// out.
@@ -743,13 +743,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
             None => return Ok(false),
         };
-        let Some(ranges) = self.map.ranges(layer, expert as usize) else {
-            self.transit.stage_free.push(stage);
-            return Err(StoreError::Plan(format!("layer {layer} has no expert {expert}")));
-        };
-        let ranges: Vec<_> = ranges.collect();
-        let id = self.next_read;
-        self.next_read += 1;
         // A guess is a prefetch, which the reader keeps behind every read a step waits for
         // and to a few small chunks at the drive, so that a step of a few rows never waits
         // long behind one. While VRAM is lent, a prompt is read alone (in lent steps, or
@@ -763,25 +756,17 @@ impl<D: SlotDevice> ExpertStore<D> {
         } else {
             Class::Prefetch
         };
-        let mut bytes = 0;
-        for (part, range) in ranges.iter().enumerate() {
-            let span = self.reader.span(range.file, range.offset, range.len)?;
-            self.transit.stage_skip[stage as usize][part] = span.skip as u32;
-            // SAFETY: the buffer is this staging slot's part of the region,
-            // which nobody else touches until the read has come back: a slot
-            // is free only when no read and no upload uses it.
-            let buffer = unsafe { Buffer::from_raw(self.stage_part(layer, stage, part), span.len) };
-            let read = Read {
-                key: part_key(id, part),
-                file: range.file,
-                offset: range.offset,
-                len: range.len,
-                class,
-                buffer,
-            };
-            self.reader.submit(read).map_err(|rejected| StoreError::Io(rejected.error))?;
-            bytes += span.len as u64;
-        }
+        let parts: Vec<*mut u8> = (0..3).map(|part| self.stage_part(layer, stage, part)).collect();
+        // SAFETY: the buffers are this staging slot's parts of the region,
+        // which nobody else touches until the read has come back: a slot is
+        // free only when no read and no upload uses it.
+        let Some((id, bytes, skips)) =
+            (unsafe { self.submit_expert_read(layer, expert, class, &parts)? })
+        else {
+            self.transit.stage_free.push(stage);
+            return Err(StoreError::Plan(format!("layer {layer} has no expert {expert}")));
+        };
+        self.transit.stage_skip[stage as usize] = skips;
         self.transit.reads.insert(id, key);
         if let Some(entry) = self.transit.entries.get_mut(&key) {
             entry.state = State::Reading { stage, read: id, parts_left: 3, failed: false };
