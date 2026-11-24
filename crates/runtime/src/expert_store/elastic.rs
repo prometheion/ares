@@ -29,12 +29,12 @@
 //! were given, which then change hands. A slot's number in its layer never
 //! changes; only the memory behind it does, and only while nothing reads it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use super::region::Released;
-use super::tier::{Pool, Tier};
+use super::tier::{Move, Pool, Tier};
 use super::{ExpertStore, SlotDevice, StoreError};
 
 /// How long the end of a step waits for the reads and copies that are on
@@ -369,8 +369,9 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Takes every slot of `piece` out of use, so that the piece can be
-    /// given up: see the [module documentation](self). Returns false, with
-    /// nothing taken, when the layers cannot give that many slots.
+    /// given up: see the [module documentation](self) ([`Tier::vacate`]).
+    /// Returns false, with nothing taken, when the layers cannot give that
+    /// many slots.
     fn vacate(&mut self, piece: usize) -> bool {
         let Some((pool, slots)) = self.pieces.layout.slots_of(piece) else { return false };
         let copy = self.region.is_locked(piece);
@@ -379,72 +380,26 @@ impl<D: SlotDevice> ExpertStore<D> {
         if dying.is_empty() {
             return true;
         }
-        let stride = self.ram.pools[pool].stride as usize;
         let members = self.pool_layers(pool);
-        let spare: Vec<usize> = members
-            .iter()
-            .map(|layer| self.ram.slots(*layer).saturating_sub(self.ram.floor[*layer]))
-            .collect();
-        let total: usize = spare.iter().sum();
-        if total < dying.len() {
-            return false;
-        }
-        let mut quota: Vec<usize> = spare.iter().map(|s| s * dying.len() / total).collect();
-        for _ in quota.iter().sum::<usize>()..dying.len() {
-            let most = (0..members.len())
-                .max_by_key(|i| spare[*i] - quota[*i])
-                .expect("a pool with slots has layers");
-            quota[most] += 1;
-        }
-        // Every layer gives its coldest.
-        let mut given: Vec<(usize, u32)> = Vec::with_capacity(dying.len());
-        for (layer, n) in members.iter().zip(&quota) {
-            if *n == 0 {
-                continue;
-            }
+        let floor: Vec<usize> = members.iter().map(|layer| self.ram.floor[*layer]).collect();
+        for layer in &members {
             self.refresh_worth(*layer);
-            let worth = self.ram_worth.layer(*layer);
-            for slot in self.ram.sets[*layer].give_back(*n, self.step, worth) {
-                self.stats.piece_evictions += u64::from(slot.evicted.is_some());
-                given.push((*layer, slot.slot));
-            }
         }
-        if given.len() < dying.len() {
-            // A slot was busy after all: the layers take theirs back.
-            for layer in &members {
-                let back: Vec<u32> = given
-                    .iter()
-                    .filter(|(l, _)| l == layer)
-                    .map(|(_, local)| self.ram.slot(*layer, *local))
-                    .collect();
-                self.retake(*layer, &back);
+        let vacated =
+            self.ram.vacate(&members, &dying, &floor, self.step, |l| self.ram_worth.layer(l));
+        self.stats.piece_evictions += vacated.evicted.len() as u64;
+        let Some(moves) = vacated.moves else {
+            for layer in members {
+                self.worth_stale[layer] = true;
             }
             return false;
-        }
-        // What lies in the piece and stays moves into the slots given.
-        let owner: HashMap<u32, (usize, u32)> = members
-            .iter()
-            .flat_map(|layer| {
-                let locals = self.ram.locals(*layer).iter().enumerate();
-                locals.map(move |(local, slot)| (*slot, (*layer, local as u32)))
-            })
-            .collect();
-        let in_piece: HashSet<u32> = dying.iter().copied().collect();
-        let given: Vec<(usize, u32, u32)> = given
-            .into_iter()
-            .map(|(layer, local)| (layer, local, self.ram.slot(layer, local)))
-            .collect();
-        let gone: HashSet<u32> = given.iter().map(|(_, _, slot)| *slot).collect();
-        let mut homes = given.iter().filter(|(_, _, slot)| !in_piece.contains(slot));
-        for slot in dying.iter().filter(|slot| !gone.contains(slot)) {
-            let (stays, number) = owner[slot];
-            let (gives, given_number, home) =
-                *homes.next().expect("as many slots were given as lie in the piece");
+        };
+        // What lies in the piece and stays is copied into the slots given.
+        let stride = self.ram.pools[pool].stride as usize;
+        for Move { from, to, .. } in moves {
             if copy {
-                let (from, to) = (
-                    self.pieces.layout.slot_at(pool, *slot),
-                    self.pieces.layout.slot_at(pool, home),
-                );
+                let (from, to) =
+                    (self.pieces.layout.slot_at(pool, from), self.pieces.layout.slot_at(pool, to));
                 // SAFETY: both slots are inside the region and locked, they
                 // are different slots of one pool, and nothing reads or
                 // writes the tier's memory now (`ram_quiet`).
@@ -453,9 +408,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     std::ptr::copy_nonoverlapping(region.add(from), region.add(to), stride);
                 }
             }
-            self.ram_skip[pool][home as usize] = self.ram_skip[pool][*slot as usize];
-            self.ram.remap(stays, number, home);
-            self.ram.remap(gives, given_number, *slot);
+            self.ram_skip[pool][to as usize] = self.ram_skip[pool][from as usize];
         }
         for slot in dying {
             self.pieces.live[pool][slot as usize] = false;
@@ -464,7 +417,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// The slots of `piece`, which is locked again, go back to the layers
-    /// that hold their numbers.
+    /// that hold their numbers ([`Tier::reopen`]).
     fn revive(&mut self, piece: usize) {
         let Some((pool, slots)) = self.pieces.layout.slots_of(piece) else { return };
         let reborn: HashSet<u32> =
@@ -472,29 +425,12 @@ impl<D: SlotDevice> ExpertStore<D> {
         if reborn.is_empty() {
             return;
         }
-        for layer in self.pool_layers(pool) {
-            let own: Vec<u32> = self
-                .ram
-                .locals(layer)
-                .iter()
-                .copied()
-                .filter(|slot| reborn.contains(slot))
-                .collect();
-            self.retake(layer, &own);
+        for layer in self.ram.reopen(pool, &reborn) {
+            self.worth_stale[layer] = true;
         }
         for slot in reborn {
             self.pieces.live[pool][slot as usize] = true;
         }
-    }
-
-    /// `layer` takes `slots` of its pool into use again: slots it holds the
-    /// numbers of and had given up ([`Tier::retake`]).
-    fn retake(&mut self, layer: usize, slots: &[u32]) {
-        if slots.is_empty() {
-            return;
-        }
-        self.ram.retake(layer, slots);
-        self.worth_stale[layer] = true;
     }
 }
 

@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::tier::Move;
 use super::{ExpertStore, SlotDevice, StoreError};
 
 /// Slots of a device's pool that are lent: `slots` slots from `first` on, the
@@ -267,10 +268,11 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Lends the slots of `tier_pool` (whose layers are `members`) from
-    /// `first` to its end: every layer gives its coldest in proportion to
-    /// what it has above the floor of a loan, what they held is evicted, and
-    /// what lies in the lent slots and stays moves into the slots given.
-    /// `false` when a slot was busy after all; nothing changed then.
+    /// `first` to its end ([`Tier::vacate`](super::tier::Tier::vacate)): every
+    /// layer gives its coldest in proportion to what it has above the floor of
+    /// a loan, what they held is evicted, and what lies in the lent slots and
+    /// stays moves into the slots given. `false` when a slot was busy after
+    /// all; nothing is lent then.
     fn lend_pool(
         &mut self,
         device: usize,
@@ -280,93 +282,45 @@ impl<D: SlotDevice> ExpertStore<D> {
     ) -> Result<bool, StoreError> {
         let pool = self.vram.pools[tier_pool];
         let lent: Vec<u32> = (first..pool.slots).collect();
-        let spare: Vec<usize> = members
-            .iter()
-            .map(|l| self.vram.slots(*l).saturating_sub(self.scratch_floor(*l)))
-            .collect();
-        let total: usize = spare.iter().sum();
-        let mut quota: Vec<usize> = spare.iter().map(|s| s * lent.len() / total).collect();
-        for _ in quota.iter().sum::<usize>()..lent.len() {
-            let most = (0..members.len())
-                .filter(|i| spare[*i] > quota[*i])
-                .max_by_key(|i| spare[*i] - quota[*i])
-                .expect("the layers have the spare slots that were counted");
-            quota[most] += 1;
+        let floor: Vec<usize> = members.iter().map(|l| self.scratch_floor(*l)).collect();
+        let vacated = self.vram.vacate(members, &lent, &floor, self.step, |l| self.heat.layer(l));
+        // What the slots given held leaves as any evicted expert does.
+        for (layer, expert, slot) in vacated.evicted {
+            self.stats.evictions += 1;
+            self.devices[device].set_entry(layer, expert, -1)?;
+            self.demote(layer, expert, slot)?;
         }
-        // Every layer gives its coldest; what they held leaves as any evicted
-        // expert does.
-        let mut given: Vec<(usize, u32)> = Vec::with_capacity(lent.len());
-        for (layer, n) in members.iter().zip(&quota) {
-            if *n == 0 {
-                continue;
-            }
-            for slot in self.vram.sets[*layer].give_back(*n, self.step, self.heat.layer(*layer)) {
-                if let Some(expert) = slot.evicted {
-                    self.stats.evictions += 1;
-                    self.devices[device].set_entry(*layer, expert, -1)?;
-                    self.demote(*layer, expert, self.vram.slot(*layer, slot.slot))?;
-                }
-                given.push((*layer, slot.slot));
-            }
+        for layer in members {
             self.worth_stale[*layer] = true;
         }
-        if given.len() < lent.len() {
-            // A slot was busy after all: the layers take theirs back.
-            for layer in members {
-                let back: Vec<u32> = given
-                    .iter()
-                    .filter(|(l, _)| l == layer)
-                    .map(|(_, local)| self.vram.slot(*layer, *local))
-                    .collect();
-                self.vram.retake(*layer, &back);
-            }
-            return Ok(false);
-        }
-        // What lies in the lent slots and stays moves into the slots given.
-        let owner: HashMap<u32, (usize, u32)> = members
-            .iter()
-            .flat_map(|layer| {
-                let locals = self.vram.locals(*layer).iter().enumerate();
-                locals.map(move |(local, slot)| (*slot, (*layer, local as u32)))
-            })
-            .collect();
-        let in_loan: HashSet<u32> = lent.iter().copied().collect();
-        let given: Vec<(usize, u32, u32)> = given
-            .into_iter()
-            .map(|(layer, local)| (layer, local, self.vram.slot(layer, local)))
-            .collect();
-        let gone: HashSet<u32> = given.iter().map(|(_, _, slot)| *slot).collect();
-        let mut homes = given.iter().filter(|(_, _, slot)| !in_loan.contains(slot));
+        let Some(moves) = vacated.moves else { return Ok(false) };
+        // The experts that lay in the lent slots move on the device.
         let mut held: HashMap<usize, HashMap<u32, u32>> = HashMap::new();
-        for slot in lent.iter().filter(|slot| !gone.contains(slot)) {
-            let (stays, number) = owner[slot];
-            let (gives, given_number, home) =
-                *homes.next().expect("as many slots were given as are lent");
-            let held = held.entry(stays).or_insert_with(|| {
-                let set = &self.vram.sets[stays];
-                (0..self.heat.layer(stays).len() as u32)
+        for Move { layer, number, from, to } in moves {
+            let held = held.entry(layer).or_insert_with(|| {
+                let set = &self.vram.sets[layer];
+                (0..self.heat.layer(layer).len() as u32)
                     .filter_map(|e| set.slot(e).map(|local| (local, e)))
                     .collect()
             });
             if let Some(expert) = held.get(&number).copied() {
-                let g = self.layers[stays];
+                let g = self.layers[layer];
                 let parts = [0, 1, 2].map(|part| (g.offsets[part], g.lens[part]));
                 self.devices[device].adopt(
                     g.device_pool,
-                    *slot,
+                    from,
                     g.device_pool,
-                    home,
+                    to,
                     &parts,
-                    stays,
+                    layer,
                     expert,
                 )?;
                 self.stats.scratch_moves += 1;
             }
-            self.vram.remap(stays, number, home);
-            self.vram.remap(gives, given_number, *slot);
         }
         // The numbers behind the lent slots stay given back until the loan
         // ends, whatever the layers take meanwhile.
+        let in_loan: HashSet<u32> = lent.iter().copied().collect();
         for layer in members {
             let locals: Vec<u32> = (0..self.vram.locals(*layer).len() as u32)
                 .filter(|local| in_loan.contains(&self.vram.slot(*layer, *local)))
@@ -410,22 +364,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let Some(lent) = self.scratch.get_mut(device).and_then(Option::take) else { return Ok(()) };
         for (loan, tier_pool) in lent.loans {
             let back: HashSet<u32> = (loan.first..loan.first + loan.slots).collect();
-            for layer in 0..self.layers.len() {
-                if self.vram.pool_of[layer] != tier_pool {
-                    continue;
-                }
-                let own: Vec<(u32, u32)> = (0..self.vram.locals(layer).len() as u32)
-                    .map(|local| (local, self.vram.slot(layer, local)))
-                    .filter(|(_, slot)| back.contains(slot))
-                    .collect();
-                if own.is_empty() {
-                    continue;
-                }
-                for (local, _) in &own {
-                    self.vram.sets[layer].bring_back(*local);
-                }
-                let slots: Vec<u32> = own.iter().map(|(_, slot)| *slot).collect();
-                self.vram.retake(layer, &slots);
+            for layer in self.vram.reopen(tier_pool, &back) {
                 self.worth_stale[layer] = true;
             }
         }

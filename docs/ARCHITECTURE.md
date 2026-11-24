@@ -6333,11 +6333,12 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   transit, not into the tier's free slots); what
   those held is evicted as any evicted expert is (copied down to RAM when the RAM tier keeps
   it), the experts that lie in the lent slots and stay move on the device into the slots
-  given (`SlotDevice::adopt`), and the numbers change hands, as the RAM tier does with the
-  pieces it gives back. A lent number is set aside in its `SlotSet` (`SlotSet::set_aside`):
-  nothing takes it again until the loan ends (`bring_back`). (This loan of scratch is not the
-  slot a miss is uploaded into "on loan" of `fix/mtp-and-slots`; the names keep them apart:
-  `ExpertStore::lend_scratch`, `StoreStats::scratch_loans`.) The first part to begin a wide step lends on every device, waits
+  given (`SlotDevice::adopt`), and the numbers change hands: the same bookkeeping as the RAM
+  tier's for the pieces it gives back (`Tier::vacate`; each moves the bytes in its own
+  memory). A lent number is set aside in its `SlotSet` (`SlotSet::set_aside`): nothing takes
+  it again until the loan ends (`Tier::reopen`). (This loan of scratch is not the slot a miss
+  is uploaded into "on loan" of `fix/mtp-and-slots`; the names keep them apart:
+  `ExpertStore::lend_pieces`, `StoreStats::scratch_loans`.) The first part to begin a wide step lends on every device, waits
   until nothing touches the slots of the device (no read, upload or adoption on its way) and
   the moves and copies down have run, and only then does the step begin for the store.
 - *The way back.* The slots go back, empty, at the end of the first step that does not run
@@ -7260,7 +7261,8 @@ look by look. The users:
   pool gives slots in proportion to what it has above the two a layer keeps,
   each layer gives its coldest (the copies of experts that VRAM holds first),
   and the experts that lie in the piece and stay are copied into the slots
-  that were given (`expert_store/elastic.rs`). The driver's unlock waits for
+  that were given (`expert_store/elastic.rs`; the bookkeeping, `Tier::vacate`,
+  is the one the loans of VRAM to a step's scratch use). The driver's unlock waits for
   the device to finish what it has, and a step's kernels can wait on the
   device for an expert the store brings, so a piece is never unlocked while
   a step runs: the thread that ends the step unlocks what the step's end gave

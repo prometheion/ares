@@ -1,6 +1,6 @@
 //! One tier of the expert store: pools of slots and who holds them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ares_weights::{LayerNeed, SlotSet, SplitRule, split_slots};
 
@@ -35,6 +35,28 @@ pub(crate) struct Tier {
 
 /// What a slot number that a layer gave up for good has behind it: no slot of the pool.
 pub(super) const NO_MEMORY: u32 = u32::MAX;
+
+/// What lies in a slot that is vacated and stays ([`Tier::vacate`]): what `layer` holds
+/// behind its number `number` lay in slot `from` of the pool and is to lie in slot `to`,
+/// which the number names now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Move {
+    pub layer: usize,
+    pub number: u32,
+    pub from: u32,
+    pub to: u32,
+}
+
+/// What [`Tier::vacate`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Vacated {
+    /// What the slots the layers gave held, as (layer, expert, the slot of the pool it lay
+    /// in): evicted, whether the slots were vacated or not.
+    pub evicted: Vec<(usize, u32, u32)>,
+    /// What moves, with the tier's numbers changed already; `None` when the layers could
+    /// not give as many slots: they have taken back what they gave, and nothing is vacated.
+    pub moves: Option<Vec<Move>>,
+}
 
 impl Tier {
     /// A tier for layers of `n_experts` experts: `layers[l]` is the place and
@@ -213,6 +235,117 @@ impl Tier {
             self.remap(layer, number, slot);
             self.remap(layer, other, has);
         }
+    }
+
+    /// Takes `slots` of a pool out of use for the pool's layers `members`, between steps,
+    /// without taking them as they lie: every layer gives slots in proportion to what it
+    /// has above its floor (`floor[i]` for `members[i]`; the largest remainders round),
+    /// each its coldest by `worth(layer)` at `step`, and what lies in `slots` and stays
+    /// moves into the slots given outside them, whose numbers change hands. The owner of
+    /// the tier moves the bytes and lets the evicted experts go; a slot's number in its
+    /// layer never changes, only the memory behind it. The RAM tier vacates the pieces it
+    /// gives back to the system (`elastic.rs`), VRAM the slots it lends to a step's scratch
+    /// (`scratch.rs`); [`Tier::reopen`] brings them back.
+    pub fn vacate<'w>(
+        &mut self,
+        members: &[usize],
+        slots: &[u32],
+        floor: &[usize],
+        step: u64,
+        worth: impl Fn(usize) -> &'w [f32],
+    ) -> Vacated {
+        let mut vacated = Vacated::default();
+        let spare: Vec<usize> =
+            members.iter().zip(floor).map(|(l, f)| self.slots(*l).saturating_sub(*f)).collect();
+        let total: usize = spare.iter().sum();
+        if total < slots.len() {
+            return vacated;
+        }
+        let mut quota: Vec<usize> = spare.iter().map(|s| s * slots.len() / total).collect();
+        for _ in quota.iter().sum::<usize>()..slots.len() {
+            let most = (0..members.len())
+                .filter(|i| spare[*i] > quota[*i])
+                .max_by_key(|i| spare[*i] - quota[*i])
+                .expect("the layers have the spare slots that were counted");
+            quota[most] += 1;
+        }
+        // Every layer gives its coldest.
+        let mut given: Vec<(usize, u32)> = Vec::with_capacity(slots.len());
+        for (layer, n) in members.iter().zip(&quota) {
+            if *n == 0 {
+                continue;
+            }
+            for slot in self.sets[*layer].give_back(*n, step, worth(*layer)) {
+                if let Some(expert) = slot.evicted {
+                    vacated.evicted.push((*layer, expert, self.slot(*layer, slot.slot)));
+                }
+                given.push((*layer, slot.slot));
+            }
+        }
+        if given.len() < slots.len() {
+            // A slot was busy after all: the layers take theirs back.
+            for layer in members {
+                let back: Vec<u32> = given
+                    .iter()
+                    .filter(|(l, _)| l == layer)
+                    .map(|(_, local)| self.slot(*layer, *local))
+                    .collect();
+                self.retake(*layer, &back);
+            }
+            return vacated;
+        }
+        // What lies in the slots and stays moves into the slots given.
+        let owner: HashMap<u32, (usize, u32)> = members
+            .iter()
+            .flat_map(|layer| {
+                let locals = self.locals(*layer).iter().enumerate();
+                locals.map(move |(local, slot)| (*slot, (*layer, local as u32)))
+            })
+            .collect();
+        let vacating: HashSet<u32> = slots.iter().copied().collect();
+        let given: Vec<(usize, u32, u32)> = given
+            .into_iter()
+            .map(|(layer, local)| (layer, local, self.slot(layer, local)))
+            .collect();
+        let gone: HashSet<u32> = given.iter().map(|(_, _, slot)| *slot).collect();
+        let mut homes = given.iter().filter(|(_, _, slot)| !vacating.contains(slot));
+        let mut moves = Vec::new();
+        for slot in slots.iter().filter(|slot| !gone.contains(slot)) {
+            let (stays, number) = owner[slot];
+            let (gives, given_number, home) =
+                *homes.next().expect("as many slots were given as are vacated");
+            self.remap(stays, number, home);
+            self.remap(gives, given_number, *slot);
+            moves.push(Move { layer: stays, number, from: *slot, to: home });
+        }
+        vacated.moves = Some(moves);
+        vacated
+    }
+
+    /// The vacated `slots` of `pool` go back into use, empty, for the layers that hold
+    /// their numbers ([`Tier::vacate`]; a number set aside for a loan comes back as well).
+    /// Returns the layers that took slots.
+    pub fn reopen(&mut self, pool: usize, slots: &HashSet<u32>) -> Vec<usize> {
+        let mut layers = Vec::new();
+        for layer in 0..self.sets.len() {
+            if self.pool_of[layer] != pool {
+                continue;
+            }
+            let own: Vec<(u32, u32)> = (0..self.locals(layer).len() as u32)
+                .map(|local| (local, self.slot(layer, local)))
+                .filter(|(_, slot)| slots.contains(slot))
+                .collect();
+            if own.is_empty() {
+                continue;
+            }
+            for (local, _) in &own {
+                self.sets[layer].bring_back(*local);
+            }
+            let own: Vec<u32> = own.iter().map(|(_, slot)| *slot).collect();
+            self.retake(layer, &own);
+            layers.push(layer);
+        }
+        layers
     }
 }
 
