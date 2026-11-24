@@ -400,31 +400,21 @@ pub struct AttentionShape {
     pub head_dim: u32,
 }
 
-/// One compiled shape of the delta-rule kernels.
+/// The delta-rule kernels (`ARES_DELTA_KERNELS(d128, ...)` in `kernels/layers.cu`): two lanes
+/// per row of the matrix and 64 rows per block, the grid `head_dim / DELTA_ROWS_PER_BLOCK`
+/// blocks per head.
 #[derive(Clone, Debug)]
 struct DeltaKernels {
-    /// Rows of the matrix per block: the grid has `head_dim / rows_per_block` blocks per head.
-    rows_per_block: u32,
-    threads: u32,
     window_f32: Function,
     window_f16: Function,
     commit_f32: Function,
     commit_f16: Function,
 }
 
-/// The compiled shapes of the delta rule: suffix, lanes per row, rows per block.
-const DELTA_VARIANTS: [(&str, u32, u32); 10] = [
-    ("d128", 2, 64),
-    ("lpr4_rb64", 4, 64),
-    ("lpr8_rb64", 8, 64),
-    ("lpr4_rb32", 4, 32),
-    ("lpr4_rb128", 4, 128),
-    ("lpr2_rb32", 2, 32),
-    ("lpr8_rb32", 8, 32),
-    ("lpr1_rb64", 1, 64),
-    ("lpr2_rb64_tc8", 2, 64),
-    ("lpr2_rb16", 2, 16),
-];
+/// Rows of the matrix a block of the delta-rule kernels takes, and its threads (two lanes a
+/// row).
+const DELTA_ROWS_PER_BLOCK: u32 = 64;
+const DELTA_THREADS: u32 = 2 * DELTA_ROWS_PER_BLOCK;
 
 /// The layer kernels on one device.
 #[derive(Clone, Debug)]
@@ -445,9 +435,7 @@ pub struct LayerKernels {
     merge_push: Function,
     conv_window: Function,
     conv_commit: Function,
-    delta_fork: Function,
-    delta: Vec<(&'static str, DeltaKernels)>,
-    delta_selected: usize,
+    delta: DeltaKernels,
 }
 
 fn check_align(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
@@ -475,22 +463,12 @@ impl LayerKernels {
     /// Loads the layer kernels on `device`.
     pub fn load(device: &Device) -> Result<Self> {
         let module = Module::load(device, IMAGE)?;
-        let delta = DELTA_VARIANTS
-            .iter()
-            .map(|&(suffix, lpr, rb)| {
-                Ok((
-                    suffix,
-                    DeltaKernels {
-                        rows_per_block: rb,
-                        threads: rb * lpr,
-                        window_f32: module.function(&format!("ares_delta_window_f32_{suffix}"))?,
-                        window_f16: module.function(&format!("ares_delta_window_f16_{suffix}"))?,
-                        commit_f32: module.function(&format!("ares_delta_commit_f32_{suffix}"))?,
-                        commit_f16: module.function(&format!("ares_delta_commit_f16_{suffix}"))?,
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let delta = DeltaKernels {
+            window_f32: module.function("ares_delta_window_f32_d128")?,
+            window_f16: module.function("ares_delta_window_f16_d128")?,
+            commit_f32: module.function("ares_delta_commit_f32_d128")?,
+            commit_f16: module.function("ares_delta_commit_f16_d128")?,
+        };
         Ok(Self {
             device: device.clone(),
             embed_gather: module.function("ares_embed_gather")?,
@@ -508,31 +486,12 @@ impl LayerKernels {
             merge_push: module.function("ares_merge_push")?,
             conv_window: module.function("ares_conv_window")?,
             conv_commit: module.function("ares_conv_commit")?,
-            delta_fork: module.function("ares_delta_window_fork_f32")?,
             delta,
-            delta_selected: 0,
         })
     }
 
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// The names of the compiled shapes of the delta rule (for tuning); the
-    /// first is the default.
-    pub fn delta_variants() -> impl Iterator<Item = &'static str> {
-        DELTA_VARIANTS.iter().map(|v| v.0)
-    }
-
-    /// Selects a compiled shape of the delta rule by name.
-    pub fn select_delta_variant(&mut self, name: &str) -> Result<()> {
-        let at = self
-            .delta
-            .iter()
-            .position(|(n, _)| *n == name)
-            .ok_or_else(|| invalid("delta variant", format!("no variant '{name}'")))?;
-        self.delta_selected = at;
-        Ok(())
     }
 
     /// Embedding gather: `out[r]` is the row of the table for the token of row `r` of the
@@ -901,7 +860,7 @@ impl LayerKernels {
         if dims.n_segs == 0 || dims.max_seg_rows == 0 {
             return Ok(());
         }
-        let k = &self.delta[self.delta_selected].1;
+        let k = &self.delta;
         let function = match format {
             StateFormat::F32 => &k.window_f32,
             StateFormat::F16 => &k.window_f16,
@@ -919,60 +878,9 @@ impl LayerKernels {
             .ptr(out)
             .u32(shape.n_k_heads)
             .u32(shape.n_v_heads);
-        let blocks = shape.n_v_heads * (shape.head_dim / k.rows_per_block);
+        let blocks = shape.n_v_heads * (shape.head_dim / DELTA_ROWS_PER_BLOCK);
         // SAFETY: the argument list matches ares_delta_window_*.
-        unsafe { function.launch(stream, [blocks, dims.n_segs, 1], [k.threads, 1, 1], 0, args) }
-    }
-
-    /// The design of the llama.cpp fork's delta-rule kernel (4 columns of the
-    /// matrix per warp, 8 lanes per column, `k` and `q` read from global memory at
-    /// every row, no staging), ported to this engine's inputs: the baseline
-    /// that `examples/layers_bench.rs` times the delta rule against. f32 state
-    /// only; writes the state when `write_state`.
-    ///
-    /// # Safety
-    ///
-    /// As [`LayerKernels::delta_window`].
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn delta_window_fork_design(
-        &self,
-        stream: &Stream,
-        step: DevicePtr,
-        dims: StepDims,
-        shape: RecurrentShape,
-        write_state: bool,
-        q: DevicePtr,
-        kv: DevicePtr,
-        alpha: DevicePtr,
-        beta_in: DevicePtr,
-        dt_bias: DevicePtr,
-        ssm_a: DevicePtr,
-        state: DevicePtr,
-        state_slot_stride: u64,
-        out: DevicePtr,
-    ) -> Result<()> {
-        shape.check()?;
-        if dims.n_segs == 0 || dims.max_seg_rows == 0 {
-            return Ok(());
-        }
-        let args = Args::new()
-            .ptr(step)
-            .ptr(q)
-            .ptr(kv)
-            .ptr(alpha)
-            .ptr(beta_in)
-            .ptr(dt_bias)
-            .ptr(ssm_a)
-            .ptr(state)
-            .u64(state_slot_stride)
-            .ptr(out)
-            .u32(shape.n_k_heads)
-            .u32(shape.n_v_heads)
-            .u32(u32::from(write_state));
-        // SAFETY: the argument list matches ares_delta_window_fork_f32.
-        unsafe {
-            self.delta_fork.launch(stream, [shape.n_v_heads, dims.n_segs, 8], [32, 4, 1], 0, args)
-        }
+        unsafe { function.launch(stream, [blocks, dims.n_segs, 1], [DELTA_THREADS, 1, 1], 0, args) }
     }
 
     /// Advances the delta-rule matrices of the segments that are not direct over
@@ -1004,7 +912,7 @@ impl LayerKernels {
         if dims.n_segs == 0 || dims.max_seg_rows == 0 {
             return Ok(());
         }
-        let k = &self.delta[self.delta_selected].1;
+        let k = &self.delta;
         let function = match format {
             StateFormat::F32 => &k.commit_f32,
             StateFormat::F16 => &k.commit_f16,
@@ -1020,9 +928,9 @@ impl LayerKernels {
             .u64(state_slot_stride)
             .u32(shape.n_k_heads)
             .u32(shape.n_v_heads);
-        let blocks = shape.n_v_heads * (shape.head_dim / k.rows_per_block);
+        let blocks = shape.n_v_heads * (shape.head_dim / DELTA_ROWS_PER_BLOCK);
         // SAFETY: the argument list matches ares_delta_commit_*.
-        unsafe { function.launch(stream, [blocks, dims.n_segs, 1], [k.threads, 1, 1], 0, args) }
+        unsafe { function.launch(stream, [blocks, dims.n_segs, 1], [DELTA_THREADS, 1, 1], 0, args) }
     }
 
     /// Advances the convolution windows over the accepted rows. `which`

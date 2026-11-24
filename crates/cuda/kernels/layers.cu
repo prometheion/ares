@@ -9,27 +9,16 @@
 #include "layer_norm.cuh"
 #include "layer_conv.cuh"
 #include "layer_delta.cuh"
-#include "layer_delta_fork.cuh"
 #include "layer_act_f16.cuh"
 #include "layer_merge.cuh"
 
-// The delta rule for the head width of both architectures (128). The default
-// shape: two lanes per row of the matrix (64 values each in registers), 64 rows
-// per block, 16 rows of the segment staged at a time. Measured best of the
-// shapes below for prompt rows on both development GPUs (see
-// examples/layers_bench.rs), equal for decode rows.
+// The delta rule for the head width of both architectures (128): two lanes per
+// row of the matrix (64 values each in registers), 64 rows per block, 16 rows
+// of the segment staged at a time. Of the shapes measured (1 to 8 lanes per
+// row, 16 to 128 rows per block, 8 or 16 rows staged; examples/layers_bench.rs
+// before 2026-11-24) the best for prompt rows on both development GPUs, equal
+// for decode rows. src/layers.rs launches it with these numbers.
 ARES_DELTA_KERNELS(d128, 128, 2, 64, 16)
-
-// Other shapes of the same kernel, selectable by name for tuning (src/layers.rs).
-ARES_DELTA_KERNELS(lpr4_rb64, 128, 4, 64, 16)
-ARES_DELTA_KERNELS(lpr8_rb64, 128, 8, 64, 16)
-ARES_DELTA_KERNELS(lpr4_rb32, 128, 4, 32, 16)
-ARES_DELTA_KERNELS(lpr4_rb128, 128, 4, 128, 16)
-ARES_DELTA_KERNELS(lpr2_rb32, 128, 2, 32, 16)
-ARES_DELTA_KERNELS(lpr8_rb32, 128, 8, 32, 16)
-ARES_DELTA_KERNELS(lpr1_rb64, 128, 1, 64, 16)
-ARES_DELTA_KERNELS(lpr2_rb64_tc8, 128, 2, 64, 8)
-ARES_DELTA_KERNELS(lpr2_rb16, 128, 2, 16, 16)
 
 // Rows of a result that was computed as some columns of a wider one, put in
 // their place: dst[r][at + i] = src[r][i] for r < n_rows, i < width, with

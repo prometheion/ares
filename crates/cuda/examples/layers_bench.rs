@@ -13,7 +13,7 @@
 //! tells whether the kernel is bound by memory.
 //!
 //! ```sh
-//! cargo run --release -p ares-cuda --example layers_bench [device] [decode|prompt|delta|all]
+//! cargo run --release -p ares-cuda --example layers_bench [device] [decode|prompt|all]
 //! ```
 
 // Every launch below works on buffers that `run` allocates for the largest configuration and
@@ -145,7 +145,7 @@ fn print_table(title: &str, configs: &[Config], lines: &[Line]) {
 }
 
 /// Times every kernel for each configuration.
-fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool, only: Option<&str>) {
+fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool) {
     let max_rows = configs.iter().map(Config::rows).max().unwrap();
     let max_seqs = configs.iter().map(|c| c.seqs).max().unwrap();
     let vd = SHAPE.value_dim();
@@ -203,9 +203,6 @@ fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool, on
 
     let mut lines: Vec<Line> = Vec::new();
     let mut add = |name: &str, f: &mut dyn FnMut(&Config) -> (f64, f64)| {
-        if only.is_some_and(|prefix| !name.starts_with(prefix)) {
-            return;
-        }
         let cells = configs.iter().map(|c| f(c)).collect();
         lines.push(Line { name: name.to_owned(), cells });
     };
@@ -358,45 +355,6 @@ fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool, on
                 * delta_len as f64
                 * stride_bytes as f64
                 * if direct { 2.0 } else { 1.0 };
-            let io = f64::from(c.rows()) * f64::from(vd) * 4.0
-                + f64::from(c.rows()) * f64::from(kd + vd) * 4.0 * 0.5;
-            (us, gbs(state_bytes + io, us))
-        });
-    }
-    for (name, direct) in
-        [("delta_window fork design, deferred", false), ("delta_window fork design, direct", true)]
-    {
-        add(name, &mut |c| {
-            let rec = record(c, direct);
-            let step = rig.buf(rec.as_bytes().len() as u64, 0);
-            step.write(0, rec.as_bytes()).unwrap();
-            let us = rig.time(iters(c), |i| unsafe {
-                let off = if with_state_rotation {
-                    u64::from(i) % LAYERS as u64 * u64::from(max_seqs) * delta_stride * 4
-                } else {
-                    0
-                };
-                rig.layers
-                    .delta_window_fork_design(
-                        &rig.stream,
-                        step.ptr(),
-                        rec.dims(),
-                        SHAPE,
-                        direct,
-                        q_out.ptr(),
-                        kv_out.ptr(),
-                        alpha.ptr(),
-                        beta.ptr(),
-                        dt.ptr(),
-                        ssm_a.ptr(),
-                        delta32.ptr().offset(off),
-                        delta_stride,
-                        out.ptr(),
-                    )
-                    .unwrap()
-            });
-            let state_bytes =
-                f64::from(c.seqs) * delta_len as f64 * 4.0 * if direct { 2.0 } else { 1.0 };
             let io = f64::from(c.rows()) * f64::from(vd) * 4.0
                 + f64::from(c.rows()) * f64::from(kd + vd) * 4.0 * 0.5;
             (us, gbs(state_bytes + io, us))
@@ -559,7 +517,7 @@ fn main() -> Result<()> {
             continue;
         }
         let device = Device::open(info.ordinal, Wait::Spin)?;
-        let mut rig = Rig {
+        let rig = Rig {
             stream: Stream::new(&device, 0)?,
             layers: LayerKernels::load(&device)?,
             start: Event::timed(&device)?,
@@ -568,34 +526,10 @@ fn main() -> Result<()> {
         };
         println!("\n=== CUDA{} {} ({} SMs)", info.ordinal, info.name, info.multiprocessors);
         if which == "all" || which == "decode" {
-            run(&rig, &decode_configs(), "Decode steps", true, None);
+            run(&rig, &decode_configs(), "Decode steps", true);
         }
         if which == "all" || which == "prompt" {
-            run(&rig, &prompt_configs(), "Prompt rows of one sequence", false, None);
-        }
-        if which == "variants" {
-            // Only the delta rule, for every compiled shape of it.
-            let chosen = std::env::var("LAYERS_VARIANTS").ok();
-            for variant in LayerKernels::delta_variants() {
-                if chosen.as_ref().is_some_and(|list| !list.split(',').any(|v| v == variant)) {
-                    continue;
-                }
-                rig.layers.select_delta_variant(variant).unwrap();
-                run(
-                    &rig,
-                    &decode_configs(),
-                    &format!("delta rule, shape {variant}: decode"),
-                    true,
-                    Some("delta_window f32"),
-                );
-                run(
-                    &rig,
-                    &prompt_configs(),
-                    &format!("delta rule, shape {variant}: prompt"),
-                    false,
-                    Some("delta_window f32"),
-                );
-            }
+            run(&rig, &prompt_configs(), "Prompt rows of one sequence", false);
         }
     }
     Ok(())

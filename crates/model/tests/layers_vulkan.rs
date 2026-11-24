@@ -34,7 +34,7 @@ use std::sync::OnceLock;
 use ares_vulkan as backend;
 use backend::{
     Device, DeviceBuffer, DevicePtr, Kernels, LayerKernels, MAX_BATCH, Precision, PrefillPath,
-    StepDims, Stream, device_count, quantized_activation_copy_offset,
+    StateFormat, StepDims, Stream, device_count, quantized_activation_copy_offset,
 };
 use layers::DeviceMatrix;
 
@@ -119,9 +119,16 @@ const ROUNDED_EVERY_ROW: bool = false;
 /// 1e-6 with the state in f32.
 const F16_OUTPUT_LIMIT: f64 = 2e-4;
 
-/// The shapes of the delta rule the f16 state is tested with: all of them.
-fn f16_delta_variants() -> impl Iterator<Item = &'static str> {
+/// The layer kernels with each shape of the delta rule the tests run in `format`: every
+/// compiled shape, in both formats.
+fn delta_shapes(gpu: &Gpu, _format: StateFormat) -> Vec<(&'static str, LayerKernels)> {
     LayerKernels::delta_variants()
+        .map(|variant| {
+            let mut layers = gpu.layers.clone();
+            layers.select_delta_variant(variant).unwrap();
+            (variant, layers)
+        })
+        .collect()
 }
 
 /// The embedding gather of the rows of `tokens` (in the step at `step`) from a table of

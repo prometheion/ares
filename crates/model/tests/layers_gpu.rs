@@ -1,7 +1,6 @@
 //! The layer kernels of `ares-cuda` (`LayerKernels`) held to the CPU reference. The tests are
 //! in `layers/mod.rs`, which `tests/layers_vulkan.rs` runs on `ares-vulkan` with the same
-//! inputs, references and limits; this file gives them what CUDA does its own way, and holds
-//! the test of the fork's delta-rule design, which only CUDA has.
+//! inputs, references and limits; this file gives them what CUDA does its own way.
 //!
 //! These tests open GPUs, so like the other GPU tests they run only with
 //! `ARES_TEST_CUDA=1`. The ones on the real 0.8B also need
@@ -17,8 +16,7 @@
 //! - `recurrent_protocol_*`: convolution, delta rule, commit on made-up inputs, several
 //!   sequences of different lengths in one launch, a sequence at position 0 and
 //!   others deep in their history, window / verify / commit / direct steps one
-//!   after the other, for every compiled shape of the delta rule and for both
-//!   state formats.
+//!   after the other, for both state formats.
 //! - `embedding_gather_*`: rows of the real q6_K token table.
 //! - `a_recurrent_block_*`: a whole block of the real 0.8B (norm, five matrix
 //!   products, convolution, delta rule, gated norm, output product, residual,
@@ -31,14 +29,11 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use ares_cuda as backend;
-use ares_model::qwen35::reference::pieces::l2_norm;
 use backend::{
     Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, Precision,
-    PrefillPath, RecurrentShape, Segment, StateFormat, StepDims, StepRecord, Stream,
-    quantized_activation_bytes,
+    PrefillPath, StateFormat, StepDims, Stream, quantized_activation_bytes,
 };
 use common::gpu::gpus;
-use common::helpers::{Rng, rel_max};
 use layers::DeviceMatrix;
 
 mod common;
@@ -73,9 +68,9 @@ const ROUNDED_EVERY_ROW: bool = true;
 /// of 128 values).
 const F16_OUTPUT_LIMIT: f64 = 5e-4;
 
-/// The shapes of the delta rule the f16 state is tested with.
-fn f16_delta_variants() -> impl Iterator<Item = &'static str> {
-    ["d128", "lpr8_rb32"].into_iter()
+/// The layer kernels with each shape of the delta rule the tests run in `format`: CUDA has one.
+fn delta_shapes(gpu: &Gpu, _format: StateFormat) -> Vec<(&'static str, LayerKernels)> {
+    vec![("d128", gpu.layers.clone())]
 }
 
 /// The embedding gather of the rows of `tokens` (in the step at `step`) from a table of
@@ -195,107 +190,5 @@ impl<'a> Chain<'a> {
             }
         }
         y
-    }
-}
-
-/// The port of the fork's kernel design that the benchmark times the delta rule
-/// against must compute the same thing as ours, or the timing compares nothing.
-#[test]
-fn the_fork_design_baseline_computes_the_same_delta_rule() {
-    let Some(gpus) = gpus() else { return };
-    let shape = RecurrentShape { n_k_heads: 2, n_v_heads: 6, head_dim: 128, conv_kernel: 4 };
-    let (nv, dk) = (6usize, 128usize);
-    let (kd, vd) = (shape.key_dim() as usize, shape.value_dim() as usize);
-    for device in gpus {
-        let gpu = Gpu::new(device);
-        let mut rng = Rng(0xF0_4C);
-        let segments = [
-            Segment { row0: 0, n_rows: 19, slot: 1, pos0: 0, direct: true },
-            Segment { row0: 19, n_rows: 3, slot: 0, pos0: 0, direct: false },
-        ];
-        let n = 22usize;
-        let record = StepRecord::new(&segments, &vec![0; n], None, &[]).unwrap();
-        let step = gpu.bytes(record.as_bytes());
-        let unit = |rng: &mut Rng, rows: usize, width: usize| -> Vec<f32> {
-            let raw = rng.floats(rows * width, 1.0);
-            let mut out = vec![0.0f32; raw.len()];
-            for (src, dst) in raw.chunks(128).zip(out.chunks_mut(128)) {
-                l2_norm(src, 1e-6, dst);
-            }
-            out
-        };
-        let q = unit(&mut rng, n, kd);
-        let mut kv = unit(&mut rng, n, kd + vd);
-        for row in kv.chunks_mut(kd + vd) {
-            for v in &mut row[kd..] {
-                *v *= 3.0;
-            }
-        }
-        let alpha = rng.floats(n * nv, 2.0);
-        let beta = rng.floats(n * nv, 2.0);
-        let dt = rng.floats(nv, 1.0);
-        let a: Vec<f32> = rng.floats(nv, 1.5).iter().map(|v| -v.exp()).collect();
-        let state = rng.floats(2 * nv * dk * dk, 0.3);
-        let (qb, kvb, ab, bb, dtb, aab) = (
-            gpu.floats(&q),
-            gpu.floats(&kv),
-            gpu.floats(&alpha),
-            gpu.floats(&beta),
-            gpu.floats(&dt),
-            gpu.floats(&a),
-        );
-        let stride = (nv * dk * dk) as u64;
-        for direct_state in [false, true] {
-            let (s_ours, s_fork) = (gpu.floats(&state), gpu.floats(&state));
-            let (o_ours, o_fork) = (gpu.empty((n * vd * 4) as u64), gpu.empty((n * vd * 4) as u64));
-            unsafe {
-                gpu.layers
-                    .delta_window(
-                        &gpu.stream,
-                        step.ptr(),
-                        record.dims(),
-                        shape,
-                        StateFormat::F32,
-                        qb.ptr(),
-                        kvb.ptr(),
-                        ab.ptr(),
-                        bb.ptr(),
-                        dtb.ptr(),
-                        aab.ptr(),
-                        s_ours.ptr(),
-                        stride,
-                        o_ours.ptr(),
-                    )
-                    .unwrap();
-                gpu.layers
-                    .delta_window_fork_design(
-                        &gpu.stream,
-                        step.ptr(),
-                        record.dims(),
-                        shape,
-                        direct_state,
-                        qb.ptr(),
-                        kvb.ptr(),
-                        ab.ptr(),
-                        bb.ptr(),
-                        dtb.ptr(),
-                        aab.ptr(),
-                        s_fork.ptr(),
-                        stride,
-                        o_fork.ptr(),
-                    )
-                    .unwrap();
-            }
-            let e_out = rel_max(&gpu.read(&o_fork, n * vd), &gpu.read(&o_ours, n * vd));
-            assert!(e_out < 2e-6, "outputs differ by {e_out}");
-            // Our direct segment (slot 1) was written; the fork design writes both segments when
-            // asked to, so compare the slot that both wrote.
-            if direct_state {
-                let (a, b) =
-                    (gpu.read(&s_ours, 2 * nv * dk * dk), gpu.read(&s_fork, 2 * nv * dk * dk));
-                let e = rel_max(&b[nv * dk * dk..], &a[nv * dk * dk..]);
-                assert!(e < 2e-6, "states differ by {e}");
-            }
-        }
     }
 }

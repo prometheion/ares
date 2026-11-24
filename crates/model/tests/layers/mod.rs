@@ -19,8 +19,8 @@ use super::backend::{
     StepRecord, quantized_activation_bytes,
 };
 use super::{
-    Chain, F16_OUTPUT_LIMIT, Gpu, Mode, ROUNDED_EVERY_ROW, add_residual, embed_gather,
-    f16_delta_variants, gpus,
+    Chain, F16_OUTPUT_LIMIT, Gpu, Mode, ROUNDED_EVERY_ROW, add_residual, delta_shapes,
+    embed_gather, gpus,
 };
 use crate::common::helpers::{Rng, model_path, rel_l2, rel_max};
 
@@ -215,7 +215,12 @@ struct StepSpec {
 
 /// Runs steps of several sequences through the kernels and through the
 /// reference, window by window, and compares everything after each step.
-fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f64, f64) {
+fn recurrent_protocol(
+    format: StateFormat,
+    variant: &str,
+    layers: &LayerKernels,
+    gpu: &Gpu,
+) -> (f64, f64, f64) {
     let storage = match format {
         StateFormat::F32 => StateStorage::F32,
         StateFormat::F16 => StateStorage::F16,
@@ -349,8 +354,6 @@ fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f6
         let q_b = gpu.empty((n * kd * 4) as u64);
         let kv_b = gpu.empty((n * (kd + vd) * 4) as u64);
         let out_b = gpu.empty((n * vd * 4) as u64);
-        let mut layers = gpu.layers.clone();
-        layers.select_delta_variant(variant).unwrap();
         unsafe {
             layers
                 .conv_window(
@@ -500,8 +503,8 @@ fn recurrent_protocol_f32_matches_the_reference_for_every_shape() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let gpu = Gpu::new(device);
-        for variant in LayerKernels::delta_variants() {
-            let (out, conv, state) = recurrent_protocol(StateFormat::F32, variant, &gpu);
+        for (variant, layers) in delta_shapes(&gpu, StateFormat::F32) {
+            let (out, conv, state) = recurrent_protocol(StateFormat::F32, variant, &layers, &gpu);
             report(&format!("{} f32 {variant} delta_out_rel_max", device.info().name), out);
             report(&format!("{} f32 {variant} conv_rel_max", device.info().name), conv);
             report(&format!("{} f32 {variant} state_rel_max", device.info().name), state);
@@ -514,8 +517,8 @@ fn recurrent_protocol_f16_state_matches_the_reference_holding_f16() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let gpu = Gpu::new(device);
-        for variant in f16_delta_variants() {
-            let (out, conv, state) = recurrent_protocol(StateFormat::F16, variant, &gpu);
+        for (variant, layers) in delta_shapes(&gpu, StateFormat::F16) {
+            let (out, conv, state) = recurrent_protocol(StateFormat::F16, variant, &layers, &gpu);
             report(&format!("{} f16 {variant} delta_out_rel_max", device.info().name), out);
             report(&format!("{} f16 {variant} state_rel_max", device.info().name), state);
             let _ = conv;
