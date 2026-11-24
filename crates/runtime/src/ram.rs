@@ -23,11 +23,12 @@
 //!   device part locks in chunks when a place is first used, so the memory
 //!   the cache holds is the memory it has used and not the whole budget
 //!   ([`PlaceChunks`]), and the pages that left the devices, a buffer per
-//!   device share of a page ([`PinnedRam::cache_buffer`]). A cache with a
-//!   level on SSD keeps one place and a few pages whatever the machine has:
-//!   state passes through them on its way to the drive and back. That is the
-//!   cache's floor ([`PinnedRam::want_cache`]), and neither the tier of
-//!   experts nor the machine is given it.
+//!   device share of a page ([`PinnedRam::cache_buffer`]). A cache keeps one
+//!   place (for a model with recurrent state) whatever the machine has, and
+//!   with a level on SSD a few pages as well: state passes through them on
+//!   its way to the drive and back. That is the cache's floor
+//!   ([`PinnedRam::want_cache`]), and neither the tier of experts nor the
+//!   machine is given it.
 //!
 //! # The limit and the allowances
 //!

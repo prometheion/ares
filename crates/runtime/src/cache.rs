@@ -52,11 +52,12 @@
 //!   and the level on SSD counts it when it was due there
 //!   ([`SsdCounters::states_skipped`]): nothing is read from a place that was
 //!   never written.
-//! - **A floor.** With the level on SSD in use the cache keeps one place (for
-//!   a model with recurrent state) and [`RESERVE`] pages whatever the
-//!   allowance says, its floor in the books: state passes through them on the
-//!   way to the drive and back, so a prompt resumes from SSD while the
-//!   machine has no room for the cache.
+//! - **A floor.** The cache keeps one place (for a model with recurrent
+//!   state) whatever the allowance says, so that a conversation resumes from
+//!   its last checkpoint at least, and with the level on SSD in use
+//!   [`RESERVE`] pages as well: state passes through them on the way to the
+//!   drive and back, so a prompt resumes from SSD while the machine has no
+//!   room for the cache. That is its floor in the books.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
