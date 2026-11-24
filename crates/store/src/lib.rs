@@ -853,10 +853,11 @@ impl PageStore {
         }))
     }
 
-    /// Makes the record `pending` wrote known. A record that was not written,
-    /// or whose segment the store has given up or moved past meanwhile, is
-    /// dropped. Frees space when the limit is passed.
-    pub fn commit(&mut self, pending: Pending) -> bool {
+    /// Makes the record `pending` wrote known, and says how many bytes of
+    /// the drive it takes. A record that was not written, or whose segment
+    /// the store has given up or moved past meanwhile, is dropped (`None`).
+    /// Frees space when the limit is passed.
+    pub fn commit(&mut self, pending: Pending) -> Option<u64> {
         let Pending { kind, hash, location, written, .. } = pending;
         let record = location.record_bytes();
         let fits = self
@@ -864,7 +865,7 @@ impl PageStore {
             .get(&location.segment)
             .is_some_and(|segment| segment.len == location.offset);
         if !written || !fits || self.index_of(kind).contains_key(&hash) {
-            return false;
+            return None;
         }
         let segment = self.segments.get_mut(&location.segment).expect("checked above");
         segment.len += record;
@@ -874,7 +875,7 @@ impl PageStore {
         self.index(kind).insert(hash, location);
         self.touch(location.segment);
         self.evict_to_fit();
-        true
+        Some(record)
     }
 
     /// The segments written since the last call, to sync outside of the store.
@@ -911,7 +912,7 @@ impl PageStore {
             return Ok(false);
         };
         pending.write(parts)?;
-        Ok(self.commit(pending))
+        Ok(self.commit(pending).is_some())
     }
 
     /// Finds the record of `kind` under `hash`, which counts as a use.

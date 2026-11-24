@@ -214,9 +214,7 @@ impl Shared {
             let written = begun.and_then(|begun| {
                 let Some(mut pending) = begun else { return Ok(0) };
                 pending.write(&io)?;
-                let bytes = ares_store::BLOCK as u64
-                    + io.iter().map(|part| ares_store::padded(part.len) as u64).sum::<u64>();
-                Ok(if self.store().commit(pending) { bytes } else { 0 })
+                Ok(self.store().commit(pending).unwrap_or(0))
             });
             match written {
                 Err(error) if attempt == 1 && self.recover(&error) => {}

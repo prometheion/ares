@@ -151,7 +151,7 @@ fn parts_are_read_into_aligned_buffers_outside_of_the_store() {
     pending
         .write(&[Part { buf: &source, len, tag: 3 }, Part { buf: &small, len: 5, tag: 4 }])
         .unwrap();
-    assert!(store.commit(pending));
+    assert!(store.commit(pending).is_some());
     assert_eq!(store.bytes(), (BLOCK + 3 * BLOCK + BLOCK) as u64);
 
     let located = store.locate(Kind::Page, hash).unwrap();
@@ -172,7 +172,7 @@ fn parts_are_read_into_aligned_buffers_outside_of_the_store() {
     // and the next record takes its place.
     let lost = root_hash().extend(&[2; 4]);
     let pending = store.begin(Kind::Page, lost, root_hash(), 1, &[100]).unwrap().unwrap();
-    assert!(!store.commit(pending), "nothing was written");
+    assert!(store.commit(pending).is_none(), "nothing was written");
     put_page(&mut store, root_hash().extend(&[3; 4]), root_hash(), 1, &[9; 100]);
     drop(store);
     let store = PageStore::open(&dir.0, fingerprint("a"), Config::default()).unwrap();
