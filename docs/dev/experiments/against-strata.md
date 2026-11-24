@@ -2,6 +2,8 @@
 
 Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
+## UD-Q4_K_XL from the SSD on one 16 GB card (2026-11-22)
+
 **UD-Q4_K_XL from the SSD on one 16 GB card** (2026-11-22, branch `flash/ssd-stream`; the test
 machine: RTX 4060 Ti 16 GB on PCIe 4.0 x4, 62 GiB RAM, Samsung 990 1 TB under btrfs; the 104 GiB
 file with `--ram 40G` and Strata 0.2.15 (engine 0.1.60) with `--resident-budget-gib 40`, both with

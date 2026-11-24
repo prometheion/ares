@@ -127,7 +127,7 @@ hundred megabytes apart) and a choice that does not rest on one round of
 three, and either changes the layouts of other matrices on both cards, which
 has to be measured as a change of its own.
 
-### Qwen3.8-Flash-Next on the two cards
+## Qwen3.8-Flash-Next on the two cards, measured (2026-11-11)
 
 Measured 2026-11-11 with `crates/model/examples/qwen4exp_run.rs`, one
 sequence, no drafts, a missing expert uploaded. Strata on the same machine
@@ -167,6 +167,8 @@ An expert that is in no slot can be computed on the CPU instead of being
 uploaded, chosen per expert by measured cost. On the recorded routing with
 few slots that took the expert path from 33 to 44 steps per second; with 99
 % of the picks in a slot it makes no measurable difference to the model.
+
+## The 27B's attention heads by context, measured (2026-11-22)
 
 **The 27B, measured** (2026-11-22, `qwen35_run --attention-shares`, UD-Q4_K_S,
 K and V in `q8`, no drafts, one sequence opened with 33 024 cells, runs in turn

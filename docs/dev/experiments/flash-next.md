@@ -35,6 +35,8 @@ without the block at the same load exists, so whether the block makes this model
 faster is not shown; the first requests of the third row say that windows of eight
 rows on tiers that do not hold the text make it slower.
 
+## Flash-Next through the server, measured (2026-11-11 and 2026-11-12)
+
 **Measured through the server** (2026-11-11, RTX 4070 and RTX 3060, the
 engine started with `--chat-var enable_thinking=false` and otherwise its
 defaults, greedy, 128 tokens, a prompt of about 1000 tokens: 1000 German, 1070
@@ -427,6 +429,8 @@ tokens per second from run to run):
   coldest member of the RAM tier (run 3), the steps after the prompt read 14 experts a step
   from the file where the build of before read 6 to 8. Hence the odds per kind of step and
   the room nobody uses.
+
+## The gap between 17 and 22 ms a step
 
 **What the gap between 17 and 22 ms is made of, and what the size of the tier
 did.** The tool counts, for every decode step at 1000 tokens, the experts the

@@ -2,6 +2,8 @@
 
 Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
+## Wide steps, measured (2026-11-12)
+
 **Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`0a43601`,
 steps of eight rows) and the one with wide steps started one after the other, both with the
 n-gram drafts the server made before the draft policy, greedy, 128 tokens, prompts of about 1000 tokens (German, Rust) and 4700 (the long one: prose,
@@ -40,6 +42,8 @@ same 1000 tokens read again (the experts of the text are in the tiers), 512 rows
 tokens per second on the layers split and 357 on the two on every layer; 4000 tokens in slices
 of 512 rows read at 112 and 145 tokens per second warm and 67 and 63 cold, in slices of 2048 at
 147 and 129 warm (one layer of a slice then waits 160 to 350 ms for 110 to 300 missed experts).
+
+## Float matrices of a wide step, measured (2026-11-12)
 
 **Float matrices of a wide step, measured** (2026-11-12, RTX 4070 and RTX 3060; the engine
 of before (`b8b0271`, the float matrices in launches of eight rows) and the one with the
@@ -91,6 +95,8 @@ token is the reference's in 160 of 160 German and 79 of 80 English rows (158 and
 In steps of eight rows, which the float tile kernels do not touch, it is 158 and 80 after 160
 and 80. The rows that differ are near ties (the two logits 0.01 to 0.15 apart), and which
 rows they are changes from run to run with the misses the CPU serves, as before.
+
+## Transit, measured (2026-11-12)
 
 **Transit, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`b8b0271`:
 every miss of a wide step takes a slot of its layer) and the one with transit started one
