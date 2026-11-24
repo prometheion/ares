@@ -87,7 +87,5 @@ mod vocab;
 pub use chat::{ChatError, ChatOptions, ChatTemplate, Message, Tool, ToolCall};
 pub use error::{Error, Result};
 pub use json::{Json, JsonError};
-pub use reasoning::ReasoningFormat;
 pub use tokenizer::{EncodeOptions, TokenKind, Tokenizer};
-pub use tools::ToolFormat;
 pub use vocab::SpecialTokens;

@@ -6,9 +6,7 @@
 //! passes when a file is not named. Reading the metadata of a file needs no GPU.
 
 use ares_gguf::Gguf;
-use ares_tokenizer::{
-    ChatOptions, EncodeOptions, Json, Message, Tokenizer, Tool, ToolCall, ToolFormat,
-};
+use ares_tokenizer::{ChatOptions, EncodeOptions, Json, Message, Tokenizer, Tool, ToolCall};
 
 const FILES: [(&str, &str); 3] = [
     ("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B"),
@@ -25,8 +23,8 @@ fn tokenizer_of(variable: &str, what: &str) -> Option<Tokenizer> {
 }
 
 /// The form all three templates write a call in.
-fn tagged() -> ToolFormat {
-    ToolFormat {
+fn tagged() -> ares_api::ToolFormat {
+    ares_api::ToolFormat {
         call_open: "<tool_call>\n<function=".into(),
         name_close: ">\n".into(),
         param_open: "<parameter=".into(),

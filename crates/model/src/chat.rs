@@ -5,11 +5,9 @@
 
 use std::sync::Arc;
 
-use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role, ThinkingFormat, ToolFormat};
+use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role, ThinkingFormat};
 use ares_runtime::{Boundary, EncodedPrompt, ImageInput, ImageSpan, Vision};
-use ares_tokenizer::{
-    ChatOptions, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
-};
+use ares_tokenizer::{ChatOptions, EncodeOptions, Json, Message, Tokenizer, Tool, ToolCall};
 
 use crate::qwen3vl::Projector;
 
@@ -134,46 +132,29 @@ impl ModelText {
 /// template's default with `chat` applied.
 pub fn chat_format(tokenizer: &Tokenizer, chat: &ChatOptions) -> ChatFormat {
     // A template the server was started with takes the place of the file's.
-    let (reasoning, tools, system_first) = match &chat.template {
-        Some(template) => (
-            ReasoningFormat::detect(template),
-            ares_tokenizer::ToolFormat::detect(template),
-            template.system_first(),
-        ),
-        None => (tokenizer.reasoning_format(), tokenizer.tool_format(), tokenizer.system_first()),
+    let (thinking, tools, system_first) = match &chat.template {
+        Some(template) => {
+            (template.thinking_format(), template.tool_format(), template.system_first())
+        }
+        None => (tokenizer.thinking_format(), tokenizer.tool_format(), tokenizer.system_first()),
     };
     ChatFormat {
+        thinking: thinking.map(|format| thinking_format(format, chat)),
+        tools,
         system_first,
-        thinking: reasoning.map(|format| thinking_format(format, chat)),
-        tools: tools.map(|format| ToolFormat {
-            call_open: format.call_open,
-            name_close: format.name_close,
-            param_open: format.param_open,
-            key_close: format.key_close,
-            param_close: format.param_close,
-            call_close: format.call_close,
-            before_calls: format.before_calls,
-            between_calls: format.between_calls,
-        }),
     }
 }
 
-/// The thinking a template declares, for a model rendered with `chat`.
-pub fn thinking_format(format: ReasoningFormat, chat: &ChatOptions) -> ThinkingFormat {
+/// The thinking a template declares, `format`, for a model rendered with
+/// `chat`: whether the model thinks when a request does not say is what the
+/// variables of `chat` say.
+pub fn thinking_format(format: ThinkingFormat, chat: &ChatOptions) -> ThinkingFormat {
     let on_by_default =
         match chat.variables.iter().rev().find(|(name, _)| name == "enable_thinking") {
             Some((_, Json::Bool(on))) => *on,
             _ => chat.enable_thinking,
         };
-    ThinkingFormat {
-        on_by_default,
-        effort: format.effort,
-        refused_efforts: format.refused_efforts,
-        start: format.start,
-        end: format.end,
-        prompt_on: format.prompt_on,
-        prompt_off: format.prompt_off,
-    }
+    ThinkingFormat { on_by_default, ..format }
 }
 
 /// `chat` with the variables of a request on top: a request's variable wins

@@ -211,6 +211,7 @@ dependencies = [
 name = "ares-tokenizer"
 version = "0.0.1"
 dependencies = [
+ "ares-api",
  "ares-gguf",
  "minijinja",
  "thiserror",

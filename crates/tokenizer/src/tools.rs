@@ -2,7 +2,8 @@
 //!
 //! A model calls a tool by writing the call into its reply, in the form its
 //! chat template writes the calls of earlier turns into the prompt.
-//! [`ToolFormat::detect`] reads that form off the template: it renders an
+//! [`ChatTemplate::tool_format`] reads that form off the template into a
+//! [`ToolFormat`]: it renders an
 //! assistant message that calls made-up tools with made-up arguments, finds the
 //! names, keys and values in the text, and takes what stands between them as
 //! the pieces of the format. Nothing is known by the name of a model.
@@ -26,6 +27,8 @@
 //! here. Templates that write a call as one JSON object (`{"name": ...,
 //! "arguments": ...}` between tags) are among those.
 
+use ares_api::ToolFormat;
+
 use crate::chat::{ChatOptions, ChatTemplate, Message, Tool, ToolCall};
 use crate::json::Json;
 
@@ -40,132 +43,90 @@ const NUMBER_VALUE: &str = "7204";
 const LAST_KEY: &str = "key_probe_a48d";
 const LAST_VALUE: &str = "VALUE_PROBE_b59e";
 
-/// How a chat template writes the calls of tools: the texts around the name
-/// of the tool, the keys and the values of its arguments.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolFormat {
-    /// From the start of a call to the name of the tool
-    /// (`"<tool_call>\n<function="`).
-    pub call_open: String,
-    /// After the name (`">\n"`).
-    pub name_close: String,
-    /// Before the key of an argument (`"<parameter="`).
-    pub param_open: String,
-    /// Between the key and the value (`">\n"`).
-    pub key_close: String,
-    /// After the value (`"\n</parameter>\n"`).
-    pub param_close: String,
-    /// After the last argument, to the end of the call
-    /// (`"</function>\n</tool_call>"`).
-    pub call_close: String,
-    /// Between the text of a message and its first call (`"\n\n"`).
-    pub before_calls: String,
-    /// Between two calls (`"\n"`).
-    pub between_calls: String,
+/// Reads the format off `template`, or `None` if the template writes calls in
+/// another form, or not at all ([`ChatTemplate::tool_format`]).
+pub(crate) fn detect(template: &ChatTemplate) -> Option<ToolFormat> {
+    let text = rendered(template)?;
+    // The names stand in the list of tools too, which comes first.
+    let calls = &text[text.find(ANSWER)? + ANSWER.len()..];
+    let mut rest = calls;
+    let mut gaps = Vec::new();
+    for probe in
+        [FIRST, TEXT_KEY, TEXT_VALUE, NUMBER_KEY, NUMBER_VALUE, SECOND, LAST_KEY, LAST_VALUE, THIRD]
+    {
+        let at = rest.find(probe)?;
+        gaps.push(&rest[..at]);
+        rest = &rest[at + probe.len()..];
+    }
+    let [lead, name_to_key, key_close, value_to_key, _, value_to_call, _, _, _] = gaps[..] else {
+        return None;
+    };
+
+    // A piece that opens something starts at its tag.
+    let param_open = &name_to_key[name_to_key.rfind('<')?..];
+    let name_close = name_to_key.strip_suffix(param_open)?;
+    let param_close = value_to_key.strip_suffix(param_open)?;
+    // From the end of one call to the name of the next, and from the text
+    // of the message to the name of the first: what both end with opens a
+    // call, less the white space that separates.
+    let call_to_call = value_to_call.strip_prefix(param_close)?;
+    let shared = common_suffix(call_to_call, lead);
+    let call_open = shared.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let before_calls = lead.strip_suffix(call_open)?;
+    let closed = call_to_call.strip_suffix(call_open)?;
+    let call_close = closed.trim_end_matches(|c: char| c.is_ascii_whitespace());
+    let between_calls = &closed[call_close.len()..];
+
+    let format = ToolFormat {
+        call_open: call_open.to_owned(),
+        name_close: name_close.to_owned(),
+        param_open: param_open.to_owned(),
+        key_close: key_close.to_owned(),
+        param_close: param_close.to_owned(),
+        call_close: call_close.to_owned(),
+        before_calls: before_calls.to_owned(),
+        between_calls: between_calls.to_owned(),
+    };
+    let pieces = [
+        &format.call_open,
+        &format.name_close,
+        &format.param_open,
+        &format.key_close,
+        &format.param_close,
+        &format.call_close,
+    ];
+    if pieces.iter().any(|piece| piece.is_empty()) || format.trigger().is_empty() {
+        return None;
+    }
+    // The pieces must write the three calls exactly as the template did.
+    calls.starts_with(&written(&format)).then_some(format)
 }
 
-impl ToolFormat {
-    /// Reads the format off `template`, or `None` if the template writes calls
-    /// in another form, or not at all.
-    pub fn detect(template: &ChatTemplate) -> Option<Self> {
-        let text = rendered(template)?;
-        // The names stand in the list of tools too, which comes first.
-        let calls = &text[text.find(ANSWER)? + ANSWER.len()..];
-        let mut rest = calls;
-        let mut gaps = Vec::new();
-        for probe in [
-            FIRST,
-            TEXT_KEY,
-            TEXT_VALUE,
-            NUMBER_KEY,
-            NUMBER_VALUE,
-            SECOND,
-            LAST_KEY,
-            LAST_VALUE,
-            THIRD,
-        ] {
-            let at = rest.find(probe)?;
-            gaps.push(&rest[..at]);
-            rest = &rest[at + probe.len()..];
+/// The calls of the probe message as the pieces of `format` write them.
+fn written(format: &ToolFormat) -> String {
+    let mut text = format.before_calls.clone();
+    let calls: [(&str, &[(&str, &str)]); 3] = [
+        (FIRST, &[(TEXT_KEY, TEXT_VALUE), (NUMBER_KEY, NUMBER_VALUE)]),
+        (SECOND, &[(LAST_KEY, LAST_VALUE)]),
+        (THIRD, &[]),
+    ];
+    for (index, (name, arguments)) in calls.iter().enumerate() {
+        if index > 0 {
+            text.push_str(&format.between_calls);
         }
-        let [lead, name_to_key, key_close, value_to_key, _, value_to_call, _, _, _] = gaps[..]
-        else {
-            return None;
-        };
-
-        // A piece that opens something starts at its tag.
-        let param_open = &name_to_key[name_to_key.rfind('<')?..];
-        let name_close = name_to_key.strip_suffix(param_open)?;
-        let param_close = value_to_key.strip_suffix(param_open)?;
-        // From the end of one call to the name of the next, and from the text
-        // of the message to the name of the first: what both end with opens a
-        // call, less the white space that separates.
-        let call_to_call = value_to_call.strip_prefix(param_close)?;
-        let shared = common_suffix(call_to_call, lead);
-        let call_open = shared.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        let before_calls = lead.strip_suffix(call_open)?;
-        let closed = call_to_call.strip_suffix(call_open)?;
-        let call_close = closed.trim_end_matches(|c: char| c.is_ascii_whitespace());
-        let between_calls = &closed[call_close.len()..];
-
-        let format = Self {
-            call_open: call_open.to_owned(),
-            name_close: name_close.to_owned(),
-            param_open: param_open.to_owned(),
-            key_close: key_close.to_owned(),
-            param_close: param_close.to_owned(),
-            call_close: call_close.to_owned(),
-            before_calls: before_calls.to_owned(),
-            between_calls: between_calls.to_owned(),
-        };
-        let pieces = [
-            &format.call_open,
-            &format.name_close,
-            &format.param_open,
-            &format.key_close,
-            &format.param_close,
-            &format.call_close,
-        ];
-        if pieces.iter().any(|piece| piece.is_empty()) || format.trigger().is_empty() {
-            return None;
+        text.push_str(&format.call_open);
+        text.push_str(name);
+        text.push_str(&format.name_close);
+        for (key, value) in *arguments {
+            text.push_str(&format.param_open);
+            text.push_str(key);
+            text.push_str(&format.key_close);
+            text.push_str(value);
+            text.push_str(&format.param_close);
         }
-        // The pieces must write the three calls exactly as the template did.
-        calls.starts_with(&format.written()).then_some(format)
+        text.push_str(&format.call_close);
     }
-
-    /// The text that tells a call has begun: the start of `call_open` up to
-    /// its first white space (`"<tool_call>"`).
-    pub fn trigger(&self) -> &str {
-        let end = self.call_open.find(|c: char| c.is_ascii_whitespace());
-        &self.call_open[..end.unwrap_or(self.call_open.len())]
-    }
-
-    /// The calls of the probe message as the pieces write them.
-    fn written(&self) -> String {
-        let mut text = self.before_calls.clone();
-        let calls: [(&str, &[(&str, &str)]); 3] = [
-            (FIRST, &[(TEXT_KEY, TEXT_VALUE), (NUMBER_KEY, NUMBER_VALUE)]),
-            (SECOND, &[(LAST_KEY, LAST_VALUE)]),
-            (THIRD, &[]),
-        ];
-        for (index, (name, arguments)) in calls.iter().enumerate() {
-            if index > 0 {
-                text.push_str(&self.between_calls);
-            }
-            text.push_str(&self.call_open);
-            text.push_str(name);
-            text.push_str(&self.name_close);
-            for (key, value) in *arguments {
-                text.push_str(&self.param_open);
-                text.push_str(key);
-                text.push_str(&self.key_close);
-                text.push_str(value);
-                text.push_str(&self.param_close);
-            }
-            text.push_str(&self.call_close);
-        }
-        text
-    }
+    text
 }
 
 /// A conversation in which the assistant calls three tools, rendered.
@@ -266,7 +227,7 @@ mod tests {
 
     #[test]
     fn the_tags_of_a_call_are_read_off_the_template() {
-        let format = ToolFormat::detect(&template(TAGGED)).expect("a format");
+        let format = detect(&template(TAGGED)).expect("a format");
         assert_eq!(
             format,
             ToolFormat {
@@ -285,9 +246,9 @@ mod tests {
 
     #[test]
     fn a_template_that_writes_calls_as_json_or_not_at_all_has_no_format() {
-        assert_eq!(ToolFormat::detect(&template(AS_JSON)), None);
+        assert_eq!(detect(&template(AS_JSON)), None);
         let plain = "{%- for m in messages %}{{- m.role + ': ' + m.content + '\n' }}{%- endfor %}";
-        assert_eq!(ToolFormat::detect(&template(plain)), None);
+        assert_eq!(detect(&template(plain)), None);
     }
 
     #[test]
@@ -297,7 +258,7 @@ mod tests {
             .replace("<function=", "<fn=")
             .replace("</function>", "</fn>")
             .replace("parameter", "arg");
-        let format = ToolFormat::detect(&template(&other)).expect("a format");
+        let format = detect(&template(&other)).expect("a format");
         assert_eq!(format.call_open, "<call>\n<fn=");
         assert_eq!(format.param_close, "\n</arg>\n");
         assert_eq!(format.call_close, "</fn>\n</call>");

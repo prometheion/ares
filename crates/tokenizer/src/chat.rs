@@ -211,6 +211,18 @@ impl ChatTemplate {
         &self.source
     }
 
+    /// How the template handles thinking, or `None` if it has none: the tags
+    /// it writes around reasoning and how it ends the prompt (`reasoning.rs`).
+    pub fn thinking_format(&self) -> Option<ares_api::ThinkingFormat> {
+        crate::reasoning::detect(self)
+    }
+
+    /// How the template writes the calls of tools, or `None` if it writes them
+    /// in a form that is not understood, or not at all (`tools.rs`).
+    pub fn tool_format(&self) -> Option<ares_api::ToolFormat> {
+        crate::tools::detect(self)
+    }
+
     /// Whether the template takes a system message only before every other
     /// message, as Qwen's do (they raise an exception for a later one): it
     /// renders a system message and a user's, and refuses a system message

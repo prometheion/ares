@@ -7,8 +7,9 @@
 //! `ARES_TEST_FLASH_NEXT` (Qwen3.8-Flash-Next, first part); a test says so and
 //! passes when a file is not named. Reading the metadata of a file needs no GPU.
 
+use ares_api::ThinkingFormat;
 use ares_gguf::Gguf;
-use ares_tokenizer::{ChatTemplate, ReasoningFormat, Tokenizer};
+use ares_tokenizer::{ChatTemplate, Tokenizer};
 
 /// The structure of the Qwen3.5 template: the reasoning of an assistant turn
 /// between think tags, trimmed, kept for earlier turns unless
@@ -52,8 +53,14 @@ fn template(source: &str) -> ChatTemplate {
     ChatTemplate::new(source, "", "").unwrap()
 }
 
-fn detect(source: &str) -> Option<ReasoningFormat> {
-    ReasoningFormat::detect(&template(source))
+fn detect(source: &str) -> Option<ThinkingFormat> {
+    template(source).thinking_format()
+}
+
+/// Whether the prompt with thinking on ends inside the block: the model then
+/// continues with the reasoning.
+fn opens(format: &ThinkingFormat) -> bool {
+    !format.prompt_on.is_empty() && !format.prompt_on.contains(format.end_tag())
 }
 
 #[test]
@@ -69,7 +76,7 @@ fn sees_how_the_prompt_ends_with_thinking_on_and_off() {
     let format = detect(QWEN_LIKE).unwrap();
     assert_eq!(format.prompt_on, "<think>\n");
     assert_eq!(format.prompt_off, "<think>\n\n</think>\n\n");
-    assert!(format.opens(), "with thinking on the model continues inside the block");
+    assert!(opens(&format), "with thinking on the model continues inside the block");
     assert!(format.switchable());
 }
 
@@ -81,7 +88,7 @@ fn a_prompt_that_does_not_mention_the_tags_leaves_the_opening_to_the_model() {
         .replace("{{- '<think>\\n\\n</think>\\n\\n' }}", "");
     let format = detect(&source).unwrap();
     assert_eq!((format.prompt_on.as_str(), format.prompt_off.as_str()), ("", ""));
-    assert!(!format.opens());
+    assert!(!opens(&format));
     assert!(!format.switchable());
 }
 
@@ -93,17 +100,6 @@ fn a_switch_that_changes_nothing_in_the_prompt_is_no_switch() {
     assert_eq!(format.prompt_on, "<think>\n");
     assert_eq!(format.prompt_off, "<think>\n");
     assert!(!format.switchable());
-}
-
-#[test]
-fn finds_out_whether_the_template_keeps_the_reasoning_of_earlier_turns() {
-    assert!(detect(QWEN_LIKE).unwrap().keeps_history);
-    // The reasoning of the turn that follows the last question only.
-    let source = QWEN_LIKE.replace(
-        "preserve_thinking is undefined or preserve_thinking is true or loop.index0",
-        "loop.index0",
-    );
-    assert!(!detect(&source).unwrap().keeps_history);
 }
 
 #[test]
@@ -203,26 +199,24 @@ fn tokenizer_of(variable: &str, what: &str) -> Option<Tokenizer> {
 
 /// What the templates of Qwen3.8-27B and Qwen3.8-Flash-Next declare: the
 /// structure of `QWEN_LIKE`.
-fn qwen_format() -> ReasoningFormat {
-    ReasoningFormat {
+fn qwen_format() -> ThinkingFormat {
+    ThinkingFormat {
         start: "<think>\n".into(),
         end: "\n</think>\n\n".into(),
         prompt_on: "<think>\n".into(),
         prompt_off: "<think>\n\n</think>\n\n".into(),
-        keeps_history: true,
+        on_by_default: true,
         effort: true,
         refused_efforts: Vec::new(),
     }
 }
 
 #[test]
-fn the_template_of_qwen35_0_8b_has_the_same_tags_but_drops_the_thinking_of_earlier_turns() {
+fn the_template_of_qwen35_0_8b_has_the_same_tags_and_reads_no_effort() {
     let Some(tokenizer) = tokenizer_of("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B") else { return };
-    // It is the first template of the family: the reasoning of a turn stays in the prompt
-    // only after the last user message, whatever `preserve_reasoning` says, and the
-    // template does not read an effort.
-    let format = ReasoningFormat { keeps_history: false, effort: false, ..qwen_format() };
-    assert_eq!(tokenizer.reasoning_format(), Some(format));
+    // It is the first template of the family: it does not read an effort.
+    let format = ThinkingFormat { effort: false, ..qwen_format() };
+    assert_eq!(tokenizer.thinking_format(), Some(format));
     assert!(tokenizer.system_first());
 }
 
@@ -230,8 +224,8 @@ fn the_template_of_qwen35_0_8b_has_the_same_tags_but_drops_the_thinking_of_earli
 fn the_template_of_qwen38_27b_declares_the_qwen_format() {
     let Some(tokenizer) = tokenizer_of("ARES_TEST_QWEN38_27B", "Qwen3.8-27B") else { return };
     // It takes low, medium, high and xhigh.
-    let format = ReasoningFormat { refused_efforts: vec!["minimal".into()], ..qwen_format() };
-    assert_eq!(tokenizer.reasoning_format(), Some(format));
+    let format = ThinkingFormat { refused_efforts: vec!["minimal".into()], ..qwen_format() };
+    assert_eq!(tokenizer.thinking_format(), Some(format));
     assert!(tokenizer.system_first());
 }
 
@@ -242,7 +236,7 @@ fn the_template_of_qwen38_flash_next_declares_the_qwen_format() {
     };
     // It takes low, medium and xhigh, its default.
     let refused_efforts = vec!["minimal".into(), "high".into()];
-    let format = ReasoningFormat { refused_efforts, ..qwen_format() };
-    assert_eq!(tokenizer.reasoning_format(), Some(format));
+    let format = ThinkingFormat { refused_efforts, ..qwen_format() };
+    assert_eq!(tokenizer.thinking_format(), Some(format));
     assert!(tokenizer.system_first());
 }

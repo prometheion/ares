@@ -3,7 +3,8 @@
 //! A model that thinks writes its reasoning between two tags before it answers,
 //! and its chat template knows the tags: it writes them around the reasoning of
 //! an earlier turn, and it may open the block itself when it ends the prompt.
-//! [`ReasoningFormat::detect`] reads that off the template by rendering small
+//! [`ChatTemplate::thinking_format`] reads that off the template into a
+//! [`ThinkingFormat`] by rendering small
 //! conversations and comparing the texts, the way llama.cpp's autoparser does,
 //! so that nothing is known by the name of a model:
 //!
@@ -13,12 +14,13 @@
 //! - the end of the prompt is rendered with `enable_thinking` on and off, and
 //!   the part of it that starts at the opening tag says whether the model
 //!   continues inside the block and whether the template closes an empty one;
-//! - the reasoning of an earlier turn is rendered with `preserve_reasoning` on,
-//!   and a few values of `reasoning_effort` are tried, to see which of these
-//!   two variables the template reads.
+//! - a few values of `reasoning_effort` are tried, to see whether the template
+//!   reads the variable and which values it refuses.
 //!
 //! A template that does not write a pair of tags around the reasoning of an
 //! assistant message is taken to have no thinking: there is nothing to find.
+
+use ares_api::ThinkingFormat;
 
 use crate::chat::{ChatOptions, ChatTemplate, Message};
 use crate::json::Json;
@@ -32,74 +34,27 @@ const ANSWER: &str = "ANSWER_PROBE_c91d";
 /// the default of any template.
 const EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 
-/// How a chat template handles thinking.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReasoningFormat {
-    /// What the template writes before the reasoning of an assistant message:
-    /// the opening tag and the white space after it (`"<think>\n"`).
-    pub start: String,
-    /// What it writes after the reasoning: the white space before the closing
-    /// tag, the tag, and the white space after it (`"\n</think>\n\n"`).
-    pub end: String,
-    /// The end of the prompt with thinking on, from the opening tag on
-    /// (`"<think>\n"`), or empty if the prompt does not contain the tag.
-    pub prompt_on: String,
-    /// The same with thinking off (`"<think>\n\n</think>\n\n"`).
-    pub prompt_off: String,
-    /// Whether the template keeps the reasoning of earlier turns in the
-    /// history when `preserve_reasoning` is on.
-    pub keeps_history: bool,
-    /// Whether the template reads `reasoning_effort`.
-    pub effort: bool,
-    /// The usual values of `reasoning_effort` (`minimal`, `low`, `medium`,
-    /// `high`, `xhigh`) that the template refuses (raises an error for), when
-    /// it reads the variable: Qwen3.8-Flash-Next's takes `xhigh`, `medium` and
-    /// `low`.
-    pub refused_efforts: Vec<String>,
-}
-
-impl ReasoningFormat {
-    /// Reads the format off `template`, or `None` if the template has no
-    /// thinking.
-    pub fn detect(template: &ChatTemplate) -> Option<Self> {
-        let (start, end) = tags(template)?;
-        let tag = without_space(&start).to_owned();
-        // The end of the prompt, from the opening tag on.
-        let prompt = |thinking| {
-            let tail = prompt_tail(template, thinking)?;
-            Some(tail.find(&tag).map(|at| tail[at..].to_owned()).unwrap_or_default())
-        };
-        Some(Self {
-            start,
-            end,
-            prompt_on: prompt(true)?,
-            prompt_off: prompt(false)?,
-            keeps_history: keeps_history(template),
-            effort: reads_effort(template),
-            refused_efforts: refused_efforts(template),
-        })
-    }
-
-    /// The opening tag without the white space around it.
-    pub fn start_tag(&self) -> &str {
-        without_space(&self.start)
-    }
-
-    /// The closing tag without the white space around it.
-    pub fn end_tag(&self) -> &str {
-        without_space(&self.end)
-    }
-
-    /// Whether the prompt with thinking on ends inside the block: the model
-    /// then continues with the reasoning.
-    pub fn opens(&self) -> bool {
-        !self.prompt_on.is_empty() && !self.prompt_on.contains(self.end_tag())
-    }
-
-    /// Whether `enable_thinking` changes the end of the prompt.
-    pub fn switchable(&self) -> bool {
-        self.prompt_on != self.prompt_off
-    }
+/// Reads how `template` handles thinking, or `None` if it has no thinking
+/// ([`ChatTemplate::thinking_format`]). Whether the model thinks when a
+/// request does not say is what [`ChatOptions`] say by default; the engine
+/// sets it from the options it renders with.
+pub(crate) fn detect(template: &ChatTemplate) -> Option<ThinkingFormat> {
+    let (start, end) = tags(template)?;
+    let tag = without_space(&start).to_owned();
+    // The end of the prompt, from the opening tag on.
+    let prompt = |thinking| {
+        let tail = prompt_tail(template, thinking)?;
+        Some(tail.find(&tag).map(|at| tail[at..].to_owned()).unwrap_or_default())
+    };
+    Some(ThinkingFormat {
+        start,
+        end,
+        prompt_on: prompt(true)?,
+        prompt_off: prompt(false)?,
+        on_by_default: ChatOptions::default().enable_thinking,
+        effort: reads_effort(template),
+        refused_efforts: refused_efforts(template),
+    })
 }
 
 /// `text` without the ASCII white space at both ends, which is what templates
@@ -186,20 +141,6 @@ fn prompt_tail(template: &ChatTemplate, thinking: bool) -> Option<String> {
         common -= 1;
     }
     Some(full[common..].to_owned())
-}
-
-/// Whether the reasoning of an earlier turn is in the prompt when
-/// `preserve_reasoning` is on.
-fn keeps_history(template: &ChatTemplate) -> bool {
-    let mut assistant = Message::new("assistant", ANSWER);
-    assistant.reasoning_content = REASONING.to_owned();
-    let conversation = [Message::new("user", "Hi"), assistant, Message::new("user", "Again")];
-    let options = ChatOptions {
-        add_generation_prompt: false,
-        variables: vec![("preserve_reasoning".to_owned(), Json::Bool(true))],
-        ..ChatOptions::default()
-    };
-    template.render(&conversation, &[], &options).is_ok_and(|text| text.contains(REASONING))
 }
 
 /// The usual values of `reasoning_effort` that a template which reads the

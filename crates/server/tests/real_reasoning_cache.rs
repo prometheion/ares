@@ -38,9 +38,7 @@ use ares_runtime::{
 };
 use ares_sampler::SampleParams;
 use ares_state::PageLayout;
-use ares_tokenizer::{
-    ChatOptions, ChatTemplate, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer,
-};
+use ares_tokenizer::{ChatOptions, ChatTemplate, EncodeOptions, Json, Message, Tokenizer};
 use axum::Router;
 use serde_json::{Value, json};
 
@@ -317,8 +315,8 @@ impl Server {
             None => qwen,
             Some(source) => {
                 let template = ChatTemplate::new(source, "", "").unwrap();
-                let thinking = ReasoningFormat::detect(&template)
-                    .map(|format| chat::thinking_format(format, &chat));
+                let thinking =
+                    template.thinking_format().map(|format| chat::thinking_format(format, &chat));
                 let system_first = template.system_first();
                 Arc::new(Templated {
                     trace: trace.clone(),

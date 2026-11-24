@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The formats a chat template declares are the API's types.
+ares-api = { path = "../api" }
 ares-gguf.workspace = true
 minijinja.workspace = true
 thiserror.workspace = true
