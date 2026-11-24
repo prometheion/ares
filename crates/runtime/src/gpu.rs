@@ -1035,9 +1035,7 @@ impl Worker {
         // step has finished; the destination holds `record_bytes` bytes.
         unsafe { stream.copy_from_host(self.record_device.ptr(), bytes.as_ptr(), bytes.len())? };
         let entries_at = view.entries_offset_words() as u64;
-        let mut taken = 0u64;
-        for i in 0..view.updates() {
-            let update = view.update(i);
+        for (update, entries) in view.table_updates() {
             if update.slot >= self.max_slots || update.first + update.count > self.table_stride {
                 return Err(ModelError::Invalid(format!(
                     "page-table update {update:?} is outside {} slots of {} entries",
@@ -1048,11 +1046,10 @@ impl Worker {
                 (u64::from(update.slot) * u64::from(self.table_stride) + u64::from(update.first))
                     * 4,
             );
-            let from = self.record_device.ptr().offset((entries_at + taken) * 4);
+            let from = self.record_device.ptr().offset((entries_at + u64::from(entries.start)) * 4);
             // SAFETY: both ranges are inside their buffers (checked above and
             // by the record's layout) and do not overlap.
             unsafe { stream.copy(to, from, update.count as usize * 4)? };
-            taken += u64::from(update.count);
         }
         times.upload_ns = begun.elapsed().as_nanos() as u64;
 

@@ -514,15 +514,12 @@ impl Executor for HostExecutor {
         }
         let mut tables = self.tables.lock().expect("tables");
         // The page-table updates, as the device copies them.
-        let mut taken = 0;
-        for i in 0..view.updates() {
-            let update = view.update(i);
+        for (update, entries) in view.table_updates() {
             let table = &mut tables[update.slot as usize];
             table.resize((update.first + update.count) as usize, 0);
-            for k in 0..update.count {
-                table[(update.first + k) as usize] = view.entry(taken + k);
+            for (at, k) in (update.first..).zip(entries) {
+                table[at as usize] = view.entry(k);
             }
-            taken += update.count;
         }
         match &mut self.oracle {
             Some(oracle) => {

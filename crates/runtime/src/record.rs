@@ -146,6 +146,8 @@
 //! reads the sequence's pages); the synthetic model has no attention kernel,
 //! so this is how a row's result comes to depend on its whole sequence.
 
+use std::ops::Range;
+
 use ares_cuda::{Segment, StepDims};
 use ares_sampler::{ENTRIES_PER_ROW, Entry, SampleParams, SampleRow, TokenMask};
 
@@ -1185,6 +1187,18 @@ impl<'a> RecordView<'a> {
         assert!(i < self.updates(), "update {i} of {}", self.updates());
         let at = self.header[H_OFF_UPDATES] as usize + i as usize * 12;
         TableUpdate { slot: self.word(at), first: self.word(at + 4), count: self.word(at + 8) }
+    }
+
+    /// The page-table updates in order, each with the range of the entries
+    /// section that holds its entries: the updates' entries lie there one
+    /// after the other.
+    pub fn table_updates(&self) -> impl Iterator<Item = (TableUpdate, Range<u32>)> + '_ {
+        let mut taken = 0;
+        (0..self.updates()).map(move |i| {
+            let update = self.update(i);
+            taken += update.count;
+            (update, taken - update.count..taken)
+        })
     }
 
     /// The word offset of the entries section, in 32-bit words from the start

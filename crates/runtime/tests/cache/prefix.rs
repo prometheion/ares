@@ -872,17 +872,13 @@ fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
     let e = engine_with(&model, config(256, 0), move |host| {
         host.with_observer(move |record| {
             let mut pages = log.lock().unwrap();
-            let mut taken = 0;
-            for i in 0..record.updates() {
-                let update = record.update(i);
-                for k in 0..update.count {
-                    let page = record.entry(taken + k);
+            for (_, entries) in record.table_updates() {
+                for page in entries.map(|k| record.entry(k)) {
                     pages.tabled.insert(page);
                     if pages.after_first {
                         pages.later.insert(page);
                     }
                 }
-                taken += update.count;
             }
             for i in 0..record.freed() {
                 let page = record.freed_page(i);
