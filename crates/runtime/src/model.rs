@@ -151,6 +151,16 @@ impl DrafterKind {
         }
     }
 
+    /// Whether a chain of this drafter ends by the bars of its links: a
+    /// drafter that makes its links one after the other can stop where the
+    /// next would not pay; one pass makes all of a window's drafts at once.
+    pub fn ends_chains_by_bars(self) -> bool {
+        match self {
+            DrafterKind::Mtp => true,
+            DrafterKind::Dflash => false,
+        }
+    }
+
     /// Where the statistics count the drafts of this kind
     /// ([`Counters::drafts_tested_at`](crate::Counters)): the n-gram drafter is 0.
     pub fn source(self) -> usize {

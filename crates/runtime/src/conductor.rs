@@ -113,7 +113,7 @@ use crate::cache::Cache;
 use crate::config::RuntimeConfig;
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::image::{ImageInput, ImageName, ImageRows, ImageSpan, ImageStore, Spans, cell_name};
-use crate::model::{ContextSpec, Drafter, DrafterKind, Model, TowerJob, Vision};
+use crate::model::{ContextSpec, Drafter, Model, TowerJob, Vision};
 use crate::record::{self, Commit, ImageRun, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
@@ -496,10 +496,7 @@ impl Active {
             self.completion += 1;
             if model.ends(token) {
                 self.stop.token(&[]);
-                self.stop.flush(&mut self.emitted);
-                self.sampler.reply_ended();
-                self.finished = Some(FinishReason::Stop);
-                return;
+                return self.end_reply(FinishReason::Stop);
             }
             let previous = self.states.last().copied().unwrap_or_else(|| spec.start());
             self.tokens.push(token);
@@ -518,21 +515,21 @@ impl Active {
                 return;
             }
             // A reply caught in a loop ends as a limit ends it (`guard`).
-            if self.sampler.cuts(&self.tokens, self.prompt_len as usize) {
-                self.stop.flush(&mut self.emitted);
-                self.sampler.reply_ended();
-                self.finished = Some(FinishReason::Length);
-                return;
-            }
-            if self.max_tokens.is_some_and(|max| self.completion >= max)
+            if self.sampler.cuts(&self.tokens, self.prompt_len as usize)
+                || self.max_tokens.is_some_and(|max| self.completion >= max)
                 || self.tokens.len() as u32 >= context_length
             {
-                self.stop.flush(&mut self.emitted);
-                self.sampler.reply_ended();
-                self.finished = Some(FinishReason::Length);
-                return;
+                return self.end_reply(FinishReason::Length);
             }
         }
+    }
+
+    /// The reply ends for `finish`: the text the stop strings held back goes
+    /// out, and the sampler's rules learn that the reply is over.
+    fn end_reply(&mut self, finish: FinishReason) {
+        self.stop.flush(&mut self.emitted);
+        self.sampler.reply_ended();
+        self.finished = Some(finish);
     }
 }
 
@@ -611,6 +608,21 @@ struct TowerPass {
     ms: f64,
 }
 
+/// What a step record is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordKind {
+    /// A round or a piece of prompt, every window with its drafts as tokens;
+    /// a step the model may pause after `pause_ms` (0: it may not).
+    Round { pause_ms: u32 },
+    /// The paused step goes on, for at most `pause_ms` more: its rows were
+    /// counted and its saves inside named when it was first written.
+    Resume { pause_ms: u32 },
+    /// The step that only drafts ([`Conductor::chains_first`]): the windows
+    /// whose drafts a model's drafter makes, as far as their chains are
+    /// asked, with their draft bars.
+    DraftsOnly,
+}
+
 /// One sequence's rows in the step being run.
 #[derive(Clone, Copy, Debug)]
 struct StepPart {
@@ -627,13 +639,21 @@ struct StepPart {
     replay: bool,
 }
 
-/// The load of `rows` consecutive rows of a sequence that start at position
-/// `context`, for a model whose rows read at most `span` cells each.
+impl StepPart {
+    /// The model's drafter that makes the drafts of this part, of sequence
+    /// `a`: a window with drafts whose sequence took a model drafter's offer.
+    fn model_drafter(&self, a: &Active) -> Option<usize> {
+        a.model_drafter.filter(|_| self.rows > 1 && matches!(self.kind, PartKind::Window))
+    }
+}
+
 /// The fewest rows a piece of prompt is cut to by its time bound
 /// ([`RuntimeConfig::piece_ms`]): the smallest step of prompt the warm-up
 /// measures.
 const MIN_PIECE: u32 = 16;
 
+/// The load of `rows` consecutive rows of a sequence that start at position
+/// `context`, for a model whose rows read at most `span` cells each.
 fn load_of(span: u32, context: u64, rows: u32) -> Load {
     let span = u64::from(span);
     // The rows that still read less than the span, and the ones at it.
@@ -752,10 +772,6 @@ pub(crate) struct Conductor {
     paused: Option<StepPart>,
     /// The paused step's sequence ended: the next record says so.
     give_up: bool,
-    /// The milliseconds the next step may run before the model pauses it, and whether the
-    /// record being written goes on with a paused step (its rows were counted).
-    pause_ms: u32,
-    resuming: bool,
     /// The rows of the images among the paused step's rows, held for it so that the
     /// image store cannot let them go before it goes on: its record stages them again.
     paused_images: Vec<(ImageName, Arc<ImageRows>)>,
@@ -911,8 +927,6 @@ impl Conductor {
             paused: None,
             paused_images: Vec::new(),
             give_up: false,
-            pause_ms: 0,
-            resuming: false,
             asks,
             asked: 0,
             inner_due: Vec::new(),
@@ -1803,7 +1817,7 @@ impl Conductor {
         self.requests.clear();
         let round = turn == Turn::Round;
         let span = u64::from(self.span);
-        let generating = self.slots.iter().flatten().filter(|a| a.generating()).count() as u32;
+        let generating = self.generating_besides(None);
         // Every draft row needs its logits, like the one row every sequence
         // may need: drafts share what the model gives beyond those, and the
         // rows of a step that verifies drafts are bounded by the model.
@@ -2069,14 +2083,7 @@ impl Conductor {
                 _ => (!a.generating()).then(|| a.prefill_left()),
             }
         }));
-        let generating = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(slot, a)| {
-                Some(*slot) != paused_slot && a.as_ref().is_some_and(|a| a.generating())
-            })
-            .count() as u32;
+        let generating = self.generating_besides(paused_slot);
         let deepest = self
             .slots
             .iter()
@@ -2367,12 +2374,8 @@ impl Conductor {
         } else {
             0.0
         };
-        if pass {
-            self.pause_ms = self.config.piece_ms.max(1.0) as u32;
-        }
-        let used = self.write_record(false);
-        self.pause_ms = 0;
-        let used = match used {
+        let pause_ms = if pass { self.config.piece_ms.max(1.0) as u32 } else { 0 };
+        let used = match self.write_record(RecordKind::Round { pause_ms }) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
         };
@@ -2639,34 +2642,31 @@ impl Conductor {
         if let Some(cache) = &mut self.cache {
             cache.settle_leaving(&mut self.pool, &mut *self.exec);
         }
-        self.pause_ms = budget_ms;
-        self.resuming = true;
-        let used = self.write_record(false);
-        self.pause_ms = 0;
-        self.resuming = false;
-        let used = match used {
+        let used = match self.write_record(RecordKind::Resume { pause_ms: budget_ms }) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
         };
         self.stats.record(Phase::Write, t_write.elapsed().as_nanos() as u64);
-        let generating = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(slot, a)| {
-                *slot != part.slot as usize && a.as_ref().is_some_and(|a| a.generating())
-            })
-            .count() as u32;
+        let generating = self.generating_besides(Some(part.slot as usize));
         let turn = Turn::Piece { rows: part.rows };
         self.run_record(began, used, turn, generating, 0.0, false);
+    }
+
+    /// The sequences that generate, besides the one in slot `besides` (the
+    /// paused step's, which runs alone).
+    fn generating_besides(&self, besides: Option<usize>) -> u32 {
+        let slots = self.slots.iter().enumerate();
+        slots
+            .filter(|(slot, a)| {
+                Some(*slot) != besides && a.as_ref().is_some_and(|a| a.generating())
+            })
+            .count() as u32
     }
 
     /// Whether `part` is a window whose drafts one of the model's drafters
     /// makes.
     fn takes_model_drafts(&self, part: &StepPart) -> bool {
-        part.rows > 1
-            && matches!(part.kind, PartKind::Window)
-            && self.slots[part.slot as usize].as_ref().is_some_and(|a| a.model_drafter.is_some())
+        self.slots[part.slot as usize].as_ref().and_then(|a| part.model_drafter(a)).is_some()
     }
 
     /// The step that only drafts: the model's drafters make the drafts of the
@@ -2676,7 +2676,7 @@ impl Conductor {
     /// window as pay ([`Conductor::verify_lengths`]). Returns what the step
     /// took, in milliseconds: the price of the drafts.
     fn chains_first(&mut self) -> Result<f64, String> {
-        let used = self.write_record(true)?;
+        let used = self.write_record(RecordKind::DraftsOnly)?;
         let step_ms = self.run_on_devices(used).map_err(|error| error.to_string())?;
 
         // The drafts of every chain, in the order of the windows: those of the
@@ -2686,9 +2686,7 @@ impl Conductor {
         let mut longest = vec![0usize; self.drafters.len()];
         for part in &self.parts {
             let a = self.slots[part.slot as usize].as_mut().expect("running");
-            let Some(d) =
-                a.model_drafter.filter(|_| part.rows > 1 && matches!(part.kind, PartKind::Window))
-            else {
+            let Some(d) = part.model_drafter(a) else {
                 continue;
             };
             let asked = part.rows as usize - 1;
@@ -2742,9 +2740,7 @@ impl Conductor {
         let mut drafters: Vec<usize> = Vec::new();
         for (index, part) in self.parts.iter().enumerate() {
             let a = self.slots[part.slot as usize].as_mut().expect("running");
-            let Some(d) =
-                a.model_drafter.filter(|_| part.rows > 1 && matches!(part.kind, PartKind::Window))
-            else {
+            let Some(d) = part.model_drafter(a) else {
                 fixed += part.rows;
                 fixed_cells += load_of(self.span, part.from, part.rows).cells;
                 continue;
@@ -2808,15 +2804,13 @@ impl Conductor {
         }
     }
 
-    /// Writes the step record for the parts in `self.parts`. Returns its
-    /// length in bytes. With `drafts_only`, the record of the step that only
-    /// drafts ([`Conductor::chains_first`]): the windows whose drafts the
-    /// model's own drafter makes, as long as their chains are asked, with
-    /// their draft bars. Without, the round or the piece itself, every window
-    /// with its drafts as tokens. The commit of the step before goes with
-    /// whichever comes first.
-    fn write_record(&mut self, drafts_only: bool) -> Result<usize, String> {
+    /// Writes the step record for the parts in `self.parts`, of the `kind`
+    /// it is (see [`RecordKind`]). Returns its length in bytes. The commit of
+    /// the step before goes with whichever comes first.
+    fn write_record(&mut self, kind: RecordKind) -> Result<usize, String> {
         let full = |e: record::RecordFull| format!("{e}");
+        let drafts_only = kind == RecordKind::DraftsOnly;
+        let resuming = matches!(kind, RecordKind::Resume { .. });
         let (mut segments, mut rows) = (0u32, 0u32);
         for part in self.parts.iter().filter(|p| !drafts_only || self.takes_model_drafts(p)) {
             segments += 1;
@@ -2825,16 +2819,17 @@ impl Conductor {
         let buffer = self.exec.record();
         let mut writer =
             RecordWriter::new(buffer, self.step_no + 1, segments, rows).map_err(full)?;
-        if drafts_only {
-            writer.drafts_only();
-        } else {
-            writer.pause_after(self.pause_ms);
+        match kind {
+            RecordKind::DraftsOnly => writer.drafts_only(),
+            RecordKind::Round { pause_ms } | RecordKind::Resume { pause_ms } => {
+                writer.pause_after(pause_ms)
+            }
         }
         if std::mem::take(&mut self.give_up) {
             writer.give_up_paused();
         }
         writer.asked(self.asked);
-        if !self.resuming && !drafts_only {
+        if !resuming && !drafts_only {
             writer.inner_saves(&self.inner).map_err(full)?;
         }
         self.runs.clear();
@@ -2855,8 +2850,8 @@ impl Conductor {
         // first that ends chains by them (a model has one MTP block at most).
         let mut bars_of: Option<usize> = None;
         for part in &self.parts {
-            let own = if drafts_only && part.rows > 1 && matches!(part.kind, PartKind::Window) {
-                self.slots[part.slot as usize].as_ref().and_then(|a| a.model_drafter)
+            let own = if drafts_only {
+                self.slots[part.slot as usize].as_ref().and_then(|a| part.model_drafter(a))
             } else {
                 None
             };
@@ -2869,7 +2864,7 @@ impl Conductor {
             match part.kind {
                 PartKind::Prefill { completes } => {
                     has_prompt = true;
-                    if self.resuming {
+                    if resuming {
                         // Counted when the step was first written.
                     } else if part.replay {
                         counters.replay_rows += u64::from(part.rows);
@@ -2959,16 +2954,12 @@ impl Conductor {
                         // The draft rows' tokens below are placeholders: the
                         // model's drafter makes them.
                         writer.model_drafts(d as u32 + 1).map_err(full)?;
-                        // A drafter that makes its links one after the other
-                        // ends its chain by the bars; one pass makes them all.
                         let links = part.rows as usize - 1;
-                        let needs: &[f32] = match self.drafters[d].kind {
-                            DrafterKind::Mtp => &a.model_needs,
-                            DrafterKind::Dflash => &[],
-                        };
+                        let by_bars = self.drafters[d].kind.ends_chains_by_bars();
+                        let needs: &[f32] = if by_bars { &a.model_needs } else { &[] };
                         self.bars.extend(needs.iter().take(links));
                         self.bars.resize(self.bars.len() + links - links.min(needs.len()), 0.0);
-                        if self.drafters[d].kind == DrafterKind::Mtp {
+                        if by_bars {
                             bars_of.get_or_insert(d);
                         }
                     }
