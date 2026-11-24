@@ -64,3 +64,53 @@ the process's resident memory 13.0 MiB less; `qwen35_prefix`: the 0.8B's
 checkpoints from 303 MiB to none while the engine is idle, resident memory
 301 MiB less, the next answers equal to those without a cache, none taken
 while memory is short, kept again afterwards).
+
+## Page-locked memory between steps, measured (2026-11-24)
+
+The rule that page-locked memory changes only while no device runs a job
+(`fix/far-free`; "When page-locked memory changes" in
+[`../architecture/host-memory.md`](../architecture/host-memory.md)), against main
+9b6d7df0 on the RTX 4070 and RTX 3060, alternating main, the branch, main, the
+branch; the load average was 4 to 18 from other work on the machine.
+
+*The deadlock gone.* The requests of `real_cache`'s Flash-Next resume test alone
+(IQ2_XS, `--ram 8G --context 20480 --parallel 2 --cache`, K and V of the first
+18 432 tokens in VRAM and the rest in RAM; a first and a second turn of about
+9.8k tokens, two other conversations, the second turn again), which stalled in
+two of three runs before: 10 of 10 runs answered all five, the same answers
+each time, and every server stopped on SIGTERM in under a second. The test
+binary `real_cache` 5 of 5 (4 of 4 tests each, 256 to 292 s). The bench flow of
+the K/V merge check (the model's own context, `--ram 8G`, a short request, a
+prompt of about 80k tokens beyond VRAM, then an unrelated short request): no
+hang in 5 runs of main and 5 of the branch; the long prompt's first token
+after 112.8 to 157.0 s on main (median 125.6) and 115.1 to 128.0 s on the
+branch (median 124.6), the short request's after 1.5 to 2.4 s and 1.5 to 3.7 s.
+
+*Giving memory back under the rule* (`real_elastic` with a helper that
+takes 4 GiB in steps of 64 MiB, the engine on both cards following this
+machine less 4.5 GiB, load average 3 to 7): the tier fell from 17.31 to
+16.63 GiB, its first piece gone 4.0 s after the helper started (when what the
+engine sees fell under its headroom of 437 MiB), the machine's available
+memory never under 5.52 GiB, a release seen to take 100 ms; generation ran at
+45.7 pieces per second while the helper held its memory (39.7 before), and the
+tier was back within 256 MiB 6.0 s after the helper freed it.
+
+*What the frees between steps cost.* Nothing that the runs show:
+
+| Build | Flash-Next decode, tokens/s (German, English, code; first ask and second) | 8k prompt | 27B decode at the owner's settings | 27B 8k |
+| --- | --- | --- | --- | --- |
+| main | 18.1 72.9 · 32.9 48.6 · 30.8 52.9 | 12.53 s | 62.4 252.4 · 77.8 247.5 · 107.2 247.3 | 6.99 s |
+| branch | 22.1 47.1 · 36.5 51.8 · 29.2 66.6 | 12.38 s | 73.8 251.8 · 79.6 252.2 · 108.0 252.1 | 7.04 s |
+| main | 22.3 59.5 · 35.2 53.9 · 31.3 71.6 | 12.47 s | 74.9 249.7 · 77.8 250.1 · 103.0 250.0 | 7.07 s |
+| branch | 23.1 52.7 · 36.8 58.9 · 31.2 73.2 | 12.47 s | 73.9 250.3 · 78.6 250.6 · 107.8 250.4 | 7.07 s |
+
+Flash-Next (IQ2_XS, both cards, `--ram 8G`, `--cache`, its MTP block): the
+second asks swing with the drafts accepted, in both builds; VRAM 11 701 and
+11 661 MiB in all four runs, ready in 38.5 to 41.1 s. The 27B (`--split tensor
+--shares 0.625,0.375 --context 262144 --parallel 2 --kv q5 --drafters mtp
+--draft-vocab`, `--ram 16G`, `--cache`): VRAM 11 457 and 10 095 MiB in all four.
+A free that the rule moves to the end of a step costs that step what it cost
+the thread that did it before (the end of a step unlocked the tier's pieces on a
+device thread, the conductor does it now as it collects the step; the RAM
+thread's frees of checkpoint chunks, which ran beside the steps, wait for the
+end of the step they meet).

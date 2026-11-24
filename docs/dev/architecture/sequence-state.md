@@ -278,7 +278,8 @@ one array per part, indexed by page number.
     starts from a checkpoint one restore. Against the seconds a start from
     nothing costs this is no problem, and a staging area in VRAM
     (which the copies could use to overlap with the step) is not built. The
-    first use of a place waits for its lock: 21 to 22.5 ms for the RTX 4070's
+    first use of a place waits for its lock (on the conductor's thread before
+    the step since 2026-11-24, on the device's before): 21 to 22.5 ms for the RTX 4070's
     93.5 MiB and 11.8 ms for the RTX 3060's 56.1 MiB, once per place (the
     first two places of a run cost 52 and 49 ms of waiting on the host). RAM
     locked: 748 MiB after the first conversation (5 places) and 1048 MiB after

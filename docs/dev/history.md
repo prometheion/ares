@@ -23,8 +23,52 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
 | Cleanup phase 1, runtime | merged 2026-11-24 (every GPU suite passed on the two local cards; about 1,300 lines fewer): the old pass in waves, unreached API, one bookkeeping for loans and the RAM tier's give-back, one tracker of the thinking; the old fill moved to phase 2; the cache's RAM files' items now free since kv merged (see "Cleanup") |
 | 6: K/V beyond VRAM into RAM (Flash-Next) | merged 2026-11-24 after every GPU suite passed on the two local cards: 13,056 expert slots (53 %) against main's 10,752 (44 %) at the model's own context, an 80k prompt in 103 s; finished requests' far pages rank as prompt cache and are dropped, never written page by page, when RAM has no room (that wait stalled the conductor after an 80k far prompt). Open: the hang seen twice in the merge check did not come back in 10 runs (cause not found); main's lent steps with the CPU's share give one of two first tokens at a near tie (not the far pages') |
 
+### From "Qwen3.8 Flash-Next (`qwen4exp`) / Host memory"
+
+- [x] A MoE model and a dense model on one device under memory pressure: the dense
+      checkpoints were freed on the watch's thread, the path that deadlocked. Since `fix/far-free`
+      (2026-11-24) the gate of page-locked memory is the process's: every engine's frees wait
+      for the steps of all of them (not tried with two models).
+
 ### From "Whole features not started"
 
+  - [x] **A deadlock in libcuda between the RAM thread and a device thread** (found 2026-11-24 by
+        the `real_cache` test `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd`,
+        whose `--context 20480` overflows since a named context does; 2 of 2 in the suite, 2 of 3 of
+        the same flow outside it, `/var/tmp/ares-c2load/hang/`): `ares-ram` frees page-locked
+        checkpoint chunks (`PinnedRam::sweep_checkpoints` from `Machine::look`) with
+        `cuMemFreeHost`, which synchronizes with the devices and holds the driver's lock, while
+        `ares-device-1` in a step waits for that lock in `cuMemcpyHtoDAsync` (`CudaSlots::set_entry`
+        from `ExpertStore::poll_cpu`), and the step waits for it: the engine stands still, and
+        does not stop on SIGINT. Very likely the hang seen twice in the merge check of item 6.
+        Fixed on `fix/far-free` (2026-11-24): page-locked memory changes only while no device runs
+        a job, for every thread of the process (`ares_cuda::gate`; "When page-locked memory
+        changes" in `dev/architecture/host-memory.md`): a free or an unlock asked for during a step
+        is done when the step ends, a lock or an allocation waits for the end or fails inside a
+        step, and what a step needs locked (checkpoint chunks, far pieces, a tier piece) is locked
+        before the hand-over. The cause: a step's kernels spin on the device for what only the
+        device's host thread brings (an expert's slot entry), and that thread needs the driver's
+        process-wide lock to enqueue it; `cuMemFreeHost` from another thread takes the lock and
+        waits for the devices' queued work, so neither moves. Proof on the two local cards: the
+        test's requests alone (`repro.py`) 10 of 10 with the same answers, `real_cache` 5 of 5
+        (4 of 4 each), the merge check's bench flow (an 80k prompt beyond VRAM at `--ram 8G`,
+        then a short request) 5 of 5 without a hang on this branch and 5 of 5 on main 9b6d7df0
+        (no hang on main either); every GPU suite of the server (`real_cache` among them,
+        and `real_elastic` once more with a helper that takes 4 GiB: the tier gave memory back
+        while generating), `qwen4exp_runtime` (the known near tie of
+        `flash_next_writes_with_drafts_what_it_writes_without` once), `qwen4exp_device`,
+        `qwen4exp_prefix` and every binary of `ares-runtime` passed; alternating A/B of Flash-Next's decode and an 8k
+        prompt on both cards at `--ram 8G` and of the 27B at the owner's settings: the same as
+        main's (`dev/experiments/host-memory.md`, "Page-locked memory between steps"). Notes:
+        `/var/tmp/ares-farfree/notes.md`.
+  - [x] K and V beyond VRAM on two cards: not run with the real file (the made-up model's test
+        passes on the RTX 4070 + RTX 3060). Run on 2026-11-24 (`fix/far-free`): Flash-Next IQ2_XS
+        on the RTX 4070 + RTX 3060 with K and V beyond VRAM, `real_cache`'s resume test (a
+        named context of 20 480 tokens, 18 432 of them in VRAM) 5 of 5 and its requests alone 10
+        of 10, and the merge check's 80k prompt beyond VRAM 10 of 10.
+  - [x] **The hang of a request after a long far request** (merge check 2026-11-23): the
+        deadlock above, found and fixed 2026-11-24 (`fix/far-free`): the bench flow of the merge
+        check ran 5 of 5 without a hang there and on main.
   - [x] **Lent wide steps with K and V beyond VRAM "fail since the prompt kernel"** (merge check
         2026-11-23, `integrate2`): neither the far pages' nor the prompt kernel's (`kvfix`,
         2026-11-24). The failing case compared the first token of a prompt read in lent steps (32
@@ -81,6 +125,14 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
       `mask_allows`; the runtime's defaults from the sampler's constants; `Breakers::of_tokens`
       the tests' own, `keeps_history` gone, `opens` a test helper. Typed tools, one JSON
       value type and the mirostat range stay open in `OPEN.md`.
+- [x] Found on the way (main d15f5d90 as well): `ares-tokenizer --test model`
+      `renders_the_prompts_of_llama_cpp` fails with `ARES_TEST_QWEN35_0_8B` set (request 26,
+      a message of two text parts, renders nothing here where llama.cpp renders them joined);
+      `real_flash_next` `flash_next_answers_in_both_placements` asks for `--split tensor` on a
+      machine of one card and fails instead of saying it is skipped. Both fixed on `fix/far-free`
+      (2026-11-24): the rendering was right (the server joins a message's text parts as they
+      are, llama.cpp's prompt is "part1part2"); the test joins them now. The placements test
+      is skipped with a note when one device is named (both splits need two).
 - [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
       one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
       one place, the conductor split, the two model loaders of the server, shared device helpers.

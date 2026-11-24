@@ -132,18 +132,21 @@ look by look. The users:
   is the one the loans of VRAM to a step's scratch use). The driver's unlock waits for
   the device to finish what it has, and a step's kernels can wait on the
   device for an expert the store brings, so a piece is never unlocked while
-  a step runs: the thread that ends the step unlocks what the step's end gave
-  up, where every device has ended the step, and the watch's thread does it
-  for an engine that runs nothing, with the store held so that no step
-  begins meanwhile. A piece that was given up keeps its lock until then and
+  a step runs ("When page-locked memory changes" below): what the step's end
+  gave up is unlocked once every device has ended the step, by the conductor
+  as it collects the step, and the watch's thread does it for an engine that
+  runs nothing, with the store held so that no step begins meanwhile. A piece
+  that was given up keeps its lock until then and
   is not locked again before (`HostRegion::is_releasing`): the driver
   refuses a lock of a range that a lock still covers
   (`CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`). The end of a step that gave
   up a small piece and then a larger one of another pool did that once,
   when the small one fit in what the larger one left below the allowance
   (Flash-Next's pools have slots of three sizes, and the last piece of a
-  pool is smaller). When the allowance rises, a piece is locked at the end
-  of every step (that step ends 30 to 70 ms later), or by the watch for 40
+  pool is smaller). When the allowance rises, a piece is locked before
+  every step on the conductor's thread (`Flow::before_step`; that step
+  begins 30 to 70 ms later; until 2026-11-24 the end of the step before did
+  it on a device thread), or by the watch for 40
   ms at a time while nothing runs, and its slots come back empty; they fill
   from what the routers pick, and from the heat while nothing runs (see "The
   usage profile of the experts"), which reads nothing into the tier while it
@@ -154,8 +157,9 @@ look by look. The users:
   page that the cache locks when a page leaves the devices
   (`PinnedRam::cache_buffer`, `cuMemHostAlloc` for that device; kept for the
   next page and given back when the allowance falls), and the checkpoints of
-  recurrent state, which a device part locks in chunks of at least 32 MiB
-  when a place is first used (`PlaceChunks`). The conductor keeps no more
+  recurrent state, locked for each device part in chunks of at least 32 MiB
+  when a place is first used (`PlaceChunks`), before the step or transfer that
+  uses it is handed to the devices (`PinnedRam::hold_places`). The conductor keeps no more
   than the allowance holds: it takes nothing new when the allowance has no
   room, gives up what goes for nothing first when it falls and writes what
   only RAM holds before that goes (between steps; an idle conductor is woken
@@ -202,8 +206,9 @@ experts it is what the tier is planned for. A dense model's server therefore
 lets the prompt cache use what the machine has, less the headroom, and gives
 the coldest up when the machine needs the memory. A lock that does not fit the
 limit fails the step with the books in the message. The first use of a place
-waits for the lock on the device's thread (21 to 22.5 ms for 93.5 MiB, 11.8
-ms for 56.1 MiB, measured with the 27B); locking ahead in the background is
+waits for the lock before the step, on the conductor's thread (21 to 22.5 ms for 93.5 MiB, 11.8
+ms for 56.1 MiB, measured with the 27B on the device's thread, where it was until
+2026-11-24); locking ahead in the background is
 not built. `GET /metrics` reports the bytes locked
 (`ares_checkpoint_ram_bytes`, `ares_expert_ram_tier_bytes`) and the counters
 of the expert store (`ares_expert_*`).
@@ -221,18 +226,87 @@ What these runs also showed, and what follows from it:
   release is forgotten, by half every ten minutes. A release that does not
   wait for a step would keep it at a few hundred MiB; it would need memory
   that the device does not read during a step, and is not built.
-- Not built, and not tried: a mixture of experts and a dense model loaded on
-  the same device, with memory short. The chunks of the dense model's
-  checkpoints are freed on the watch's thread whatever the devices do; that
-  is safe for a dense model alone, whose kernels never wait for the host,
-  and it is the same wait as above when a step of a mixture of experts runs
-  on that device. Freeing them between the steps of every engine on the
-  device needs a rule that the engines of a device share.
+- Not tried: a mixture of experts and a dense model loaded on the same
+  device, with memory short. Until 2026-11-24 the chunks of checkpoints were
+  freed on the watch's thread whatever the devices did, which hung Flash-Next
+  itself (below); the rule that every engine of the process shares since then
+  frees them between the steps of all of them.
 - With `--ram 28G` on this machine the engine holds what is available less
   the headroom when it loads, not 28 GiB: 20 to 21 GiB with the 21 to 22 GiB
   that were available in the calm runs here, of which Flash-Next on both
   cards can use about 16 GiB (its experts without a slot in VRAM) and on one card
   all of it.
+
+**When page-locked memory changes** (`crates/cuda/src/gate.rs`, since
+2026-11-24). Allocating, freeing, locking and unlocking page-locked memory
+(`cuMemHostAlloc`, `cuMemFreeHost`, `cuMemHostRegister`, `cuMemHostUnregister`)
+take a lock of the driver's that every call of the process needs, and a free
+or an unlock waits under it for the work the devices have queued. NVIDIA
+documents part of it: the CUDA C Programming Guide lists "a page-locked host
+memory allocation" among the operations between which the commands of two
+streams cannot run at the same time (3.2.6.5.4, "Implicit Synchronization"),
+and the driver's `cuMemFree` "may perform implicit synchronization"; PyTorch's
+host allocator notes that `cudaFreeHost` "waits for the work already queued on
+the current device" (`aten/src/ATen/core/CachingHostAllocator.h` at 09daa3ff)
+and frees outside its locks. llama.cpp frees page-locked memory only when a
+buffer goes (unload) and vLLM takes its page-locked buffers once; neither
+changes it while it serves, so there was no code to take. A step's kernels
+wait on the device for the host: for the slot of an expert the store brings
+(`expert_ffn.cuh` polls the table entry that `CudaSlots::set_entry` copies),
+for the host's claim and sums of an expert the CPU computes, for the peer's
+half of a layer. The thread that ends such a wait enqueues a copy, and the
+copy needs the driver's lock. A free on another thread while a step runs
+therefore waits for the kernel, the kernel for the thread and the thread for
+the free, for good (a kernel gives up after 0xF0000000 polls, about an hour).
+Seen 2026-11-24 with Flash-Next on both cards at `--ram 8G` and a named
+context beyond VRAM (`real_cache`'s resume test; two of three runs of its
+requests alone): the watch's thread in `cuMemFreeHost` of a chunk of
+checkpoint places (`PinnedRam::sweep_checkpoints`), device 1 in
+`cuMemcpyHtoDAsync` of a slot entry, waiting for the driver's lock, the
+conductor waiting for device 1, the engine deaf to SIGINT. The rule, for every
+thread of the process: **page-locked memory changes only while no device runs
+a job** (a step, a transfer between the devices and the host, a job of the
+image tower). The executor holds the gate from the hand-over of a job to its
+end (`gate::Steps`, from `GpuExecutor::dispatch` to `collect`; the hand-driven
+`Session` of the model's tests around its step), and each device thread marks
+itself inside the job (`gate::InStep`). Then:
+
+- A lock or an allocation (`gate::change`, in `PinnedBuffer::new` and
+  `HostRegistration::new`) waits until no job runs and keeps the next one
+  from beginning until it is done; inside a job it fails with an error
+  instead of waiting for the end of its own step. A thread that holds what a
+  step waits for (the watch's thread with the expert store held) only tries
+  (`gate::try_change`).
+- A free or an unlock (`gate::retire`, in the drops of `PinnedBuffer` and
+  `HostRegistration`) is done at once when no job runs, and otherwise when
+  the last job that runs ends, on the thread that ends it (the conductor,
+  in `collect`, before the next step). A user that books its bytes (a chunk
+  of checkpoint places, a page of the prompt cache in RAM, a piece of the
+  tier of experts or of a far pool) retires the memory together with its
+  booking and with what follows the unlock (`MADV_DONTNEED`, the piece free
+  to be locked again), so the books give the bytes back when the memory is
+  free, and a piece is not locked again before its unlock is done.
+- So what a step needs locked is locked before it is handed over, on the
+  conductor's thread: the chunks of the checkpoint places that the record's
+  copies and the saves inside the step use (`PinnedRam::hold_places`, also
+  before a transfer that brings checkpoints in), and in Flash-Next the pieces
+  of the far pools that hold the far pages the record's tables name and a
+  piece more of the tier of experts when it may hold more
+  (`Model::before_step`, `Flow::before_step`; a wrapper of a model must pass
+  the hook on, and a step with far pools that was not prepared so fails). The
+  buffers that a prompt read layer by layer reads its picks into and sends its
+  inbox from are taken when a part is opened.
+
+The gate is the process's and not an engine's, as the driver's lock is: an
+engine that loads beside one that serves waits for its steps, and what an
+engine frees while another runs a step waits for that step's end. What the
+frees between steps cost is measured in
+[`../experiments/host-memory.md`](../experiments/host-memory.md) ("Page-locked
+memory between steps"). Device memory (`cuMemAlloc`, `cuMemFree`) is not
+behind the gate: an engine takes it when its model is opened and frees it when
+the model goes, but for one fallback inside a step (a plan of the 27B's
+attention larger than its buffer, `Plan::upload`) and an engine that unloads
+beside another that serves ([`OPEN.md`](../../OPEN.md), "Host memory").
 
 Nothing that costs speed happens silently:
 

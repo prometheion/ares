@@ -266,10 +266,13 @@ so nothing idle in VRAM needs lending.
   step and answered no command for half a minute while the next request
   waited (seen in the merge check of 2026-11-23; `cache/tests.rs`
   `far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive`).
-  The device
-  threads keep the books of which pages the tables name (and which a transfer
-  brings in) and the first part to begin a step for the store locks the pieces
-  the step reaches (`Flow::lock_far`) before the store's step begins: when the
+  The flow
+  keeps the books of which pages the tables name (and which a transfer
+  brings in), and the conductor locks the pieces the step reaches before it
+  hands the step over (`Model::before_step`, `Flow::before_step`,
+  `Flow::lock_far`): page-locked memory does not change inside a step ("When
+  page-locked memory changes" in [`host-memory.md`](host-memory.md)); a step
+  with far pools that was not prepared so fails. When the
   limit has no room the tier's allowance already leaves it
   (`PinnedRam::set_context_target`) and the tier gives pieces up then, with no
   step running.
