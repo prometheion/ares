@@ -3,6 +3,9 @@
 //! The types here own raw allocations. The engine does not allocate per
 //! request: it takes a few large buffers at load time (sized through a
 //! `Ledger`) and carves them up itself, so these calls are off the hot path.
+//! Page-locked memory changes only while no device runs a step ([`crate::gate`]):
+//! its allocations and locks wait for one, and its frees and unlocks are done
+//! after it.
 
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
@@ -10,6 +13,7 @@ use std::ptr::NonNull;
 
 use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::gate;
 use crate::sys::*;
 
 /// An address in device memory.
@@ -169,10 +173,12 @@ impl PinnedBuffer {
         }
         let driver = device.bind()?;
         let mut raw: *mut c_void = std::ptr::null_mut();
-        // SAFETY: the pointer is valid for the write of one address.
-        driver.check("cuMemHostAlloc", unsafe {
-            (driver.api.mem_host_alloc)(&mut raw, len, CU_MEMHOSTALLOC_PORTABLE)
-        })?;
+        gate::change("pinned allocation", || {
+            // SAFETY: the pointer is valid for the write of one address.
+            driver.check("cuMemHostAlloc", unsafe {
+                (driver.api.mem_host_alloc)(&mut raw, len, CU_MEMHOSTALLOC_PORTABLE)
+            })
+        })??;
         let ptr = NonNull::new(raw.cast::<u8>()).ok_or(Error::Invalid {
             what: "pinned allocation",
             detail: "the driver returned a null pointer".into(),
@@ -210,9 +216,24 @@ impl DerefMut for PinnedBuffer {
 
 impl Drop for PinnedBuffer {
     fn drop(&mut self) {
+        gate::retire(HostFree { device: self.device.clone(), ptr: self.ptr.as_ptr().cast() });
+    }
+}
+
+/// The free of a [`PinnedBuffer`], done when it is dropped: where no step runs.
+struct HostFree {
+    device: Device,
+    ptr: *mut c_void,
+}
+
+// SAFETY: the pointer is a token of the driver's that may be freed on any thread.
+unsafe impl Send for HostFree {}
+
+impl Drop for HostFree {
+    fn drop(&mut self) {
         if let Ok(driver) = self.device.bind() {
             // SAFETY: the pointer came from cuMemHostAlloc and is freed once.
-            unsafe { (driver.api.mem_free_host)(self.ptr.as_ptr().cast()) };
+            unsafe { (driver.api.mem_free_host)(self.ptr) };
         }
     }
 }
@@ -255,10 +276,12 @@ impl HostRegistration {
             flags |= CU_MEMHOSTREGISTER_READ_ONLY;
         }
         let ptr = ptr.cast_mut().cast::<c_void>();
-        // SAFETY: the caller guarantees the range is mapped and page-aligned.
-        driver.check("cuMemHostRegister", unsafe {
-            (driver.api.mem_host_register)(ptr, len, flags)
-        })?;
+        gate::change("page-locking host memory", || {
+            // SAFETY: the caller guarantees the range is mapped and page-aligned.
+            driver.check("cuMemHostRegister", unsafe {
+                (driver.api.mem_host_register)(ptr, len, flags)
+            })
+        })??;
         Ok(Self { device: device.clone(), ptr })
     }
 
@@ -275,10 +298,12 @@ impl HostRegistration {
         let driver = device.bind()?;
         let flags = CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP;
         let raw = ptr.cast::<c_void>();
-        // SAFETY: the caller guarantees the range is mapped and page-aligned.
-        driver.check("cuMemHostRegister", unsafe {
-            (driver.api.mem_host_register)(raw, len, flags)
-        })?;
+        gate::change("page-locking host memory", || {
+            // SAFETY: the caller guarantees the range is mapped and page-aligned.
+            driver.check("cuMemHostRegister", unsafe {
+                (driver.api.mem_host_register)(raw, len, flags)
+            })
+        })??;
         let registration = Self { device: device.clone(), ptr: raw };
         let mut at: CUdeviceptr = 0;
         // SAFETY: the range was registered with the device map flag above.
@@ -291,8 +316,25 @@ impl HostRegistration {
 
 impl Drop for HostRegistration {
     fn drop(&mut self) {
+        gate::retire(Unlock { device: self.device.clone(), ptr: self.ptr });
+    }
+}
+
+/// The unlock of a [`HostRegistration`], done when it is dropped: where no step
+/// runs.
+struct Unlock {
+    device: Device,
+    ptr: *mut c_void,
+}
+
+// SAFETY: as for the registration.
+unsafe impl Send for Unlock {}
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
         if let Ok(driver) = self.device.bind() {
-            // SAFETY: the range was registered by `new` and is unregistered once.
+            // SAFETY: the range was registered by `HostRegistration` and is
+            // unregistered once.
             unsafe { (driver.api.mem_host_unregister)(self.ptr) };
         }
     }

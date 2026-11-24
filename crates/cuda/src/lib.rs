@@ -8,7 +8,8 @@
 //!   device memory.
 //! - [`Device`] opens a device of a class this build runs ([`BUILT_CLASSES`]:
 //!   the tested ones; other GPUs are for the Vulkan backend). [`DeviceBuffer`]
-//!   and [`PinnedBuffer`] own memory on it and next to it.
+//!   and [`PinnedBuffer`] own memory on it and next to it; [`gate`] says when
+//!   page-locked memory may change (never while a device runs a step).
 //! - [`Stream`] and [`Event`] order work on a device and between devices.
 //! - [`Kernels`] holds the engine's compiled kernels on a device;
 //!   [`TowerKernels`] those of the image tower besides its products.
@@ -26,6 +27,7 @@ mod dflash;
 mod driver;
 mod error;
 mod experts;
+pub mod gate;
 mod kernels;
 mod layers;
 mod memory;
