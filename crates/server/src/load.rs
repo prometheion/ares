@@ -706,6 +706,58 @@ pub(crate) fn describe_links(held: &[Held]) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// What an engine found when it started: whether the prompt cache on SSD
+/// (`ssd`, when one was asked for) is in use and what its store holds, and
+/// the price of a step as the calibration measured it, by rows and for each
+/// of the model's `drafters` by drafts.
+pub(crate) fn log_started(
+    runtime: &Runtime,
+    ssd: Option<&SsdConfig>,
+    drafters: &[ares_runtime::Drafter],
+) {
+    let Some(snapshot) = runtime.snapshot() else { return };
+    if let Some(ssd) = ssd {
+        let held = snapshot.counters.ssd;
+        match &snapshot.ssd_problem {
+            Some(why) => tracing::warn!(
+                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and \
+                 in RAM alone: {why}",
+                ssd.dir.display()
+            ),
+            None => tracing::info!(
+                "prompt cache on SSD: {}, at most {} for everything in it; this model's store \
+                 holds {} pages and {} checkpoints in {}; texts of {} tokens and more are \
+                 written when they leave RAM, and when the model is unloaded",
+                ssd.dir.display(),
+                Bytes(ssd.max_bytes),
+                held.store_pages,
+                held.store_states,
+                Bytes(held.store_bytes),
+                ssd.min_cells
+            ),
+        }
+    }
+    if let Some(calibration) = snapshot.calibration {
+        let table = |points: &[(u32, f64)]| {
+            join(points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")), ", ")
+        };
+        tracing::info!(
+            "the price of a step was measured in {:.1} s ({} steps), in ms by rows: {}{}",
+            calibration.seconds,
+            calibration.steps,
+            table(&calibration.step_ms),
+            calibration
+                .chain_ms
+                .iter()
+                .zip(drafters)
+                .map(|(chain, drafter)| {
+                    format!("; {} by drafts: {}", drafter.kind.name(), table(chain))
+                })
+                .collect::<String>()
+        );
+    }
+}
+
 pub(crate) fn join<T: ToString>(items: impl IntoIterator<Item = T>, with: &str) -> String {
     items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>().join(with)
 }
@@ -1760,46 +1812,7 @@ fn load_qwen35(
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
-    if let (Some(ssd), Some(snapshot)) = (&ssd, runtime.snapshot()) {
-        let held = snapshot.counters.ssd;
-        match &snapshot.ssd_problem {
-            Some(why) => tracing::warn!(
-                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and \
-                 in RAM alone: {why}",
-                ssd.dir.display()
-            ),
-            None => tracing::info!(
-                "prompt cache on SSD: {}, at most {} for everything in it; this model's store \
-                 holds {} pages and {} checkpoints in {}; texts of {} tokens and more are \
-                 written when they leave RAM, and when the model is unloaded",
-                ssd.dir.display(),
-                Bytes(ssd.max_bytes),
-                held.store_pages,
-                held.store_states,
-                Bytes(held.store_bytes),
-                ssd.min_cells
-            ),
-        }
-    }
-    if let Some(calibration) = runtime.snapshot().and_then(|snapshot| snapshot.calibration) {
-        let table = |points: &[(u32, f64)]| {
-            points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")).collect::<Vec<_>>().join(", ")
-        };
-        tracing::info!(
-            "the price of a step was measured in {:.1} s ({} steps), in ms by rows: {}{}",
-            calibration.seconds,
-            calibration.steps,
-            table(&calibration.step_ms),
-            calibration
-                .chain_ms
-                .iter()
-                .zip(model.drafters())
-                .map(|(chain, drafter)| {
-                    format!("; {} by drafts: {}", drafter.kind.name(), table(chain))
-                })
-                .collect::<String>()
-        );
-    }
+    log_started(&runtime, ssd.as_ref(), &model.drafters());
 
     // What it took.
     for ((h, report), f) in held.iter().zip(model.reports()).zip(&footprint) {

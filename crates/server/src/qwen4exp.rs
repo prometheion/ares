@@ -28,7 +28,7 @@ use ares_tokenizer::Tokenizer;
 
 use crate::load::{
     LoadError, Loaded, VRAM_HEADROOM, describe_links, drafter_files, hold_devices, join,
-    ram_limit_of, read_vocabulary, refuse, short,
+    log_started, ram_limit_of, read_vocabulary, refuse, short,
 };
 use crate::models::Site;
 use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, Drafter, LoadOptions, SplitKind};
@@ -764,46 +764,7 @@ pub(crate) fn load(
              prompt read alone takes steps of {own_rows} rows"
         );
     }
-    if let (Some(ssd), Some(snapshot)) = (&ssd, runtime.snapshot()) {
-        let held = snapshot.counters.ssd;
-        match &snapshot.ssd_problem {
-            Some(why) => tracing::warn!(
-                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and \
-                 in RAM alone: {why}",
-                ssd.dir.display()
-            ),
-            None => tracing::info!(
-                "prompt cache on SSD: {}, at most {} for everything in it; this model's store \
-                 holds {} pages and {} checkpoints in {}; texts of {} tokens and more are \
-                 written when they leave RAM, and when the model is unloaded",
-                ssd.dir.display(),
-                Bytes(ssd.max_bytes),
-                held.store_pages,
-                held.store_states,
-                Bytes(held.store_bytes),
-                ssd.min_cells
-            ),
-        }
-    }
-    if let Some(calibration) = runtime.snapshot().and_then(|snapshot| snapshot.calibration) {
-        let table = |points: &[(u32, f64)]| {
-            join(points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")), ", ")
-        };
-        tracing::info!(
-            "the price of a step was measured in {:.1} s ({} steps), in ms by rows: {}{}",
-            calibration.seconds,
-            calibration.steps,
-            table(&calibration.step_ms),
-            calibration
-                .chain_ms
-                .iter()
-                .zip(model.drafters())
-                .map(|(chain, drafter)| {
-                    format!("; {} by drafts: {}", drafter.kind.name(), table(chain))
-                })
-                .collect::<String>()
-        );
-    }
+    log_started(&runtime, ssd.as_ref(), &model.drafters());
     fill_tiers(&runtime, &model, &name)?;
     log_expert_costs(&model);
 
