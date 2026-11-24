@@ -8,10 +8,10 @@ repository says what Ares is, how to build it and how to run it.
 
 | Document | What it is for |
 | --- | --- |
-| [`FEATURES.md`](FEATURES.md) | What Ares can do today, one line per feature, with the options and routes by name. Brought up to date at every merge. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How the engine works and why: the principles and scope decisions, the crates, a step, sequence state, speculation, sampling, weights, devices and kernels, the image tower, host memory, loading and the server. The place to start before changing code. It is long; find a part by its section. |
+| [`user/features.md`](user/features.md) | What Ares can do today, one line per feature, with the options and routes by name. Brought up to date at every merge. |
+| [`dev/architecture/`](dev/architecture/overview.md) | How the engine works and why: the principles and scope decisions, the crates, a step, sequence state, speculation, sampling, weights, devices and kernels, the image tower, host memory, loading and the server. The place to start before changing code. It is long; find a part by its section. |
 | [`OPEN.md`](OPEN.md) | The working list: what is in work, the defects, the measurements owed, the owner's decisions and the questions to the owner. Brought up to date at every merge. |
-| [`reference/feature-checklist.md`](reference/feature-checklist.md) | What the other inference engines have, one row per capability, and where Ares stands. Some rows lag behind; `OPEN.md` names them. |
+| [`dev/studies/feature-checklist.md`](dev/studies/feature-checklist.md) | What the other inference engines have, one row per capability, and where Ares stands. Some rows lag behind; `OPEN.md` names them. |
 
 `OPEN.md` is written for the people and agents who work on the engine. It
 names paths on the development machine, such as notes, benches and captures
@@ -22,18 +22,18 @@ Ares; they say where the evidence for a line was kept.
 ## Studies (`reference/`)
 
 Each of these was made on the date it names and is not kept current. They are
-the evidence behind decisions in `ARCHITECTURE.md`.
+the evidence behind decisions in `dev/architecture/`.
 
 | Document | What it is |
 | --- | --- |
-| [`qwen35-architecture.md`](reference/qwen35-architecture.md) | The specification of the `qwen35` architecture (Qwen3.5 and Qwen3.8 dense), which the CPU reference in `crates/model` implements, with its proof against llama.cpp. |
-| [`qwen4exp-architecture.md`](reference/qwen4exp-architecture.md) | The specification of the `qwen4exp` architecture (Qwen3.8 Flash-Next). |
-| [`kv-real-data.md`](reference/kv-real-data.md) | The K/V formats measured on attention data captured from real models. |
-| [`engines-survey.md`](reference/engines-survey.md) | Techniques of other engines worth taking, by feature. |
-| [`serving-engines-code-survey.md`](reference/serving-engines-code-survey.md) | How vLLM, SGLang, FlashInfer and others build their fast parts, read in their code. |
-| [`moe-offload-survey.md`](reference/moe-offload-survey.md) | How the engines that the Run My AI project credits offload mixtures of experts. |
-| [`strata-notes.md`](reference/strata-notes.md) | Notes from reading Strata, the reference engine for Flash-Next. |
-| [`codacus-notes.md`](reference/codacus-notes.md), [`kvarn-notes.md`](reference/kvarn-notes.md), [`runmyai-notes.md`](reference/runmyai-notes.md) | Notes from reading one project each: TheCodacus' llama.cpp fork, KVarN (beellama.cpp), Run My AI. |
+| [`qwen35-architecture.md`](dev/studies/qwen35-architecture.md) | The specification of the `qwen35` architecture (Qwen3.5 and Qwen3.8 dense), which the CPU reference in `crates/model` implements, with its proof against llama.cpp. |
+| [`qwen4exp-architecture.md`](dev/studies/qwen4exp-architecture.md) | The specification of the `qwen4exp` architecture (Qwen3.8 Flash-Next). |
+| [`kv-real-data.md`](dev/studies/kv-real-data.md) | The K/V formats measured on attention data captured from real models. |
+| [`engines-survey.md`](dev/studies/engines-survey.md) | Techniques of other engines worth taking, by feature. |
+| [`serving-engines-code-survey.md`](dev/studies/serving-engines-code-survey.md) | How vLLM, SGLang, FlashInfer and others build their fast parts, read in their code. |
+| [`moe-offload-survey.md`](dev/studies/moe-offload-survey.md) | How the engines that the Run My AI project credits offload mixtures of experts. |
+| [`strata-notes.md`](dev/studies/strata-notes.md) | Notes from reading Strata, the reference engine for Flash-Next. |
+| [`codacus-notes.md`](dev/studies/codacus-notes.md), [`kvarn-notes.md`](dev/studies/kvarn-notes.md), [`runmyai-notes.md`](dev/studies/runmyai-notes.md) | Notes from reading one project each: TheCodacus' llama.cpp fork, KVarN (beellama.cpp), Run My AI. |
 
 ## Tools beside the code
 

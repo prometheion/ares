@@ -2,7 +2,7 @@
 //! mixture of experts over several residual streams, with recurrent layers (a
 //! gated delta rule), every fourth layer an attention layer that reads the
 //! cells an indexer selects, and a hashed n-gram embedding. The specification
-//! is `docs/reference/qwen4exp-architecture.md`.
+//! is `docs/dev/studies/qwen4exp-architecture.md`.
 
 pub mod config;
 pub mod device;

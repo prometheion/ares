@@ -175,7 +175,7 @@ worth: the chance that the drafts up to its own are right times what a token
 costs at the rate the round was chosen for), which a model whose rows may
 have to wait for the file uses to decide whether a row is worth the wait (see
 "A row that verifies a draft waits for the file only while it is worth it"
-under [Weights](#weights)). A row the model leaves (`StepOutput::inexact`)
+under [Weights](weights.md)). A row the model leaves (`StepOutput::inexact`)
 gives no draft from it on: the conductor accepts at most the drafts the rows
 before it tested.
 
@@ -334,7 +334,7 @@ row `k` of it gives the logits that a step of that row alone gives after the
 the same product in any launch of a decode step, the recurrent blocks carry
 their state from row to row as single steps store it, and attention plans
 every generated row as if it were the only row of its step (see "Attention
-kernels" under [Devices](#devices)). The tests: every kind of block, every
+kernels" under [Devices](devices.md)). The tests: every kind of block, every
 format of K and V, windows with rejected drafts, on made-up models
 (`crates/model/tests/qwen35_windows.rs`: every logit, the recurrent state and
 the stored K and V); the 0.8B on one card, in a tensor split and in a layer

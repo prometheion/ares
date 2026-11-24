@@ -1,6 +1,6 @@
 # Experiments: Flash-Next against Strata
 
-Dated measurement logs, moved here verbatim from `ARCHITECTURE.md` and `OPEN.md` on 2026-11-24. They are not kept current: each names its date, build and machine.
+Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
 **UD-Q4_K_XL from the SSD on one 16 GB card** (2026-11-22, branch `flash/ssd-stream`; the test
 machine: RTX 4060 Ti 16 GB on PCIe 4.0 x4, 62 GiB RAM, Samsung 990 1 TB under btrfs; the 104 GiB

@@ -12,7 +12,7 @@ One row is one capability that a user or operator of an inference server can obs
 ## How to read it
 
 **Columns.** `Engines`: who has it (short names below). `What it is`: precise enough to build or to reject.
-`Ares`: `done`, `partly: <what is missing>` or `not started`, from `docs/ARCHITECTURE.md` (Status of 2026-11-11),
+`Ares`: `done`, `partly: <what is missing>` or `not started`, from the architecture document (Status of 2026-11-11; now `docs/dev/architecture/`),
 `README.md`, `crates/server/src/{cli,wire,routes,error}.rs` and `crates/runtime/src/conductor.rs`.
 `Frame`: `yes`, or `no: <the scope decision that excludes it>`. `Need`: for rows inside the frame, how much users
 depend on it (`essential`, `common`, `niche`); this is my judgment, not a measurement.
@@ -32,7 +32,7 @@ have something the others lack: `swap` = llama-swap (the proxy in front of the u
 `tokenspeed`.
 
 **Three engines that inherit rows.** `fork`, `avalon` and `ik` are forks of llama.cpp. `fork` is named in a row
-only where Ares' documents (`docs/ARCHITECTURE.md`: scope decisions, "What is taken from where", Status, Next
+only where Ares' documents (`docs/dev/architecture/overview.md`: scope decisions, "What is taken from where", Status, Next
 steps, Speculation) or the production preset (its `models.ini`) name
 the feature. It presumably has every `llama` row as well (inferred: it is a fork and its preset uses upstream's
 keys); its history was not read. `avalon` carries upstream's server unchanged as far as its
@@ -229,7 +229,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | P15 | Attention that reads quantized K/V in place | fork, tabby?, lmdeploy? | no f16 copy of the cache (`flash-attn-native-quants`) | done (CUDA) | yes | essential |
 | P16 | K/V of a running sequence beyond VRAM | llama, sglang, strata?, tabby? | a context larger than VRAM holds, the rest in RAM | not started (designed in the RAM broker) | yes | common |
 | P17 | Sparse attention over selected cells | strata, tfold, ik, sglang, trt | for sparse-attention models only the selected cells are read | partly: runs in qwen4exp; kernel choice by measurement and many-row items are open | yes | essential |
-| P18 | Every GGUF weight type on the GPU | llama, ik | all 28 types computed on the quantized data | partly: decode kernels for all 28 on CUDA and Vulkan; many-row kernels with a device layout for 12; the experts of a MoE layer in all 28 on CUDA, as gate and up and as down, in the decode and in the many-row kernels (tested against the reference decoder and timed per type on both cards 2026-11-12, see "Experts in every weight type" in ARCHITECTURE.md), and on the CPU (kernels on the file's bytes for IQ2_S, IQ2_XXS, IQ1_M and Q2_0, the reference decoder row by row for the others, 2 to 11 times as slow); no expert kernels on Vulkan | yes | essential |
+| P18 | Every GGUF weight type on the GPU | llama, ik | all 28 types computed on the quantized data | partly: decode kernels for all 28 on CUDA and Vulkan; many-row kernels with a device layout for 12; the experts of a MoE layer in all 28 on CUDA, as gate and up and as down, in the decode and in the many-row kernels (tested against the reference decoder and timed per type on both cards 2026-11-12, see "Experts in every weight type" in `docs/dev/architecture/kernels.md`), and on the CPU (kernels on the file's bytes for IQ2_S, IQ2_XXS, IQ1_M and Q2_0, the reference decoder row by row for the others, 2 to 11 times as slow); no expert kernels on Vulkan | yes | essential |
 | P19 | Expert tiers: VRAM, RAM, SSD | strata, avalon, ik, sglang, tfold | hot experts in VRAM slots, more in RAM the engine owns, the rest read from the file | partly: runs for qwen4exp behind the runtime and the server, the RAM tier within the one RAM limit; the tier does not give memory back, and experts are not read ahead of their routers | yes | essential |
 | P20 | The CPU computes experts that are not on a GPU | llama, ik, kobold, avalon, strata, tabby | missed experts run on the CPU while the GPU runs the cached ones | partly: in the expert store of P19, with its limits | yes | essential |
 | P21 | Expert election by heat, prefetch | strata, avalon, ik | the cached set follows use; the next experts are fetched ahead | partly: heat and the split of slots are used by qwen4exp; guesses and the token table are not used by a running model | yes | common |
@@ -491,8 +491,8 @@ summarising fetch.
 
 | Engine | Source | Notes |
 | --- | --- | --- |
-| Ares | `docs/ARCHITECTURE.md`, `README.md`, `crates/server/src/{cli,wire,routes,error,lib,main}.rs`, `crates/runtime/src/conductor.rs` (grep), `docs/reference/{engines-survey,serving-engines-code-survey}.md` | local, read only |
-| fork | its `models.ini`; Ares' ARCHITECTURE.md | local; the fork's repository was not read |
+| Ares | `docs/dev/architecture/`, `README.md`, `crates/server/src/{cli,wire,routes,error,lib,main}.rs`, `crates/runtime/src/conductor.rs` (grep), `docs/reference/{engines-survey,serving-engines-code-survey}.md` | local, read only |
+| fork | its `models.ini`; Ares' architecture document | local; the fork's repository was not read |
 | llama | `https://raw.githubusercontent.com/ggml-org/llama.cpp/master/tools/server/README.md` (both halves); the same README in Avalon's tree, `Avalon's tools/server/README.md`, read directly | the two agree |
 | avalon | `Avalon's README.md` (commit e09e775, 2026-11-11) | the notes file the survey notes of Avalon did not exist when this was written |
 | ik | `https://raw.githubusercontent.com/ikawrakow/ik_llama.cpp/main/README.md` | README only; its server README was not read |
@@ -527,4 +527,4 @@ OpenAI-route details (structured output back ends, parsers by name); LM Studio b
 web-fetched engine.
 
 Counts were made with:
-`awk -F'|' 'NF==9 && /^\| [A-Z][0-9][0-9] /{n++; a=$6; f=$7; s=(a ~ /^ done/)?"done":(a ~ /^ partly/)?"partly":"not"; if (f ~ /^ yes/) y[s]++; else o++} END {print n, y["done"], y["partly"], y["not"], o}' docs/reference/feature-checklist.md`
+`awk -F'|' 'NF==9 && /^\| [A-Z][0-9][0-9] /{n++; a=$6; f=$7; s=(a ~ /^ done/)?"done":(a ~ /^ partly/)?"partly":"not"; if (f ~ /^ yes/) y[s]++; else o++} END {print n, y["done"], y["partly"], y["not"], o}' docs/dev/studies/feature-checklist.md`

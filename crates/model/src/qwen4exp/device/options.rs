@@ -74,7 +74,8 @@ pub struct ModelOptions {
     /// before missed there and no tier holds. Off unless a measurement asks for it: that
     /// guess is mostly wrong (what a step read and the heat keeps is in RAM afterwards, so
     /// what is left to guess is what one row used), and with it a prompt read 1.6 to 2.8 GiB
-    /// more from the file and 5 to 30 % slower (measured 2026-11-12, see ARCHITECTURE.md).
+    /// more from the file and 5 to 30 % slower (measured 2026-11-12, see
+    /// `docs/dev/experiments/flash-next-prompts.md`).
     pub read_ahead: bool,
     /// The bytes of a piece of the RAM tier under the runtime: what the tier
     /// locks or gives back at a time. `None` for the store's own size; tests

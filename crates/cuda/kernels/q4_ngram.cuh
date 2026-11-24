@@ -1,5 +1,5 @@
 // The device part of the hashed n-gram embedding of qwen4exp (section 3.4 of
-// docs/reference/qwen4exp-architecture.md). The host hashes the tokens and
+// docs/dev/studies/qwen4exp-architecture.md). The host hashes the tokens and
 // reads the table rows from the file; the device gets, per row of the step,
 // the stored bytes of the rows of all heads and does the rest:
 //

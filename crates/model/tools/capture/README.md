@@ -69,7 +69,7 @@ done
 ```
 
 The numbers measured with these runs are in
-`docs/reference/qwen35-architecture.md`, section "Proof against llama.cpp".
+`docs/dev/studies/qwen35-architecture.md`, section "Proof against llama.cpp".
 
 `CAP_NODES` keeps further graph nodes by name, for example
 `CAP_NODES=attn_norm-0,linear_attn_out-0,attn_post_norm-0,ffn_out-0`; the names are

@@ -23,7 +23,7 @@ use ares_core::Ledger;
 use super::StoreError;
 
 /// The bytes of a piece, about: what is locked or released at a time (a
-/// piece is whole slots). See "Host memory" in `docs/ARCHITECTURE.md` for the
+/// piece is whole slots). See "Host memory" in `docs/dev/architecture/host-memory.md` for the
 /// times that chose it.
 pub const PIECE: usize = 64 << 20;
 

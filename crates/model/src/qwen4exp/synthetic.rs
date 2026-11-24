@@ -1,5 +1,5 @@
 //! A writer for small made-up models of the `qwen4exp` architecture
-//! (`docs/reference/qwen4exp-architecture.md`, section 8.3), so that the
+//! (`docs/dev/studies/qwen4exp-architecture.md`, section 8.3), so that the
 //! architecture can be checked without the 63 GiB file: by the tests of this
 //! crate, by GPU implementations against the reference, and by the reference
 //! against the llama.cpp fork, which reads the same file.

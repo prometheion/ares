@@ -179,7 +179,7 @@ one array per part, indexed by page number.
   one priority: the line is taken by priority first, a shortage spills the
   worst priority first, and a request that does not fit makes running ones
   of a worse priority give way (see "Priorities of requests" under
-  [Server](#server)). The object decides and reports; the
+  [Server](server.md)). The object decides and reports; the
   conductor carries it out.
 - In the conductor (`crates/runtime/src/conductor/`, `cache/`), for a
   model that takes part (`Model::prefix_cache`):
@@ -405,7 +405,7 @@ same way on every device, from the segments of the record:
 The formats were chosen on synthetic rows and then measured on the K and V of
 two real models (Qwen3.5-0.8B and Qwen3.8-27B, one text of 3.7k tokens; the
 measure is the error of attention, not of logits;
-`docs/reference/kv-real-data.md`):
+`docs/dev/studies/kv-real-data.md`):
 
 - The scale search lowers the error of the attention output by 12 %, 15 % and
   18 % at `q6`, `q5` and `q4` against the plain scale of `q8`, in every layer.
@@ -446,7 +446,7 @@ tolerance for kernels is ten times that.
 ### What this prepares for Qwen4
 
 The reference is Strata's implementation of Qwen3.8-Flash-Next (`qwen4exp`);
-see [reference/strata-notes.md](reference/strata-notes.md). The items of the
+see [reference/strata-notes.md](../studies/strata-notes.md). The items of the
 Qwen4 handover map as follows.
 
 | Handover item | In this engine |

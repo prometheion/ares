@@ -75,7 +75,7 @@
 //! sent back unchanged is therefore written into the prompt as the model
 //! generated it, on every turn the same, which is what lets the prefix cache
 //! continue the conversation (see "A conversation that continues from the
-//! cache" in `docs/ARCHITECTURE.md`). A `summary` and an `encrypted_content`
+//! cache" in `docs/dev/architecture/api.md`). A `summary` and an `encrypted_content`
 //! of an item are accepted and nothing of them enters the prompt: a summary
 //! is not the reasoning, and encrypted content is text only the service that
 //! wrote it can read.

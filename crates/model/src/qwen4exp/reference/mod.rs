@@ -1,5 +1,5 @@
 //! A CPU implementation of the forward pass of `qwen4exp`, written to be read
-//! next to `docs/reference/qwen4exp-architecture.md` (section 3) and to be
+//! next to `docs/dev/studies/qwen4exp-architecture.md` (section 3) and to be
 //! right.
 //!
 //! It is an oracle, not an engine: clarity and exactness come before speed.

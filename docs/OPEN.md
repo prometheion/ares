@@ -3,10 +3,10 @@
 Updated 2026-11-22, `main` at the prefill path measured per type on full-rate cards (after the
 shared layer's steps 5 and 6: one MTP driver, drafter kinds `ngram`, `mtp`, `dflash`; nothing
 pushed). What is there is listed in
-[`FEATURES.md`](FEATURES.md).
+[`user/features.md`](user/features.md).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
-[`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 70 done,
+[`dev/studies/feature-checklist.md`](dev/studies/feature-checklist.md) (223 rows: 70 done,
 42 partly, 88 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out
 of date: reasoning is built, and `q7` to `q4` run in the 27B).
 
@@ -57,7 +57,7 @@ state the runtime touches (pages, slot state, checkpoints, windows, commits, rep
 or when it drafts; products, norms, kernel choice per row count, fused launches and exchanges
 between cards stay with the model. Steps 0 to 8 made the K/V group, the recurrent block, the
 slot arena with its checkpoints, the token rows, the head view and the MTP driver shared
-(`crates/model/src/blocks`; the rule is in `ARCHITECTURE.md`, "The shared model layer"). Design
+(`crates/model/src/blocks`; the rule is in `dev/architecture/overview.md`, "The shared model layer"). Design
 study: `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on its own.
 - What trees (9, 10) find from 8: the lattice of every pass is kept (`Drafter::lattice`: 16
   candidates and a 16 x 16 score table per position, tokens already mapped through the head
@@ -320,7 +320,7 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       the first text of a process differs a little where many misses are waited for (KL
       0.0001 German, 0 English, 0.0025 code, top-1 99.0 %). Owed: find what (3) reads that
       depends on the run (tier state, a slot's leftovers, the order in which waited experts
-      land), and say in ARCHITECTURE.md which paths are reproducible; (1) and (2) are choices
+      land), and say in the architecture (`dev/architecture/`) which paths are reproducible; (1) and (2) are choices
       for speed that a test of quality must know.
 - [ ] The first reading of a short prompt after other texts is slower with transit
       (35 against 86 tokens/s in one run); not understood.
@@ -359,7 +359,7 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       at 8 rows 7 % slower on the RTX 3060 since the kernels for all types.
 
 ### Parity with the 27B (the owner's rule: what one model can, the other must)
-Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
+Everything `user/features.md` lists for the 27B and not for Flash-Next is owed:
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.
 
@@ -403,7 +403,7 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       default build has no sm_120 code and refuses the card (only tested classes, 2026-11-23). When
       the card is in: a build with `ARES_CUDA_ARCHS=89,120` there and the whole GPU suite on it;
       when it passes, 120 joins `TESTED` in `crates/cuda/build.rs` (and the names in
-      `ARCHITECTURE.md` "GPU classes", `FEATURES.md`, `README.md`); then Blackwell's own paths
+      `dev/architecture/devices.md` "GPU classes", `user/features.md`, `README.md`); then Blackwell's own paths
       where they pay, measured: FP4 tensor cores
       for NVFP4 and MXFP4 weights (Strata 0.1.65 names `dense_fp4_tc` and `moe_fp4_tc`), FP8; the
       prefill path per type measured there as on every card; and Ares against Basalt (Blackwell
@@ -420,14 +420,14 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       cards hold the model and its expert cache; an aux card holds drafters (a draft model, DFlash,
       an MTP block) and, for a mixture of experts, its free VRAM as one more expert tier between
       the main cards and RAM. The option's name and form go to the owner before it is built.
-      Measured 2026-11-22 (`ARCHITECTURE.md`, "What the second card is for"): for the 27B the
+      Measured 2026-11-22 (`dev/architecture/devices.md`, "What the second card is for"): for the 27B the
       second card is worth most as room for K and V (the attention heads by shares of their own,
       as the fork's `--attn-split`: 2.1 times the context, 3 % slower decode at 1000 cells and
       9 % at 32 000). Built as how the plan works, with no option (the owner, 2026-11-22):
       `AttentionShares::ByContext`, heads with the weights as far as the wanted context
       (`--context`, or the model's own) fits, moved only as far as it needs. The rest of the
       roles item (what the aux card is called, drafters on it) waits for the owner.
-- [ ] Flash-Next's second card (measured 2026-11-22, `ARCHITECTURE.md`, "What the second card is
+- [ ] Flash-Next's second card (measured 2026-11-22, `dev/architecture/devices.md`, "What the second card is
       for"): on every layer it is worth most (twice the VRAM tier); as an expert tier only (no
       dense share, `core_share` 1) it decodes as fast and reads warm prompts 27 % faster than the
       share chosen today from read times. Proposed: the plan measures at load a wide and a decode
@@ -561,7 +561,7 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       Vulkan backend once it runs models. What was not tuned on CUDA goes there too.
 - [x] K/V of a running sequence beyond VRAM (P16). The owner, 2026-11-22: without `--context` a
       model gets its own context always, and what of it does not fit in VRAM overflows into RAM.
-      Built for Flash-Next (2026-11-22, `kv/overflow`; "K and V beyond VRAM" in `ARCHITECTURE.md`).
+      Built for Flash-Next (2026-11-22, `kv/overflow`; "K and V beyond VRAM" in `dev/architecture/flash-next.md`).
       Open:
   - [ ] The 27B: not built. Its 16 dense layers read every cell, so K and V in RAM cross the link
         once per token: 5.4 ms per 1000 cells on the test machine's x4 link, about 1.4 ms on a x16
@@ -597,7 +597,7 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
 Every tensor of both models takes every weight type the shape allows (the audit of every place
-that refused a type is in the branch's notes; ARCHITECTURE.md "Files in any type" and "A layer
+that refused a type is in the branch's notes; `dev/architecture/flash-next.md` "Files in any type" and "A layer
 with fewer slots in VRAM than a step picks"). Left:
 - [ ] Gate and up of a layer's routed experts in two types are refused (the expert kernels read
       both with one decoder): the owner wants it (2026-11-17): two launches where the types differ, the fused kernel where they agree.

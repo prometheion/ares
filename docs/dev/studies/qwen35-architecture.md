@@ -455,7 +455,7 @@ less than f32 was not measured; llama.cpp keeps f32.
 
 A step runs a **window** of rows of a sequence: the newest token followed by draft
 tokens, or a slice of a prompt. The rows are computed from the committed state, and
-the accepted prefix is committed afterwards (`docs/ARCHITECTURE.md`, "A step"). For
+the accepted prefix is committed afterwards (`docs/dev/architecture/overview.md`, "A step"). For
 this architecture:
 
 - **Attention blocks**: the window's K and V rows are appended to the sequence's

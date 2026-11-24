@@ -95,7 +95,7 @@
 //   with many load instructions per item are slower on it than on int8 there (1024
 //   rows: IQ3_S 23 %, IQ3_XXS 15 %, Q8_0 12 %, IQ4_NL 10 %, IQ4_XS 9 %; Q6_K and Q3_K
 //   were 12 and 11 % until their words were read as 16-byte pieces, ares_ld_words_a2), the
-//   others as fast (docs/ARCHITECTURE.md, "Prefill weight kernels"; the path is
+//   others as fast (docs/dev/architecture/kernels.md, "Prefill weight kernels"; the path is
 //   measured per type, src/kernels/paths.rs).
 //
 // A type `T` provides (mm_types.cuh):

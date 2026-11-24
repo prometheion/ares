@@ -573,7 +573,7 @@ struct EngMmTQ10 {
 // finite number), one below 2^-14 loses bits from the bottom (an f16 subnormal, absolute
 // error at most 2^-25), and one below 2^-25 becomes zero. The variant with f16 accumulation
 // adds partial sums of 64 products of a weight and a value of at most 1, which overflow at
-// weights of about 1000 and more (an infinity as well). docs/ARCHITECTURE.md, "Float
+// weights of about 1000 and more (an infinity as well). docs/dev/architecture/kernels.md, "Float
 // matrices", has the range of the matrices of the two models.
 template <int ELEM_BYTES, bool BF16>
 struct EngMmFloat {

@@ -138,7 +138,7 @@ pub enum PrefillPath {
     /// they cannot overflow for weights up to [`WeightRange::F16_SUMS_MAX`], and
     /// they are rounded to f16 after every 8 products: a partial sum below
     /// 1.2e-4 of the row's factor to a multiple of 2^-24 of it, which an output
-    /// of very small weights feels (`docs/ARCHITECTURE.md`, "Float matrices").
+    /// of very small weights feels (`docs/dev/architecture/kernels.md`, "Float matrices").
     F16Flush,
 }
 
@@ -908,7 +908,7 @@ impl Kernels {
     /// multiple of it. The rows of that form lie a whole number of lines apart, counted
     /// from the start of the buffer, and a step of the tile kernels reads 64 values of a
     /// row, which is one line. From a start that is 64 bytes off a line every step reads
-    /// two, and the products are slower (docs/ARCHITECTURE.md, "The token embedding of
+    /// two, and the products are slower (docs/dev/architecture/devices.md, "The token embedding of
     /// `qwen35`": 1 % of a prompt on an RTX 3060). 16 bytes are all the kernels ask for;
     /// the 8-bit form, of which a step reads 64 bytes of a row, is as fast from either.
     pub const ACTIVATION_LINE: u64 = 128;

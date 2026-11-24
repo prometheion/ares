@@ -673,7 +673,7 @@ fn answers(
 /// change each other's logits a little through the recurrent or the attention
 /// layers (2e-4 of the logit on the 27B with every matrix in its device
 /// layout, 1e-3 in the file's layout: see "Speculation" in
-/// `docs/ARCHITECTURE.md`), so the texts agree as far as that stays below the
+/// `docs/dev/architecture/speculation.md`), so the texts agree as far as that stays below the
 /// margin of their picks, which it did for the two questions here with
 /// every matrix in its device layout. The measured choice puts other matrices in
 /// the file's layout in every load (more with an MTP block), so its two

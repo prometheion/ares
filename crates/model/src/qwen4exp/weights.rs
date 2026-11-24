@@ -1,5 +1,5 @@
 //! The weights of a `qwen4exp` model: which tensors there are, of which shape,
-//! and where their bytes are (`docs/reference/qwen4exp-architecture.md`,
+//! and where their bytes are (`docs/dev/studies/qwen4exp-architecture.md`,
 //! section 2.3).
 //!
 //! The table is built against a [`Config`] and is exact: a tensor that is

@@ -1,6 +1,6 @@
 # kv_real: the engine's KV formats on captured attention data
 
-Results and method: `docs/reference/kv-real-data.md`. This directory is not a
+Results and method: `docs/dev/studies/kv-real-data.md`. This directory is not a
 workspace member (it has its own `[workspace]`); it builds against
 `crates/quant` by path. Commands below are the ones that were used. CPU only:
 `CUDA_VISIBLE_DEVICES=""`, `-dev none`, `-ngl 0`, 6 threads at `nice -n 10`.

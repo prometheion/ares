@@ -90,7 +90,7 @@ a trigger the reasoning carries no mask, and a reply may end in it. The guide
 compiles the interrupt's rule next to the structure's (one grammar when the two
 are the same), and refuses an interrupt whose text is empty. No field of a
 request sets an interrupt; the server writes one for the tools of a request
-(see [Server](#server), "Tool calls").
+(see [Server](server.md), "Tool calls").
 
 *Drafts.* The text with drafts is the text without. Every row of a window gets
 the mask of its own path, so a draft the rule forbids is never the pick of the

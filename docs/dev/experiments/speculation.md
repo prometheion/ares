@@ -1,6 +1,6 @@
 # Experiments: speculation
 
-Dated measurement logs, moved here verbatim from `ARCHITECTURE.md` and `OPEN.md` on 2026-11-24. They are not kept current: each names its date, build and machine.
+Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
 ## The chain in a step of its own, measured (2026-11-15 and 2026-11-16)
 
@@ -337,7 +337,7 @@ accepted 0.78, 0.78, 0.74, 0.74, 0.81, 0.81 and 0.85 of the times each position 
 
 The MTP block is in `main` (`--drafters <file>`): exact. Measured 2026-11-16 on two cards
 with `--ram 8G` (the runs are in "What made the MTP block of Flash-Next pay" in
-`ARCHITECTURE.md`): with the block 21 to 35 tokens per second on new text and 27 to 64 the
+`speculation.md`): with the block 21 to 35 tokens per second on new text and 27 to 64 the
 second time, against 13 to 22 and 17 to 29 without it at about the same load; one server
 asked with and without drafts in turn gave 12 to 35 % more with them on the mean. On one
 card (the RTX 4070, a third of the experts in VRAM) the block makes it 7 to 34 % slower.

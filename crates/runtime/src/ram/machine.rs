@@ -157,7 +157,7 @@ impl Default for Rule {
             period: Duration::from_millis(50),
             reserve: 128 * MIB,
             // One thread that writes to new pages; see "Host memory" in
-            // docs/ARCHITECTURE.md for the measurement.
+            // docs/dev/experiments/host-memory.md for the measurement.
             speed: 2 * GIB,
             latency: Duration::from_millis(100),
             piece: crate::expert_store::PIECE as u64,

@@ -277,7 +277,7 @@ impl Flow {
     /// a flag per far slot) and gives back the others, between steps, with
     /// the store not in a step. The tier of experts gives up what the RAM
     /// limit has no room for: a running sequence's K and V rank above it
-    /// (see "Host memory" in `docs/ARCHITECTURE.md`).
+    /// (see "Host memory" in `docs/dev/architecture/host-memory.md`).
     fn lock_far(&self, feed: &mut Feed, live: &[bool]) -> Result<(), ModelError> {
         if self.far.is_empty() {
             return Ok(());

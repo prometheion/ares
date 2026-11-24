@@ -24,7 +24,7 @@ held to:
 
 A request's own value always holds, also one that switches a sampler off
 (`top_k: 0`). A field it leaves out or writes as `null` takes the model's
-default, and without one the engine's own value (see [Sampling](#sampling)).
+default, and without one the engine's own value (see [Sampling](sampling.md)).
 The defaults are filled in where every generating route takes its model
 (`generate::prepare`), so they are the same on `/v1/chat/completions`,
 `/v1/completions`, `/v1/messages` and `/v1/responses`, also for a field the API
@@ -308,7 +308,7 @@ marker is the trigger of the detected `ToolFormat` and the tags are those of
 the detected thinking; nothing is known by the name of a model.
 
 - The engine: the structure of the request names the marker as an interrupt
-  (see [Sampling](#sampling)), with the rule of a call whose marker is written.
+  (see [Sampling](sampling.md)), with the rule of a call whose marker is written.
   From the token after the marker the reply is held as a call after `</think>`
   is: a name among the tools, arguments by the schema, the closing tags, then
   white space, another call if several are allowed, or the end. With `required`
@@ -374,7 +374,7 @@ called has a rule. With `auto` the rule is free for the thinking and for the
 text before a call: there the request takes the model's drafts like a
 request without tools, and the conductor stops taking what a window gives at
 the token that makes the rule bind (the trigger, also when it stands inside the
-thinking; see "Drafts" under [Sampling](#sampling)). Inside a call it takes the
+thinking; see "Drafts" under [Sampling](sampling.md)). Inside a call it takes the
 n-gram drafter's drafts alone. A request that has to call (`required`, a named
 function) may not end while it thinks, so its thinking rows carry a mask and
 are not free: it takes the n-gram drafter's drafts alone for its whole reply.

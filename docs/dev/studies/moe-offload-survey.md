@@ -41,7 +41,7 @@ layer's experts once per prompt instead of once per batch of tokens:
   layers.
 
 Ares does not have it. In `ares-sched` a step runs its rows through every
-layer once, and ARCHITECTURE.md plans read-ahead for prefill but no layer-major
+layer once, and the architecture document plans read-ahead for prefill but no layer-major
 order and no waves. It is recorded only in runmyai-notes.md and
 codacus-notes.md.
 
@@ -329,9 +329,9 @@ is on the host.
 ### Already in Ares
 
 - Hot experts in VRAM, GPU and CPU at the same time, results summed (Fiddler,
-  ktransformers, BELLS split, AI-DER): ARCHITECTURE "Weights", `ares-weights`.
+  ktransformers, BELLS split, AI-DER): `docs/dev/architecture/weights.md`, "Weights", `ares-weights`.
 - CPU or upload by a measured cost model (Fiddler's rule, ik_llama.cpp PR
-  520): ARCHITECTURE "Weights". The detail to keep: the variable is the rows
+  520): `docs/dev/architecture/weights.md`, "Weights". The detail to keep: the variable is the rows
   routed to one expert, with GPU time constant and CPU time linear.
 - Counts with decay, swaps with a margin and a cap (AI-DER's rule, BELLS,
   ktransformers' update, the LRU caches of llama.cpp and ik_llama.cpp):
@@ -344,7 +344,7 @@ is on the host.
   TokenWing), direct I/O in place from the GGUF: `ares-io`. Reading mirrored
   model files from several drives goes beyond TokenWing, which reads one.
 - Router prediction of the next layer (FATE, ProMoE's baseline, TokenWing):
-  planned in ARCHITECTURE "Weights".
+  planned in `docs/dev/architecture/weights.md`, "Weights".
 - Hashed-row tables read on demand (`--defer-ple`): `ares-io` rows.
 - Page-locked staging and mapped weights (`--cpu-moe-pinned`,
   `GGML_CUDA_NO_PINNED_WEIGHTS`): `ares-cuda`.

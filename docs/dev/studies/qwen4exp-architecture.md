@@ -769,7 +769,7 @@ An exact match with either engine is not defined by the architecture.
 
 ## 6. For the engine: the state of a sequence
 
-In the terms of [ARCHITECTURE.md](../ARCHITECTURE.md), "Sequence state".
+In the terms of [`architecture/sequence-state.md`](../architecture/sequence-state.md), "Sequence state".
 
 ### 6.1 Per position: pages
 
@@ -781,7 +781,7 @@ In the terms of [ARCHITECTURE.md](../ARCHITECTURE.md), "Sequence state".
 
 That is 12288 values per cell for the trunk: 24576 bytes as f16, 13056
 bytes with the engine's `q8` (8.5 bits per value), which is what the layout
-in ARCHITECTURE.md already assumes. The MTP block adds 1024 values, 1088
+in the architecture document already assumes. The MTP block adds 1024 values, 1088
 bytes in `q8`. For a split over devices, Strata's all-cards engine divides
 the cells among the cards by block and keeps every pooled key on every card
 (S: `src/split/src/kernels.hpp`, "The K/V cache is split by position").

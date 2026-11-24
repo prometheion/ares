@@ -345,7 +345,7 @@
 //! per-channel offsets, a small non-zero mean, and, as stress cases, a single
 //! large value among small ones and a large mean. The first five were taken as
 //! realistic, the last two as stress. Afterwards the formats were measured on the
-//! K and V rows of two real models (`docs/reference/kv-real-data.md`, one text of
+//! K and V rows of two real models (`docs/dev/studies/kv-real-data.md`, one text of
 //! 3.7k tokens, error of attention, not of logits): the gain of the ladder over
 //! the rule of `q8` is the same there (0.8, 1.0 and 1.6 dB at q6, q5 and q4, in
 //! every layer), real rows are less peaky than the synthetic outlier rows (the
@@ -589,7 +589,7 @@ pub const GROUP_VALUES: usize = 32;
 ///
 /// The codec itself ([`encode_tile`]) takes any number of rows; this is the
 /// number the policy and its sizes use. Measured on real K and V at `q4`
-/// before the mean was built (`docs/reference/kv-real-data.md`, section 6),
+/// before the mean was built (`docs/dev/studies/kv-real-data.md`, section 6),
 /// tiles of 32, 128 and 512 cells lowered the error of the attention output by
 /// 36%, 31% and 28%, for 0.5, 0.125 and 0.03 bits per value.
 pub const TILE_CELLS: usize = 128;
@@ -862,7 +862,7 @@ const fn larger(a: usize, b: usize) -> usize {
 ///
 /// kvarn (beellama.cpp) keeps the first 128 and the newest 128 to 255 positions
 /// of a sequence in `f16`, and that is where most of its gain at 4 bits comes
-/// from (`docs/reference/kvarn-notes.md`). In the table of its author (Qwen 3.6
+/// from (`docs/dev/studies/kvarn-notes.md`). In the table of its author (Qwen 3.6
 /// 27B, 64k context, median KLD against `bf16` KV) an `f16` tail of the newest
 /// 128 tokens lowers the KLD of the plain 4-bit type by 35%, of the 5-bit one by
 /// 16%, of the 6-bit one by 5% and of the 8-bit one by 1%; a tail of 1024 by 43%,
@@ -902,7 +902,7 @@ const fn larger(a: usize, b: usize) -> usize {
 /// and the tiles apply to both sides as soon as one of them has a mean. The
 /// fields are public for a caller that wants other numbers.
 ///
-/// Measured on real K and V (`docs/reference/kv-real-data.md`, a context of 3.7k
+/// Measured on real K and V (`docs/dev/studies/kv-real-data.md`, a context of 3.7k
 /// tokens, error of attention): with 128 first and 256 newest cells exact the
 /// error of the attention output at `q4` is 76% lower than with no exact cells.
 /// The newest cells carry most of it (the newest 128 hold about half of the

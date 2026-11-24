@@ -1,5 +1,5 @@
 // The selection of the cells a row of qwen4exp attends to (section 3.6 of
-// docs/reference/qwen4exp-architecture.md) and its hand-over to the attention
+// docs/dev/studies/qwen4exp-architecture.md) and its hand-over to the attention
 // kernels as lists of cell ranges.
 //
 // A row that sees n = pos + 1 cells has floor(n / B) blocks and a tail of

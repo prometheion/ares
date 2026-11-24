@@ -187,7 +187,7 @@ Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every e
 ### From "Qwen3.8 Flash-Next (`qwen4exp`) / Experts from the SSD"
 
 - [x] Long prompts layer by layer over the whole prompt, interruptible (branch
-      `flash/layer-major`, 2026-11-23; ARCHITECTURE.md "Long prompts layer by layer"): a step
+      `flash/layer-major`, 2026-11-23; `architecture/flash-next-prompts.md` "Long prompts layer by layer"): a step
       of one prompt wider than the own scratch is a pass of micro-batches of the own rows per
       layer and the layer's experts once for all rows, about 56 KiB a row kept on a loan sized
       for the prompt, in every placement; it pauses between two micro-batches when a request
@@ -197,7 +197,7 @@ Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every e
       Measured locally (IQ2_XS, `--ram 8G`, 17k prompt, A/B against `flash/prompt`, with the
       checkpoints inside the pass): the prompt 2.1 times as fast on two cards and 3.0 on one,
       the tokens after it 1.2 to 1.3 times, a request that comes during it its first token
-      after 0.8 to 1.8 s instead of 21 to 49 s (ARCHITECTURE.md). **Not measured yet:** the
+      after 0.8 to 1.8 s instead of 21 to 49 s (`experiments/flash-next-prompts.md`). **Not measured yet:** the
       test machine against Strata (2k/8k/32k, UD-Q3_K_XL and UD-Q4_K_XL; it was off). Built with it: the CPU's share of a pass of up to 2048 rows;
       the next layer's experts that no tier holds read into staging while a layer's
       micro-batches run.
@@ -327,7 +327,7 @@ the agents' builds):
       177 MiB free beyond the 256 MiB left unreserved, the 3060 at 9 931 MiB.
 - [x] Flash-Next's second card: the role timed at load (`devices/load-choice`): on the two cards
       the trial keeps experts only, and the runs agree (warm prompts 20 to 29 % faster than
-      with the share, decode as fast; ARCHITECTURE "The second card's role is timed at load").
+      with the share, decode as fast; `architecture/devices.md`, "The second card's role is timed at load").
 
 ## 2026-11-22
 
@@ -353,14 +353,14 @@ the agents' builds):
    for Qwen3.8) on both models; what does not fit in VRAM overflows into RAM. On the 27B the
    attention heads move to the second card as far as the context needs (built on `devices/roles`).
    Built 2026-11-22 for Flash-Next (branch `kv/overflow`, "K and V beyond VRAM" in
-   `ARCHITECTURE.md`): the indexer's keys of every page and the K and V of the first pages (a
+   `architecture/flash-next.md`): the indexer's keys of every page and the K and V of the first pages (a
    thirty-second of the room for slots) in VRAM, the rest in page-locked RAM read over the link.
    The 27B's is not built: measured, its dense layers read every cell over the link (220 ms a step
    at 32k cells on a x4 link), see "Qwen3.8 27B".
 7. [x] Priorities of requests (server). Done 2026-11-22 (branch `server/priorities`): measured on
    the test machine, a request of priority 0 next to busy requests of priority 5 has its first
    token in 21 ms where one of priority 5 waits 382 ms to 10 s (see "Priorities of requests" in
-   `ARCHITECTURE.md`). The server part of item 8 is on the same branch.
+   `architecture/server.md`). The server part of item 8 is on the same branch.
 
 ### From "In work now"
 
@@ -393,14 +393,14 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       missing from the GPU on the CPU from page-locked RAM (Ares computes 14-42 % there and
       uploads the rest). Strata also skips missed experts of rank 7 and lower by default (not
       like for like; Ares' `--expert-prune skip:8` is that). Built 2026-11-22 (see "Members,
-      loans and promotions" in ARCHITECTURE.md): the fill makes VRAM the hottest of every layer
+      loans and promotions" in `architecture/experts.md`): the fill makes VRAM the hottest of every layer
       (at the start, after the warm-up, when idle); members change only by the rule of a
       promotion, at most what the link does in a step; a miss goes to the CPU or the link by the
       measured costs, and an upload that is not worth a member's place goes up on loan. Also
       found: the profile counted every row of a prompt, so it ranked what long prompts used (a
       decode's hit rate 16-23 % when VRAM was filled from the comparison's profile); a wide step
       now counts an expert once (profile format 2). Measured against the build of before, both
-      without a profile (ARCHITECTURE.md, after "Members, loans and promotions"): with the MTP
+      without a profile (`experiments/flash-next.md`, "Members, loans and promotions, measured (2026-11-22)"): with the MTP
       block 20.0-37.6 tokens/s against 17.2-34.8 at 56G (mean +11 %), without it the same
       (16.4-21.9), at 24G +13 to 14 %; VRAM hit 59-72 % in both builds (Strata 62-83 %), 36-53
       uploads a token against 51-58, the CPU 18-26 % of the picks. Started from a profile of use
@@ -417,7 +417,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       products start expert by expert. A job of one expert and row now takes 37-45 us on the test
       machine, three experts of a row 97 us (74 GB/s, near the memory's rate); the cost model
       sends nearly every miss to the CPU. See "The kernels for the types of the Flash-Next files"
-      in ARCHITECTURE.md. Decode against the build of before (40G, the bench of the Strata
+      in `architecture/kernels.md`. Decode against the build of before (40G, the bench of the Strata
       comparison): with the MTP block 33.6 to 36.4 tokens/s against 26.0 to 26.1 (mean of six
       asks), without it 24.9 against 15.0; the wait for misses 18 ms a token against 28 to 41.
 - [x] The agent suite on the test machine (b-a-on, 2026-11-22): a turn whose prompt is almost
@@ -450,7 +450,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       fewer bytes read from the file (84 GiB against 139 for 32k). **Not met:** a request that
       arrives while a prompt is read alone waits for the lent step in flight (its first token
       after 13.5 s against 2.7 s with steps of 512 rows): see "Large prompt steps on lent VRAM"
-      in ARCHITECTURE.md. **Owner's decision:** keep the large lone step, bound it in time
+      in `architecture/flash-next-prompts.md`. **Owner's decision:** keep the large lone step, bound it in time
       (fewer rows, less gain) until the step can be interrupted, or build the interruptible
       layer-major pass next. Left: TokenWing's order (each layer over the whole
       prompt, an expert read once per prompt, about 80 KiB a row instead of 0.5 to 0.7 MiB of
@@ -502,7 +502,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 - [x] A root checkpoint at the end of the system prompt and of the tool list, a checkpoint at
       every message boundary and at fixed distances inside a long prompt (the owner, 2026-11-18),
       for both models (2026-11-22, branch `cache/checkpoints`; "Sequence state" in
-      `ARCHITECTURE.md`). Open: a root that comes back from the drive is a plain checkpoint
+      `architecture/sequence-state.md`). Open: a root that comes back from the drive is a plain checkpoint
       again (the store keeps no mark); message checkpoints that later requests left behind are
       not written to the drive, so with one checkpoint place in RAM (Flash-Next at `--ram 8G`)
       an edit far back resumes from the root or from the drive's deepest checkpoint before it;
@@ -531,7 +531,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       conversation fits (2026-11-22, `server/priorities`). Context shift is not possible for
       them (a delta-rule state cannot lose a token; llama.cpp switches it off for such models
       too); a cut of a prompt to its last N tokens (vLLM, TGI, SGLang) is not built, see
-      "The Responses API" in `ARCHITECTURE.md`.
+      "The Responses API" in `architecture/api.md`.
 - [x] `/v1/completions` and `/tokenize` read the text of control tokens (`<|im_start|>`) as
       those tokens, as llama-server does (2026-11-22, `server/priorities`); `/tokenize` takes
       `parse_special: true` and refuses `false` and `add_special`.
@@ -559,7 +559,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 - [x] Priorities (S06): `priority` and `x-ares-priority`, the line, the places, the pages, the
       rows of a step and a full `--queue` by priority, preemption of a worse priority to the
       prefix cache (2026-11-22, `server/priorities`; see "Priorities of requests" in
-      `ARCHITECTURE.md`). Open: a prompt of a worse priority still takes its share of the time
+      `architecture/server.md`). Open: a prompt of a worse priority still takes its share of the time
       next to generation of a better one (the floor of generation, not the priority, bounds it); a
       threshold of the gap before a running request gives way (SGLang's, 10 by default) is not
       there (any gap is enough); the randomized test of admission plays one priority.
@@ -576,7 +576,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 - [x] Claude Code could not talk to Ares at all: `context_management`, `thinking.display` and
       system turns between the others were refused, and effort `high` would have reached
       Flash-Next's template, which refuses it. Served since (see "The Messages API" in
-      `ARCHITECTURE.md`).
+      `architecture/api.md`).
 - [x] A stream's response started only with the first token: Claude Code gave up after six
       minutes while Flash-Next computed its first prompt and sent it again. It now starts
       after 10 s without it (`Config::stream_wait`).
@@ -593,13 +593,13 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
         the graph. The program reads no image file, so no own image, no wide or tall grid and
         no resize went through the fork; the resize is checked against Pillow instead.
   - [x] 1. CPU reference of the tower (`ares-model::qwen3vl`): config, size rule, resize, patch
-        rows, the pass. See "The image tower" in `ARCHITECTURE.md`.
+        rows, the pass. See "The image tower" in `architecture/images.md`.
   - [x] 2. The tower on the device (`qwen3vl::DeviceTower`, `ares_cuda::TowerKernels`): the
         products on the f16 tile kernels with f32 sums (`ffn_down` padded to 4320 inputs),
         dense attention for heads of 72, norms with bias, bias and GELU, the 2-D rotation and
         the position table's resize as kernels of their own; residual and norm statistics in
         `f32`. Held to the exact reference per image (see "The image tower" in
-        `ARCHITECTURE.md`). Open: the row kernels between the products take about a third of
+        `architecture/images.md`). Open: the row kernels between the products take about a third of
         the time outside the attention (fusing the residual with the norm after it, a bias in
         the products' epilogue); the tower on Vulkan. Not taken: f16 sums flushed every 64
         values in the products other than `ffn_down` (5 to 9 % faster, up to twice as far
@@ -617,7 +617,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
         planned. Image spans next to tokens, the rotary position `(t, h, w)` of every row in the
         record (the cell in the row extras), the image stage (page-locked, 1024 rows at most) and a
         store of image rows (256 MiB of ordinary memory, least recently used first). See "Images in
-        a prompt" in `ARCHITECTURE.md`. Open: which device computes a block faster is not
+        a prompt" in `architecture/images.md`. Open: which device computes a block faster is not
         measured; the share counts a piece with a tower job as one piece.
   - [x] 5. The splice in `qwen35` (checked against the fork on the 27B on both cards: the same
         prompt tokens, the same 80 tokens of a reply with f16 K/V and exact products; see
@@ -682,7 +682,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       (Q8_0, Q6_K, Q3_K f16 +10 to 14 %) and the activation tiles grouped by L2 (512 rows, the
       prompt step: +12 to 19 % on the f16 path). Q6_K, Q3_K and Q5_K now take the exact path,
       IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and Q8_0 int8. Qwen3.8-27B UD-Q4_K_S, 2048 tokens: 1000 ->
-      1025 tokens/s. `docs/ARCHITECTURE.md`, "Prefill weight kernels".
+      1025 tokens/s. `docs/dev/architecture/kernels.md`, "Prefill weight kernels".
 - [x] Capped cards measure their prefill path per type too (the owner, 2026-11-22; built in
       `devices/load-choice`): on the 27B the prompt reads as fast as before (1342 to 1358
       tokens/s against 1346 to 1361, three alternating pairs on the two development cards), the
@@ -869,7 +869,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       similar one carries well under 1 % of a missed expert's output). IQ2_XS, 8 GiB:
       `skip:4` 0.7 reads per token instead of 4.5, 45 tokens/s instead of 31, KL 0.011;
       Q4_K_XL from the SSD: `skip:8` 5.0 tokens/s instead of 3.5 at KL 0.026, `skip:1` 17.5
-      at KL 0.50. Tables in ARCHITECTURE.md ("Pruning as a fourth level").
+      at KL 0.50. Tables in `experiments/flash-next.md` ("Pruning, measured (2026-11-16)").
 
 ### From "Drafters (every model)"
 

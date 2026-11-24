@@ -1,5 +1,5 @@
 //! The configuration of a `qwen4exp` model, read from the metadata of its GGUF
-//! file (`docs/reference/qwen4exp-architecture.md`, section 2.2).
+//! file (`docs/dev/studies/qwen4exp-architecture.md`, section 2.2).
 //!
 //! Parsing is strict. Every key the architecture needs must be present, a key
 //! under `qwen4exp.` that this implementation does not know is an error (it

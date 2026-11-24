@@ -2,7 +2,7 @@
 //
 // A step carries rows of any mix of sequences: for each sequence one segment of
 // consecutive rows. The conductor writes one record per step into a pinned
-// buffer and uploads it with one copy ("A step" in docs/ARCHITECTURE.md);
+// buffer and uploads it with one copy ("A step" in docs/dev/architecture/overview.md);
 // the kernels below get a pointer to it and read what they need. Nothing about
 // a step's shape is compiled in or passed per launch except the sizes that
 // decide the grid.

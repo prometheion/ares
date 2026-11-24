@@ -1436,7 +1436,7 @@ fn tile_index(tile: u32) -> Result<usize> {
 /// IQ2_XXS, IQ1_M and IQ1_S as gate and up and Q2_0 as down have a decoder written for
 /// these kernels (`kernels/expertrows_types.cuh`); every other type and role decodes with
 /// the item decoder of the dense tile kernels (`kernels/expertrows_mm.cuh`), which holds
-/// more in registers per step. `docs/ARCHITECTURE.md` has the measured times of each.
+/// more in registers per step. `docs/dev/architecture/kernels.md` has the measured times of each.
 #[derive(Debug, Clone)]
 pub struct ExpertRowKernels {
     device: Device,

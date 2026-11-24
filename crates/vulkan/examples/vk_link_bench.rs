@@ -1,6 +1,6 @@
 //! Measures how fast two Vulkan devices exchange data, per route and message size: the
 //! counterpart of the CUDA layer's `linkbench`, with the same sizes and the same chain, so the
-//! numbers can be put next to `docs/ARCHITECTURE.md`'s table.
+//! numbers can be put next to `docs/dev/architecture/devices.md`'s table.
 //!
 //! A tensor split sums partial results across devices twice per layer, so the cost of a small
 //! message (latency) and of a large one (bandwidth) decides how a model is split and which route

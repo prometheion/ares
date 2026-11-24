@@ -170,7 +170,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// Lends VRAM of `device`, between steps: `pieces` bytes of its pools, in
     /// the order of [`ExpertStore::lendable_pieces`]; the slots at the end of
     /// each pool leave the layers (see "Large prompt steps on lent VRAM" in
-    /// `docs/ARCHITECTURE.md`). `None` while something still touches the
+    /// `docs/dev/architecture/flash-next-prompts.md`). `None` while something still touches the
     /// device's slots (poll the store and ask again: the pieces lent so far
     /// stay lent) or when a pool cannot give its piece. A device lends once at
     /// a time; a device that has lent at least `pieces` keeps its loan. The

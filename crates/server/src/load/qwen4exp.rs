@@ -54,7 +54,7 @@ const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
 /// otherwise, as far as the expert slots can lend its scratch: every expert a
 /// prompt picks is read once a step, so a long prompt reads the experts of
 /// the file once per this many rows (chosen by measurement, see "Large prompt
-/// steps on lent VRAM" in `docs/ARCHITECTURE.md`).
+/// steps on lent VRAM" in `docs/dev/architecture/flash-next-prompts.md`).
 const DEFAULT_BATCH: u32 = 8192;
 
 /// The same for a prompt read layer by layer, which keeps about 56 KiB of a row (Flash-Next)

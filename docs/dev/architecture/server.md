@@ -39,7 +39,7 @@ accepted, and `token_hash`, a hash of the reply's token ids in the final message
 and in the last event of a stream). A request can switch drafting off for itself
 with `"draft": false`; the two replies of one request, with and without drafts,
 are then compared by their hashes over HTTP (they are equal, with the fast kernels and with `--precision exact`: see
-"The text with drafts is the text without" under [Speculation](#speculation)).
+"The text with drafts is the text without" under [Speculation](speculation.md)).
 The prefix cache is on for `qwen35` without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages
 and the checkpoint instead of computing it, the answer's `usage` says how much
@@ -48,10 +48,10 @@ the tokens that were computed, and `/metrics` has the counters (starts from the
 cache, cells taken from it, rows replayed, checkpoints saved, restored and
 dropped, pages copied, pages cached, RAM locked for checkpoints). The sampling
 fields of the OpenAI API and of llama.cpp's server are read under their names
-(see [Sampling](#sampling)), `n` completions of a prompt are `n` requests that
+(see [Sampling](sampling.md)), `n` completions of a prompt are `n` requests that
 read the prompt once, and the probabilities of the tokens come back in the
 answer, streamed or not, and `grammar`, `json_schema` and `response_format` make the
-reply follow a GBNF grammar or a JSON schema (see [Sampling](#sampling), "Structured
+reply follow a GBNF grammar or a JSON schema (see [Sampling](sampling.md), "Structured
 output"; the same fields on chat and on completions, and a model that thinks is free
 while it thinks). A field of a request that the server does not hand to
 the engine is refused by name, not ignored: images without `--mmproj`, and

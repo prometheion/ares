@@ -78,7 +78,7 @@ fn the_large_model_is_configured_as_its_file_says() {
 
 /// llama.cpp quantizes the activations that meet quantized weights and keeps
 /// K and V in f16, so the two do not agree to rounding: the bounds here are
-/// the measured differences (`docs/reference/qwen35-architecture.md`) with a
+/// the measured differences (`docs/dev/studies/qwen35-architecture.md`) with a
 /// margin, which still catch any difference in the computation itself.
 #[test]
 fn the_small_model_stays_within_the_measured_distance_of_llama_cpp() {

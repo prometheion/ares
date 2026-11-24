@@ -7,7 +7,7 @@
 // What an adapted type costs next to a written one: the item is decoded whole when a step
 // begins (16 words per row stream held across the step's four groups, where a written type
 // decodes a group as it is used), and the down kernel, whose threads take 16 values each,
-// loads and decodes the item for half of it. docs/ARCHITECTURE.md has the measurements.
+// loads and decodes the item for half of it. docs/dev/architecture/kernels.md has the measurements.
 #pragma once
 
 #include "expertrows_down.cuh"

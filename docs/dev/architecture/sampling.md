@@ -3,7 +3,7 @@
 A request can set what the model's logits go through before a token is drawn
 from them, and ask for the probabilities of what was drawn. All of it runs on
 the device, in the kernels of `ares-cuda` (`kernels/sampler_*.cuh`) or of
-`ares-vulkan` (`shaders/sample_*.comp`, see [Vulkan](#vulkan)), and is
+`ares-vulkan` (`shaders/sample_*.comp`, see [Vulkan](vulkan.md)), and is
 defined by `ares-sampler`, a crate with no device in it: the settings of a
 row (`SampleParams`, `SampleRow`), the arithmetic every backend repeats
 operation by operation (`arith`), the pick of one row written from its
@@ -97,7 +97,7 @@ longer than 1024 is refused.
 
 **What a field is when a request leaves it out.** The model's default, if
 the server was given one for that field (`--temperature`, `--top-p` and the
-others: "The defaults of a model's requests" under [Server](#server)), and
+others: "The defaults of a model's requests" under [Server](server.md)), and
 the engine's own value otherwise: temperature 0, which takes the most probable
 token; no top-k, top-p 1, min-p 0, typical 1 and top-n-sigma 0, which cut
 nothing; XTC and the dynamic temperature off (threshold 0.1, exponent 1); the
@@ -142,7 +142,7 @@ with drafts and without in all 14 settings through the server
 right), equal under two rules about the tokens, and equal for requests that run
 next to each other. Since 2026-11-15 a row of a draft window has the logits of
 the row alone bit for bit with the fast kernels too (see "The text with drafts
-is the text without" under [Speculation](#speculation)), so the same holds as
+is the text without" under [Speculation](speculation.md)), so the same holds as
 a model is served. What a row still depends on is the steps that computed its
 prompt and, past 16 generated rows in a step, the size of the step ("Rounding"
 under "Sequence state"): where that shows, a sampled text can part where two
@@ -360,4 +360,4 @@ DRY after a sampler that cuts, names one of them twice or more than 16 samplers
 that cut or scale (`SamplerKind::order_problem` in `ares-api`, the one rule
 that requests and the server's `--samplers` are held to). Structured output is read from `grammar`,
 `json_schema` and `response_format` (below), and the calls of tools are held
-to a grammar the server writes (see [Server](#server), "Tool calls").
+to a grammar the server writes (see [Server](server.md), "Tool calls").

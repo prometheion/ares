@@ -59,7 +59,7 @@ keeps the prompt cache on disk with direct I/O, and loads the driver's
 
 ## What it does
 
-A short list. [`docs/FEATURES.md`](docs/FEATURES.md) has one line for every
+A short list. [`docs/user/features.md`](docs/user/features.md) has one line for every
 feature.
 
 - **API routes:** `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
@@ -322,11 +322,11 @@ ports, limits).
 
 [`docs/README.md`](docs/README.md) says what each document is for:
 
-- [`docs/FEATURES.md`](docs/FEATURES.md): what Ares can do today, one line each.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): how the engine works.
+- [`docs/user/features.md`](docs/user/features.md): what Ares can do today, one line each.
+- [`docs/dev/architecture/`](docs/dev/architecture/overview.md): how the engine works.
 - [`docs/OPEN.md`](docs/OPEN.md): the working list of what is open, measured
   and decided.
-- [`docs/reference/`](docs/reference/): studies of the model architectures and
+- [`docs/dev/studies/`](docs/dev/studies/): studies of the model architectures and
   of other engines.
 
 ## Thanks

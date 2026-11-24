@@ -300,7 +300,7 @@ The two cards of the development machine differ in speed (479 against 341 GB/s),
 in their link (PCIe 4.0 x16 against 3.0 x4, 3.3 GB/s) and not in memory (12 GiB
 each). How the slower one is used best was measured on 2026-11-22 for both
 models (the owner's question of that day; the roles of 2026-11-17 in
-[`OPEN.md`](OPEN.md)).
+[`OPEN.md`](../../OPEN.md)).
 
 **The fork's attention split.** The owner's llama.cpp fork has `--attn-split`
 (`-as`, with `--split-mode tensor` only; commits 553a934 to ff1a44e): every

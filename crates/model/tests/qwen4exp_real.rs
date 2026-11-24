@@ -27,7 +27,7 @@ const PROMPT: [u32; 22] = [
 
 /// What the model continues with under greedy picks: `<think>\nThe user ...`.
 /// Strata 0.1.48 gives the same tokens for this prompt (and the same 64
-/// tokens after it; `docs/reference/qwen4exp-architecture.md`, section 10).
+/// tokens after it; `docs/dev/studies/qwen4exp-architecture.md`, section 10).
 const CONTINUATION: [u32; 4] = [248068, 198, 760, 1156];
 
 #[test]

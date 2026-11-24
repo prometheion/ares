@@ -108,7 +108,7 @@ enum MaskKind {
     /// The defaults of `KvPolicy::new` as they were when the first measurements
     /// were made (first 128, 64, 32 at q4, q5, q6; newest 256, 128, 64; sliding;
     /// the larger numbers of the two formats), kept here so that the numbers of
-    /// `docs/reference/kv-real-data.md` stay reproducible.
+    /// `docs/dev/studies/kv-real-data.md` stay reproducible.
     Policy,
     /// `KvPolicy::new(k, v)` of the engine as it is now: whole tiles of 128
     /// between its two windows are stored in the formats, the rest is exact.

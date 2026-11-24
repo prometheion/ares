@@ -1,6 +1,6 @@
 # Experiments: Flash-Next prompts
 
-Dated measurement logs, moved here verbatim from `ARCHITECTURE.md` and `OPEN.md` on 2026-11-24. They are not kept current: each names its date, build and machine.
+Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
 **Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`0a43601`,
 steps of eight rows) and the one with wide steps started one after the other, both with the
@@ -227,7 +227,7 @@ in flight, about 11 s here, and then for a piece of its own (with lone steps of 
 2048 rows, measured while other work loaded the machine to 13 to 23, it waited 9.5 and 12.3 s,
 the long prompt read at 147 and 208 tokens/s); a step cannot be cut, so what the
 owner asked for (no request waits seconds behind a long prompt) needs the interruptible pass
-of "Long prompts layer by layer" in OPEN.md, or a lone step bounded in time.
+of "Long prompts layer by layer" in `../architecture/flash-next-prompts.md`, or a lone step bounded in time.
 
 ## Long prompts layer by layer, measured (2026-11-23)
 

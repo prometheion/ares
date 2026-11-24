@@ -1,5 +1,5 @@
 //! A CPU implementation of the forward pass of `qwen35`, written to be read
-//! next to `docs/reference/qwen35-architecture.md` and to be right.
+//! next to `docs/dev/studies/qwen35-architecture.md` and to be right.
 //!
 //! It is an oracle, not an engine: clarity and exactness come before speed. The
 //! arithmetic is the architecture's own, in `f32` storage with `f64` sums and
@@ -16,7 +16,7 @@
 //! change it. [`Reference::commit`] then applies the first `accepted` rows of a
 //! window to the state: their keys and values are appended and the recurrent
 //! state is advanced over exactly those rows, which is what the engine does
-//! after verifying a draft ("A step" in `docs/ARCHITECTURE.md`). Rejected rows
+//! after verifying a draft ("A step" in `docs/dev/architecture/overview.md`). Rejected rows
 //! leave no trace. [`Reference::forward`] is a window that is committed whole.
 //!
 //! A row gives the same bits whether it is run alone, in a window with others,

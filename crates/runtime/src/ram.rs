@@ -1,7 +1,7 @@
 //! The engine's page-locked host memory, kept in one set of books.
 //!
 //! The engine has one limit of host RAM (see "Host memory" in
-//! `docs/ARCHITECTURE.md`), and the users of that memory make room for each
+//! `docs/dev/architecture/host-memory.md`), and the users of that memory make room for each
 //! other by rank. Page-locked memory is what the devices copy to and from
 //! without a bounce buffer, so it is where state that lives in RAM has to be;
 //! today there are four users:

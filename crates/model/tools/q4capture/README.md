@@ -11,7 +11,7 @@ workspace member. Everything below is CPU only: `CUDA_VISIBLE_DEVICES=""`,
 `-ngl 0 -dev none`.
 
 The model is the made-up one of `ares_model::qwen4exp::synthetic` (section 8.3 of
-`docs/reference/qwen4exp-architecture.md`): 8 layers (two attention), 3 streams of
+`docs/dev/studies/qwen4exp-architecture.md`): 8 layers (two attention), 3 streams of
 32, 12 experts of which a token uses 3, 6 value heads on 2 key heads, 4 query heads
 on 2 key/value heads, an indexer budget of 8 cells in blocks of 4, an n-gram layer
 with a table of 424 rows. The fork loads it as it is.

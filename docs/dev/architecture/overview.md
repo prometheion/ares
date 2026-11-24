@@ -1,8 +1,8 @@
 # Architecture of Ares
 
 This document describes how the engine is built and why. It is the place to
-start before changing anything. What runs today is in [`FEATURES.md`](FEATURES.md),
-what is open in [`OPEN.md`](OPEN.md).
+start before changing anything. What runs today is in [`user/features.md`](../../user/features.md),
+what is open in [`OPEN.md`](../../OPEN.md).
 
 The goal ([issue 1](https://github.com/prometheion/ares/issues/1)) is one
 inference server that takes the best technique of every existing engine and
@@ -30,12 +30,12 @@ Scope decisions:
   with draft trees, image input, the decision endpoint and the prompt cache
   on SSD. The list of features, who has each and
   how far Ares is, is
-  [reference/feature-checklist.md](reference/feature-checklist.md); a
+  [reference/feature-checklist.md](../studies/feature-checklist.md); a
   release date is not a reason to leave a row out.
 
 - **Nothing is tuned to one machine.** The CUDA backend serves the GPU
   classes it was tested on (today Ampere 8.6 and Ada 8.9, see
-  [Devices](#devices)), the Vulkan backend every other. Which kernel, block
+  [Devices](devices.md)), the Vulkan backend every other. Which kernel, block
   shape or row-count boundary a device gets may depend on its class (its
   compute capability on CUDA: "Ampere and Ada use this"; what the device
   reports on Vulkan) or on something measured on the device at load (the
@@ -91,7 +91,7 @@ Scope decisions:
   devices use whatever direct path a system has, on either backend.
 - **No CPU inference.** A model does not run on the CPU, and no layer of a
   dense model is offloaded to it. The CPU computes in one place only: the
-  experts of a MoE model that are not on the GPU (see [Weights](#weights)).
+  experts of a MoE model that are not on the GPU (see [Weights](weights.md)).
 - **Rust**, with kernels in CUDA C++ and GLSL.
 - **No opt-in for improvements.** An optimisation without a downside is
   simply how the engine works and has no switch. Options exist only for real
@@ -171,9 +171,9 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-core` | Tensor element types and block geometry, byte units, memory ledgers | Done, unit tested |
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
-| `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; both backends' kernels are held to it bit for bit; see [Sampling](#sampling) |
+| `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; both backends' kernels are held to it bit for bit; see [Sampling](sampling.md) |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the sampler's kernels, the image tower's kernels besides its products, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
-| `ares-grammar` | The grammar engine on the host: GBNF grammars, JSON schemas and Lark grammars turned into the set of tokens that may come next (llguidance behind a vocabulary of bytes per token), the reasoning gate, the cut of forbidden drafts | Done; GPU-free tests of the engine, and through the runtime and the server; see [Sampling](#sampling) |
+| `ares-grammar` | The grammar engine on the host: GBNF grammars, JSON schemas and Lark grammars turned into the set of tokens that may come next (llguidance behind a vocabulary of bytes per token), the reasoning gate, the cut of forbidden drafts | Done; GPU-free tests of the engine, and through the runtime and the server; see [Sampling](sampling.md) |
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; the sampler's kernels; sums between devices | Device layer and weight, layer, attention and sampler kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh, 9 attention and 8 sampler tests on both GPUs; the sampler's records equal `ares-sampler`'s reference bit for bit); no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit, read and written with direct I/O outside of its index | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; the prefix cache of `qwen35` keeps its level on SSD in it (`--cache`) |
@@ -182,14 +182,14 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule, the split of slots and the guess queue (its reads ahead of a router); the token table is not used by a running model yet, and elections only by the simulations of `tests/premises` (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking and tool calls, `count_tokens`, `tokenize`, `pieces`, `failure`; the `Structure` of a reply and the `Json` value of requests) | Done, unit tested |
 | `ares-tokenizer` | Text to token ids and back for the byte-level BPE vocabularies of GGUF models, as llama.cpp does; the chat templates (the Jinja dialect of the supported models) and what a template declares about thinking and tool calls | Done; tests against `llama-tokenize` and `llama-server --jinja` |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); unit tests in `src` and route suites against a scripted engine without a GPU, suites that start the real binary (some need the 27B or the files of Flash-Next) and suites that run the engine in the test's process (the suites of the routes on the 0.8B, or on any file the server loads with `ARES_TEST_API_MODEL`: they pass on Flash-Next); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader, and `tests/real_router.rs` on real devices); images through a projector (`--mmproj`, see [Images in a prompt](#images-in-a-prompt)), `/v1/systemone` answers 501 |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, the prefix cache with its levels in RAM and on SSD, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` and `qwen4exp` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by both models on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`; pages that leave the devices go to RAM and, with `--cache`, to the SSD), and a request that gives way is not spilled with its pages: what it computed stays in the prefix cache, and it computes again what the cache no longer holds; the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's MTP block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) feeds both models' image cells (see [Images in a prompt](#images-in-a-prompt)) |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); unit tests in `src` and route suites against a scripted engine without a GPU, suites that start the real binary (some need the 27B or the files of Flash-Next) and suites that run the engine in the test's process (the suites of the routes on the 0.8B, or on any file the server loads with `ARES_TEST_API_MODEL`: they pass on Flash-Next); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader, and `tests/real_router.rs` on real devices); images through a projector (`--mmproj`, see [Images in a prompt](images.md#images-in-a-prompt)), `/v1/systemone` answers 501 |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, the prefix cache with its levels in RAM and on SSD, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` and `qwen4exp` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by both models on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`; pages that leave the devices go to RAM and, with `--cache`, to the SSD), and a request that gives way is not spilled with its pages: what it computed stays in the prefix cache, and it computes again what the cache no longer holds; the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](flash-next.md)) |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's MTP block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](devices.md#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) feeds both models' image cells (see [Images in a prompt](images.md#images-in-a-prompt)) |
 
-Both test architectures are specified under [reference/](reference/):
-[qwen35](reference/qwen35-architecture.md) and
-[qwen4exp](reference/qwen4exp-architecture.md). The projector for images is
-described under [The image tower](#the-image-tower).
+Both test architectures are specified under [reference/](../studies/):
+[qwen35](../studies/qwen35-architecture.md) and
+[qwen4exp](../studies/qwen4exp-architecture.md). The projector for images is
+described under [The image tower](images.md).
 
 ### The shared model layer
 
@@ -303,7 +303,7 @@ The blocks so far:
   logits come in the same order, and a list on the device names each column's
   token for the sampler.
 - **The MTP driver** (`blocks/mtp.rs`): one for every model, described under
-  "The MTP driver" in [Speculation](#speculation). A model gives it its MTP
+  "The MTP driver" in [Speculation](speculation.md). A model gives it its MTP
   layer and where its hidden state is tapped.
 - **The step's inputs and drafts** (`blocks/step.rs`): what a part reads from
   the step record (tokens, segments, replays, rotary positions, the windows
@@ -420,7 +420,7 @@ requests ──► plan ──► upload step record ──► window ──► 
    histograms, sums of integers) and the pick is made by Gumbel noise of
    (seed, position, token) from a counter-based generator. Its arithmetic is
    repeated bit for bit on the host (`ares_sampler::sample_reference`), which
-   is what its tests compare with; see [Sampling](#sampling). Under a tensor
+   is what its tests compare with; see [Sampling](sampling.md). Under a tensor
    split every device holds the logits of a slice of the vocabulary and the
    devices add up small partial results between the sampler's steps. Only the
    picks and the eight best candidates of each row (80 bytes per row), and the
@@ -590,21 +590,21 @@ threads and the hand-overs cost, not how fast a real model will be.
 | vLLM, SGLang, TGI, TokenSpeed, LMDeploy, ExLlamaV3 (their schedulers and caches) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals and eviction for recurrent state; a context term in the step cost | `ares-sched`, `ares-state` (done as bookkeeping, not wired into the conductor) |
 | TensorRT-LLM, SGLang, vLLM (suffix decoding) | One n-gram drafter on a suffix automaton over a corpus shared by all requests | `ares-sched`, used by the conductor |
 | MiniJinja | The interpreter of chat templates | `ares-tokenizer` |
-| llguidance | Grammar-constrained output: the grammar engine on the host gives a mask per row, which the sampler applies on the device (the mask and its hook are built, see [Sampling](#sampling)) | Done (`ares-grammar`): GBNF and JSON schema on the sampler's mask, after the reasoning of a model that thinks, and a forbidden draft is cut; Lark grammars are in the engine for the tool calls and have no request field |
+| llguidance | Grammar-constrained output: the grammar engine on the host gives a mask per row, which the sampler applies on the device (the mask and its hook are built, see [Sampling](sampling.md)) | Done (`ares-grammar`): GBNF and JSON schema on the sampler's mask, after the reasoning of a model that thinks, and a forbidden draft is cut; Lark grammars are in the engine for the tool calls and have no request field |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |
-| Run My AI, ik_llama.cpp, Fiddler, ktransformers, BELLS, AI-DER, FATE, ProMoE | Direct reads with demand before prefetch; prefill layer by layer in waves of experts; the RAM tier as a cache with admission and protection; the order of work inside a MoE layer; slots per layer by need; fused gate and up of an expert | `ares-io` (reads done); the rest planned, see [Weights](#weights) |
+| Run My AI, ik_llama.cpp, Fiddler, ktransformers, BELLS, AI-DER, FATE, ProMoE | Direct reads with demand before prefetch; prefill layer by layer in waves of experts; the RAM tier as a cache with admission and protection; the order of work inside a MoE layer; slots per layer by need; fused gate and up of an expert | `ares-io` (reads done); the rest planned, see [Weights](weights.md) |
 
-Notes on each source are under [reference/](reference/). The reading of the
+Notes on each source are under [reference/](../studies/). The reading of the
 other engines' code, with a ranked list of what to take and a list of where
 Ares still copies llama.cpp without a reason, is
-[reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md).
+[studies/serving-engines-code-survey.md](../studies/serving-engines-code-survey.md).
 
 ## Status and what is open
 
-What the engine can do today is listed in [`FEATURES.md`](FEATURES.md), what is still
-open in [`OPEN.md`](OPEN.md); both are brought up to date at every merge into `main`.
+What the engine can do today is listed in [`user/features.md`](../../user/features.md), what is still
+open in [`OPEN.md`](../../OPEN.md); both are brought up to date at every merge into `main`.
 This document describes how the parts work and why. Numbers in it carry the date they
-were measured; the current ones are in `FEATURES.md`.
+were measured; the current ones are in `docs/user/features.md`.
 
 ## Open questions
 
@@ -612,5 +612,5 @@ were measured; the current ones are in `FEATURES.md`.
   attention keeps at the cut-off. This must be settled against the real
   Qwen4.
 - **Pascal and Turing cards (GTX 10, GTX 16, RTX 20).** Settled: CUDA runs
-  only on the tested classes (see [Devices](#devices)); these and every other
+  only on the tested classes (see [Devices](devices.md)); these and every other
   untested GPU go through the Vulkan backend.

@@ -41,7 +41,7 @@ pub struct RuntimeConfig {
     /// used, within [`crate::GpuConfig::ram_limit`], which
     /// [`crate::GpuConfig::new`] sets to what the executor needs and this
     /// together; the checkpoints and the pages share it, and it follows the
-    /// machine (see "Host memory" in `docs/ARCHITECTURE.md`).
+    /// machine (see "Host memory" in `docs/dev/architecture/host-memory.md`).
     pub cache_ram: u64,
     /// The most bytes the rows of images take that the image tower has
     /// computed (ordinary memory, by image, in the conductor's image store): a

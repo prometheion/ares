@@ -4,7 +4,7 @@
 //! What is tested is the block against itself (a row has the same bits alone,
 //! in a window and after a commit; a chain is its links one by one and leaves
 //! no trace) and its input against a naive transcription of section 4 of
-//! `docs/reference/qwen4exp-architecture.md`. What the block of the real model
+//! `docs/dev/studies/qwen4exp-architecture.md`. What the block of the real model
 //! guesses is measured in `qwen4exp_real.rs`.
 
 use std::path::PathBuf;

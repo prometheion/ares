@@ -74,7 +74,7 @@
 //! back unchanged is written into the prompt as the model generated it, on
 //! every turn the same, which is what lets the prefix cache continue the
 //! conversation (see "A conversation that continues from the cache" in
-//! `docs/ARCHITECTURE.md`). A `redacted_thinking` block holds text only
+//! `docs/dev/architecture/api.md`). A `redacted_thinking` block holds text only
 //! Anthropic's service can read: it is accepted and nothing of it enters the
 //! prompt.
 //!

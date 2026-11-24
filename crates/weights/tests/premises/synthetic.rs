@@ -1,7 +1,7 @@
 //! A synthetic routing workload for the premise tests.
 //!
 //! Nothing in it was measured on a model. It is built to have the properties
-//! of real routing that the survey (`docs/reference/moe-offload-survey.md`)
+//! of real routing that the survey (`docs/dev/studies/moe-offload-survey.md`)
 //! reports, so that a technique that depends on them can be shown to work on
 //! it, and so that the numbers it gives are not mistaken for numbers of a
 //! model:

@@ -1,6 +1,6 @@
 # Experiments: Flash-Next decode, experts and tiers
 
-Dated measurement logs, moved here verbatim from `ARCHITECTURE.md` and `OPEN.md` on 2026-11-24. They are not kept current: each names its date, build and machine.
+Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
 ## The MTP block of Flash-Next, measured (2026-11-15)
 

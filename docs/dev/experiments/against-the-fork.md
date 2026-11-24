@@ -1,6 +1,6 @@
 # Experiments: the 27B against the owner's llama.cpp fork
 
-Dated measurement logs, moved here verbatim from `ARCHITECTURE.md` and `OPEN.md` on 2026-11-24. They are not kept current: each names its date, build and machine.
+Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture document (now [`../architecture/`](../architecture/overview.md)) and from [`OPEN.md`](../../OPEN.md). They are not kept current: each names its date, build and machine.
 
 ## Against the owner's production (2026-11-23, the 27B UD-Q4_K_S on the RTX 4070 + RTX 3060)
 

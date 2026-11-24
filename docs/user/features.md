@@ -1,7 +1,7 @@
 # What Ares can do today
 
 Updated 2026-11-23 for `main`. One line per feature; how it works is in
-[`ARCHITECTURE.md`](ARCHITECTURE.md), what is missing in [`OPEN.md`](OPEN.md).
+[`dev/architecture/`](../dev/architecture/overview.md), what is missing in [`OPEN.md`](../OPEN.md).
 Everything here runs on CUDA and was tested on an RTX 4070 with an RTX 3060. CUDA runs on the
 GPU classes it was tested on only: Ampere (8.6, RTX 30) and Ada (8.9, RTX 40); another GPU is
 refused (the server skips it) and is to run through Vulkan, where the kernels exist and no model

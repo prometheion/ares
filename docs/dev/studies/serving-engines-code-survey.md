@@ -114,7 +114,7 @@ again.
 - VRAM: none (host: a hash and two pointers per block).
 - Ares: **have** the chain and the leaf-first order (`ares-state`). **Take**
   the registration when a page fills. `PrefixIndex::insert` can be called at
-  any time, but ARCHITECTURE.md only says that the index "holds pages after
+  any time, but the architecture document only says that the index "holds pages after
   their sequence ended" and the runtime has no prefix cache yet; if pages
   enter at the end, two requests that start with the same prompt at the same
   time share nothing. SGLang does the same after every prompt chunk (below).
@@ -448,7 +448,7 @@ figure the cost is a formula.
 | Cause | Where it is decided | Cost | In Ares |
 | --- | --- | --- | --- |
 | **The K/V pool takes everything that is left.** After the weights, the measured peak of a dummy pass and the estimate for CUDA graphs, all of `gpu_memory_utilization` (default 0.92) times the card goes to K/V at start, whether a request needs it or not, and never shrinks | `vllm/v1/worker/gpu_worker.py` `determine_available_memory` (655-830); `vllm/config/cache.py:215`; `gpu_model_runner.py` `initialize_kv_cache_tensors` (6904) | The rest of the card. Nothing else (a second model, experts, a larger batch) can use it | One pool too, but sized by the ledger from the configured context, shared with checkpoints and, later, movable (see TensorRT-LLM's address ranges) |
-| **K/V in f16.** The default type is the model's | `vllm/config/cache.py:235` (`cache_dtype: "auto"`) | 16 bits per value. For a `qwen4exp`-shaped model and 262 144 tokens: 6.7 GiB against 3.56 GiB at `q8` and 1.94 GiB at `q4` *(calc from ARCHITECTURE.md's 3.56 GiB)* | `q8` by default, `q4` with exact cells |
+| **K/V in f16.** The default type is the model's | `vllm/config/cache.py:235` (`cache_dtype: "auto"`) | 16 bits per value. For a `qwen4exp`-shaped model and 262 144 tokens: 6.7 GiB against 3.56 GiB at `q8` and 1.94 GiB at `q4` *(calc from the architecture document's 3.56 GiB)* | `q8` by default, `q4` with exact cells |
 | **Weights at the checkpoint's width.** 16 bits unless the checkpoint is quantized; embedding and output head usually stay f16 | Model loading; `docs/features/speculative_decoding/mtp.md` gives a head of 248k x 2560 as "0.6 or 0.35 GiB" quantized | 1.27 GB per f16 table of that size *(calc)* | Everything at the GGUF's width |
 | **A CUDA graph per batch size.** Sizes 1, 2, 4, then every 8 up to 256, then every 16 up to 512 by default, bounded by the request limit | `vllm/config/compilation.py:695-707`; `profile_cudagraph_memory` in `gpu_worker.py:727` | Measured at start and taken from K/V; no figure in the docs. SGLang reserves `2 MB x max batch` for decode graphs *(stated)*; the llama.cpp fork was measured at 26 MiB per shape and GPU | None (principle 1) |
 | **The peak of a dummy pass, kept for good.** A pass at the largest step (2048 tokens) is run and its peak, with what the allocator could not give back, is reserved | `gpu_worker.py:697-760`; `vllm/utils/mem_utils.py` `memory_profiling` (230). A comment at 704 describes a freed multi-GiB block that stays pinned by a small allocation | Whatever PyTorch peaked at | One scratch area per step, in the ledger |
@@ -1257,7 +1257,7 @@ loaded before a compute phase and stored to shared memory after it.
 - Where: `src/turbomind/kernels/attention/mainloop_sm70.h`,
   `kernel/decoding_sm75_128.cu`; `src/turbomind/kernels/core/mma.h`
   (126-144).
-- Ares: **take**; this is the Turing path that ARCHITECTURE.md lists as open
+- Ares: **take**; this is the Turing path that the architecture document lists as open
   for the prefill kernels, and the attention kernels need it too.
 
 **Prompts do not read quantized blocks** *(read)*. For a prompt the history
@@ -1832,7 +1832,7 @@ the part of llama.cpp Ares wants.
    what is expected and corrects the expectation; TGI queues. **Instead:**
    item 5 above.
 
-7. **The lookup drafters are llama.cpp's three.** ARCHITECTURE.md plans "the
+7. **The lookup drafters are llama.cpp's three.** The architecture document plans "the
    full drafter stack of llama.cpp": the simple lookup, then the map and
    cache variants. The simple one keeps the last position of every run of n
    tokens of one sequence. **Instead:** one suffix automaton or incremental

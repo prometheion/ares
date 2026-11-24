@@ -4,7 +4,7 @@
 //! the stream mixer, the device part of the hashed n-gram embedding, and the
 //! indexer of the sparse attention with its block scores, the selection of
 //! the cells a row attends to and the hand-over of that selection to the
-//! attention kernels. `docs/reference/qwen4exp-architecture.md` (sections 3.3,
+//! attention kernels. `docs/dev/studies/qwen4exp-architecture.md` (sections 3.3,
 //! 3.4 and 3.6) defines what they compute.
 //!
 //! They follow the layer kernels: sizes are arguments, the rows of a step and

@@ -1,5 +1,5 @@
 // The stream mixer of qwen4exp ("hyper-connection", section 3.3 of
-// docs/reference/qwen4exp-architecture.md): what a read and a write do
+// docs/dev/studies/qwen4exp-architecture.md): what a read and a write do
 // between their three matrix products.
 //
 //   read:   xn[c] = rms(R[c]) * norm[c]                 ares_q4_stream

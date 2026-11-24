@@ -44,7 +44,7 @@ const MATVEC_ROWS: u32 = 4;
 const MMVQ_WARPS: u32 = 4;
 
 /// How one weight kernel is built. Measured per type on the two development cards
-/// (`vk_mmvq_bench`), see `docs/ARCHITECTURE.md`.
+/// (`vk_mmvq_bench`), see `docs/dev/architecture/vulkan.md`.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     /// Output rows per warp.

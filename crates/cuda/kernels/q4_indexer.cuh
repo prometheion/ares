@@ -1,5 +1,5 @@
 // The indexer of qwen4exp's sparse attention (section 3.6 of
-// docs/reference/qwen4exp-architecture.md): the queries of the rows, the
+// docs/dev/studies/qwen4exp-architecture.md): the queries of the rows, the
 // pooled keys of the blocks a step completes, the raw keys a sequence carries
 // for its unfinished block, and the scores of the blocks a row sees.
 //

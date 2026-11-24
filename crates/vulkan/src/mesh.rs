@@ -71,7 +71,7 @@
 //! # What is measured on the development machine
 //!
 //! RTX 4070 (PCIe 4.0 x16) + RTX 3060 (PCIe 3.0 x4), driver 615.78.08, patched
-//! for peer-to-peer in CUDA (see `docs/ARCHITECTURE.md`, "Several devices");
+//! for peer-to-peer in CUDA (see `docs/dev/architecture/devices.md`, "Several devices");
 //! `examples/vk_mesh_probe.rs` prints all of this:
 //!
 //! - Memory exported as `OPAQUE_FD` by one card is **imported without error by

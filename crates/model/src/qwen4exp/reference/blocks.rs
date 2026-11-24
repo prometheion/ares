@@ -1,5 +1,5 @@
 //! The operations of the forward pass that are particular to `qwen4exp`, one
-//! function per formula of `docs/reference/qwen4exp-architecture.md`, section
+//! function per formula of `docs/dev/studies/qwen4exp-architecture.md`, section
 //! 3. Each takes plain slices, so a GPU kernel can be given the same input and
 //! compared with the output. Sums are in `f64` in the order the comments name;
 //! every result is rounded to `f32` once.

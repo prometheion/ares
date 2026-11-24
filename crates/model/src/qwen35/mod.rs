@@ -1,6 +1,6 @@
 //! The `qwen35` architecture: Qwen3.5 and Qwen3.8 dense models, which mix
 //! recurrent blocks (a gated delta rule) with every fourth block of full
-//! attention. The specification is `docs/reference/qwen35-architecture.md`.
+//! attention. The specification is `docs/dev/studies/qwen35-architecture.md`.
 
 pub mod config;
 pub mod device;

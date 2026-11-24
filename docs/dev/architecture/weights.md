@@ -130,7 +130,7 @@ pages) and comes with the runtime.
   design of pieces planned in `ares-sched` and waves of a layer's experts
   through the tiers, which is gone.
 - **More from the engines that stream experts** (details and the sources'
-  numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)).
+  numbers in [reference/moe-offload-survey.md](../studies/moe-offload-survey.md)).
   Built as bookkeeping in `ares-weights`, with no runtime using it yet; the
   numbers are from a synthetic workload with the properties the sources
   report (locality in time, topics that change, early layers that route by

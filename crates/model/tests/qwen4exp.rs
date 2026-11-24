@@ -1,7 +1,7 @@
 //! The `qwen4exp` reference on a small made-up model: no model file is needed.
 //!
 //! The model is `ares_model::qwen4exp::synthetic` (section 8.3 of
-//! `docs/reference/qwen4exp-architecture.md`). What is tested here is the
+//! `docs/dev/studies/qwen4exp-architecture.md`). What is tested here is the
 //! reference against itself (a row has the same bits alone, in a window and
 //! after a commit; rejected rows leave no trace; the selection rules differ
 //! exactly as specified; experts and table rows are read only when a token

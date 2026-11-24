@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tables of section 13 of docs/reference/kv-real-data.md: the built mean per tile.
+"""Tables of section 13 of docs/dev/studies/kv-real-data.md: the built mean per tile.
 
 usage: built_tables.py OLD_RESULTS... -- BUILT_RESULTS [section]
 OLD_RESULTS are result files of `kvreal run` with the default, tilemean and

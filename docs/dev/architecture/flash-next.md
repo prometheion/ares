@@ -28,7 +28,7 @@ server builds.
 
 **It drafts with its MTP block, from the model file or a file of the block.**
 The model's draft head is a block of its own (section 4 of the
-[specification](reference/qwen4exp-architecture.md)): one layer of the attention
+[specification](../studies/qwen4exp-architecture.md)): one layer of the attention
 kind with its own mixture of 512 experts, two projections that make its input
 from the trunk's residual after the last layer and the embedding of the token
 behind it, and its own final mixer in front of the model's output head. The
@@ -40,7 +40,7 @@ this model before a device is touched. `--draft-vocab` is the head view of
 every drafter of the model (`blocks/head.rs`): the output head's rows of its
 tokens come first, the model's logits in that order. Without a block the model
 does not speculate: the n-gram drafter takes part as soon as a model drafter
-does and never alone (see [Speculation](#speculation)).
+does and never alone (see [Speculation](speculation.md)).
 
 - *Where it runs.* On the device that holds the output head, in every placement
   (one card; the last card of a split by layers; the card that mixes when both
@@ -49,7 +49,7 @@ does and never alone (see [Speculation](#speculation)).
   that reads the model's output head where it is. Its keys, values and indexer
   keys are pages of its own, addressed through the model's page tables.
 - *What it does in a step* is the driver's (see "The MTP driver" under
-  [Speculation](#speculation)), with a lag of one: its cell `i` pairs the trunk's
+  [Speculation](speculation.md)), with a lag of one: its cell `i` pairs the trunk's
   residual of cell `i` with the token of cell `i + 1`. In front of every step of
   the model it (1) follows the rows of the step before that count, eight to a
   launch; (2) writes the newest cell of every sequence; (3) for the windows that
