@@ -91,7 +91,9 @@ use std::time::Instant;
 
 use ares_core::LedgerError;
 use ares_io::{Buffer, Class, Completion, ExpertMap, Read, Reader};
-use ares_weights::{ExpertHeat, GuessQueue, LayerNeed, SplitRule, Start, Swap, Want, split_slots};
+use ares_weights::{
+    ExpertHeat, GuessQueue, LayerNeed, SlotSet, SplitRule, Start, Swap, Want, split_slots,
+};
 
 pub use device::{CudaSlots, SlotDevice};
 use elastic::{Layout, Pieces};
@@ -575,6 +577,39 @@ impl<D: SlotDevice> std::fmt::Debug for ExpertStore<D> {
             .field("wants", &self.wants.len())
             .field("reads", &self.reads.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Where a pick that has no slot in VRAM is to come from, counted in `stats`
+/// as a miss of that kind: `None` when its upload into VRAM runs already
+/// (with its entry behind it; not one a promotion between steps runs,
+/// `promoting`), otherwise what [`ram_source`] says.
+fn classify_miss(
+    vram: &SlotSet,
+    ram: &SlotSet,
+    stats: &mut StoreStats,
+    expert: u32,
+    promoting: bool,
+) -> Option<Source> {
+    if vram.is_loading(expert) && !promoting {
+        stats.miss_on_its_way += 1;
+        return None;
+    }
+    Some(ram_source(ram, stats, expert))
+}
+
+/// Where a pick that the VRAM tier does not bring is: in RAM, on its way into
+/// RAM, or only in the file; counted in `stats` as a miss of that kind.
+fn ram_source(ram: &SlotSet, stats: &mut StoreStats, expert: u32) -> Source {
+    if ram.contains(expert) {
+        stats.miss_from_ram += 1;
+        Source::Ram
+    } else if ram.is_loading(expert) {
+        stats.miss_on_its_way += 1;
+        Source::OnItsWay
+    } else {
+        stats.miss_from_disk += 1;
+        Source::Disk
     }
 }
 
@@ -1076,6 +1111,15 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// not in a slot; the store has started to bring those, and the step
     /// waits for them on the device.
     pub fn routed(&mut self, layer: usize, picks: &[u32]) -> Result<usize, StoreError> {
+        self.open_layer(layer, picks);
+        self.demand(layer, picks)
+    }
+
+    /// The route record of `layer` has arrived with `picks`: the layers
+    /// before it have passed, the heat learns the picks, the guesses and
+    /// what was read ahead for the layer are done with, and the tiers keep
+    /// the picks until the step is over.
+    fn open_layer(&mut self, layer: usize, picks: &[u32]) {
         for phase in &mut self.phase[..layer] {
             *phase = Phase::Passed;
         }
@@ -1084,7 +1128,9 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.guesses.forget_layer(layer);
         self.ahead_routed(layer, picks);
         self.wants.retain(|w| w.layer != layer || w.demand);
-        self.demand(layer, picks)
+        self.worth_stale[layer] = true;
+        self.vram.sets[layer].routed(picks, self.step);
+        self.ram.sets[layer].routed(picks, self.step);
     }
 
     /// The kernels that compute `experts` of `layer` in the running step have ended: the
@@ -1101,9 +1147,6 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// The experts of `layer` that the kernels enqueued next need, with
     /// everything else of the layer free to give way.
     fn demand(&mut self, layer: usize, picks: &[u32]) -> Result<usize, StoreError> {
-        self.worth_stale[layer] = true;
-        self.vram.sets[layer].routed(picks, self.step);
-        self.ram.sets[layer].routed(picks, self.step);
         let now = Instant::now();
         let mut missing = 0;
         for expert in picks {
@@ -1112,18 +1155,9 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.stats.hits += 1;
                 continue;
             }
-            let source = if self.vram.sets[layer].is_loading(*expert)
-                || self.ram.sets[layer].is_loading(*expert)
-            {
-                self.stats.miss_on_its_way += 1;
-                Source::OnItsWay
-            } else if self.ram.sets[layer].contains(*expert) {
-                self.stats.miss_from_ram += 1;
-                Source::Ram
-            } else {
-                self.stats.miss_from_disk += 1;
-                Source::Disk
-            };
+            let (vram, ram) = (&self.vram.sets[layer], &self.ram.sets[layer]);
+            let source = classify_miss(vram, ram, &mut self.stats, *expert, false)
+                .unwrap_or(Source::OnItsWay);
             self.wants.push(Wanted {
                 layer,
                 expert: *expert,

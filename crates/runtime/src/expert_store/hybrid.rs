@@ -42,7 +42,7 @@ use ares_cuda::{ExpertShape, RouteGroup};
 use ares_weights::{SPARE_WORTH, Start, Swap, SwapRule, Want};
 
 use super::cpu::{CpuExpert, CpuPool, LayerJob, MAX_ROWS, act_bytes};
-use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted};
+use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted, classify_miss};
 
 mod wide;
 
@@ -279,6 +279,19 @@ impl CostModel {
     }
 }
 
+/// What the picks of a layer came to ([`ExpertStore::routed_rows`]).
+#[derive(Default)]
+struct Routed {
+    /// The picks in no slot.
+    missing: usize,
+    /// The misses the link or the CPU serves, by group, with where their
+    /// bytes are.
+    candidates: Vec<(usize, Miss, Source)>,
+    /// The groups whose rows are left without their expert: claimed, they
+    /// add nothing.
+    left: Vec<usize>,
+}
+
 /// An expert the CPU will compute for an open layer once its bytes are in RAM.
 #[derive(Clone, Copy, Debug)]
 struct Late {
@@ -426,13 +439,10 @@ impl<D: SlotDevice> ExpertStore<D> {
         act: &[u8],
     ) -> Result<usize, StoreError> {
         let picks: Vec<u32> = groups.iter().map(|g| g.expert).collect();
-        if self.serve() == Serve::Stream {
-            return self.routed(layer, &picks);
-        }
-        // What was read ahead for the layer is done with (`ahead.rs`).
-        self.ahead_routed(layer, &picks);
-        let Some(hybrid) = self.hybrid.as_ref() else { return self.routed(layer, &picks) };
-        let shape = hybrid.shapes[layer];
+        let shape = match &self.hybrid {
+            Some(hybrid) if hybrid.serve != Serve::Stream => hybrid.shapes[layer],
+            _ => return self.routed(layer, &picks),
+        };
         if n_rows == 0 || n_rows > MAX_ROWS || act.len() < act_bytes(shape.n_embd as usize, n_rows)
         {
             return Err(StoreError::Plan(format!(
@@ -440,24 +450,28 @@ impl<D: SlotDevice> ExpertStore<D> {
                 act.len()
             )));
         }
-
-        for phase in &mut self.phase[..layer] {
-            *phase = Phase::Passed;
-        }
-        self.phase[layer] = Phase::Open;
-        self.heat.record(layer, &picks);
-        self.guesses.forget_layer(layer);
-        self.wants.retain(|w| w.layer != layer || w.demand);
-        self.worth_stale[layer] = true;
-        self.vram.sets[layer].routed(&picks, self.step);
-        self.ram.sets[layer].routed(&picks, self.step);
-
-        // The misses, and where each one's bytes are.
+        self.open_layer(layer, &picks);
         let now = Instant::now();
-        let mut missing = 0;
-        let mut candidates: Vec<(usize, Miss, Source)> = Vec::new();
-        // The misses left without a read or a job: claimed, they add nothing.
-        let mut left: Vec<usize> = Vec::new();
+        let routed = self.classify_rows(layer, groups, now);
+        if routed.candidates.is_empty() && routed.left.is_empty() {
+            if routed.missing > 0 {
+                self.poll()?;
+            }
+            return Ok(routed.missing);
+        }
+        let (on_cpu, joins) = self.split_misses(layer, &routed.candidates);
+        self.claim_misses(layer, token, n_rows, groups, act, &routed, on_cpu, &joins, now)?;
+        self.poll()?;
+        Ok(routed.missing)
+    }
+
+    /// Where each pick of `layer` is: a hit, a miss whose upload runs
+    /// already (wanted, with nothing more to decide), a row left without its
+    /// expert (`windows.rs`), or a candidate for the link or the CPU with
+    /// where its bytes are.
+    fn classify_rows(&mut self, layer: usize, groups: &[RouteGroup], now: Instant) -> Routed {
+        let hybrid = self.hybrid.as_ref().expect("only with a CPU half");
+        let mut routed = Routed::default();
         // Whether the layer waits for the file anyway: a read that a row which
         // must run needs. A read for draft rows next to it costs nothing more.
         let mut layer_waits = groups.iter().any(|group| {
@@ -474,11 +488,11 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.stats.hits += 1;
                 continue;
             }
-            missing += 1;
+            routed.missing += 1;
             let promoting = hybrid.promoting.contains(&(layer, expert));
-            if self.vram.sets[layer].is_loading(expert) && !promoting {
+            let (vram, ram) = (&self.vram.sets[layer], &self.ram.sets[layer]);
+            let Some(source) = classify_miss(vram, ram, &mut self.stats, expert, promoting) else {
                 // An upload with its entry behind it: the kernels get a slot.
-                self.stats.miss_on_its_way += 1;
                 if !self.wants.iter().any(|w| w.layer == layer && w.expert == expert) {
                     self.wants.push(Wanted {
                         layer,
@@ -491,16 +505,6 @@ impl<D: SlotDevice> ExpertStore<D> {
                     });
                 }
                 continue;
-            }
-            let source = if self.ram.sets[layer].contains(expert) {
-                self.stats.miss_from_ram += 1;
-                Source::Ram
-            } else if self.ram.sets[layer].is_loading(expert) {
-                self.stats.miss_on_its_way += 1;
-                Source::OnItsWay
-            } else {
-                self.stats.miss_from_disk += 1;
-                Source::Disk
             };
             // A row that verifies a draft waits for the file only while it is
             // worth the wait (`windows.rs`), and a row left already needs
@@ -523,7 +527,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     self.guesses.guess(&mut self.ram.sets, layer, &[expert], self.step + 1);
                 }
                 self.windows.leave(group.rows);
-                left.push(g);
+                routed.left.push(g);
                 continue;
             }
             let miss = Miss {
@@ -531,15 +535,28 @@ impl<D: SlotDevice> ExpertStore<D> {
                 heat: self.heat.layer(layer)[expert as usize],
                 cpu_only: promoting,
             };
-            candidates.push((g, miss, source));
+            routed.candidates.push((g, miss, source));
         }
-        if candidates.is_empty() && left.is_empty() {
-            if missing > 0 {
-                self.poll()?;
-            }
-            return Ok(missing);
-        }
+        routed
+    }
 
+    /// Which of the candidates the CPU computes, and which of the others
+    /// join the layer's members rather than coming on loan.
+    ///
+    /// What the link would serve sooner becomes a member only where it takes
+    /// a free slot or beats the coldest member the step did not pick as a
+    /// promotion would, the hottest misses first. The others are uploaded on
+    /// loan: into the slot of a member on loan, or of the coldest member,
+    /// which leaves the members for the slots on loan. So the link serves
+    /// misses beside the CPU as the costs say, and the members change by
+    /// heat, not with every miss.
+    fn split_misses(
+        &self,
+        layer: usize,
+        candidates: &[(usize, Miss, Source)],
+    ) -> (Vec<bool>, Vec<bool>) {
+        let hybrid = self.hybrid.as_ref().expect("only with a CPU half");
+        let shape = hybrid.shapes[layer];
         let device = self.layers[layer].device;
         let misses: Vec<Miss> = candidates.iter().map(|c| c.1).collect();
         let mut on_cpu = match hybrid.serve {
@@ -549,13 +566,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
             _ => vec![true; misses.len()],
         };
-        // What the link would serve sooner becomes a member only where it
-        // takes a free slot or beats the coldest member the step did not pick
-        // as a promotion would, the hottest misses first. The others are
-        // uploaded on loan: into the slot of a member on loan, or of the
-        // coldest member, which leaves the members for the slots on loan. So
-        // the link serves misses beside the CPU as the costs say, and the
-        // members change by heat, not with every miss.
         let rule = hybrid.rule;
         let set = &self.vram.sets[layer];
         let mut free = set.n_free();
@@ -579,7 +589,30 @@ impl<D: SlotDevice> ExpertStore<D> {
                 }
             }
         }
+        (on_cpu, joins)
+    }
 
+    /// Wants the uploads of the candidates the link serves and claims those
+    /// the CPU computes, with the rows left without their expert, from the
+    /// device: the CPU's jobs start for what RAM holds, the others when
+    /// their reads land.
+    #[allow(clippy::too_many_arguments)]
+    fn claim_misses(
+        &mut self,
+        layer: usize,
+        token: u32,
+        n_rows: usize,
+        groups: &[RouteGroup],
+        act: &[u8],
+        routed: &Routed,
+        on_cpu: Vec<bool>,
+        joins: &[bool],
+        now: Instant,
+    ) -> Result<(), StoreError> {
+        let hybrid = self.hybrid.as_ref().expect("only with a CPU half");
+        let shape = hybrid.shapes[layer];
+        let device = self.layers[layer].device;
+        let candidates = &routed.candidates;
         // What the CPU claims stays in its RAM slot until the layer's sums
         // are delivered, and the sums wait for every claimed expert. So the
         // CPU may claim only as many experts that are yet to be read as the
@@ -603,7 +636,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let mut ready: Vec<CpuExpert> = Vec::new();
         let mut held: Vec<u32> = Vec::new();
         let mut late: Vec<Late> = Vec::new();
-        for (((g, _, source), cpu), joins) in candidates.iter().zip(&on_cpu).zip(&joins) {
+        for (((g, _, source), cpu), joins) in candidates.iter().zip(&on_cpu).zip(joins) {
             let group = &groups[*g];
             self.wants.retain(|w| w.layer != layer || w.expert != group.expert);
             let cpu = (*cpu || vram_room == 0) && (*source == Source::Ram || room > 0);
@@ -644,9 +677,9 @@ impl<D: SlotDevice> ExpertStore<D> {
                 });
             }
         }
-        for g in left {
-            claimed.push(g as u32);
-            claimed_experts.push(groups[g].expert);
+        for g in &routed.left {
+            claimed.push(*g as u32);
+            claimed_experts.push(groups[*g].expert);
         }
         self.waits.push((layer, now));
         if !claimed.is_empty() {
@@ -669,8 +702,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 hybrid.open.push(claims);
             }
         }
-        self.poll()?;
-        Ok(missing)
+        Ok(())
     }
 
     /// Where the matrices of `expert` of `layer` are in the RAM tier.

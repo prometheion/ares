@@ -50,7 +50,7 @@ use std::time::Instant;
 use ares_io::{Buffer, Class, Read};
 use ares_weights::{Start, Swap, SwapRule, Want};
 
-use super::{ExpertStore, Phase, SlotDevice, StoreError, part_key, read_of};
+use super::{ExpertStore, Phase, SlotDevice, Source, StoreError, part_key, ram_source, read_of};
 
 /// The transit and staging slots of a store: what [`super::StorePlan`] works
 /// out.
@@ -340,14 +340,9 @@ impl<D: SlotDevice> ExpertStore<D> {
                 }
                 None => {
                     // A pick that found no slot, as the store counts the others.
-                    let ram = &self.ram.sets[layer];
                     self.stats.picks += 1;
-                    if ram.contains(*expert) {
-                        self.stats.miss_from_ram += 1;
-                    } else if ram.is_loading(*expert) {
-                        self.stats.miss_on_its_way += 1;
-                    } else {
-                        self.stats.miss_from_disk += 1;
+                    let ram = &self.ram.sets[layer];
+                    if ram_source(ram, &mut self.stats, *expert) == Source::Disk {
                         named.unguessed += 1;
                     }
                     self.transit.entries.insert(
