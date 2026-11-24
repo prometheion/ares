@@ -538,20 +538,16 @@ impl Planning<'_> {
         place(&gguf, self.devices, opts).map_err(|e| self.named_split(e))
     }
 
-    /// The context: the operator's, all of it in VRAM, or without a number
-    /// from the operator the model's own (the owner's rule of 2026-11-22).
-    /// Every page of K and V in VRAM is expert slots fewer, and a step reads
-    /// only the cells the indexer picks, so the indexer's keys of every page
-    /// stay in VRAM, the K and V of the first pages up to a share of the room
-    /// for slots, and those of the pages beyond in RAM, as far as the
-    /// sequences grow into them (`ares_model::blocks::far`).
+    /// The context: the operator's (`--context`, for all sequences together;
+    /// a request holds at most the model's own), or without a number from the
+    /// operator the model's own (the owner's rule of 2026-11-22). Every page of
+    /// K and V in VRAM is expert slots fewer, and a step reads only the cells
+    /// the indexer picks, so the indexer's keys of every page stay in VRAM,
+    /// the K and V of the first pages up to a share of the room for slots, and
+    /// those of the pages beyond in RAM, as far as the sequences grow into them
+    /// (`ares_model::blocks::far`); a named context is placed the same way.
     fn context(&self, config: &Config, spread: Spread) -> Result<Context, LoadError> {
         let parallel = self.asked.parallel;
-        if let Some(tokens) = self.options.context {
-            let pages = plan::pool_pages(tokens, parallel);
-            let why = "as asked".to_owned();
-            return Ok(Context { tokens, pages, near: None, far_most: 0, why, spread });
-        }
         let model_context = self.model_context;
         let trial = TRIAL_CONTEXT.min(model_context);
         let gguf = Gguf::open(&self.options.model)?;
@@ -572,15 +568,21 @@ impl Planning<'_> {
         let floors = slot_floors(config, &placement, self.asked.drafter_bytes);
         let parts =
             page_parts(&gguf, self.devices, &trial_options, &placement).map_err(model_error)?;
-        let all = plan::pool_pages(model_context, parallel);
+        let asked = self.options.context;
+        let all = plan::pool_pages(asked.unwrap_or(model_context), parallel);
         let Some(near) = plan::near_pages(&slots, &floors, &parts, all) else {
-            let error = refuse(
-                "the devices have no room for the indexer's keys of the model's context next to \
-                 the experts' slots; name a context with --context",
-            );
+            let error = refuse(match asked {
+                Some(context) => format!(
+                    "--context {context}: the devices have no room for the indexer's keys of so \
+                     many tokens next to the experts' slots; name a smaller context"
+                ),
+                None => "the devices have no room for the indexer's keys of the model's context \
+                         next to the experts' slots; name a context with --context"
+                    .to_owned(),
+            });
             return Err(short(self.site, error));
         };
-        let plan = plan::ContextPlan::overflowing(model_context, all, near, parallel);
+        let plan = plan::ContextPlan::overflowing(asked, model_context, all, near, parallel);
         let far_most = parts.iter().map(|(kv, _)| kv).sum::<u64>() * u64::from(all - near);
         tracing::info!(
             "plan: the context takes {} of the bytes for expert slots (the indexer's keys of \

@@ -65,7 +65,7 @@ What is left out is decided from the devices and the model, and the log says how
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--context <TOKENS>` | Tokens of sequence state for all sequences together. One request holds at most this or the model's own context. A context that is named lies in VRAM; the load fails if the devices cannot hold it. | the model's own context (262144 for Qwen3.8). 27B: as much of it as the free VRAM holds, rounded down to a multiple of 1024. Flash-Next: all of it, the K and V beyond the first pages in page-locked RAM inside `--ram` |
+| `--context <TOKENS>` | Tokens of sequence state for all sequences together. One request holds at most this or the model's own context. A dense model (the 27B) holds a named context in VRAM, and the load fails if the devices cannot hold it; Flash-Next places it as its own: the indexer's keys and the K and V of the first pages in VRAM, the rest in page-locked RAM inside `--ram`. | the model's own context (262144 for Qwen3.8). 27B: as much of it as the free VRAM holds, rounded down to a multiple of 1024. Flash-Next: all of it, the K and V beyond the first pages in page-locked RAM inside `--ram` |
 | `--parallel <N>` | Sequences that run at once. Each takes VRAM for its recurrent state; further requests wait. At least 1; Flash-Next at most 8. | `4` |
 | `--kv <FORMAT>` | Storage format of K and V: `f16`, `q8`, `q7`, `q6`, `q5` or `q4`, or two names `K,V` such as `q8,f16`. See [models.md](models.md). | `q8` |
 

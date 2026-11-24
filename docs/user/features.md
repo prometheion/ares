@@ -14,7 +14,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Weight types | all 28 GGUF types | all 28, in every tensor |
 | K and V | `f16`, `q8` to `q4`, K and V apart (`--kv`) | the same; the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and the SSD; the CPU computes missed ones |
-| Context | `--context`, or the model's own (262 144) as far as VRAM holds it | `--context`, or the model's own (262 144) with the K and V beyond the first pages in RAM |
+| Context | `--context`, or the model's own (262 144) as far as VRAM holds it | `--context` (all sequences together), or the model's own (262 144), with the K and V beyond the first pages in RAM |
 | MTP drafts | the block in the model file or in a file of its own; exact | the block from a file of its own or from the model file; exact |
 | DFlash2 drafts | chains, one card or tensor split | chains, one card or both cards on every layer |
 | Prompt cache | RAM and SSD levels | RAM and SSD levels; its RAM is what the expert tier leaves |

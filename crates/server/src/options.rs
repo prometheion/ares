@@ -286,7 +286,9 @@ pub const OPTIONS: &[Opt] = &[
         "--context",
         "<TOKENS>",
         "Tokens of sequence state held for all sequences together; one request holds at \
-         most this or the model's own context [default: what the devices' free memory holds]",
+         most this or the model's own context. A dense model holds them in VRAM; Flash-Next \
+         keeps the K and V beyond its share of VRAM in RAM [default: the model's own context, \
+         for a dense model as far as VRAM holds it]",
     )
     .heading("Sequence state."),
     Opt::model(

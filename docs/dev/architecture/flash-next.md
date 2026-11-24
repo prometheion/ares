@@ -209,9 +209,11 @@ indexer's keys of every page stay in VRAM, the K and V of the first pages up
 to a thirty-second of the room for slots (`plan::near_pages`; what the context
 in VRAM cost before 2026-11-22, 17 408 to 18 432 tokens for two sequences on
 this machine), those of the rest in page-locked RAM as sequences grow into
-them. The plan says what was wanted and how much of it is in VRAM
-(`plan::ContextPlan::overflowing`). A context named with `--context` is all in
-VRAM, as before. Options that mean nothing for the
+them. A context named with `--context` (for all sequences together, so it may
+be larger than the model's own: four sequences of 131 072 cells are
+`--context 524288`; a request still holds at most the model's own) is placed
+the same way (the owner, 2026-11-24). The plan says what was wanted and how
+much of it is in VRAM (`plan::ContextPlan::overflowing`). Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
 `--draft-vocab`, more sequences than the eight rows of a
 generating step (`--parallel`), `--drafters mtp` (the model file carries no MTP block;

@@ -783,7 +783,8 @@ there are two devices and each can write the other's memory), the context
 (without `--context`, the model's own: the indexer's keys of every page in VRAM,
 the K and V of the first pages up to a share of the room for expert slots, those
 of the pages beyond in page-locked RAM as the sequences grow into them; a
-context that is named lies in VRAM), and the RAM (`--ram`, whose limit less
+context named with `--context`, for all sequences together, is placed the same
+way), and the RAM (`--ram`, whose limit less
 what the engine needs is the tier of experts, and what the tier leaves the
 prompt cache's). Before it listens the server fills the tiers of experts from
 the usage profile kept for the model file (in `--cache`, else the user's cache
