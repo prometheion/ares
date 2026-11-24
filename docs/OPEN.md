@@ -1680,7 +1680,7 @@ the agents' builds):
   of page-locked frees fixed (it reaches the 27B too, through the prompt cache's checkpoints).
   Then: llama-swap's 27B entry runs Ares at the owner's settings with its own prompt-cache
   directory; the owner's llama.cpp trees go once every branch, stash and local commit is on
-  GitHub or in a bundle (Ares's own uses moved first: the draft vocabulary, the tools' default
+  GitHub or in a bundle, right away with no fallback period (the owner) (Ares's own uses moved first: the draft vocabulary, the tools' default
   paths, the fork comparisons from `/var/tmp/ares-survey/src/`); llama-swap's configuration is
   cleaned up and the program updated (restarts and installs are the owner's, with sudo).
 - Take code, not ideas (the owner, 2026-11-24): where an open engine has what Ares needs, its
