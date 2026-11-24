@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ares_api::{ChatFormat, EngineError, GenerateRequest, ModelCard, Prompt, Sampling};
+use ares_runtime::testing::Pauses;
 use ares_runtime::{
     Clock, ContextSpec, DeviceContext, DeviceModel, EncodedPrompt, ExecError, Executor, ImageInput,
     ImageSpan, LinkSpec, Model, ModelError, Pick, RecordView, Runtime, RuntimeConfig, Split,
@@ -166,10 +167,9 @@ struct Checker {
     next: HashMap<u32, Next>,
     /// The pass under way: the image's seed and the next unit.
     pass: Option<(u8, u32)>,
-    /// A step of one prompt wider than `.0` rows runs in `.1` pieces, each paused but the
-    /// last; the step being run and the pieces it has had; the time a piece takes.
-    pauses: Option<(u32, u32)>,
-    pausing: Option<((u32, u32, u32), u32)>,
+    /// The steps of one prompt that run in pieces, each paused but the last, and the time a
+    /// piece takes.
+    pauses: Option<Pauses>,
     piece: Duration,
     seen: Arc<Mutex<Seen>>,
 }
@@ -184,7 +184,6 @@ impl Checker {
             next: HashMap::new(),
             pass: None,
             pauses: None,
-            pausing: None,
             piece: Duration::ZERO,
             seen,
         }
@@ -245,24 +244,10 @@ impl Executor for Checker {
         let view = RecordView::new(&self.record[..self.used]).unwrap();
         std::thread::sleep(self.piece);
         // A step of one prompt wider than the pauses' rows runs in pieces.
-        out.paused = false;
-        if let Some((rows, pieces)) = self.pauses {
-            if view.gives_up_paused() {
-                self.pausing = None;
-            }
-            let key = (view.segments() == 1)
-                .then(|| view.segment(0))
-                .filter(|s| s.direct && s.n_rows > rows)
-                .map(|s| (s.slot, s.pos0 as u32, s.n_rows));
-            if let Some(key) = key {
-                let done = match self.pausing {
-                    Some((at, done)) if at == key => done + 1,
-                    _ => 1,
-                };
-                out.paused = done < pieces;
-                self.pausing = out.paused.then_some((key, done));
-            }
-        }
+        out.paused = match &mut self.pauses {
+            Some(pauses) => pauses.step(&view).is_some_and(|done| done < pauses.pieces()),
+            None => false,
+        };
         // The rows are checked in every piece; only the last one moves the positions on.
         let kept = self.next.clone();
         let mut seen = self.seen.lock().unwrap();
@@ -444,7 +429,7 @@ fn a_paused_step_stages_its_image_rows_again_after_the_store_let_them_go() {
         // One image of 12 rows of 4 values.
         |config| RuntimeConfig { image_rows: 12 * 16, ..config },
         |mut checker| {
-            checker.pauses = Some((20, 40));
+            checker.pauses = Some(Pauses::new(20, 40));
             checker.piece = Duration::from_millis(2);
             checker
         },

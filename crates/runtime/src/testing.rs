@@ -174,22 +174,57 @@ pub struct HostExecutor {
     leaving: Option<Box<dyn Fn(u64, u32) -> bool + Send>>,
     inexact: Vec<u32>,
     /// The steps a model of long prompts runs in pieces ([`HostExecutor::with_pauses`]),
-    /// and whether the step that was dispatched was paused.
+    /// the saves inside the paused step (its first record named them), and whether the
+    /// step that was dispatched was paused.
     pauses: Option<Pauses>,
+    paused_inner: Vec<crate::InnerSave>,
     paused: bool,
 }
 
-/// Which steps the executor pauses as a model that reads long prompts in pieces does: a
-/// step of one prompt wider than `rows` rows runs in `pieces` dispatches, of which every one
-/// but the last is paused; the rows of the one it runs (`at`: slot, first position, rows) and
-/// the dispatches it has had.
+/// Which steps a model that reads long prompts in pieces pauses: a step of one prompt
+/// wider than `rows` rows runs in `pieces` pieces, and every piece but the last pauses it
+/// ([`StepOutput::paused`]). For an executor without a model that plays such a model.
 #[derive(Clone, Debug)]
-struct Pauses {
+pub struct Pauses {
     rows: u32,
     pieces: u32,
+    /// The paused step (its slot, first position and rows) and the pieces it has had.
     at: Option<((u32, u32, u32), u32)>,
-    /// The saves inside the paused step, which its first record named.
-    inner: Vec<crate::InnerSave>,
+}
+
+impl Pauses {
+    pub fn new(rows: u32, pieces: u32) -> Self {
+        Self { rows, pieces, at: None }
+    }
+
+    /// The record of a step that is about to run: `Some(piece)`, the piece it is from 1
+    /// on, for a step the model runs in pieces, `None` for any other. The step pauses
+    /// after a piece below [`Pauses::pieces`].
+    pub fn step(&mut self, view: &RecordView<'_>) -> Option<u32> {
+        if view.gives_up_paused() {
+            self.at = None;
+        }
+        let key = (!view.drafts_only() && view.segments() == 1)
+            .then(|| view.segment(0))
+            .filter(|s| s.direct && s.n_rows > self.rows)
+            .map(|s| (s.slot, s.pos0 as u32, s.n_rows))?;
+        let done = match self.at {
+            Some((at, done)) if at == key => done + 1,
+            _ => 1,
+        };
+        self.at = (done < self.pieces).then_some((key, done));
+        Some(done)
+    }
+
+    /// The pieces a paused step runs in.
+    pub fn pieces(&self) -> u32 {
+        self.pieces
+    }
+
+    /// The slot of the step that is paused now.
+    pub fn paused_slot(&self) -> Option<u32> {
+        self.at.map(|((slot, ..), _)| slot)
+    }
 }
 
 impl std::fmt::Debug for HostExecutor {
@@ -245,6 +280,7 @@ impl HostExecutor {
             leaving: None,
             inexact: Vec::new(),
             pauses: None,
+            paused_inner: Vec::new(),
             paused: false,
         }
     }
@@ -353,7 +389,7 @@ impl HostExecutor {
     /// paused sequence's state.
     pub fn with_pauses(mut self, rows: u32, pieces: u32) -> Self {
         assert!(pieces >= 1, "a step is at least one piece");
-        self.pauses = Some(Pauses { rows, pieces, at: None, inner: Vec::new() });
+        self.pauses = Some(Pauses::new(rows, pieces));
         self
     }
 
@@ -468,31 +504,19 @@ impl Executor for HostExecutor {
         let mut rows_run = true;
         let mut inner: Vec<crate::InnerSave> =
             (0..view.inner_saves()).map(|i| view.inner_save(i)).collect();
-        if let Some(pauses) = &mut self.pauses {
-            if view.gives_up_paused() {
-                pauses.at = None;
+        if let Some(pauses) = &mut self.pauses
+            && let Some(done) = pauses.step(&view)
+        {
+            self.paused = done < pauses.pieces();
+            rows_run = !self.paused;
+            if done == 1 {
+                self.paused_inner = std::mem::take(&mut inner);
             }
-            let pass = (!view.drafts_only() && view.segments() == 1)
-                .then(|| view.segment(0))
-                .filter(|s| s.direct && s.n_rows > pauses.rows)
-                .map(|s| (s.slot, s.pos0 as u32, s.n_rows));
-            if let Some(key) = pass {
-                let done = match pauses.at {
-                    Some((at, done)) if at == key => done + 1,
-                    _ => 1,
-                };
-                self.paused = done < pauses.pieces;
-                pauses.at = self.paused.then_some((key, done));
-                rows_run = !self.paused;
-                if done == 1 {
-                    pauses.inner = std::mem::take(&mut inner);
-                }
-                if rows_run {
-                    inner = std::mem::take(&mut pauses.inner);
-                }
+            if rows_run {
+                inner = std::mem::take(&mut self.paused_inner);
             }
         }
-        let paused_slot = self.pauses.as_ref().and_then(|p| p.at).map(|((slot, ..), _)| slot);
+        let paused_slot = self.pauses.as_ref().and_then(Pauses::paused_slot);
         // A save inside a step is one the model can make: in a step of one prompt wider than
         // its own rows (a pass), with as many rows as it asks for on either side.
         let margin = self.model.saves_inside_steps();
