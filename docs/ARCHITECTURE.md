@@ -178,7 +178,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit, read and written with direct I/O outside of its index | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; the prefix cache of `qwen35` keeps its level on SSD in it (`--cache`) |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
-| `ares-sched` | Step planner (generation, decision rows and prompts in one step), the share of time between generation and prompts, admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the price of a step by its rows with a term for the context, draft length choice and the acceptance of drafts, the n-gram drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses all of it (admission without spill to RAM) |
+| `ares-sched` | Step planner (generation, decision rows and prompts in one step), the share of time between generation and prompts, admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the price of a step by its rows with a term for the context, draft length choice and the acceptance of drafts, the draft policy of the rounds that ties them together (`Drafting`: the windows a round verifies, the bars of a chain's links, the worth of a token), the n-gram drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses all of it (admission without spill to RAM) |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule, the split of slots and the guess queue (its reads ahead of a router); the token table is not used by a running model yet, and elections only by the simulations of `tests/premises` (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking and tool calls, `count_tokens`, `tokenize`, `pieces`, `failure`; the `Structure` of a reply and the `Json` value of requests) | Done, unit tested |
 | `ares-tokenizer` | Text to token ids and back for the byte-level BPE vocabularies of GGUF models, as llama.cpp does; the chat templates (the Jinja dialect of the supported models) and what a template declares about thinking and tool calls | Done; tests against `llama-tokenize` and `llama-server --jinja` |
@@ -728,7 +728,7 @@ one array per part, indexed by page number.
   of a worse priority give way (see "Priorities of requests" under
   [Server](#server)). The object decides and reports; the
   conductor carries it out.
-- In the conductor (`crates/runtime/src/conductor.rs`, `cache.rs`), for a
+- In the conductor (`crates/runtime/src/conductor/`, `cache/`), for a
   model that takes part (`Model::prefix_cache`):
   - A request is looked up when it arrives and again when it starts. It
     shares the cached pages and a tail, restores the state from the last
@@ -997,7 +997,11 @@ moves its state to the host and back (`Model::durable`,
 The levels are the devices, RAM and the drive, as in the owner's llama.cpp
 fork; there is no level of the prompt cache in VRAM besides the working state
 on the cards. What RAM holds and what goes first is
-`crates/runtime/src/cache/ram.rs`; when things move, `cache.rs`.
+`crates/runtime/src/cache/ram.rs`; when things move, `cache/moves.rs` (to and from
+the drive `cache/ssd/pump.rs`). A run that comes back from either level enters the
+index through the same helpers (`run_of`, `deepest`, `run_pages`, `take_page`,
+`keeps_form`, `Cache::hang`), RAM's at once inside the look, the drive's across the
+pump's rounds.
 
 - **What it holds.** A page or tail that the index gives up is copied out of
   the pool into RAM before anything writes its page of the pool again
@@ -1099,7 +1103,7 @@ on the cards. What RAM holds and what goes first is
   what was still queued (0.4 s).
 
 **On SSD.** The prefix cache has a level on SSD below RAM (`ares --cache
-<dir>`; `crates/runtime/src/cache/ssd.rs` over `ares-store`). What leaves RAM
+<dir>`; `crates/runtime/src/cache/ssd/` over `ares-store`). What leaves RAM
 is written to a store, and so is what is worth keeping when an engine ends; a
 prompt whose start is in none of the levels above but in the store has it
 brought back before it starts. A conversation therefore resumes after its
@@ -1472,8 +1476,8 @@ and nothing is left to commit. What the record carries besides (the commit of
 the step before, the copies, the page tables, the freed pages) is carried out
 as in any record. The drafts come back with what the drafter said of each.
 Then the conductor knows every draft, and chooses how many of each chain the
-round verifies by the same rate it chooses windows by (`ares_sched::choose`,
-the chain paid for): a draft is worth the chance of its probability
+round verifies by the same rate it chooses windows by (`Drafting::shorten`
+over `ares_sched::choose`, the chain paid for): a draft is worth the chance of its probability
 (`ares_sched::Confidence`) times the chances of the drafts before it, and a
 draft the request's rule forbids is cut with the drafts after it, as an
 n-gram draft is. The rows of the drafts it does not take are not in the step,
@@ -1493,7 +1497,10 @@ gives no draft from it on: the conductor accepts at most the drafts the rows
 before it tested.
 
 The decision of a window's shape is in one place for every model, the
-conductor; a model only makes chains (the 27B on the device, link after link
+conductor with `ares_sched::Drafting` (which keeps what the engine knows of the
+model's drafters: their acceptance and confidence, the price of their chains,
+the bars of their links and the worth of a token, and chooses a round's
+windows from it); a model only makes chains (the 27B on the device, link after link
 with the picks kept there; Flash-Next with every pick read on the host) and
 runs the step it is given. A tree of drafts extends the same choice: its
 rows are ranked by the chances along their path (see `crates/sched/src/window.rs`).
@@ -5168,7 +5175,7 @@ so nothing idle in VRAM needs lending.
   (490 after a prompt of 80 507 tokens), and with a wait for the writer to free
   a buffer of RAM for each (up to a quarter of a second) the conductor ran no
   step and answered no command for half a minute while the next request
-  waited (seen in the merge check of 2026-11-23; `cache.rs`
+  waited (seen in the merge check of 2026-11-23; `cache/tests.rs`
   `far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive`).
   The device
   threads keep the books of which pages the tables name (and which a transfer

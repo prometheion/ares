@@ -1509,6 +1509,25 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
 - [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
       one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
       one place, the conductor split, the two model loaders of the server, shared device helpers.
+      Runtime part done on `cleanup2/runtime`: the leftovers of phase 1 (the cache's four oracle
+      suites are one test binary with one rig, `tests/cache/`; `testing::TestMachine`); one policy
+      for page-locked memory (the books count and rank in one place, `Books::allowances`; the
+      broker of `ares-core` is gone); budgets in one place (the server's RAM default in the load
+      alone, `Durable::page_room`, `SsdConfig::floor_pages`, `StoreConfig::slots_for`, the store's
+      rounds and resident bytes, the store's commit says its bytes); the cache's RAM and SSD
+      levels bring a run back through the same helpers, and the cache is split into files; the
+      picks of a route record classified once (`routed_rows` in three parts); the draft policy in
+      `ares_sched::Drafting` and the conductor split into files by concern (`RecordKind` for what
+      a record is for); the old expert fill gone (`plan_listed_fill`, the bench reads ahead
+      through `ahead`). Left: admission's restore of spilled pages (its model test simulates a
+      world that brings pages back; moving it to recompute rewrites that world); the rest of the
+      store's small copies of finding 13 (running means, odds, the step clock, the profile and
+      table files, the read submission of `read` and `transit_read`); the expert store's test
+      rig, the CPU kernels' test rig and the fake executor of `tests/images.rs`; the transit
+      sizing that lives in the model (`plan_transit`) and the store config built twice (the
+      model's files); one host budget for both server loaders (the server's phase 2 merges them);
+      `write_record` and `step` of the conductor in smaller parts; the host executor's places on
+      `PlaceChunks` (its oracle plays the strictest device, which the chunks are not).
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
