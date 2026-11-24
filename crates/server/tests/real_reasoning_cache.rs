@@ -20,7 +20,7 @@
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
-//!     cargo test --release -p ares-server --test reasoning_cache -- --test-threads=1
+//!     cargo test --release -p ares-server --test real_reasoning_cache -- --test-threads=1
 //! ```
 
 use std::path::PathBuf;

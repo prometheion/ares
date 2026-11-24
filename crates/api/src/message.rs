@@ -64,10 +64,10 @@ impl fmt::Debug for Image {
 ///
 /// `content` is plain text: a front end that accepts richer content (a list
 /// of parts) flattens it before it gets here, or refuses what it cannot
-/// flatten. Its images are beside it, each at its place in the text. The four optional fields exist for the chat template and are never
-/// interpreted on the way; they are `None` when the client did not send them.
-/// The chat template sees an empty value as an absent one, as llama.cpp's
-/// does.
+/// flatten. Its images are beside it, each at its place in the text. The four
+/// optional fields exist for the chat template and are never interpreted on
+/// the way; they are `None` when the client did not send them. The chat
+/// template sees an empty value as an absent one, as llama.cpp's does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,

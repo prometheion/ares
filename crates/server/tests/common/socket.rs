@@ -1,6 +1,9 @@
 //! HTTP/1.1 as a client speaks it on a plain socket: one request on its own
 //! connection, which the server closes after the answer.
 
+use std::io::Read;
+use std::net::TcpStream;
+
 use serde_json::Value;
 
 /// The bytes of a request with `body` (which may be empty) as JSON.
@@ -71,4 +74,38 @@ fn dechunk(mut raw: &[u8]) -> Vec<u8> {
         raw = &raw[(start + size + 2).min(raw.len())..];
     }
     out
+}
+
+/// Reads from `stream` until `count` events of a streamed answer have come.
+pub fn read_events(stream: &mut TcpStream, count: usize) -> Vec<u8> {
+    let mut seen = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while String::from_utf8_lossy(&seen).matches("data: ").count() < count {
+        let n = stream.read(&mut buffer).unwrap();
+        assert!(n > 0, "the stream ended early: {}", String::from_utf8_lossy(&seen));
+        seen.extend_from_slice(&buffer[..n]);
+    }
+    seen
+}
+
+/// The text of a streamed chat or completion: its deltas put together, the
+/// reasoning of a model that thinks (its own field) before the content.
+pub fn streamed_text(chunks: &[Value]) -> String {
+    chunks
+        .iter()
+        .filter_map(|chunk| {
+            let choice = chunk["choices"].get(0)?;
+            let delta = &choice["delta"];
+            Some(
+                [
+                    delta["reasoning_content"].as_str(),
+                    delta["content"].as_str(),
+                    choice["text"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<String>(),
+            )
+        })
+        .collect()
 }

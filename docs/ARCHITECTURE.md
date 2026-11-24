@@ -1882,7 +1882,7 @@ the stored K and V); the 0.8B on one card, in a tensor split and in a layer
 split with every format (`a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement`
 in `tests/qwen35_device_runtime.rs`); the kernels and the plan in `ares-cuda`
 (`a_row_of_a_window_has_the_bits_it_has_alone`); and the 27B over HTTP by the
-hash of a reply's tokens (`ares-server`'s `tests/real.rs`).
+hash of a reply's tokens (`ares-server`'s `tests/real_drafts.rs`).
 
 It was not so before 2026-11-15, with the fast kernels. Measured then with
 `qwen35_run --engine 8 --undrafted` (German prose, English prose and code, 300
@@ -7597,7 +7597,8 @@ output"; the same fields on chat and on completions, and a model that thinks is 
 while it thinks). A field of a request that the server does not hand to
 the engine is refused by name, not ignored: images without `--mmproj`, and
 the sampler's few limits (a history of more than 1024 tokens for the
-penalties, more than 20 alternatives, `min_keep` above 1, adaptive-p).
+penalties and DRY, a DRY length allowed above 1024, more than 20
+alternatives, `min_keep` above 1, adaptive-p).
 A client that disconnects frees its sequence. The
 first signal lets running requests finish, the second ends them, and the
 devices are released before the process exits.
@@ -7826,7 +7827,7 @@ repeat:
   end of the old one (4 with thinking off), whatever the client sends back.
 
 Through the server, with the 0.8B on a GPU and served with the template of
-Qwen3.8-27B (read from its file; `tests/reasoning_cache.rs`, asked greedily), a client that sends
+Qwen3.8-27B (read from its file; `tests/real_reasoning_cache.rs`, asked greedily), a client that sends
 `reasoning_content` back gets this from the engine's report of each request
 (`Snapshot::requests`) and `/metrics`:
 

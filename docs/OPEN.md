@@ -304,7 +304,7 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       branch's; the placement `One` passes.
 
 ### Defects seen in the merge check of 2026-11-17 (intermittent, slower but not wrong)
-- [ ] `ares-server --test real` `flash_next_drafts_with_its_mtp_block` sometimes verifies no
+- [ ] `ares-server --test real_flash_next` `flash_next_drafts_with_its_mtp_block` sometimes verifies no
       draft at all (0 of 0) for a whole run; passes in other runs. Suspected: the conductor's
       prices measured cold at the start shut the windows out while warm-up is off with drafts.
 - [ ] `ares-server --test real_cache` `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd`
@@ -712,7 +712,7 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 
 ## Qwen3.8 27B (`qwen35`)
 - [ ] Seen 2026-11-17 (main 4bec4b9 as well): with `max_tokens` 40 the first greedy reply to
-      real.rs's German question after a start (IQ2_XXS, one card, fast kernels) and the same
+      real_drafts.rs' German question after a start (IQ2_XXS, one card, fast kernels) and the same
       request again, its prefix from the cache, are different tokens (hashes 4d9a1bef2efe92d9
       and c1f7796b6753a9e5), with drafts and without; at 160 tokens all agree. Not looked into.
 - [x] Drafts under a layer split (2026-11-17, step 6 of the shared layer: the MTP block on the

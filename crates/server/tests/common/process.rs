@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -34,6 +34,51 @@ fn cache_home() -> PathBuf {
 pub fn port(base: u16, offset: u16) -> u16 {
     let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(base);
     base + offset
+}
+
+/// What the suites that serve a real model ask it.
+pub const GERMAN: &str = "Erkl\u{e4}re in drei S\u{e4}tzen, warum der Himmel blau ist.";
+pub const ENGLISH: &str = "Explain in three sentences why the sky is blue.";
+
+/// How long anything of a server of one small model may take before a test
+/// fails instead of hanging.
+pub const LIMIT: Duration = Duration::from_secs(60);
+
+/// `ares --model <model>` started on `port` with exactly `flags`; nothing it
+/// does may take longer than `limit`.
+pub fn serve_model(model: &Path, port: u16, flags: &[&str], limit: Duration) -> Server {
+    let mut command = ares();
+    command.arg("--model").arg(model).args(["--port", &port.to_string()]).args(flags);
+    Server::start(command, limit)
+}
+
+/// [`serve_model`] as the suites of one model start it: on the test device,
+/// with exact products, so that a text does not depend on what else is in a
+/// step, and a context of 8192 tokens, unless `flags` name `--devices`,
+/// `--precision` or `--context`; a minute for anything ([`LIMIT`]).
+pub fn serve(model: &Path, port: u16, flags: &[&str]) -> Server {
+    let device = super::test_device().to_string();
+    let mut all: Vec<&str> = Vec::new();
+    if !flags.contains(&"--devices") {
+        all.extend(["--devices", device.as_str()]);
+    }
+    if !flags.contains(&"--precision") {
+        all.extend(["--precision", "exact"]);
+    }
+    if !flags.contains(&"--context") {
+        all.extend(["--context", "8192"]);
+    }
+    all.extend(flags);
+    serve_model(model, port, &all, LIMIT)
+}
+
+/// Polls until `condition` holds; fails the test after [`LIMIT`].
+pub fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + LIMIT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A running `ares`. Killed when dropped, so that a failing test leaves

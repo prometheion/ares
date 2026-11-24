@@ -1,7 +1,7 @@
 //! The `ares` binary and a `qwen4exp` model file, as far as that needs no
 //! GPU: the options that mean nothing for a mixture of experts, and the
 //! numbers that cannot work, are refused by name before a device is touched.
-//! `tests/real.rs` serves the real model.
+//! `tests/real_flash_next.rs` serves the real model.
 
 use std::path::PathBuf;
 use std::process::Output;
