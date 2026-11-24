@@ -3,7 +3,8 @@
 `ares --model <file.gguf>` loads a model on the devices and serves it;
 `ares --models-preset <file.ini>` serves several, each loaded when a request
 names it (see "Several models" below).
-Without options it plans for itself: the first device that holds the weights
+Without options it plans for itself (the 27B here; Flash-Next's plan is at the end of
+[API](api.md)): the first device that holds the weights
 and a context, or else a tensor split over all devices with shares from the
 memory bandwidth each device reports, and the model's own context (its
 file's context length) as far as the VRAM that is left holds it (a tensor
@@ -40,7 +41,7 @@ and in the last event of a stream). A request can switch drafting off for itself
 with `"draft": false`; the two replies of one request, with and without drafts,
 are then compared by their hashes over HTTP (they are equal, with the fast kernels and with `--precision exact`: see
 "The text with drafts is the text without" under [Speculation](speculation.md)).
-The prefix cache is on for `qwen35` without a flag: a prompt that
+The prefix cache is on for both models without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages
 and the checkpoint instead of computing it, the answer's `usage` says how much
 (`prompt_tokens_details.cached_tokens`, as OpenAI does), `timings.prompt_n` counts
