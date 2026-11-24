@@ -147,7 +147,19 @@ fn request(body: &Json) -> Option<(Vec<Message>, Vec<Tool>, ChatOptions)> {
         let mut message = Message { role: string(get(item, "role"))?, ..Message::default() };
         match get(item, "content") {
             Some(Json::String(text)) => message.content = text.clone(),
-            Some(Json::Array(_)) => return None,
+            // Text parts are joined as they are, as the server joins the parts of a message
+            // without images (`openai/request.rs`, `content`) and as the template joins them in
+            // llama.cpp; a part of another kind (an image) has no counterpart here.
+            Some(Json::Array(parts)) => {
+                for part in parts {
+                    match (get(part, "type"), get(part, "text")) {
+                        (Some(Json::String(kind)), Some(Json::String(text))) if kind == "text" => {
+                            message.content.push_str(text)
+                        }
+                        _ => return None,
+                    }
+                }
+            }
             _ => {}
         }
         if let Some(Json::Array(calls)) = get(item, "tool_calls") {
