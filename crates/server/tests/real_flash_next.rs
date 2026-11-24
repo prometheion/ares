@@ -82,10 +82,15 @@ const ENGLISH_WORDS: &[&str] = &["light", "scatter", "rayleigh", "wavelength", "
 /// Flash-Next through the binary on both devices, in both placements: it
 /// answers in German and in English, two requests at once and a request that
 /// is cancelled while it streams leave the server able to answer, and the
-/// counters say how the experts were found.
+/// counters say how the experts were found. Both placements need two devices:
+/// with one named (`ARES_TEST_DEVICES`) the test is skipped.
 #[test]
 fn flash_next_answers_in_both_placements() {
     let Some(model) = flash_model() else { return };
+    if std::env::var("ARES_TEST_DEVICES").is_ok_and(|d| !d.contains(',')) {
+        eprintln!("skipped: both placements need two devices, ARES_TEST_DEVICES names one");
+        return;
+    }
     for (offset, split, placement) in
         [(0, "tensor", "both devices on every layer"), (1, "layer", "layers 0..")]
     {
