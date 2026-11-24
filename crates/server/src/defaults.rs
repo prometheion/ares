@@ -5,8 +5,9 @@
 //! as a key of a preset file. An option that gives a field of a request its
 //! default has the name of the field, with dashes: `--top-p` for `top_p`,
 //! `--repeat-last-n` for `repeat_last_n`, `--max-tokens` for `max_tokens`
-//! (`SETTINGS` in this module is the list). One option is not a default but a
-//! bound: `--max-tokens-limit`, the most tokens of any reply.
+//! (the rows of [`crate::options::OPTIONS`] with a `Setting`). One option is
+//! not a default but a bound: `--max-tokens-limit`, the most tokens of any
+//! reply.
 //!
 //! # What a request gets
 //!
@@ -50,7 +51,7 @@
 
 use ares_api::Sampling;
 
-use crate::options::Invalid;
+use crate::options::{Invalid, OPTIONS};
 use crate::wire::Parsed;
 
 /// The header of a response whose request asked for more tokens than the
@@ -88,22 +89,21 @@ impl std::fmt::Display for Conflict {
     }
 }
 
-/// A field of the sampler that the options of a model give a default.
+/// A field of the sampler that an option of a model gives a default: the
+/// option's row of [`OPTIONS`] holds it.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Setting {
-    /// The option (`--top-p`); the key of a preset file is the name without
-    /// the two dashes.
-    pub flag: &'static str,
     /// The field of a request it is the default of (`top_p`).
     pub field: &'static str,
     /// What the option takes, for the error of a value it does not take.
     pub expected: &'static str,
     /// Reads the value of the option into the field; `false` for a text that
     /// is not a value of its kind.
-    read: fn(&mut Sampling, &str) -> bool,
+    pub read: fn(&mut Sampling, &str) -> bool,
     /// The field as a request writes it, if it is set.
-    show: fn(&Sampling) -> Option<serde_json::Value>,
+    pub show: fn(&Sampling) -> Option<serde_json::Value>,
     /// Gives the first the field of the second where it has none.
-    fill: fn(&mut Sampling, &Sampling),
+    pub fill: fn(&mut Sampling, &Sampling),
 }
 
 /// `value` as the decimal number that was written for it: `0.95` as an `f32`
@@ -113,7 +113,7 @@ pub(crate) fn decimal(value: f32) -> f64 {
 }
 
 /// A number with a fraction.
-mod number {
+pub(crate) mod number {
     pub fn read(text: &str) -> Option<f32> {
         text.trim().parse().ok()
     }
@@ -124,7 +124,7 @@ mod number {
 }
 
 /// A number of tokens.
-mod count {
+pub(crate) mod count {
     pub fn read(text: &str) -> Option<u32> {
         text.trim().parse().ok()
     }
@@ -135,7 +135,7 @@ mod count {
 }
 
 /// One of a few numbered versions.
-mod version {
+pub(crate) mod version {
     pub fn read(text: &str) -> Option<u8> {
         text.trim().parse().ok()
     }
@@ -146,7 +146,7 @@ mod version {
 }
 
 /// A seed.
-mod seed {
+pub(crate) mod seed {
     pub fn read(text: &str) -> Option<u64> {
         text.trim().parse().ok()
     }
@@ -158,7 +158,7 @@ mod seed {
 
 /// Strings, written as a JSON array: they may hold anything, a line break
 /// and a comma included.
-mod strings {
+pub(crate) mod strings {
     pub fn read(text: &str) -> Option<Vec<String>> {
         serde_json::from_str(text).ok()
     }
@@ -169,7 +169,7 @@ mod strings {
 }
 
 /// A text, as it is written.
-mod text {
+pub(crate) mod text {
     pub fn read(text: &str) -> Option<String> {
         Some(text.to_owned())
     }
@@ -180,7 +180,7 @@ mod text {
 }
 
 /// The samplers in the order they apply in, by their names.
-mod order {
+pub(crate) mod order {
     use ares_api::SamplerKind;
 
     pub fn read(text: &str) -> Option<Vec<SamplerKind>> {
@@ -208,108 +208,50 @@ mod order {
     }
 }
 
-macro_rules! setting {
-    ($flag:literal, $field:ident, $kind:ident, $expected:literal) => {
-        Setting {
-            flag: $flag,
-            field: stringify!($field),
-            expected: $expected,
-            read: |sampling, text| match $kind::read(text) {
-                Some(value) => {
-                    sampling.$field = Some(value);
-                    true
-                }
-                None => false,
+/// The row of [`OPTIONS`] of an option that gives the field `$field` of a
+/// request its default: its value is read and shown by the module `$kind` of
+/// this one, `$value` and `$help` are its help, `$expected` the error of a
+/// value it does not take. The ranges are those a request is held to
+/// ([`Sampling::validate`]).
+macro_rules! field {
+    ($flag:literal, $field:ident, $kind:ident, $value:literal, $expected:literal, $help:expr) => {
+        $crate::options::Opt::field(
+            $flag,
+            $value,
+            $help,
+            $crate::defaults::Setting {
+                field: stringify!($field),
+                expected: $expected,
+                read: |sampling, text| match $crate::defaults::$kind::read(text) {
+                    Some(value) => {
+                        sampling.$field = Some(value);
+                        true
+                    }
+                    None => false,
+                },
+                show: |sampling| sampling.$field.clone().map($crate::defaults::$kind::show),
+                fill: |request, default| {
+                    if request.$field.is_none() {
+                        request.$field.clone_from(&default.$field);
+                    }
+                },
             },
-            show: |sampling| sampling.$field.clone().map($kind::show),
-            fill: |request, default| {
-                if request.$field.is_none() {
-                    request.$field.clone_from(&default.$field);
-                }
-            },
-        }
+        )
     };
 }
+pub(crate) use field;
 
-/// Every field of the sampler with a default, in the order the help and a
-/// listing have them. The ranges are those a request is held to
-/// ([`Sampling::validate`]).
-pub(crate) const SETTINGS: &[Setting] = &[
-    setting!("--temperature", temperature, number, "a number from 0 on (0 picks the best token)"),
-    setting!("--top-k", top_k, count, "a number of tokens, 0 for no cut"),
-    setting!("--top-p", top_p, number, "a number above 0 and at most 1 (1 cuts nothing)"),
-    setting!("--min-p", min_p, number, "a number from 0 to 1 (0 cuts nothing)"),
-    setting!("--typical-p", typical_p, number, "a number above 0 and at most 1 (1 cuts nothing)"),
-    setting!("--top-n-sigma", top_n_sigma, number, "a number (0 or less cuts nothing)"),
-    setting!("--xtc-probability", xtc_probability, number, "a number from 0 to 1 (0 is off)"),
-    setting!("--xtc-threshold", xtc_threshold, number, "a number from 0 to 1"),
-    setting!("--dynatemp-range", dynatemp_range, number, "a number from 0 on (0 is off)"),
-    setting!("--dynatemp-exponent", dynatemp_exponent, number, "a number from 0 on"),
-    setting!("--repeat-penalty", repeat_penalty, number, "a number above 0 (1 changes nothing)"),
-    setting!("--presence-penalty", presence_penalty, number, "a number from -2 to 2"),
-    setting!("--frequency-penalty", frequency_penalty, number, "a number from -2 to 2"),
-    setting!(
-        "--repeat-last-n",
-        repeat_last_n,
-        count,
-        "a number of tokens from 0 to 1024 (0 switches the three penalties off)"
-    ),
-    setting!("--dry-multiplier", dry_multiplier, number, "a number from 0 on (0 is off)"),
-    setting!("--dry-base", dry_base, number, "a number from 0 on"),
-    setting!("--dry-allowed-length", dry_allowed_length, count, "a number of tokens up to 1024"),
-    setting!("--dry-penalty-last-n", dry_penalty_last_n, count, "a number of tokens up to 1024"),
-    setting!(
-        "--dry-sequence-breakers",
-        dry_sequence_breakers,
-        strings,
-        "a JSON array of strings, such as [\"\\n\", \":\"]"
-    ),
-    setting!("--mirostat", mirostat, version, "0 (off), 1 or 2"),
-    setting!("--mirostat-tau", mirostat_tau, number, "a number above 0"),
-    setting!("--mirostat-eta", mirostat_eta, number, "a number from 0 on"),
-    setting!(
-        "--samplers",
-        samplers,
-        order,
-        "names of samplers separated by commas, penalties and dry before the others and once \
-         each, at most 16 others (penalties,dry,top_n_sigma,top_k,typ_p,top_p,min_p,xtc,\
-         temperature)"
-    ),
-    setting!(
-        "--seed",
-        seed,
-        seed,
-        "a whole number from 0 on (without the option every request draws its own)"
-    ),
-    setting!(
-        "--reasoning-budget-tokens",
-        reasoning_budget_tokens,
-        count,
-        "a number of tokens of thinking, after which the thinking is ended"
-    ),
-    setting!(
-        "--reasoning-budget-message",
-        reasoning_budget_message,
-        text,
-        "a text written before the end of the thinking when its budget is spent"
-    ),
-];
-
-const MAX_TOKENS: &str = "--max-tokens";
-const MAX_TOKENS_LIMIT: &str = "--max-tokens-limit";
-
-/// The options of this module under their one names.
-pub(crate) fn flags() -> impl Iterator<Item = &'static str> {
-    [MAX_TOKENS, MAX_TOKENS_LIMIT].into_iter().chain(SETTINGS.iter().map(|setting| setting.flag))
+/// Every field of the sampler with a default, by its option, in the order
+/// the help and a listing have them.
+pub(crate) fn settings() -> impl Iterator<Item = (&'static str, &'static Setting)> {
+    OPTIONS.iter().filter_map(|opt| opt.setting.as_ref().map(|setting| (opt.flag, setting)))
 }
 
-/// The option that is written `name` on the command line, if it is one of
-/// this module: its one name, under which [`set`] takes it.
-pub(crate) fn lookup(name: &str) -> Option<&'static str> {
-    flags().find(|flag| *flag == name)
-}
+pub(crate) const MAX_TOKENS: &str = "--max-tokens";
+pub(crate) const MAX_TOKENS_LIMIT: &str = "--max-tokens-limit";
 
-/// Sets the option `flag` (a name [`lookup`] gave) to `value`.
+/// Sets the option `flag` (one of a row of [`OPTIONS`] with a [`Setting`],
+/// or the two of the length of a reply) to `value`.
 pub(crate) fn set(defaults: &mut Defaults, flag: &'static str, value: &str) -> Result<(), Invalid> {
     let invalid = |expected| Invalid { flag, value: value.to_owned(), expected };
     if flag == MAX_TOKENS || flag == MAX_TOKENS_LIMIT {
@@ -323,10 +265,9 @@ pub(crate) fn set(defaults: &mut Defaults, flag: &'static str, value: &str) -> R
         }
         return Ok(());
     }
-    let setting = SETTINGS
-        .iter()
-        .find(|setting| setting.flag == flag)
-        .unwrap_or_else(|| unreachable!("'{flag}' is not a name lookup gives"));
+    let (_, setting) = settings()
+        .find(|(known, _)| *known == flag)
+        .unwrap_or_else(|| unreachable!("'{flag}' is not an option of the defaults"));
     // Read alone first: the range of a value is the one a request is held to.
     let mut alone = Sampling::default();
     if !(setting.read)(&mut alone, value) || alone.validate().is_err() {
@@ -365,7 +306,7 @@ impl Defaults {
     /// limit of its reply, which is also held to the most a request gets.
     pub(crate) fn apply(&self, parsed: &mut Parsed) {
         let request = &mut parsed.request;
-        for setting in SETTINGS {
+        for (_, setting) in settings() {
             (setting.fill)(&mut request.sampling, &self.sampling);
         }
         // A request that asks for a seed of its own draw (`seed: -1`) said
@@ -384,7 +325,7 @@ impl Defaults {
     /// names none. A field that is not there is the engine's own.
     pub fn fields(&self) -> serde_json::Value {
         let mut fields = serde_json::Map::new();
-        for setting in SETTINGS {
+        for (_, setting) in settings() {
             if let Some(value) = (setting.show)(&self.sampling) {
                 fields.insert(setting.field.to_owned(), value);
             }
@@ -399,7 +340,7 @@ impl Defaults {
 impl std::fmt::Display for Defaults {
     /// One line for the log of a start.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shown = SETTINGS.iter().filter_map(|setting| {
+        let shown = settings().filter_map(|(_, setting)| {
             (setting.show)(&self.sampling).map(|value| format!(" {}={value}", setting.field))
         });
         let length = self.length(None).0.map(|limit| format!(" max_tokens={limit}"));

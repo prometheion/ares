@@ -8417,19 +8417,29 @@ limit of tokens). The methods and headers of CORS are not options: the routes
 take `GET` and `POST`, and a header a preflight asks for is allowed. A server
 that listens beyond this machine without keys says so in the log at start.
 
-**Where options come from** (`crates/server/src/cli.rs`). Every option, of the
-server and of a model, is also a variable of the environment, `ARES_` and its
-name in capitals with underscores (`ARES_TOP_P` for `--top-p`), and a line of
-the file `--config` (or `ARES_CONFIG`) names: `name = value` with the name
-without the dashes, as a key of a preset file is written (a switch takes
-`true` or `false`, `#` and `;` begin a comment, a name stands once unless its
-option may repeat); the file has no sections, the models of several stand in a
-preset file (`models-preset = <file>`). The command line holds over the
-environment and the environment over the file; with a preset file the three
-hold over its sections as the command line alone did. Only the variables of
-Ares' options are read (`ARES_LIBCUDA` and the variables of tests are other
-things), never a name without the prefix. An error names the variable or the
-file and its line.
+**Where options come from** (`crates/server/src/cli.rs`). One table,
+`options::OPTIONS`, has every option of the server and of a model: its name,
+a shorter spelling of llama-server's (`-rea`, `-b`), whether it takes a value
+or is a switch (and its spelling for off, `--no-reasoning-preserve`), whether
+it is the server's or a model's, whether it may repeat, and its help; a
+default of a request's field also has there how the field is read, shown and
+filled (`defaults::Setting`). `ares --help` is printed from the table, in its
+groups, so it names every option and no other. Every option is also a
+variable of the environment, `ARES_` and its name in capitals with
+underscores (`ARES_TOP_P` for `--top-p`), and a line of the file `--config`
+(or `ARES_CONFIG`) names: `name = value` with the name without the dashes, as
+a key of a preset file is written (a switch takes `true` or `false`, `#` and
+`;` begin a comment, a name stands once unless its option may repeat); the
+file has no sections, the models of several stand in a preset file
+(`models-preset = <file>`). The two files are read by one reader
+(`crates/server/src/ini.rs`), and a key is resolved to its option in one place
+(`options::of_key`), which also answers a name of llama-server's with the
+option of Ares that does its job, on the command line too. The command line
+holds over the environment and the environment over the file; with a preset
+file the three hold over its sections as the command line alone did. Only the
+variables of Ares' options are read (`ARES_LIBCUDA` and the variables of tests
+are other things), never a name without the prefix. An error names the
+variable or the file and its line.
 
 **Tokens and properties** (`crates/server/src/props.rs`). `POST /tokenize` takes
 `content`, a text, and gives the tokens the engine reads it as when it is the
@@ -8743,8 +8753,7 @@ model's `ram` above the server's, and a `max-tokens` above the
 under its name: the error names the option of Ares that does the job where
 there is one (`ctx-size`: `context`; `tensor-split`: `shares`; `ctk` and
 `ctv`: `kv`; `chat-template-kwargs`: `chat-var`; `sleep-idle-seconds`:
-`idle-unload`; `alias`: `aliases`, and the others of `other_name` in
-`preset.rs`). What only the devices or the model file can say (a split the
+`idle-unload`; `alias`: `aliases`, and the others of `options::other_name`). What only the devices or the model file can say (a split the
 devices cannot do, a context that fits nowhere) is found when the model is
 loaded, and is then the reason of a failed load.
 

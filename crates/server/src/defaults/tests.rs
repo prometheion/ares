@@ -45,7 +45,7 @@ const VALUES: &[(&str, [&str; 3])] = &[
 ];
 
 fn setting(flag: &str) -> &'static Setting {
-    SETTINGS.iter().find(|setting| setting.flag == flag).expect("a setting")
+    settings().find(|(known, _)| *known == flag).expect("a setting").1
 }
 
 /// The value of an option as a request writes it in its field.
@@ -85,13 +85,13 @@ fn shown(setting: &Setting, sampling: &Sampling) -> Option<Value> {
 fn every_setting_is_an_option_with_the_name_of_the_field_of_a_request() {
     assert_eq!(
         VALUES.iter().map(|(flag, _)| *flag).collect::<Vec<_>>(),
-        SETTINGS.iter().map(|setting| setting.flag).collect::<Vec<_>>(),
+        settings().map(|(flag, _)| flag).collect::<Vec<_>>(),
         "the table of this test has every setting"
     );
-    for setting in SETTINGS {
-        assert_eq!(setting.flag, format!("--{}", setting.field.replace('_', "-")));
-        assert_eq!(options::lookup(setting.flag), Some((setting.flag, Kind::Value)));
-        assert!(!options::repeats(setting.flag));
+    for (flag, setting) in settings() {
+        assert_eq!(flag, format!("--{}", setting.field.replace('_', "-")));
+        assert_eq!(options::lookup(flag), Some((flag, Kind::Value)));
+        assert!(!options::find(flag).unwrap().0.repeats);
     }
     for flag in ["--max-tokens", "--max-tokens-limit"] {
         assert_eq!(options::lookup(flag), Some((flag, Kind::Value)));
@@ -255,7 +255,7 @@ fn a_value_outside_the_range_of_its_field_is_refused_by_the_option() {
                 .expect_err(&format!("{flag} {value}"));
             assert_eq!((error.flag, error.value.as_str()), (flag, *value));
             assert_eq!(model, ModelOptions::default(), "{flag} {value}: nothing is set");
-            if let Some(setting) = SETTINGS.iter().find(|setting| setting.flag == flag) {
+            if let Some((_, setting)) = settings().find(|entry| entry.0 == flag) {
                 assert_eq!(error.expected, setting.expected);
             }
         }

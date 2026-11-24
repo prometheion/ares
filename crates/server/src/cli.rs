@@ -3,12 +3,11 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use ares_server::ReasoningFormat;
-use ares_server::defaults::Defaults;
-use ares_server::options::{self, Kind, ModelOptions};
-use ares_server::plan::LoadOptions;
+use ares_server::ini;
+use ares_server::options::{self, Kind, ModelOptions, OPTIONS, Opt, Scope};
 
-pub const USAGE: &str = "\
+/// What `--help` prints before the options.
+const HEAD: &str = "\
 ares: inference server with an OpenAI-compatible API
 
 USAGE:
@@ -24,303 +23,77 @@ the environment over the file; with a preset file all three hold over its
 sections. Variables without the prefix are never read.
 
 OPTIONS:
-        --config <FILE>        A file of options, one on each line: name = value;
-                               lines that begin with # or ; are comments
-                               [default: ARES_CONFIG, else none]
-        --model <PATH>         GGUF model file to load and serve (any part of a split model)
-        --models-preset <FILE> Serve several models from a preset file: an INI file
-                               with one section for each model, named by the id
-                               requests use, and a section [*] for all of them. A
-                               section holds the options below under their names
-                               (context = 32768), and aliases, load-on-startup and
-                               idle-unload. A model is loaded when a request names
-                               it and unloaded when another needs its room or when
-                               it was idle for its idle-unload. An option given
-                               here on the command line holds for every model
-        --host <ADDR>          Address to listen on [default: 127.0.0.1]
-        --port <PORT>          Port to listen on, 0 picks a free one [default: 8000]
-        --timeout <SECONDS>    How long a client may take to send a request, and to
-                               take what one write of an answer sent; then the
-                               connection is closed and its request ended. A reply
-                               the engine takes long for is never cut [default: 600]
-
-    Who may use the server.
-        --api-key <KEYS>       Keys a request must carry one of, separated by commas,
-                               as 'Authorization: Bearer <key>' or 'x-api-key: <key>';
-                               /health stays open [default: none, no key is asked for]
-        --api-key-file <FILE>  A file of more keys, one on each line; lines that
-                               begin with # are comments
-        --allowed-hosts <LIST> Names in a request's Host that the server answers to
-                               besides its local ones (localhost, addresses), separated
-                               by commas, or * for any. A server on a local address
-                               without keys answers only to its local names, against
-                               web pages that rebind a name of theirs to it; with these
-                               names the check holds for every address and with keys
-                               too [default: the local names on a local address without
-                               keys, else any]
-        --cors-origins <LIST>  Origins whose web pages may call the server from a browser
-                               and read its answers (CORS), such as https://chat.example.org,
-                               separated by commas, or * for any. Without keys a request
-                               from a page of any other site is refused, unless the
-                               page is local (localhost, an address) [default: none]
-
-    Where the model goes. What is left out is decided from the devices and the
-    model, and the log says how.
-        --devices <LIST>       CUDA devices to use, by the driver's index: 0,1; a
-                               GPU of a class this build does not run is skipped
-                               [default: all]
-        --split <KIND>         single: one device holds the model
-                               tensor: every device holds a slice of every block
-                               layer:  every device holds a range of blocks
-                               [default: single if one device holds the model, else tensor]
-        --shares <LIST>        Each device's share of the weights under a split:
-                               0.625,0.375 [default: by the memory bandwidth the
-                               devices report, as far as their memory allows]
-
-    Sequence state.
-        --context <TOKENS>     Tokens of sequence state held for all sequences
-                               together; one request holds at most this or the
-                               model's own context [default: what the devices'
-                               free memory holds]
-        --parallel <N>         Sequences that run at once; each takes memory for
-                               its recurrent state, further requests wait
-                               [default: 4]
-        --kv <FORMAT>          Storage format of K and V: f16, q8, q7, q6, q5 or q4,
-                               or two names (K,V). The formats from q7 on store a
-                               tile of 128 cells relative to its mean and keep the
-                               first tile and the newest cells exact; Qwen3.8-Flash-Next
-                               takes f16 and q8 only [default: q8]
-
-    Host memory.
-        --ram <SIZE>           The most RAM the whole engine may use, such as 16G or
-                               512M, for all loaded models together; ram in a
-                               model's section of a preset file is that model's
-                               part of it, and a model without one takes what is
-                               left. What the engine needs to run is taken from it
-                               first (with --cache that includes one checkpoint and
-                               the pages and checkpoints state passes through on its
-                               way to the drive and back); the rest is for the
-                               experts of a mixture of experts that have no slot in
-                               VRAM, and then for the prompt cache in RAM: the K and
-                               V that left the devices and the checkpoints of
-                               recurrent state that let a conversation continue
-                               from what was computed. Below the limit the engine
-                               holds what the machine has available less a small
-                               headroom, and gives memory back when other programs
-                               need it, the prompt cache first [default: all the
-                               machine has]
-
-    Prompt cache on SSD, below the one in RAM.
-        --cache <DIR>          A directory in which the engine keeps the state of
-                               what it has computed (K and V, and checkpoints of
-                               recurrent state), so that a prompt that starts with
-                               it resumes from there after the state has left RAM,
-                               after the model was unloaded and after a restart.
-                               Texts of 2048 tokens and more are written when they
-                               leave RAM, and what RAM and the devices hold when
-                               the model is unloaded or the server stops; a store
-                               fits one model file with its formats and split, and
-                               the directory may be shared by all models. A
-                               mixture of experts keeps the usage profile of its
-                               experts there, which fills its tiers at the next
-                               start [default: none, and nothing is written; the
-                               profiles are then kept in ~/.cache/ares]
-        --cache-size <SIZE>    The most that directory may take, such as 64G; what
-                               was used least recently goes first [default: 32G]
-
-    Speed against exactness.
-        --precision <KIND>     fast:  8-bit activations where they are faster
-                               exact: f16 products everywhere, same text whatever
-                                      else runs in a step
-                               [default: fast]
-        --drafters <LIST>      The model drafters that take part, such as mtp (the
-                               MTP block in the model file) or none; a file
-                               name is a drafter from a file of its own, an
-                               MTP block or a DFlash2 drafter, by the
-                               architecture the file names. The
-                               n-gram drafter takes part with them and
-                               never alone; with none the
-                               server does not speculate. The length of a draft
-                               and whose it is are chosen for every step from
-                               the price of a step and the acceptance measured
-                               [default: all the model has: mtp if the file has
-                               an MTP block]
-        -b, --batch-size <ROWS>
-                               Most rows of prompt in one step while a prompt is
-                               read alone. Above --ubatch-size only for a mixture
-                               of experts (Qwen3.8-Flash-Next): its expert slots
-                               in VRAM lend the step's scratch for its time, and
-                               every expert is read once a step, not once per
-                               --ubatch-size rows; a request that arrives waits
-                               for the step in flight [default: 8192 for a mixture
-                               of experts, as far as the slots can lend it, else
-                               --ubatch-size]
-        -ub, --ubatch-size <ROWS>
-                               Most rows of a step in the memory the model keeps
-                               for good, and of a piece of prompt while another
-                               request waits [default: what a thirty-second of the
-                               smaller device's memory holds for a mixture of
-                               experts, 512 for the 27B]
-        --window <ROWS>        Most rows of one sequence's window, its newest
-                               token and the drafts verified with it. The room
-                               for them is VRAM (about 5 MiB a row for the 27B,
-                               for every sequence) [default: 8, the rows one
-                               launch of the few-row weight kernels takes]
-        --draft-vocab <FILE>   Token ids (one per line) the model drafters (mtp
-                               and dflash) may propose: a shorter list makes a
-                               draft cheaper [default: every token whose head
-                               row is on the drafters' device]
-        --expert-prune <RULE:RANK>
-                               For a mixture of experts: what a step does with a
-                               pick whose expert only the SSD holds, from the RANK-th
-                               pick of a row on (1 the strongest), instead of
-                               waiting for the drive. skip leaves it out, router
-                               takes the router's next best expert that VRAM or RAM
-                               holds, similar the one most like it there (from a
-                               table of the model file kept beside the usage
-                               profile). Changes the output; similar:8 touches the
-                               8th to 10th of ten picks [default: off]
-
-    Images.
-        --mmproj <FILE>        The projector the model reads images through: the
-                               mmproj GGUF of its image tower beside the model file.
-                               Images come in requests as data URLs (image_url,
-                               Anthropic image blocks, input_image); remote URLs
-                               are not fetched [default: none, images are refused]
-        --mmproj-weights <ram|vram>
-                               Where the projector's weights stay between images:
-                               ram, page-locked inside --ram and uploaded block by
-                               block for every new image, or vram, which the
-                               context gives up (about 0.9 GiB) [default: ram]
-        --image-max-tokens <ROWS>
-                               The most rows (tokens) one image becomes, 8 to 4096;
-                               a larger image is shrunk to fit. The VRAM of the
-                               tower's scratch follows it (about 340 MiB at 4096)
-                               [default: 4096, as llama.cpp]
-
-    Prompts.
-        --chat-var <NAME=VALUE>  A variable of the model's chat template, such as
-                               add_vision_id=true; may be given several times
-        --chat-template-file <FILE>
-                               A chat template (Jinja) that takes the place of the
-                               model file's, for every conversation
-                               [default: the model file's]
-
-    The line of requests.
-        --queue <N>            The most requests that may wait for a sequence while
-                               --parallel run; one more is refused with 503 and
-                               Retry-After [default: no limit, a request waits
-                               until it runs]
-        --generation-floor <TOKENS/S>
-                               The rate every generating request keeps while a
-                               prompt is read beside it; the prompt gets the rest
-                               of the devices' time, and at least half. 0 reads
-                               prompts at once (a request that generates then gets
-                               a token per step of prompt) [default: 20]
-
-    Thinking, under the names llama-server gives these. A request can change
-    each of them for itself: enable_thinking and the other variables in
-    chat_template_kwargs, reasoning_effort, reasoning_format.
-    -rea, --reasoning <on|off|auto>
-                               Whether the model thinks before it answers: auto
-                               leaves it to the chat template [default: auto]
-        --reasoning-format <FORMAT>
-                               none: the thinking stays in content, tags and all
-                               auto: the thinking goes to reasoning_content, in
-                               streamed deltas too
-                               [default: auto]
-        --reasoning-effort <LEVEL>
-                               A level the chat template knows, such as low or
-                               medium, or default to leave it to the template
-                               [default: default]
-        --reasoning-preserve, --no-reasoning-preserve
-                               Whether the thinking of earlier turns stays in the
-                               prompt, as a client sends it back in
-                               reasoning_content: it must for a conversation to
-                               continue from what was computed [default: on]
-        --reasoning-budget-tokens <N>
-                               The most tokens the thinking of a reply may take:
-                               then the budget's message and the end of the
-                               thinking are written, and the answer follows
-                               [default: none, no budget]
-        --reasoning-budget-message <TEXT>
-                               What is written before the end of the thinking
-                               when its budget is spent [default: none]
-
-    What a request gets for a field it leaves out. An option has the name of
-    the field with dashes (--top-p for top_p), and a request's own value always
-    holds. The defaults named here are the engine's own.
-        --temperature <T>      0 picks the most probable token [default: 0]
-        --top-k <N>            Keep the N most probable tokens, 0 for all
-                               [default: 0]
-        --top-p <P>            Keep the most probable tokens that hold P of the
-                               probability, 1 for all [default: 1]
-        --min-p <P>            Drop tokens less than P times as probable as the
-                               best, 0 for none [default: 0]
-        --typical-p <P>        Locally typical sampling, 1 is off [default: 1]
-        --top-n-sigma <N>      Keep the tokens within N standard deviations of
-                               the best logit, 0 is off [default: 0]
-        --xtc-probability <P>, --xtc-threshold <P>
-                               XTC: the chance that the most probable tokens are
-                               removed, and the probability from which a token is
-                               one of them [default: 0 (off), 0.1]
-        --dynatemp-range <R>, --dynatemp-exponent <E>
-                               A temperature that moves by R around
-                               --temperature with the entropy [default: 0 (off),
-                               1]
-        --repeat-penalty <N>   Lowers the logits of the tokens that stand in the
-                               last --repeat-last-n tokens by this factor, 1 is
-                               off [default: 1]
-        --presence-penalty <N>, --frequency-penalty <N>
-                               Subtracted from the logits of those tokens, once
-                               and for every time they stand there [default: 0]
-        --repeat-last-n <N>    The tokens the three penalties look at, at most
-                               1024, 0 switches them off [default: 64]
-        --dry-multiplier <N>, --dry-base <N>, --dry-allowed-length <N>,
-        --dry-penalty-last-n <N>
-                               DRY, the penalty for a token that would repeat a
-                               sequence [default: 0 (off), 1.75, 2, 64]
-        --dry-sequence-breakers <JSON>
-                               The strings a repeated sequence does not reach
-                               across, as a JSON array
-                               [default: [\"\\n\", \":\", \"\\\"\", \"*\"]]
-        --mirostat <0|1|2>, --mirostat-tau <N>, --mirostat-eta <N>
-                               Mirostat in place of the other samplers, its
-                               target surprise and its rate [default: 0 (off),
-                               5, 0.1]
-        --samplers <LIST>      The samplers that apply and their order, by name
-                               [default: penalties,dry,top_n_sigma,top_k,typ_p,
-                               top_p,min_p,xtc,temperature]
-        --seed <N>             The seed of a request that names none, which then
-                               draws the same for the same prompt; a request
-                               asks for a draw of its own with seed -1
-                               [default: a new one for every request]
-
-    The length of a reply.
-        --max-tokens <N>       The limit of tokens for a request that names
-                               none (max_tokens, max_completion_tokens,
-                               max_output_tokens, n_predict) [default: none, a
-                               reply ends when the model ends it or the context
-                               is full]
-        --max-tokens-limit <N> The most tokens of any reply: a request that asks
-                               for more gets this many, and its response says so
-                               in the header x-ares-max-tokens-limit; a request
-                               that names no limit gets --max-tokens or, without
-                               it, this [default: none]
-
-    -h, --help                 Print this help
-
-    The log.
-        --log-format <text|json>
-                               text: a line for people; json: one JSON object for
-                               every line, for collectors [default: text]
-        --log-file <FILE>      Append the log to this file [default: standard error]
-        --log-text             The prompt and the reply of every request go into the
-                               log as well; without it the log holds neither
-
-The log level is set with the RUST_LOG environment variable (default: info).
-ARES_LIBCUDA names the driver library to load instead of the system's libcuda.so.1.
 ";
+
+/// What `--help` prints after the options.
+const TAIL: &str = "
+The log level is set with the RUST_LOG environment variable (default: info).
+ARES_LIBCUDA names the driver library to load instead of the system's
+libcuda.so.1.
+";
+
+/// The column the help of an option starts in, and the width of a line.
+const HELP_COLUMN: usize = 31;
+const WIDTH: usize = 80;
+
+/// What `ares --help` prints: the forms of the command, then every option of
+/// [`OPTIONS`] in its group, with its help.
+pub fn usage() -> String {
+    let mut text = String::from(HEAD);
+    for opt in OPTIONS {
+        if let Some(heading) = opt.heading {
+            text.push('\n');
+            for line in wrap(heading, WIDTH - 4) {
+                text.push_str(&format!("    {line}\n"));
+            }
+        }
+        let indent = if opt.short.is_some() { 4 } else { 8 };
+        let lead = format!("{}{}", " ".repeat(indent), spelling(opt));
+        let mut lines = wrap(opt.help, WIDTH - HELP_COLUMN).into_iter();
+        if lead.len() < HELP_COLUMN {
+            let first = lines.next().unwrap_or_default();
+            text.push_str(&format!("{lead:HELP_COLUMN$}{first}\n"));
+        } else {
+            text.push_str(&format!("{lead}\n"));
+        }
+        for line in lines {
+            text.push_str(&format!("{:HELP_COLUMN$}{line}\n", ""));
+        }
+    }
+    text.push_str(TAIL);
+    text
+}
+
+/// How the help writes an option: its spellings and its value.
+fn spelling(opt: &Opt) -> String {
+    let mut names: Vec<&str> = opt.short.into_iter().chain([opt.flag]).collect();
+    names.extend(opt.off);
+    let names = names.join(", ");
+    match opt.value {
+        Some(value) => format!("{names} {value}"),
+        None => names,
+    }
+}
+
+/// `text` in lines of at most `width` characters, where they can be cut
+/// between words; a `\n` in it starts a line.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for part in text.split('\n') {
+        let mut line = String::new();
+        for word in part.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -334,12 +107,10 @@ pub struct Options {
     /// Who may use the server, as given: the keys come with those of the
     /// file, read when the server starts.
     pub access: AccessOptions,
-    /// The preset file of `--models-preset`; without one `load.model` is the
-    /// one model to serve.
+    /// The preset file of `--models-preset`; without one `model` is the one
+    /// model to serve.
     pub presets: Option<PathBuf>,
-    pub load: LoadOptions,
-    pub reasoning_format: ReasoningFormat,
-    pub defaults: Defaults,
+    pub model: ModelOptions,
     /// The options of a model as they were given, by their names and in
     /// their order: with a preset file they are set again over every section.
     pub given: Vec<(&'static str, String)>,
@@ -427,8 +198,8 @@ pub enum Command {
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CliError {
-    #[error("unknown option '{0}'")]
-    UnknownOption(String),
+    #[error("unknown option '{name}'{}", .hint.map(|hint| format!(": {hint}")).unwrap_or_default())]
+    UnknownOption { name: String, hint: Option<&'static str> },
     #[error("option '{0}' needs a value")]
     MissingValue(&'static str),
     #[error("'{0}' is not a valid port: use a number from 0 to 65535")]
@@ -474,34 +245,11 @@ fn text(value: OsString) -> Result<String, CliError> {
     value.into_string().map_err(|v| CliError::NotUnicode(v.to_string_lossy().into_owned()))
 }
 
-/// The options of the server itself, as [`options::lookup`] has those of a
-/// model: their one name and how they are written. `--config` is not among
-/// them: it names where the others come from.
-fn server_option(name: &str) -> Option<(&'static str, Kind)> {
-    let flag = match name {
-        "--host" => "--host",
-        "--port" => "--port",
-        "--models-preset" => "--models-preset",
-        "--api-key" => "--api-key",
-        "--api-key-file" => "--api-key-file",
-        "--allowed-hosts" => "--allowed-hosts",
-        "--cors-origins" => "--cors-origins",
-        "--timeout" => "--timeout",
-        "--log-format" => "--log-format",
-        "--log-file" => "--log-file",
-        "--log-text" => return Some(("--log-text", Kind::Switch(true))),
-        _ => return None,
-    };
-    Some((flag, Kind::Value))
-}
-
-/// Every option under its one name, server's and model's: what the
-/// environment is asked for.
-fn every_option() -> impl Iterator<Item = &'static str> {
-    options::SERVER
-        .iter()
-        .filter_map(|name| server_option(&format!("--{name}")).map(|(flag, _)| flag))
-        .chain(options::names())
+/// An argument that is no option: what Ares has for it, if it is one of
+/// llama-server's.
+fn unknown(name: &str) -> CliError {
+    let hint = options::other_name(name.trim_start_matches('-'));
+    CliError::UnknownOption { name: name.to_owned(), hint }
 }
 
 /// The variable of the environment that gives `flag`: `ARES_` and its name in
@@ -523,7 +271,7 @@ struct Reading {
 }
 
 impl Reading {
-    /// Sets `flag` (a name of [`server_option`] or [`options::lookup`]) to
+    /// Sets `flag` (the name of an option of the server or of a model) to
     /// `value`; a switch takes `true` or `false`. A later setting replaces an
     /// earlier one.
     fn set(&mut self, flag: &'static str, value: String) -> Result<(), CliError> {
@@ -628,33 +376,30 @@ pub fn parse_with(
         let mut value = |flag: &'static str| {
             inline.clone().or_else(|| args.next()).ok_or(CliError::MissingValue(flag))
         };
-        let (flag, value) = match name {
-            "-h" | "--help" => {
+        let Some((opt, kind)) = options::find(name) else { return Err(unknown(whole)) };
+        let flag = opt.flag;
+        let value = match kind {
+            Kind::Value => text(value(flag)?)?,
+            Kind::Switch(on) => {
                 if inline.is_some() {
-                    return Err(CliError::UnexpectedValue("--help"));
+                    return Err(CliError::UnexpectedValue(flag));
                 }
-                return Ok(Command::Help);
+                on.to_string()
             }
+        };
+        match flag {
+            "--help" => return Ok(Command::Help),
             "--config" => {
                 if config.is_some() {
                     return Err(CliError::Repeated("--config"));
                 }
-                config = Some((PathBuf::from(value("--config")?), None));
+                config = Some((PathBuf::from(value), None));
                 continue;
             }
-            _ => match server_option(name).or(options::lookup(name)) {
-                Some((flag, Kind::Value)) => (flag, text(value(flag)?)?),
-                Some((flag, Kind::Switch(on))) => {
-                    if inline.is_some() {
-                        return Err(CliError::UnexpectedValue(flag));
-                    }
-                    (flag, on.to_string())
-                }
-                None => return Err(CliError::UnknownOption(whole.to_owned())),
-            },
-        };
+            _ => {}
+        }
         // A flag that is given twice is a mistake more often than a choice.
-        if !options::repeats(flag) {
+        if !opt.repeats {
             if seen.contains(&flag) {
                 return Err(CliError::Repeated(flag));
             }
@@ -665,7 +410,7 @@ pub fn parse_with(
 
     // The environment: a variable for every option, and one for the file.
     let mut environ = Vec::new();
-    for flag in every_option() {
+    for flag in OPTIONS.iter().filter(|opt| opt.scope != Scope::Command).map(|opt| opt.flag) {
         let name = variable_of(flag);
         if let Some(value) = environment(&name) {
             let value = text(value)?;
@@ -708,27 +453,14 @@ pub fn parse_with(
     // What is given holds together; with a preset file the sections are
     // checked with it when the file is read.
     model.check()?;
-    let ModelOptions { load, reasoning_format, defaults } = model;
-    let options = Options {
-        host,
-        port,
-        timeout: std::time::Duration::from_secs(timeout),
-        log,
-        access,
-        presets,
-        load,
-        reasoning_format,
-        defaults,
-        given,
-    };
+    let timeout = std::time::Duration::from_secs(timeout);
+    let options = Options { host, port, timeout, log, access, presets, model, given };
     Ok(Command::Run(Box::new(options)))
 }
 
 /// The options of a configuration file: lines `name = value` with the names
 /// of the command line's options without the dashes, as the keys of a preset
-/// file are written (a switch takes `true` or `false`; `#` and `;` begin a
-/// comment line). A name stands once, unless its option may be given
-/// several times.
+/// file are written (the `ini` module; a switch takes `true` or `false`).
 fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
     let place = |line: usize| match line {
         0 => path.display().to_string(),
@@ -737,63 +469,30 @@ fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
     let fail = |line: usize, message: String| CliError::Placed { place: place(line), message };
     let text = std::fs::read_to_string(path)
         .map_err(|e| fail(0, format!("cannot read the configuration file: {e}")))?;
+    let file = ini::parse(&text).map_err(|(line, message)| fail(line, message))?;
+    if let Some(section) = file.sections.first() {
+        return Err(fail(
+            section.line,
+            "a configuration file has no sections: the models of several go in a preset file \
+             (models-preset = <file.ini>)"
+                .into(),
+        ));
+    }
     let mut given: Vec<Given> = Vec::new();
-    let mut lines: Vec<(&'static str, usize)> = Vec::new();
-    for (index, raw) in text.lines().enumerate() {
-        let (number, line) = (index + 1, raw.trim());
-        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
-            continue;
+    for key in file.keys {
+        let opt = options::of_key(&key.name, "'ares --help' lists the options")
+            .map_err(|message| fail(key.line, message))?;
+        match opt.flag {
+            "--config" => {
+                return Err(fail(key.line, "a configuration file does not name another".into()));
+            }
+            "--help" => {
+                return Err(fail(key.line, "'help' is not an option to keep in a file".into()));
+            }
+            _ => {}
         }
-        if line.starts_with('[') {
-            return Err(fail(
-                number,
-                "a configuration file has no sections: the models of several go in a preset \
-                 file (models-preset = <file.ini>)"
-                    .into(),
-            ));
-        }
-        let Some((name, value)) = line.split_once('=') else {
-            return Err(fail(number, format!("'{line}' is not an option: write name = value")));
-        };
-        let (name, value) = (name.trim(), value.trim());
-        let dashed = format!("--{name}");
-        let (flag, value) = match server_option(&dashed).or(options::lookup(&dashed)) {
-            Some((flag, Kind::Value)) => (flag, value.to_owned()),
-            Some((flag, Kind::Switch(true))) => match value {
-                "true" | "false" => (flag, value.to_owned()),
-                other => {
-                    return Err(fail(number, format!("{name} = '{other}': write true or false")));
-                }
-            },
-            Some((flag, Kind::Switch(false))) => {
-                return Err(fail(
-                    number,
-                    format!(
-                        "'{name}' is the command line's way to switch {0} off: write {0} = false",
-                        flag.trim_start_matches('-')
-                    ),
-                ));
-            }
-            None if name == "config" => {
-                return Err(fail(number, "a configuration file does not name another".into()));
-            }
-            None if name == "help" => {
-                return Err(fail(number, "'help' is not an option to keep in a file".into()));
-            }
-            None => {
-                return Err(fail(
-                    number,
-                    format!("Ares has no option '{name}' ('ares --help' lists the options)"),
-                ));
-            }
-        };
-        if !options::repeats(flag)
-            && let Some((_, first)) = lines.iter().find(|(known, _)| *known == flag)
-        {
-            return Err(fail(number, format!("'{name}' stands twice (first at line {first})")));
-        }
-        lines.push((flag, number));
-        given.push(Given { flag, value, place: Some(place(number)) });
+        let value = opt.value_of_key(&key.value).map_err(|message| fail(key.line, message))?;
+        given.push(Given { flag: opt.flag, value, place: Some(place(key.line)) });
     }
     Ok(given)
 }
@@ -801,7 +500,9 @@ fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
 #[cfg(test)]
 mod tests {
     use ares_cuda::{CacheFormat, Precision, PruneRule};
-    use ares_server::plan::{Drafter, ExpertPrune, SplitKind};
+    use ares_server::ReasoningFormat;
+    use ares_server::defaults::Defaults;
+    use ares_server::plan::{Drafter, ExpertPrune, LoadOptions, SplitKind};
     use ares_tokenizer::Json;
 
     use super::*;
@@ -825,10 +526,10 @@ mod tests {
         // The thinking of earlier turns stays in the prompt, as in llama-server.
         let mut expected = LoadOptions::new("m.gguf");
         expected.chat_variables = vec![("preserve_reasoning".to_owned(), Json::Bool(true))];
-        assert_eq!(options.load, expected);
-        assert_eq!(options.reasoning_format, ReasoningFormat::Auto);
+        assert_eq!(options.model.load, expected);
+        assert_eq!(options.model.reasoning_format, ReasoningFormat::Auto);
         // A field a request leaves out is the engine's own, and no reply has a limit.
-        assert_eq!(options.defaults, Defaults::default());
+        assert_eq!(options.model.defaults, Defaults::default());
     }
 
     #[test]
@@ -845,7 +546,7 @@ mod tests {
         assert_eq!(spaced, inline);
         assert_eq!(spaced.host, "0.0.0.0");
         assert_eq!(spaced.port, 9000);
-        assert_eq!(spaced.load.model, PathBuf::from("/models/a b.gguf"));
+        assert_eq!(spaced.model.load.model, PathBuf::from("/models/a b.gguf"));
     }
 
     #[test]
@@ -879,7 +580,7 @@ mod tests {
             "--chat-var",
             "depth=3",
         ]);
-        let load = options.load;
+        let load = options.model.load;
         assert_eq!(load.devices, Some(vec![1, 0]));
         assert_eq!(load.split, Some(SplitKind::Tensor));
         assert_eq!(load.shares, Some(vec![0.625, 0.375]));
@@ -900,32 +601,32 @@ mod tests {
             ]
         );
 
-        let load = run(&["--model=m", "--kv", "q8,f16", "--draft-vocab", "v.txt"]).load;
+        let load = run(&["--model=m", "--kv", "q8,f16", "--draft-vocab", "v.txt"]).model.load;
         assert_eq!(load.kv, Some((CacheFormat::Q8, CacheFormat::F16)));
         assert_eq!(load.draft_vocabulary, Some(PathBuf::from("v.txt")));
-        assert_eq!(run(&["--model=m", "--split=layer"]).load.split, Some(SplitKind::Layer));
+        assert_eq!(run(&["--model=m", "--split=layer"]).model.load.split, Some(SplitKind::Layer));
         // Pruning of experts only the SSD holds: off unless asked for.
-        assert_eq!(run(&["--model=m"]).load.expert_prune, None);
-        assert_eq!(run(&["--model=m", "--expert-prune", "off"]).load.expert_prune, None);
+        assert_eq!(run(&["--model=m"]).model.load.expert_prune, None);
+        assert_eq!(run(&["--model=m", "--expert-prune", "off"]).model.load.expert_prune, None);
         assert_eq!(
-            run(&["--model=m", "--expert-prune", "similar:8"]).load.expert_prune,
+            run(&["--model=m", "--expert-prune", "similar:8"]).model.load.expert_prune,
             Some(ExpertPrune { rule: PruneRule::Similar, from_rank: 8 })
         );
         assert_eq!(
-            run(&["--model=m", "--expert-prune=skip:1"]).load.expert_prune,
+            run(&["--model=m", "--expert-prune=skip:1"]).model.load.expert_prune,
             Some(ExpertPrune { rule: PruneRule::Skip, from_rank: 1 })
         );
         // The prompt cache on SSD: off without a directory, and a size of its own.
-        let load = run(&["--model=m"]).load;
+        let load = run(&["--model=m"]).model.load;
         assert_eq!((load.cache, load.cache_size), (None, None));
-        let load = run(&["--model=m", "--cache", "/var/cache/ares", "--cache-size=64G"]).load;
+        let load = run(&["--model=m", "--cache", "/var/cache/ares", "--cache-size=64G"]).model.load;
         assert_eq!(load.cache, Some(PathBuf::from("/var/cache/ares")));
         assert_eq!(load.cache_size, Some(64 << 30));
         // The formats that keep exact cells are accepted, for K and V apart.
-        let load = run(&["--model=m", "--kv", "q5,q4"]).load;
+        let load = run(&["--model=m", "--kv", "q5,q4"]).model.load;
         assert_eq!(load.kv, Some((CacheFormat::Q5, CacheFormat::Q4)));
         assert_eq!(
-            run(&["--model=m", "--kv=q7"]).load.kv,
+            run(&["--model=m", "--kv=q7"]).model.load.kv,
             Some((CacheFormat::Q7, CacheFormat::Q7))
         );
     }
@@ -955,7 +656,7 @@ mod tests {
             "4096",
             "--max-tokens-limit=8192",
         ]);
-        let defaults = options.defaults;
+        let defaults = options.model.defaults;
         let sampling = &defaults.sampling;
         assert_eq!((sampling.temperature, sampling.top_p), (Some(0.7), Some(0.8)));
         assert_eq!((sampling.top_k, sampling.min_p), (Some(20), Some(0.0)));
@@ -1008,23 +709,20 @@ mod tests {
         );
         // The names of llama-server are not options of Ares.
         for name in ["--temp", "--n-predict", "-n", "--typical", "-s"] {
-            assert_eq!(
-                parse_strs(&["--model=m", name, "1"]),
-                Err(CliError::UnknownOption(name.to_owned()))
-            );
+            assert_eq!(parse_strs(&["--model=m", name, "1"]), Err(unknown(name)));
         }
     }
 
     #[test]
     fn drafters_are_named_one_by_one_and_a_file_is_a_block_drafter() {
-        let drafters = |list: &str| run(&["--model=m", "--drafters", list]).load.drafters;
+        let drafters = |list: &str| run(&["--model=m", "--drafters", list]).model.load.drafters;
         assert_eq!(drafters("mtp"), Some(vec![Drafter::Mtp]));
         assert_eq!(drafters("none"), Some(Vec::new()));
         assert_eq!(
             drafters("mtp, /models/dflash2.gguf"),
             Some(vec![Drafter::Mtp, Drafter::File(PathBuf::from("/models/dflash2.gguf"))])
         );
-        assert_eq!(run(&["--model=m"]).load.drafters, None, "all that are available");
+        assert_eq!(run(&["--model=m"]).model.load.drafters, None, "all that are available");
         for list in ["", "none,mtp", "mtp,mtp", "mtp,,x"] {
             assert!(
                 matches!(
@@ -1038,7 +736,7 @@ mod tests {
 
     #[test]
     fn a_chat_variable_given_again_replaces_the_earlier_one() {
-        let load = run(&["--model=m", "--chat-var", "a=1", "--chat-var", "a=two"]).load;
+        let load = run(&["--model=m", "--chat-var", "a=1", "--chat-var", "a=two"]).model.load;
         let a = ("a".to_owned(), Json::String("two".into()));
         assert_eq!(load.chat_variables.last(), Some(&a));
         assert_eq!(load.chat_variables.iter().filter(|(name, _)| name == "a").count(), 1);
@@ -1050,10 +748,10 @@ mod tests {
 
     #[test]
     fn the_thinking_flags_set_chat_variables_under_the_names_of_llama_server() {
-        let off = run(&["--model=m", "--reasoning", "off", "--reasoning-effort", "low"]).load;
+        let off = run(&["--model=m", "--reasoning", "off", "--reasoning-effort", "low"]).model.load;
         assert_eq!(variable(&off, "enable_thinking"), Some(Json::Bool(false)));
         assert_eq!(variable(&off, "reasoning_effort"), Some(Json::String("low".into())));
-        let on = run(&["--model=m", "-rea", "on"]).load;
+        let on = run(&["--model=m", "-rea", "on"]).model.load;
         assert_eq!(variable(&on, "enable_thinking"), Some(Json::Bool(true)));
         // `auto` and `default` leave it to the template, over an earlier --chat-var.
         let auto = run(&[
@@ -1065,24 +763,28 @@ mod tests {
             "--reasoning=auto",
             "--reasoning-effort=default",
         ])
+        .model
         .load;
         assert_eq!(variable(&auto, "enable_thinking"), None);
         assert_eq!(variable(&auto, "reasoning_effort"), None);
         // The default keeps the thinking of earlier turns; the flags say the same both ways.
         assert_eq!(
-            variable(&run(&["--model=m"]).load, "preserve_reasoning"),
+            variable(&run(&["--model=m"]).model.load, "preserve_reasoning"),
             Some(Json::Bool(true))
         );
-        let dropped = run(&["--model=m", "--no-reasoning-preserve"]).load;
+        let dropped = run(&["--model=m", "--no-reasoning-preserve"]).model.load;
         assert_eq!(variable(&dropped, "preserve_reasoning"), Some(Json::Bool(false)));
-        let kept = run(&["--model=m", "--reasoning-preserve"]).load;
+        let kept = run(&["--model=m", "--reasoning-preserve"]).model.load;
         assert_eq!(variable(&kept, "preserve_reasoning"), Some(Json::Bool(true)));
     }
 
     #[test]
     fn the_reasoning_format_is_one_of_the_two_names() {
         for (name, format) in [("none", ReasoningFormat::None), ("auto", ReasoningFormat::Auto)] {
-            assert_eq!(run(&["--model=m", "--reasoning-format", name]).reasoning_format, format);
+            assert_eq!(
+                run(&["--model=m", "--reasoning-format", name]).model.reasoning_format,
+                format
+            );
         }
         for (args, flag) in [
             (&["--reasoning", "maybe"][..], "--reasoning"),
@@ -1112,8 +814,20 @@ mod tests {
 
     #[test]
     fn mistakes_say_what_to_change() {
-        assert_eq!(parse_strs(&["--prot", "1"]), Err(CliError::UnknownOption("--prot".into())));
-        assert_eq!(parse_strs(&["serve"]), Err(CliError::UnknownOption("serve".into())));
+        assert_eq!(
+            parse_strs(&["--prot", "1"]),
+            Err(CliError::UnknownOption { name: "--prot".into(), hint: None })
+        );
+        assert_eq!(
+            parse_strs(&["serve"]),
+            Err(CliError::UnknownOption { name: "serve".into(), hint: None })
+        );
+        // A name of llama-server's is told what Ares has for it.
+        let said = parse_strs(&["--model=m", "-c", "4096"]).unwrap_err().to_string();
+        assert_eq!(
+            said,
+            "unknown option '-c': the context is 'context', in tokens for all sequences together"
+        );
         assert_eq!(parse_strs(&["--port"]), Err(CliError::MissingValue("--port")));
         assert_eq!(parse_strs(&["--model"]), Err(CliError::MissingValue("--model")));
         assert_eq!(parse_strs(&["--port", "70000"]), Err(CliError::InvalidPort("70000".into())));
@@ -1158,7 +872,7 @@ mod tests {
     #[test]
     fn a_value_may_look_like_a_flag() {
         // `--model --odd.gguf` is a path, not a missing value: the flag asked for one.
-        assert_eq!(run(&["--model", "--odd.gguf"]).load.model, PathBuf::from("--odd.gguf"));
+        assert_eq!(run(&["--model", "--odd.gguf"]).model.load.model, PathBuf::from("--odd.gguf"));
     }
 
     /// A file of `text` in the temporary directory, named for the test.
@@ -1185,14 +899,49 @@ mod tests {
     }
 
     #[test]
-    fn the_help_names_every_option() {
-        for flag in every_option() {
-            let named = USAGE.match_indices(flag).any(|(at, _)| {
-                let after = USAGE[at + flag.len()..].chars().next();
+    fn the_help_names_every_option_and_no_other() {
+        let help = usage();
+        let named = |flag: &str| {
+            help.match_indices(flag).any(|(at, _)| {
+                let after = help[at + flag.len()..].chars().next();
                 !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
-            });
-            assert!(named, "--help does not name {flag}");
+            })
+        };
+        for opt in OPTIONS {
+            for flag in [Some(opt.flag), opt.short, opt.off].into_iter().flatten() {
+                assert!(named(flag), "--help does not name {flag}");
+            }
         }
+        // What the help mentions of an option is one.
+        for (at, _) in help.match_indices("--") {
+            let flag: String =
+                help[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+            assert!(options::find(&flag).is_some(), "--help names {flag}, which is no option");
+        }
+        for line in help.lines() {
+            assert!(line.chars().count() <= WIDTH, "a line wider than {WIDTH}: {line}");
+        }
+    }
+
+    #[test]
+    fn the_help_has_its_options_in_columns() {
+        let help = usage();
+        let lines: Vec<&str> = help.lines().collect();
+        let at = |start: &str| lines.iter().position(|line| line.starts_with(start)).unwrap();
+        let context = at("        --context <TOKENS>");
+        assert_eq!(
+            &lines[context][HELP_COLUMN..],
+            "Tokens of sequence state held for all sequences"
+        );
+        assert!(lines[context + 1].starts_with(&format!("{:HELP_COLUMN$}together", "")));
+        let reasoning = at("    -rea, --reasoning <on|off|auto>");
+        assert_eq!(lines[reasoning].trim_end(), "    -rea, --reasoning <on|off|auto>");
+        assert!(lines[reasoning + 1].starts_with(&format!("{:HELP_COLUMN$}Whether", "")));
+        let split = at("        --split <KIND>");
+        assert!(lines[split].ends_with("single: one device holds the model"));
+        assert!(lines[split + 1].trim_start().starts_with("tensor: "));
+        assert!(help.contains("\n    Who may use the server.\n"), "{help}");
+        assert!(help.starts_with(HEAD) && help.ends_with(TAIL));
     }
 
     #[test]
@@ -1213,17 +962,17 @@ mod tests {
                 ("ARES_CORS_ORIGINS", "https://chat.example.org"),
             ],
         );
-        assert_eq!(options.load.model, PathBuf::from("/models/m.gguf"));
-        assert_eq!(options.load.context, Some(4096));
-        assert_eq!(options.defaults.sampling.top_p, Some(0.9));
-        assert_eq!(variable(&options.load, "preserve_reasoning"), Some(Json::Bool(false)));
-        assert_eq!(variable(&options.load, "depth"), Some(Json::Int(3)));
+        assert_eq!(options.model.load.model, PathBuf::from("/models/m.gguf"));
+        assert_eq!(options.model.load.context, Some(4096));
+        assert_eq!(options.model.defaults.sampling.top_p, Some(0.9));
+        assert_eq!(variable(&options.model.load, "preserve_reasoning"), Some(Json::Bool(false)));
+        assert_eq!(variable(&options.model.load, "depth"), Some(Json::Int(3)));
         assert_eq!((options.host.as_str(), options.port), ("0.0.0.0", 9000));
         assert_eq!(options.access.keys, ["k1", "k2"]);
         assert_eq!(options.access.origins, ["https://chat.example.org"]);
         // A name without the prefix is never read: the shell here has CTX.
         let options = run_with(&["--model=m"], &[("CTX", "4096"), ("CONTEXT", "4096")]);
-        assert_eq!(options.load.context, None);
+        assert_eq!(options.model.load.context, None);
         // A value a variable gives is checked like one of the command line.
         let error = with(&["--model=m"], &[("ARES_CONTEXT", "0")]).unwrap_err();
         assert_eq!(
@@ -1237,16 +986,20 @@ mod tests {
         let config = file("order.ini", "model = /m.gguf\ncontext = 1000\ntemperature = 0.5\n");
         let path = config.to_str().unwrap();
         let only_file = run_with(&["--config", path], &[]);
-        assert_eq!(only_file.load.context, Some(1000));
-        assert_eq!(only_file.defaults.sampling.temperature, Some(0.5));
+        assert_eq!(only_file.model.load.context, Some(1000));
+        assert_eq!(only_file.model.defaults.sampling.temperature, Some(0.5));
         let environment = [("ARES_CONTEXT", "2000")];
-        assert_eq!(run_with(&["--config", path], &environment).load.context, Some(2000));
+        assert_eq!(run_with(&["--config", path], &environment).model.load.context, Some(2000));
         let options = run_with(&["--config", path, "--context", "3000"], &environment);
-        assert_eq!(options.load.context, Some(3000));
-        assert_eq!(options.defaults.sampling.temperature, Some(0.5), "what only the file says");
+        assert_eq!(options.model.load.context, Some(3000));
+        assert_eq!(
+            options.model.defaults.sampling.temperature,
+            Some(0.5),
+            "what only the file says"
+        );
         // The file may also be named by the environment.
         let options = run_with(&[], &[("ARES_CONFIG", path)]);
-        assert_eq!(options.load.context, Some(1000));
+        assert_eq!(options.model.load.context, Some(1000));
         // With a preset file the options of a model are kept in that order,
         // to hold over its sections.
         let config = file("given.ini", "models-preset = /p.ini\ncontext = 1000\n");
@@ -1271,19 +1024,21 @@ mod tests {
         let options = run_with(&["--config", config.to_str().unwrap()], &[]);
         assert_eq!((options.host.as_str(), options.port), ("0.0.0.0", 8080));
         assert_eq!(options.access.key_file, Some(PathBuf::from("/etc/ares/keys")));
-        assert_eq!(variable(&options.load, "a"), Some(Json::Int(1)));
-        assert_eq!(variable(&options.load, "b"), Some(Json::Int(2)));
-        assert_eq!(variable(&options.load, "preserve_reasoning"), Some(Json::Bool(false)));
-        assert_eq!(options.defaults.max_tokens, Some(4096));
+        assert_eq!(variable(&options.model.load, "a"), Some(Json::Int(1)));
+        assert_eq!(variable(&options.model.load, "b"), Some(Json::Int(2)));
+        assert_eq!(variable(&options.model.load, "preserve_reasoning"), Some(Json::Bool(false)));
+        assert_eq!(options.model.defaults.max_tokens, Some(4096));
 
         for (text, says) in [
             ("model = /m.gguf\ncontxt = 1\n", ":2: Ares has no option 'contxt'"),
             (
                 "model = /m.gguf\ncontext = 1\ncontext = 2\n",
-                ":3: 'context' stands twice (first at line 2)",
+                ":3: the key 'context' stands twice (first at line 2)",
             ),
             ("[m]\nmodel = /m.gguf\n", ":1: a configuration file has no sections"),
-            ("model /m.gguf\n", ":1: 'model /m.gguf' is not an option"),
+            ("model /m.gguf\n", ":1: 'model /m.gguf' is not a key"),
+            ("model = /m.gguf\nctx-size = 1\n", ":2: Ares has no option 'ctx-size': the context"),
+            ("model = /m.gguf\nhelp = true\n", ":2: 'help' is not an option to keep in a file"),
             (
                 "model = /m.gguf\nno-reasoning-preserve = true\n",
                 ":2: 'no-reasoning-preserve' is the command line's way",

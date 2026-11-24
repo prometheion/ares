@@ -56,6 +56,7 @@ mod chat_body;
 pub mod defaults;
 mod error;
 mod images;
+pub mod ini;
 mod latency;
 mod listen;
 pub mod load;

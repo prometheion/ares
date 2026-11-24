@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use ares_server::load::DeviceLoader;
 use ares_server::models::{AcquireError, Models, SystemClock};
-use ares_server::options::ModelOptions;
 use ares_server::preset::Presets;
 use ares_server::{Config, serve_models};
 use tokio::net::TcpListener;
@@ -31,7 +30,7 @@ async fn main() -> ExitCode {
     let options = match cli::parse_with(std::env::args_os().skip(1), &environment) {
         Ok(cli::Command::Run(options)) => *options,
         Ok(cli::Command::Help) => {
-            print!("{}", cli::USAGE);
+            print!("{}", cli::usage());
             return ExitCode::SUCCESS;
         }
         Err(error) => {
@@ -42,18 +41,7 @@ async fn main() -> ExitCode {
     // One model on the command line is the one preset of a server without a
     // preset file. A file that cannot be served is refused here, with its
     // line, before anything is started.
-    let cli::Options {
-        host,
-        port,
-        timeout,
-        log,
-        access,
-        presets,
-        load,
-        reasoning_format,
-        defaults,
-        given,
-    } = options;
+    let cli::Options { host, port, timeout, log, access, presets, model, given } = options;
     let (presets, single) = match &presets {
         Some(file) => match Presets::read(file, &given) {
             Ok(presets) => (presets, None),
@@ -63,7 +51,7 @@ async fn main() -> ExitCode {
             }
         },
         None => {
-            let presets = Presets::single(ModelOptions { load, reasoning_format, defaults });
+            let presets = Presets::single(model);
             let id = presets.models[0].id.clone();
             (presets, Some(id))
         }

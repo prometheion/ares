@@ -53,7 +53,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::options::{self, Kind, ModelOptions};
+use crate::ini::{self, Key, Section};
+use crate::options::{self, ModelOptions, Scope};
 
 /// One model of a preset file.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,7 +143,18 @@ impl Presets {
         exists: &dyn Fn(&Path) -> bool,
     ) -> Result<Self, PresetError> {
         let at = |line: usize, reason: String| PresetError { file: file.to_owned(), line, reason };
-        let sections = sections(text).map_err(|(line, reason)| at(line, reason))?;
+        let ini = ini::parse(text).map_err(|(line, reason)| at(line, reason))?;
+        if let Some(key) = ini.keys.first() {
+            return Err(at(
+                key.line,
+                format!(
+                    "the key '{}' stands before the first section: put it in [*] or in the \
+                     section of a model",
+                    key.name
+                ),
+            ));
+        }
+        let sections = ini.sections;
 
         let mut global = Section::default();
         let mut models: Vec<&Section> = Vec::new();
@@ -199,11 +211,11 @@ impl Presets {
                 idle_unload: None,
             };
             let mut model_line = None;
-            for (scope, keys) in [(Scope::Global, &global.keys), (Scope::Model, &section.keys)] {
+            for (within, keys) in [(Within::Global, &global.keys), (Within::Model, &section.keys)] {
                 for key in keys {
                     let fail = |reason: String| at(key.line, reason);
-                    match apply(&mut preset, scope, key).map_err(fail)? {
-                        Applied::Ram(bytes) if scope == Scope::Global => {
+                    match apply(&mut preset, within, key).map_err(fail)? {
+                        Applied::Ram(bytes) if within == Within::Global => {
                             preset.options.load.ram = None;
                             ram = ram.or(Some(bytes));
                         }
@@ -295,70 +307,9 @@ impl Presets {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct Section {
-    name: String,
-    line: usize,
-    keys: Vec<Key>,
-}
-
-#[derive(Debug, Clone)]
-struct Key {
-    name: String,
-    value: String,
-    line: usize,
-}
-
-/// Cuts the text into its sections; an error is a line and what is wrong
-/// with it.
-fn sections(text: &str) -> Result<Vec<Section>, (usize, String)> {
-    let mut sections: Vec<Section> = Vec::new();
-    for (index, raw) in text.lines().enumerate() {
-        let (number, line) = (index + 1, raw.trim());
-        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('[') {
-            let Some(name) = rest.strip_suffix(']').map(str::trim) else {
-                return Err((number, format!("'{line}' is not a section: write [name]")));
-            };
-            if name.is_empty() {
-                return Err((number, "a section needs a name: the id of its model, or *".into()));
-            }
-            sections.push(Section { name: name.to_owned(), line: number, keys: Vec::new() });
-            continue;
-        }
-        let Some((name, value)) = line.split_once('=') else {
-            return Err((number, format!("'{line}' is not a key: write name = value")));
-        };
-        let (name, value) = (name.trim(), value.trim());
-        let Some(section) = sections.last_mut() else {
-            return Err((
-                number,
-                format!(
-                    "the key '{name}' stands before the first section: put it in [*] or in the \
-                     section of a model"
-                ),
-            ));
-        };
-        if let Some(first) = section.keys.iter().find(|k| k.name == name)
-            && !options::repeats(&format!("--{name}"))
-        {
-            return Err((
-                number,
-                format!(
-                    "the key '{name}' stands twice in [{}] (first at line {})",
-                    section.name, first.line
-                ),
-            ));
-        }
-        section.keys.push(Key { name: name.to_owned(), value: value.to_owned(), line: number });
-    }
-    Ok(sections)
-}
-
+/// Where a key stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
+enum Within {
     Global,
     Model,
 }
@@ -404,10 +355,10 @@ fn idle(key: &Key) -> Result<Option<Duration>, String> {
 }
 
 /// Sets what `key` says in `preset`.
-fn apply(preset: &mut Preset, scope: Scope, key: &Key) -> Result<Applied, String> {
+fn apply(preset: &mut Preset, within: Within, key: &Key) -> Result<Applied, String> {
     let name = key.name.as_str();
     match name {
-        "aliases" if scope == Scope::Global => {
+        "aliases" if within == Within::Global => {
             return Err("aliases in [*]: an alias is one model's, put it in its section".into());
         }
         "aliases" => {
@@ -426,122 +377,27 @@ fn apply(preset: &mut Preset, scope: Scope, key: &Key) -> Result<Applied, String
             preset.idle_unload = idle(key)?;
             return Ok(Applied::Option);
         }
-        _ if options::SERVER.contains(&name) => {
-            return Err(format!(
-                "'{name}' is an option of the server, not of a model: give it on the command \
-                 line (--{name})"
-            ));
-        }
         _ => {}
     }
-    let Some((flag, kind)) = options::lookup(&format!("--{name}")) else {
-        // The field of a request, written as the request writes it.
-        let dashed = name.replace('_', "-");
-        if dashed != name && options::lookup(&format!("--{dashed}")).is_some() {
-            return Err(format!("Ares has no option '{name}': the key is '{dashed}', with dashes"));
-        }
-        return Err(match other_name(name) {
-            Some(hint) => format!("Ares has no option '{name}': {hint}"),
-            None => format!(
-                "Ares has no option '{name}' ('ares --help' lists the options; the keys that \
-                 exist only in a preset file are aliases, load-on-startup and idle-unload)"
-            ),
-        });
-    };
-    if flag == "--model" && scope == Scope::Global {
+    let unknown = "'ares --help' lists the options; the keys that exist only in a preset file \
+                   are aliases, load-on-startup and idle-unload";
+    let opt = options::of_key(name, unknown)?;
+    if opt.scope != Scope::Model {
+        return Err(format!(
+            "'{name}' is an option of the server, not of a model: give it on the command line \
+             (--{name})"
+        ));
+    }
+    if opt.flag == "--model" && within == Within::Global {
         return Err("model in [*]: a model file is one model's, put it in its section".into());
     }
-    let value = match kind {
-        Kind::Value => key.value.clone(),
-        Kind::Switch(true) => truth(key)?.to_string(),
-        Kind::Switch(false) => {
-            return Err(format!(
-                "'{name}' is the command line's way to switch {0} off: write {0} = false",
-                flag.trim_start_matches('-')
-            ));
-        }
-    };
-    options::set(&mut preset.options, flag, &value)
+    let value = opt.value_of_key(&key.value)?;
+    options::set(&mut preset.options, opt.flag, &value)
         .map_err(|e| format!("{name} = '{}' is not {}", e.value, e.expected))?;
-    Ok(match flag {
+    Ok(match opt.flag {
         "--model" => Applied::Model,
         "--ram" => Applied::Ram(preset.options.load.ram.unwrap_or(0)),
         _ => Applied::Option,
-    })
-}
-
-/// What to write instead of an option of llama-server that Ares has under
-/// another name, or does not have because it has nothing to choose there.
-fn other_name(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "c" | "ctx-size" => "the context is 'context', in tokens for all sequences together",
-        "np" => "the sequences that run at once are 'parallel'",
-        "dev" | "device" => "the devices are 'devices', by the driver's numbers (0,1)",
-        "sm" | "split-mode" => "the split is 'split' (single, tensor or layer)",
-        "ts" | "tensor-split" => "the shares of a split are 'shares'",
-        "ctk" | "ctv" | "cache-type-k" | "cache-type-v" => {
-            "the formats of K and V are 'kv' (one name, or two for K and V: q5,q5)"
-        }
-        "chat-template-kwargs" => {
-            "a variable of the chat template is 'chat-var' (chat-var = reasoning_effort=medium), \
-             once for every variable"
-        }
-        "spec-type" => "the drafters are 'drafters' (mtp or none)",
-        "spec-draft-vocab" => "the draft vocabulary is 'draft-vocab'",
-        "spec-draft-n-max" | "draft-max" => {
-            "the room for drafts is 'window', the rows of one sequence's window; how long a \
-             draft is, is chosen for every step"
-        }
-        "no-mmproj-offload" | "mmproj-offload" => {
-            "where the projector's weights stay is 'mmproj-weights' (ram, the default, or vram)"
-        }
-        "image-min-tokens" => "an image becomes at least 8 rows, as in llama.cpp",
-        "cache-ram" => "the RAM the engine may use, its caches included, is 'ram'",
-        "cache-disk" => "the directory of the prompt cache on SSD is 'cache'",
-        "cache-disk-size" => "the most the prompt cache takes on SSD is 'cache-size'",
-        "ctx-checkpoints" | "checkpoint-root" | "checkpoint-spread" | "cache-save-min" => {
-            "the engine places its checkpoints and decides what of them is kept and written"
-        }
-        "sleep-idle-seconds" => "the time a model may stay idle is 'idle-unload'",
-        "a" | "alias" => "more ids of a model are 'aliases'",
-        "models-max" => {
-            "nothing counts the loaded models: one is unloaded when another needs its memory"
-        }
-        "stop-timeout" => "an unload writes nothing and waits for nothing but running requests",
-        "ngl" | "gpu-layers" | "n-gpu-layers" => "all of a model is on the devices",
-        "fa" | "flash-attn" | "jinja" => "that is always on",
-        // The defaults of the sampler: a key is the field of a request, with
-        // dashes.
-        "temp" => "the temperature of a request that names none is 'temperature'",
-        "top-nsigma" => "that default is 'top-n-sigma' (0 is off)",
-        "typical" => "that default is 'typical-p'",
-        "dynatemp-exp" => "that default is 'dynatemp-exponent'",
-        "mirostat-lr" => "mirostat's rate is 'mirostat-eta'",
-        "mirostat-ent" => "mirostat's target is 'mirostat-tau'",
-        "dry-sequence-breaker" => {
-            "DRY's breakers are 'dry-sequence-breakers', all of them in one JSON array \
-             ([\"\\n\", \":\"])"
-        }
-        "sampler-seq" | "sampling-seq" => {
-            "the order of the samplers is 'samplers', by their names \
-             (penalties,dry,top_k,top_p,min_p,temperature)"
-        }
-        "s" => "the seed of a request that names none is 'seed'",
-        "reasoning-budget" => {
-            "the budget of thinking tokens of a request that names none is \
-             'reasoning-budget-tokens'"
-        }
-        "n" | "predict" | "n-predict" => {
-            "the limit of tokens for a request that names none is 'max-tokens'; \
-             'max-tokens-limit' is the most any request gets"
-        }
-        "ignore-eos" => {
-            "a reply that does not end is what a request asks for (ignore_eos), not a default \
-             of a model"
-        }
-        "l" | "logit-bias" => "a logit bias is a request's (logit_bias); a model has no default",
-        "adaptive-target" | "adaptive-decay" => "adaptive-p is not built",
-        _ => return None,
     })
 }
 
