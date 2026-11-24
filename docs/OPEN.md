@@ -889,16 +889,10 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         `Config::from_gguf`, `Drafter::pass_layers`; `Frame::widest` and the 27B's
         `open_balanced` went down to 277 and 222 lines in stages) and the names of the audit's
         finding 13.
-  - [ ] The loaders (finding 1: `load.rs` and `qwen4exp.rs`, their copied tail, the qwen35
-        memory estimate in the server), with them the names `qwen4exp::Split` (a saved spread)
-        and `load::watch` beside `Models::watch`: after the model crate's phase 2 merges.
-  - [ ] Other crates' parts of the audit (`server.md`), not this branch's crates: `ToolFormat`
-        and the thinking format written in `ares-tokenizer` and `ares-api` (and copied in
-        `ares-model`'s `chat.rs`), three JSON value types, tools as raw JSON across the API,
-        the order rule of the samplers and the mirostat range checked in the runtime as well,
-        `LOGPROBS_MAX`/`BIAS_MAX` beside the API's limits; the mask-bit test three times
-        (grammar, sampler), llama.cpp's defaults in the sampler and the runtime; test-only
-        public code (`Breakers::of_tokens`, `keeps_history`/`opens` computed and dropped).
+  - [ ] Left of the other crates' part of the audit (`server.md`, finding 7): typed tools and
+        tool calls in `ares-api` instead of raw OpenAI JSON across the API, one JSON value type
+        in the server (with the rule for integers above `i64::MAX` decided once), and the
+        mirostat range checked by `Sampling::validate` and by the runtime's request sampler.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history.md).

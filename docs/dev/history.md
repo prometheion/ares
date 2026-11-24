@@ -63,6 +63,24 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
 
 ### From "Cleanup (the owner, 2026-11-23: the code must be clean although agents wrote it)"
 
+- [x] The loaders (finding 1: `load.rs` and `qwen4exp.rs`, their copied tail, the qwen35
+      memory estimate in the server), with them the names `qwen4exp::Split` (a saved spread)
+      and `load::watch` beside `Models::watch`: after the model crate's phase 2 merges.
+      Done (merged 2026-11-24, cleanup phase 2 of the loaders): `load/qwen35.rs` and
+      `load/qwen4exp.rs` in phases with one tail (`load/start.rs`) and one RAM budget
+      (`load/ram.rs`), the 27B's estimate in the model; `SavedSpread` and `load::machine`.
+- [x] Other crates' parts of the audit (`server.md`), not this branch's crates: `ToolFormat`
+      and the thinking format written in `ares-tokenizer` and `ares-api` (and copied in
+      `ares-model`'s `chat.rs`), three JSON value types, tools as raw JSON across the API,
+      the order rule of the samplers and the mirostat range checked in the runtime as well,
+      `LOGPROBS_MAX`/`BIAS_MAX` beside the API's limits; the mask-bit test three times
+      (grammar, sampler), llama.cpp's defaults in the sampler and the runtime; test-only
+      public code (`Breakers::of_tokens`, `keeps_history`/`opens` computed and dropped).
+      Done (merged 2026-11-24): the formats are the API's types, read once by the tokenizer;
+      `SamplerKind::order_problem` and the limits const-asserted equal; the mask bit through
+      `mask_allows`; the runtime's defaults from the sampler's constants; `Breakers::of_tokens`
+      the tests' own, `keeps_history` gone, `opens` a test helper. Typed tools, one JSON
+      value type and the mirostat range stay open in `OPEN.md`.
 - [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
       one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
       one place, the conductor split, the two model loaders of the server, shared device helpers.
