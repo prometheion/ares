@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -10,9 +11,68 @@ use std::time::{Duration, Instant};
 
 use ares_api::{
     Engine, EngineError, Event, EventSink, FinishReason, GenerateRequest, Prompt, RequestId,
-    Sampling, TokenProbs, Usage,
+    Sampling, TokenProbs, ToolFormat, Usage,
 };
-use ares_runtime::{Runtime, Snapshot, TokenFilter};
+use ares_runtime::testing::HostExecutor;
+use ares_runtime::{
+    RecordView, Runtime, RuntimeConfig, Snapshot, Split, SyntheticConfig, SyntheticModel,
+    TokenFilter,
+};
+
+/// A synthetic model of `context_length` tokens whose text loops, so that the
+/// n-gram drafter has drafts from earlier text to offer, with a draft block of
+/// its own that gets the first links right more often than the last (the
+/// n-gram drafter takes part only next to one); `eos` ends a reply.
+pub fn looping_model(context_length: u32, eos: Option<u32>) -> Arc<SyntheticModel> {
+    let mut config = SyntheticConfig::small(Split::Single, 1);
+    config.context_length = context_length;
+    config.eos = eos;
+    config.context.window = 1;
+    config.context.epoch = 40;
+    config.context.buckets = 512;
+    config.mtp_links = 7;
+    config.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
+    Arc::new(SyntheticModel::new(config).unwrap())
+}
+
+/// A runtime on the host that hands every step's record to `observer`. A
+/// step costs what a device's would (a pass over the weights and a little for
+/// each row), so that the policy sees what drafts cost and are worth; without
+/// `speculation` a window is one row, which is no drafts at all.
+pub fn observed_runtime(
+    model: &Arc<SyntheticModel>,
+    speculation: bool,
+    observer: impl FnMut(&RecordView<'_>) + Send + 'static,
+) -> Runtime {
+    let config = RuntimeConfig {
+        pages: 4096,
+        cells_per_page: 16,
+        max_slots: 64,
+        window_rows: if speculation { 8 } else { 1 },
+        warm_up: false,
+        ..RuntimeConfig::default()
+    };
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
+        .with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
+        .with_observer(observer);
+    Runtime::start(model.clone(), Box::new(host), config).unwrap()
+}
+
+/// The format of Qwen3.8's template with blanks for its line breaks (the
+/// synthetic model has no line break among its printable bytes), and with
+/// `trigger` where it has `<tool_call>`.
+pub fn tool_format(trigger: &str) -> ToolFormat {
+    ToolFormat {
+        call_open: format!("{trigger} <function="),
+        name_close: "> ".into(),
+        param_open: "<parameter=".into(),
+        key_close: "> ".into(),
+        param_close: " </parameter> ".into(),
+        call_close: "</function> </tool_call>".into(),
+        before_calls: "  ".into(),
+        between_calls: " ".into(),
+    }
+}
 
 /// How long a test waits for the engine before it fails, so that a broken
 /// engine ends a test instead of hanging it.

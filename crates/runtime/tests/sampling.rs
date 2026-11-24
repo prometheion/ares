@@ -10,53 +10,12 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use ares_api::{BiasKey, LogitBias, SamplerKind, Sampling};
-use ares_runtime::testing::HostExecutor;
-use ares_runtime::{
-    Model, RecordView, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel, TokenFilter,
-};
+use ares_runtime::{Model, RecordView, Runtime, TokenFilter};
 use ares_sampler::penalties::{Corrections, PenaltyParams, entries_for};
 use ares_sampler::{Entry, TokenMask};
 use common::*;
-
-fn model() -> Arc<SyntheticModel> {
-    let mut config = SyntheticConfig::small(Split::Single, 1);
-    config.context_length = 512;
-    // Text that loops, so that drafts from earlier text come true, and a draft
-    // block of the model's own that gets the first links right more often
-    // than the last (the n-gram drafter takes part only next to one).
-    config.context.window = 1;
-    config.context.epoch = 40;
-    config.context.buckets = 512;
-    config.mtp_links = 7;
-    config.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
-    Arc::new(SyntheticModel::new(config).unwrap())
-}
-
-/// A runtime that hands every step's record to `observer`.
-fn runtime(
-    model: &Arc<SyntheticModel>,
-    speculation: bool,
-    observer: impl FnMut(&RecordView<'_>) + Send + 'static,
-) -> Runtime {
-    let config = RuntimeConfig {
-        pages: 4096,
-        cells_per_page: 16,
-        max_slots: 64,
-        // A window of one row is no drafts at all.
-        window_rows: if speculation { 8 } else { 1 },
-        warm_up: false,
-        ..RuntimeConfig::default()
-    };
-    // A step costs what a device's would (a pass over the weights and a little
-    // for each row), so that the policy sees what drafts cost and are worth.
-    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
-        .with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
-        .with_observer(observer);
-    Runtime::start(model.clone(), Box::new(host), config).unwrap()
-}
 
 /// Calls `f` with the wanted rows of the record, in order: `(row, segment)`.
 fn wanted_rows(record: &RecordView<'_>) -> Vec<(u32, u32)> {
@@ -88,7 +47,7 @@ fn the_rows_of_a_window_carry_the_corrections_of_their_own_paths() {
     let verified = Arc::new(Mutex::new(0usize));
     let seen = verified.clone();
     let wanted_corrections = corrections.clone();
-    let rt = runtime(&model(), true, move |record| {
+    let rt = observed_runtime(&looping_model(512, None), true, move |record| {
         // A step that only drafts verifies nothing: its links pick without the
         // corrections of the drafts before them, which are not made yet.
         if record.drafts_only() {
@@ -131,7 +90,7 @@ fn the_rows_of_a_window_carry_the_corrections_of_their_own_paths() {
 fn a_request_without_corrections_has_none_in_its_records() {
     let steps = Arc::new(Mutex::new((0usize, 0usize)));
     let counts = steps.clone();
-    let rt = runtime(&model(), true, move |record| {
+    let rt = observed_runtime(&looping_model(512, None), true, move |record| {
         let mut c = counts.lock().unwrap();
         c.0 += 1;
         c.1 += (record.corrections() + record.masks().0) as usize;
@@ -147,7 +106,7 @@ fn a_request_without_corrections_has_none_in_its_records() {
 fn a_bias_is_the_same_for_every_row_and_a_ban_reaches_the_record() {
     let rows = Arc::new(Mutex::new(Vec::new()));
     let seen = rows.clone();
-    let rt = runtime(&model(), true, move |record| {
+    let rt = observed_runtime(&looping_model(512, None), true, move |record| {
         for index in 0..record.picked_rows() {
             let (first, count) = record.sampler(index).entries();
             let entries: Vec<Entry> =
@@ -174,7 +133,7 @@ fn a_bias_is_the_same_for_every_row_and_a_ban_reaches_the_record() {
 fn a_mirostat_request_verifies_no_drafts_and_another_still_does() {
     let widest = Arc::new(Mutex::new(0u32));
     let seen = widest.clone();
-    let rt = runtime(&model(), true, move |record| {
+    let rt = observed_runtime(&looping_model(512, None), true, move |record| {
         let mut w = seen.lock().unwrap();
         for i in 0..record.segments() {
             *w = (*w).max(record.segment(i).n_rows);
@@ -227,11 +186,11 @@ impl TokenFilter for Counting {
 
 #[test]
 fn a_filter_makes_a_mask_for_every_wanted_row_and_the_record_carries_it() {
-    let model = model();
+    let model = looping_model(512, None);
     let words = TokenMask::words_for(model.vocab());
     let masks = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
     let seen = masks.clone();
-    let rt = runtime(&model, true, move |record| {
+    let rt = observed_runtime(&model, true, move |record| {
         let (count, w) = record.masks();
         let mut m = seen.lock().unwrap();
         m.0 += record.picked_rows() as usize;
@@ -267,7 +226,7 @@ fn a_filter_makes_a_mask_for_every_wanted_row_and_the_record_carries_it() {
 
 #[test]
 fn what_the_sampler_cannot_serve_is_refused_by_name() {
-    let rt = runtime(&model(), false, |_| {});
+    let rt = observed_runtime(&looping_model(512, None), false, |_| {});
     // The ranges of the API are refused when the request is handed over; what
     // only the engine knows, when the conductor looks at it.
     let refused = |sampling: Sampling| -> String {

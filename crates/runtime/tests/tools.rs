@@ -10,64 +10,14 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use ares_api::{Engine, FinishReason, Interrupt, Shape, Start, Structure, ToolFormat};
 use ares_grammar::calls::{CallRule, Callable};
-use ares_runtime::testing::HostExecutor;
-use ares_runtime::{RecordView, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_runtime::RecordView;
 use common::*;
 use serde_json::json;
 
 const END: u8 = b'~';
-
-fn model() -> Arc<SyntheticModel> {
-    let mut config = SyntheticConfig::small(Split::Single, 1);
-    config.context_length = 1024;
-    config.eos = Some(u32::from(END));
-    // Text that loops, so that the n-gram drafter has drafts to offer,
-    // next to an MTP block of the model's.
-    config.context.window = 1;
-    config.context.epoch = 40;
-    config.context.buckets = 512;
-    config.mtp_links = 7;
-    config.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
-    Arc::new(SyntheticModel::new(config).unwrap())
-}
-
-fn runtime(
-    model: &Arc<SyntheticModel>,
-    speculation: bool,
-    observer: impl FnMut(&RecordView<'_>) + Send + 'static,
-) -> Runtime {
-    let config = RuntimeConfig {
-        pages: 4096,
-        cells_per_page: 16,
-        max_slots: 64,
-        window_rows: if speculation { 8 } else { 1 },
-        warm_up: false,
-        ..RuntimeConfig::default()
-    };
-    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
-        .with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
-        .with_observer(observer);
-    Runtime::start(model.clone(), Box::new(host), config).unwrap()
-}
-
-/// The format of Qwen3.8's template with blanks for its line breaks, and
-/// with `trigger` where it has `<tool_call>`.
-fn format(trigger: &str) -> ToolFormat {
-    ToolFormat {
-        call_open: format!("{trigger} <function="),
-        name_close: "> ".into(),
-        param_open: "<parameter=".into(),
-        key_close: "> ".into(),
-        param_close: " </parameter> ".into(),
-        call_close: "</function> </tool_call>".into(),
-        before_calls: "  ".into(),
-        between_calls: " ".into(),
-    }
-}
 
 /// The grammar of calls of two tools whose arguments the model cannot write
 /// without end: numbers and one string of a few.
@@ -152,13 +102,13 @@ fn watch(rows: &Arc<Mutex<Rows>>) -> impl FnMut(&RecordView<'_>) + Send + 'stati
 
 #[test]
 fn a_reply_that_must_call_is_calls_and_drafts_change_nothing() {
-    let model = model();
-    let format = format("<tool_call>");
+    let model = looping_model(1024, Some(u32::from(END)));
+    let format = tool_format("<tool_call>");
     for parallel in [false, true] {
         let mut texts = Vec::new();
         for speculation in [false, true] {
             let rows = Arc::new(Mutex::new(Rows::default()));
-            let rt = runtime(&model, speculation, watch(&rows));
+            let rt = observed_runtime(&model, speculation, watch(&rows));
             let mut request = request("a prompt", Some(900));
             request.structure = Some(Structure::new(calls(&format, parallel, false)));
             let run = run_one(&rt, request);
@@ -180,9 +130,9 @@ fn a_reply_that_must_call_is_calls_and_drafts_change_nothing() {
 
 #[test]
 fn a_reply_is_free_until_the_trigger_and_calls_after_it_with_drafts_and_without() {
-    let model = model();
+    let model = looping_model(1024, Some(u32::from(END)));
     // The model writes an '8' at its third token: that is the trigger here.
-    let format = format("8");
+    let format = tool_format("8");
     let structure = Structure {
         shape: calls(&format, true, true),
         start: Start::Reply,
@@ -192,7 +142,7 @@ fn a_reply_is_free_until_the_trigger_and_calls_after_it_with_drafts_and_without(
     let mut texts = Vec::new();
     for speculation in [false, true] {
         let rows = Arc::new(Mutex::new(Rows::default()));
-        let rt = runtime(&model, speculation, watch(&rows));
+        let rt = observed_runtime(&model, speculation, watch(&rows));
         let mut request = request("a prompt", Some(900));
         request.structure = Some(structure.clone());
         let run = run_one(&rt, request);
@@ -216,10 +166,10 @@ fn a_reply_is_free_until_the_trigger_and_calls_after_it_with_drafts_and_without(
 
 #[test]
 fn a_call_opened_inside_the_reasoning_is_bound_with_drafts_and_without() {
-    let model = model();
+    let model = looping_model(1024, Some(u32::from(END)));
     // The model writes an '8' at its third token: that is the marker of a
     // call here. It thinks, and never writes the tag that closes its thinking.
-    let format = format("8");
+    let format = tool_format("8");
     for must_call in [false, true] {
         let structure = Structure {
             shape: calls(&format, true, !must_call),
@@ -233,7 +183,7 @@ fn a_call_opened_inside_the_reasoning_is_bound_with_drafts_and_without() {
         let mut texts = Vec::new();
         for speculation in [false, true] {
             let rows = Arc::new(Mutex::new(Rows::default()));
-            let rt = runtime(&model, speculation, watch(&rows));
+            let rt = observed_runtime(&model, speculation, watch(&rows));
             let mut request = request("a prompt", Some(900));
             request.structure = Some(structure.clone());
             let run = run_one(&rt, request);

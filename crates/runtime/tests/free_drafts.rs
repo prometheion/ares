@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ares_api::{FinishReason, GenerateRequest, Shape, Start, Structure, ToolFormat};
+use ares_api::{FinishReason, GenerateRequest, Shape, Start, Structure};
 use ares_grammar::calls::{CallRule, Callable};
 use ares_runtime::testing::HostExecutor;
 use ares_runtime::{
@@ -160,21 +160,6 @@ fn tag_at(text: &[char], end: usize) -> Option<String> {
     (!earlier && !pair.contains(&' ')).then(|| pair.iter().collect())
 }
 
-/// The format of Qwen3.8's template with blanks for its line breaks, and
-/// with `trigger` where it has `<tool_call>`.
-fn format(trigger: &str) -> ToolFormat {
-    ToolFormat {
-        call_open: format!("{trigger} <function="),
-        name_close: "> ".into(),
-        param_open: "<parameter=".into(),
-        key_close: "> ".into(),
-        param_close: " </parameter> ".into(),
-        call_close: "</function> </tool_call>".into(),
-        before_calls: "  ".into(),
-        between_calls: " ".into(),
-    }
-}
-
 /// The two kinds of rule that leave a part of the reply free.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -194,7 +179,7 @@ fn rule(kind: Kind, tag: &str) -> Structure {
             interrupt: None,
         },
         Kind::Trigger => {
-            let format = format(tag);
+            let format = tool_format(tag);
             let level = json!({
                 "type": "object",
                 "properties": {"level": {"type": "integer", "minimum": 0, "maximum": 99}},

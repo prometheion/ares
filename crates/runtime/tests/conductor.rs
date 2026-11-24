@@ -866,11 +866,7 @@ fn drafting_runtime(
 
 /// The windows the policy made, by the number of drafts they verified: `[source][drafts]`.
 fn lengths(rt: &Runtime) -> [[u64; 17]; ares_runtime::DRAFT_SOURCES] {
-    snapshot_of(rt).counters.draft_lengths
-}
-
-fn snapshot_of(rt: &Runtime) -> ares_runtime::Snapshot {
-    rt.snapshot().expect("the conductor runs")
+    snapshot(rt).counters.draft_lengths
 }
 
 #[test]
@@ -883,7 +879,7 @@ fn a_model_with_no_drafter_does_not_speculate_and_the_ngram_drafter_does_not_run
     });
     let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| e);
     alone(&rt, "a text that loops", Some(300));
-    let c = snapshot_of(&rt).counters;
+    let c = snapshot(&rt).counters;
     assert_eq!((c.draft_rows, c.drafts_accepted), (0, 0), "{c:?}");
     // A token a row: the first came from the prompt's last row.
     assert_eq!(c.tokens, c.window_rows + 1, "{c:?}");
@@ -895,7 +891,7 @@ fn a_window_of_one_row_is_no_speculation_even_for_a_model_with_a_drafter_and_tex
     let model = model(repeating);
     let rt = runtime(&model, false);
     alone(&rt, "a text that loops", Some(300));
-    let c = snapshot_of(&rt).counters;
+    let c = snapshot(&rt).counters;
     assert_eq!((c.draft_rows, c.drafts_accepted), (0, 0), "{c:?}");
     // The same model and text with room for a window do draft: it is the room
     // that was missing, not the text.
@@ -903,7 +899,7 @@ fn a_window_of_one_row_is_no_speculation_even_for_a_model_with_a_drafter_and_tex
         e.with_delay(Duration::from_micros(200)).without_sleeping()
     });
     alone(&rt, "a text that loops", Some(300));
-    assert!(snapshot_of(&rt).counters.drafts_accepted > 100);
+    assert!(snapshot(&rt).counters.drafts_accepted > 100);
 }
 
 #[test]
@@ -914,9 +910,9 @@ fn the_ngram_drafter_joins_the_model_drafter_when_there_is_one() {
         e.with_delay(Duration::from_micros(200)).without_sleeping()
     });
     alone(&rt, "written twice", Some(200));
-    let before = snapshot_of(&rt).counters;
+    let before = snapshot(&rt).counters;
     alone(&rt, "written twice", Some(200));
-    let c = snapshot_of(&rt).counters;
+    let c = snapshot(&rt).counters;
     // The MTP block is never right here: what is drafted and accepted
     // comes from the n-gram drafter in the first request's text.
     assert!(c.drafts_accepted_at[0].iter().sum::<u64>() > 150, "{c:?}");
@@ -962,7 +958,7 @@ fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
     // in the scheduler's test of the back-off with the same prices.
     let (rt, _) = drafting_runtime(&[0.0], 16, true, None);
     alone(&rt, "an impossible text", Some(400));
-    let c = snapshot_of(&rt).counters;
+    let c = snapshot(&rt).counters;
     let tries: u64 = c.draft_lengths[1].iter().sum();
     assert!((2..=20).contains(&tries), "{tries} windows with drafts: {c:?}");
     assert_eq!(c.drafts_accepted, 0, "{c:?}");
@@ -1007,7 +1003,7 @@ fn a_late_step_does_not_price_a_window_out() {
         after.len() > 20 && after[..after.len() - 1].iter().all(|rows| *rows == 8),
         "{after:?}"
     );
-    let now = snapshot_of(&rt).step_ms;
+    let now = snapshot(&rt).step_ms;
     let eight = now.iter().find(|(rows, _)| *rows == 8).map(|(_, ms)| *ms).expect("measured");
     assert!((eight - launches_ms(8)).abs() < 1e-9, "{now:?}");
 }
@@ -1034,7 +1030,7 @@ fn windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay()
         .without_sleeping()
         .with_observer(watch(&steps))
     });
-    let cold = snapshot_of(&rt).calibration.expect("a warm-up").step_ms;
+    let cold = snapshot(&rt).calibration.expect("a warm-up").step_ms;
     assert_eq!(cold[..3], [(1, 12.0), (2, 21.0), (3, 30.0)]);
     let warm_up = steps.lock().unwrap().len();
     warm.store(true, Ordering::Relaxed);
@@ -1052,7 +1048,7 @@ fn windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay()
     assert!(full <= 12, "{rows:?}");
     assert!(rows[full..rows.len() - 1].iter().all(|rows| *rows == 8), "{rows:?}");
     // And the table says what the device costs now.
-    let now = snapshot_of(&rt).step_ms;
+    let now = snapshot(&rt).step_ms;
     for rows in [1, 4, 8] {
         let price = now.iter().find(|(n, _)| *n == rows).map(|(_, ms)| *ms).expect("measured");
         assert!((price - launches_ms(rows)).abs() < 1e-9, "{rows} rows: {now:?}");
@@ -1077,7 +1073,7 @@ fn unsure_drafts(sure: bool) -> (Run, ares_runtime::Snapshot) {
         e.with_step_cost(launches).with_link_cost(Duration::from_micros(300)).without_sleeping()
     });
     let run = alone(&rt, "a text that is hard in places", Some(600));
-    (run, snapshot_of(&rt))
+    (run, snapshot(&rt))
 }
 
 #[test]
@@ -1155,7 +1151,7 @@ fn the_warm_up_measures_every_window_size_and_every_link_of_the_chain() {
 #[test]
 fn the_calibration_finds_the_edge_of_a_launch_and_the_cost_of_a_link() {
     let (rt, _) = drafting_runtime(&[0.97], 8, true, None);
-    let calibration = snapshot_of(&rt).calibration.expect("the warm-up measured");
+    let calibration = snapshot(&rt).calibration.expect("the warm-up measured");
     // The table holds what the device charges for every size, to the edge:
     // eight rows are one launch and nine are two, 3 ms more.
     assert!(calibration.step_ms.len() >= 24, "{:?}", calibration.step_ms);
@@ -1188,7 +1184,7 @@ fn the_conductor_measures_the_steps_of_an_executor_that_does_not_say_what_they_t
         })
     };
     let measured = start(true);
-    let calibration = snapshot_of(&measured).calibration.expect("the warm-up measured");
+    let calibration = snapshot(&measured).calibration.expect("the warm-up measured");
     let sizes: Vec<u32> = calibration.step_ms.iter().map(|(rows, _)| *rows).collect();
     assert_eq!(sizes, (1..=16).collect::<Vec<_>>());
     // A step is never measured shorter than the executor took for it.
@@ -1207,7 +1203,7 @@ fn the_conductor_measures_the_steps_of_an_executor_that_does_not_say_what_they_t
     let run = alone(&measured, "the same words", Some(120));
     assert_eq!(run, alone(&start(false), "the same words", Some(120)));
     assert_eq!(run.usage.completion_tokens, 120);
-    let c = snapshot_of(&measured).counters;
+    let c = snapshot(&measured).counters;
     assert_eq!(c.tokens, 120, "{c:?}");
     assert!(c.steps <= 121 && c.drafts_accepted <= c.draft_rows, "{c:?}");
 }
@@ -1216,12 +1212,12 @@ fn the_conductor_measures_the_steps_of_an_executor_that_does_not_say_what_they_t
 fn a_request_that_asks_for_no_drafts_gets_none_and_says_the_same() {
     let (rt, _) = drafting_runtime(&[0.97], 8, false, None);
     let with = alone(&rt, "the same words", Some(120));
-    let drafted = snapshot_of(&rt).counters.draft_rows;
+    let drafted = snapshot(&rt).counters.draft_rows;
     assert!(drafted > 0);
     let mut plain = request("the same words", Some(120));
     plain.draft = false;
     let without = run_one(&rt, plain);
-    assert_eq!(snapshot_of(&rt).counters.draft_rows, drafted, "no draft rows for the request");
+    assert_eq!(snapshot(&rt).counters.draft_rows, drafted, "no draft rows for the request");
     assert_eq!(without, with, "the text, and the hash of its tokens, are the same");
     assert_ne!(with.usage.output_hash, 0);
 }

@@ -7,48 +7,12 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use ares_api::{Engine, EngineError, Shape, Start, Structure};
-use ares_runtime::testing::HostExecutor;
-use ares_runtime::{RecordView, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_runtime::{RecordView, Split, SyntheticConfig, SyntheticModel};
 use common::*;
 
 const END: u8 = b'~';
-
-fn model() -> Arc<SyntheticModel> {
-    let mut config = SyntheticConfig::small(Split::Single, 1);
-    config.context_length = 1024;
-    config.eos = Some(u32::from(END));
-    // Text that loops, so that the n-gram drafter has drafts to offer,
-    // next to an MTP block of the model's (the n-gram drafter takes part only
-    // next to one).
-    config.context.window = 1;
-    config.context.epoch = 40;
-    config.context.buckets = 512;
-    config.mtp_links = 7;
-    config.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
-    Arc::new(SyntheticModel::new(config).unwrap())
-}
-
-fn runtime(
-    model: &Arc<SyntheticModel>,
-    speculation: bool,
-    observer: impl FnMut(&RecordView<'_>) + Send + 'static,
-) -> Runtime {
-    let config = RuntimeConfig {
-        pages: 4096,
-        cells_per_page: 16,
-        max_slots: 64,
-        window_rows: if speculation { 8 } else { 1 },
-        warm_up: false,
-        ..RuntimeConfig::default()
-    };
-    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
-        .with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
-        .with_observer(observer);
-    Runtime::start(model.clone(), Box::new(host), config).unwrap()
-}
 
 fn gbnf(grammar: &str) -> Structure {
     Structure::new(Shape::Gbnf(grammar.to_owned()))
@@ -88,12 +52,12 @@ fn watch(rows: &Arc<Mutex<Rows>>) -> impl FnMut(&RecordView<'_>) + Send + 'stati
 
 #[test]
 fn a_grammar_is_obeyed_and_drafts_change_nothing() {
-    let model = model();
+    let model = looping_model(1024, Some(u32::from(END)));
     let grammar = "root ::= [a-c]{60} \"!\"";
     let mut runs = Vec::new();
     for speculation in [false, true] {
         let rows = Arc::new(Mutex::new(Rows::default()));
-        let rt = runtime(&model, speculation, watch(&rows));
+        let rt = observed_runtime(&model, speculation, watch(&rows));
         let run = run_one(&rt, structured(gbnf(grammar), 400));
         assert_eq!(run.finish, ares_api::FinishReason::Stop, "{run:?}");
         assert_eq!(run.text.chars().count(), 61, "{}", run.text);
@@ -114,10 +78,10 @@ fn a_grammar_is_obeyed_and_drafts_change_nothing() {
 fn a_draft_the_grammar_forbids_is_cut_before_it_is_verified() {
     // Runs of one letter: the n-gram drafter goes on with the letter
     // the grammar is about to leave, and the grammar leaves one token to pick.
-    let model = model();
+    let model = looping_model(1024, Some(u32::from(END)));
     let grammar = "root ::= \"a\"{30} \"b\"{30} \"a\"{30} \"b\"{30}";
     let rows = Arc::new(Mutex::new(Rows::default()));
-    let rt = runtime(&model, true, watch(&rows));
+    let rt = observed_runtime(&model, true, watch(&rows));
     let run = run_one(&rt, structured(gbnf(grammar), 400));
     assert_eq!(run.text, format!("{0}{1}{0}{1}", "a".repeat(30), "b".repeat(30)));
     let stats = rt.stats().expect("stats");
@@ -130,11 +94,11 @@ fn a_draft_the_grammar_forbids_is_cut_before_it_is_verified() {
 
 #[test]
 fn requests_with_different_grammars_in_one_step_get_their_own() {
-    let model = model();
+    let model = looping_model(1024, Some(u32::from(END)));
     let first = "root ::= [a-c]{50}";
     let second = "root ::= [x-z]{50}";
     let alone = |grammar: &str| {
-        let rt = runtime(&model, true, |_| {});
+        let rt = observed_runtime(&model, true, |_| {});
         run_one(&rt, structured(gbnf(grammar), 100)).text
     };
     let (a, b) = (alone(first), alone(second));
@@ -142,7 +106,7 @@ fn requests_with_different_grammars_in_one_step_get_their_own() {
     assert!(b.chars().all(|c| ('x'..='z').contains(&c)) && b.len() == 50, "{b}");
 
     let rows = Arc::new(Mutex::new(Rows::default()));
-    let rt = runtime(&model, true, watch(&rows));
+    let rt = observed_runtime(&model, true, watch(&rows));
     let start = |grammar: &str| start(&rt, structured(gbnf(grammar), 100)).unwrap();
     let (ha, hb, hc) = (start(first), start(second), start(first));
     let (together_a, together_b, together_c) =
@@ -157,7 +121,7 @@ fn requests_with_different_grammars_in_one_step_get_their_own() {
 
 #[test]
 fn the_reasoning_is_free_and_the_answer_after_its_closing_tag_is_bound() {
-    let model = model();
+    let model = looping_model(1024, Some(u32::from(END)));
     // The reasoning ends where the model writes an '8', which it does at its
     // third token; what follows is five letters from x to z, and then the end.
     let structure = Structure {
@@ -168,7 +132,7 @@ fn the_reasoning_is_free_and_the_answer_after_its_closing_tag_is_bound() {
     };
     let mut texts = Vec::new();
     for speculation in [false, true] {
-        let rt = runtime(&model, speculation, |_| {});
+        let rt = observed_runtime(&model, speculation, |_| {});
         let run = run_one(&rt, structured(structure.clone(), 1000));
         let (reasoning, answer) = run.text.split_once('8').expect("the model wrote an 8");
         assert!(reasoning.chars().any(|c| !('x'..='z').contains(&c)), "free text: {reasoning}");
@@ -182,7 +146,7 @@ fn the_reasoning_is_free_and_the_answer_after_its_closing_tag_is_bound() {
 
 #[test]
 fn a_grammar_or_a_schema_that_is_wrong_is_refused_when_the_request_comes() {
-    let rt = runtime(&model(), true, |_| {});
+    let rt = observed_runtime(&looping_model(1024, Some(u32::from(END))), true, |_| {});
     let refused = |structure: Structure| match rt
         .submit(structured(structure, 10), ares_api::EventSink::new(|_| true))
     {
@@ -209,7 +173,7 @@ fn a_reply_the_grammar_cannot_end_ends_in_an_error_and_not_in_free_text() {
     let mut config = SyntheticConfig::small(Split::Single, 1);
     config.eos = None;
     let model = Arc::new(SyntheticModel::new(config).unwrap());
-    let rt = runtime(&model, false, |_| {});
+    let rt = observed_runtime(&model, false, |_| {});
     let error = start(&rt, structured(gbnf("root ::= \"ab\""), 50)).unwrap().failure();
     assert!(error.to_string().contains("no token"), "{error}");
 }
