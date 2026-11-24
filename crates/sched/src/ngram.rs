@@ -689,9 +689,11 @@ impl NgramDrafter {
         Some(NgramMatch { len, occurrences: s.seen, agreeing: agreeing.min(s.seen) })
     }
 
-    /// The table cell of each token of the last draft, as row times four plus
-    /// column of [`NgramCorpus::table`]. This is what a calibration run
-    /// counts acceptance by.
+    /// The cell of the corpus's acceptance table of each token of the last
+    /// draft, as row times four plus column: a row per context length (1, 2,
+    /// 3, 4, 5-6, 7-8, 9-12, 13-16, 17-32, more) and a column per agreement
+    /// (once, always, mostly, seldom). This is what a calibration run counts
+    /// acceptance by.
     pub fn cells(&self) -> &[u8] {
         &self.cells[..self.proposed]
     }
