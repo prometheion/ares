@@ -58,10 +58,6 @@ use crate::options::{Invalid, OPTIONS};
 /// model's `--max-tokens-limit`: its value is the limit the reply got.
 pub const LIMIT_HEADER: &str = "x-ares-max-tokens-limit";
 
-/// The most stages of a sampler's program that cut or scale, which is the
-/// engine's limit (`ares_sampler::MAX_STAGES`).
-pub const STAGES_MAX: usize = 16;
-
 /// What the options of a model say about its requests.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Defaults {
@@ -188,18 +184,8 @@ pub(crate) mod order {
             .split(',')
             .map(|name| SamplerKind::from_name(name.trim()))
             .collect::<Option<Vec<_>>>()?;
-        // The engine's rule: the penalties and DRY correct the logits, so
-        // they stand before the stages that cut or scale, once each, and a
-        // program holds no more than `STAGES_MAX` of those.
-        let corrects =
-            |kind: &SamplerKind| matches!(kind, SamplerKind::Penalties | SamplerKind::Dry);
-        let first = kinds.iter().take_while(|kind| corrects(kind)).count();
-        let twice = first == 2 && kinds[0] == kinds[1];
-        let stages = &kinds[first..];
-        let valid = first <= 2
-            && !twice
-            && !stages.iter().any(corrects)
-            && stages.len() <= super::STAGES_MAX;
+        // The engine's rule, which requests are held to as well.
+        let valid = SamplerKind::order_problem(&kinds).is_none();
         valid.then_some(kinds)
     }
 

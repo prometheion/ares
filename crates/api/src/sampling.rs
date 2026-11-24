@@ -12,6 +12,10 @@ pub const LOGIT_BIAS_MAX: usize = 1024;
 /// The most alternatives next to a token whose probability is reported.
 pub const TOP_LOGPROBS_MAX: u32 = 20;
 
+/// The most samplers of an order that cut or scale: the engine's limit
+/// ([`SamplerKind::order_problem`]).
+pub const SAMPLER_STAGES_MAX: usize = 16;
+
 /// A token, or a text whose tokens, that a logit bias names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BiasKey {
@@ -80,6 +84,37 @@ impl SamplerKind {
             "temperature" | "temp" => SamplerKind::Temperature,
             _ => return None,
         })
+    }
+
+    /// Whether the sampler corrects the logits (the penalties, DRY) rather
+    /// than cutting or scaling them.
+    pub fn corrects(self) -> bool {
+        matches!(self, SamplerKind::Penalties | SamplerKind::Dry)
+    }
+
+    /// Why `order` is no order the engine runs, or `None` when it is one:
+    /// the penalties and DRY correct the logits, so they stand before the
+    /// samplers that cut or scale, once each, and an order holds at most
+    /// [`SAMPLER_STAGES_MAX`] of those. The requests and the server's
+    /// defaults are held to it alike.
+    pub fn order_problem(order: &[SamplerKind]) -> Option<String> {
+        let (mut corrections, mut stages) = (Vec::new(), 0);
+        for kind in order {
+            if !kind.corrects() {
+                stages += 1;
+            } else if stages > 0 {
+                return Some(format!(
+                    "{} comes after a sampler that cuts or scales; it corrects the logits and \
+                     has to come before them",
+                    kind.name()
+                ));
+            } else if corrections.contains(kind) {
+                return Some("penalties and dry can be listed once each".to_owned());
+            } else {
+                corrections.push(*kind);
+            }
+        }
+        (stages > SAMPLER_STAGES_MAX).then(|| format!("at most {SAMPLER_STAGES_MAX} entries"))
     }
 
     /// The sampler a letter of llama.cpp's `samplers` string stands for.
@@ -328,6 +363,20 @@ mod tests {
         let mut sampling = Sampling::default();
         f(&mut sampling);
         sampling
+    }
+
+    #[test]
+    fn the_corrections_come_first_once_each_and_the_stages_are_bounded() {
+        use SamplerKind::*;
+        assert_eq!(SamplerKind::order_problem(&[Penalties, Dry, TopK, Temperature]), None);
+        assert_eq!(SamplerKind::order_problem(&[TopK, MinP]), None);
+        let after = SamplerKind::order_problem(&[TopK, Penalties]).unwrap();
+        assert!(after.starts_with("penalties comes after a sampler that cuts"), "{after}");
+        let twice = SamplerKind::order_problem(&[Dry, Dry, TopK]).unwrap();
+        assert_eq!(twice, "penalties and dry can be listed once each");
+        let many = vec![TopK; SAMPLER_STAGES_MAX + 1];
+        assert_eq!(SamplerKind::order_problem(&many[..SAMPLER_STAGES_MAX]), None);
+        assert_eq!(SamplerKind::order_problem(&many).unwrap(), "at most 16 entries");
     }
 
     #[test]

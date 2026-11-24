@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ares_api::{
-    Alternative, BiasKey, EngineError, PENALTY_WINDOW_MAX, Prompt, SamplerKind, Sampling,
-    TokenProbs,
+    Alternative, BiasKey, EngineError, LOGIT_BIAS_MAX, PENALTY_WINDOW_MAX, Prompt,
+    SAMPLER_STAGES_MAX, SamplerKind, Sampling, TOP_LOGPROBS_MAX, TokenProbs,
 };
 use ares_sampler::penalties::{
     BIAS_MAX, Breakers, Corrections, DryParams, PenaltyParams, WINDOW_MAX, entries_for,
@@ -28,8 +28,18 @@ use ares_sampler::{
 use crate::exec::Pick;
 use crate::model::Model;
 
+// The API's limits are the sampler's.
 const _: () =
     assert!(PENALTY_WINDOW_MAX == WINDOW_MAX, "the API and the sampler agree on the window");
+const _: () = assert!(LOGIT_BIAS_MAX == BIAS_MAX, "the API and the sampler agree on the bias");
+const _: () = assert!(
+    TOP_LOGPROBS_MAX as usize == ares_sampler::LOGPROBS_MAX,
+    "the API and the sampler agree on the probabilities a row reports"
+);
+const _: () = assert!(
+    SAMPLER_STAGES_MAX == ares_sampler::MAX_STAGES,
+    "the API and the sampler agree on the stages of an order"
+);
 
 /// A rule about which tokens the next token of a request may be, for what
 /// decides it from the text so far (a grammar).
@@ -217,44 +227,27 @@ impl RequestSampler {
         // among them: they come first or not at all.
         let (mut penalties_on, mut dry_on) = (true, true);
         if let Some(kinds) = &sampling.samplers {
-            let mut stages = Vec::new();
-            let (mut penalties_seen, mut dry_seen) = (false, false);
-            for kind in kinds {
-                let stage = match kind {
-                    SamplerKind::Penalties | SamplerKind::Dry => {
-                        if !stages.is_empty() {
-                            return Err(invalid(format!(
-                                "samplers: {} comes after a sampler that cuts or scales; it \
-                                 corrects the logits and has to come before them",
-                                if *kind == SamplerKind::Dry { "dry" } else { "penalties" }
-                            )));
-                        }
-                        let seen = if *kind == SamplerKind::Dry {
-                            &mut dry_seen
-                        } else {
-                            &mut penalties_seen
-                        };
-                        if std::mem::replace(seen, true) {
-                            return Err(invalid(
-                                "samplers: penalties and dry can be listed once each".into(),
-                            ));
-                        }
-                        continue;
-                    }
-                    SamplerKind::TopNSigma => Stage::TopNSigma,
-                    SamplerKind::TopK => Stage::TopK,
-                    SamplerKind::TypicalP => Stage::Typical,
-                    SamplerKind::TopP => Stage::TopP,
-                    SamplerKind::MinP => Stage::MinP,
-                    SamplerKind::Xtc => Stage::Xtc,
-                    SamplerKind::Temperature => Stage::Temperature,
-                };
-                stages.push(stage);
+            if let Some(problem) = SamplerKind::order_problem(kinds) {
+                return Err(invalid(format!("samplers: {problem}")));
             }
+            let stages: Vec<Stage> = kinds
+                .iter()
+                .filter_map(|kind| match kind {
+                    SamplerKind::Penalties | SamplerKind::Dry => None,
+                    SamplerKind::TopNSigma => Some(Stage::TopNSigma),
+                    SamplerKind::TopK => Some(Stage::TopK),
+                    SamplerKind::TypicalP => Some(Stage::Typical),
+                    SamplerKind::TopP => Some(Stage::TopP),
+                    SamplerKind::MinP => Some(Stage::MinP),
+                    SamplerKind::Xtc => Some(Stage::Xtc),
+                    SamplerKind::Temperature => Some(Stage::Temperature),
+                })
+                .collect();
             p.order = Order::new(&stages).ok_or_else(|| {
-                invalid(format!("samplers: at most {} entries", ares_sampler::MAX_STAGES))
+                invalid(format!("samplers: at most {SAMPLER_STAGES_MAX} entries"))
             })?;
-            (penalties_on, dry_on) = (penalties_seen, dry_seen);
+            penalties_on = kinds.contains(&SamplerKind::Penalties);
+            dry_on = kinds.contains(&SamplerKind::Dry);
         }
 
         let mut corrections = Corrections::none();

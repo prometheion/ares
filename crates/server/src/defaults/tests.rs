@@ -100,7 +100,6 @@ fn every_setting_is_an_option_with_the_name_of_the_field_of_a_request() {
     for name in ["--temp", "--typical", "--n-predict", "--mirostat-lr", "--sampler-seq", "-s"] {
         assert_eq!(options::lookup(name), None, "{name}");
     }
-    assert_eq!(STAGES_MAX, ares_sampler::MAX_STAGES, "the engine's limit");
 }
 
 #[test]
