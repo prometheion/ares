@@ -1,3 +1,5 @@
+use crate::memory::DevicePtr;
+
 /// Why a CUDA operation failed.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -43,3 +45,19 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// An [`Error::Invalid`] about `what`.
+pub(crate) fn invalid(what: &'static str, detail: String) -> Error {
+    Error::Invalid { what, detail }
+}
+
+/// An [`Error::Invalid`] about `what` unless `ptr` lies on a multiple of `align` bytes.
+pub(crate) fn check_align(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
+    if !ptr.as_raw().is_multiple_of(align) {
+        return Err(invalid(
+            what,
+            format!("address {:#x} is not aligned to {align} bytes", ptr.as_raw()),
+        ));
+    }
+    Ok(())
+}

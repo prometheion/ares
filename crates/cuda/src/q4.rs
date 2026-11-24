@@ -86,7 +86,7 @@ use ares_core::ggml_type::ALL_TYPES;
 
 use crate::attention::{AttnItem, AttnRow, ENTRY_CELLS};
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{Result, check_align, invalid};
 use crate::kernels::types;
 use crate::layers::{CommitSet, StepDims};
 use crate::memory::DevicePtr;
@@ -113,17 +113,9 @@ pub const SELECT_MAX_BLOCKS: u32 = 65_536;
 /// The most pieces a list is cut into by [`Q4Kernels::hand_over`].
 pub const HAND_OVER_MAX_PIECES: u32 = 64;
 
-fn invalid(what: &'static str, detail: String) -> Error {
-    Error::Invalid { what, detail }
-}
-
-fn check_align(what: &'static str, ptrs: &[DevicePtr], align: u64) -> Result<()> {
-    match ptrs.iter().find(|p| !p.as_raw().is_multiple_of(align)) {
-        Some(p) => {
-            Err(invalid(what, format!("address {:#x} is not aligned to {align} bytes", p.as_raw())))
-        }
-        None => Ok(()),
-    }
+/// [`check_align`] for each of `ptrs`.
+fn check_all_aligned(what: &'static str, ptrs: &[DevicePtr], align: u64) -> Result<()> {
+    ptrs.iter().try_for_each(|p| check_align(what, *p, align))
 }
 
 /// How the pooled keys of the indexer are stored in the key pool.
@@ -470,7 +462,7 @@ impl Q4Kernels {
         check_streams("stream mixer", hc, n)?;
         let (block_out, inj) = write.unwrap_or((DevicePtr::NULL, DevicePtr::NULL));
         let (weight, xn) = norm.unwrap_or((DevicePtr::NULL, DevicePtr::NULL));
-        check_align("stream mixer", &[r, block_out, weight, xn], 16)?;
+        check_all_aligned("stream mixer", &[r, block_out, weight, xn], 16)?;
         let blocks = rows
             .checked_mul(hc)
             .ok_or_else(|| invalid("stream mixer", format!("{rows} rows of {hc} streams")))?;
@@ -654,7 +646,7 @@ impl Q4Kernels {
         if hc == 0 || n == 0 || !n.is_multiple_of(32) {
             return Err(invalid("mix", format!("{hc} streams of {n} values (a multiple of 32)")));
         }
-        check_align("mix", &[xn, gate, act], 16)?;
+        check_all_aligned("mix", &[xn, gate, act], 16)?;
         let chunks = u64::from(rows) * u64::from(n / 4);
         let blocks = u32::try_from(chunks.div_ceil(256))
             .map_err(|_| invalid("mix", format!("{rows} rows of {n} values")))?;
@@ -710,7 +702,7 @@ impl Q4Kernels {
         key_pool: DevicePtr,
     ) -> Result<()> {
         shape.check()?;
-        check_align("indexer", &[carry], 8)?;
+        check_all_aligned("indexer", &[carry], 8)?;
         if carry_stride < shape.carry_len() || !carry_stride.is_multiple_of(2) {
             return Err(invalid(
                 "indexer",
@@ -772,7 +764,7 @@ impl Q4Kernels {
         carry_stride: u64,
     ) -> Result<()> {
         shape.check()?;
-        check_align("indexer", &[carry], 8)?;
+        check_all_aligned("indexer", &[carry], 8)?;
         if dims.n_segs == 0 {
             return Ok(());
         }
@@ -969,7 +961,7 @@ impl Q4Kernels {
         // An F32 table is read in words, the f16 fields of the others in halves: every row
         // of every type keeps that alignment (the blocks of MXFP4, 17 bytes, are read in
         // bytes).
-        check_align("n-gram rows", &[fetched], 4)?;
+        check_all_aligned("n-gram rows", &[fetched], 4)?;
         let row_bytes = shape.table_row_bytes();
         let n_values = n_rows
             .checked_mul(shape.n_embd)
@@ -1373,7 +1365,7 @@ impl Q4Kernels {
             }
             None => (null, null, null, null, 0, 1),
         };
-        check_align("read", &[r_src, r_dst, own, peer_out, weights, xn, down, inject], 16)?;
+        check_all_aligned("read", &[r_src, r_dst, own, peer_out, weights, xn, down, inject], 16)?;
         let args = Args::new()
             .ptr(r_src)
             .ptr(r_dst)
@@ -1441,7 +1433,7 @@ impl Q4Kernels {
         let null = DevicePtr::NULL;
         let (peer_act, peer_flags, token) =
             peer.map_or((null, null, 0), |p| (p.data, p.flags, p.token));
-        check_align("read", &[xn, up.ptr, act, peer_act], 16)?;
+        check_all_aligned("read", &[xn, up.ptr, act, peer_act], 16)?;
         let args = Args::new()
             .ptr(xn)
             .ptr(partials)
@@ -1507,7 +1499,7 @@ impl Q4Kernels {
             to.map_or((null, null, 0), |d| (d.data, d.flags, d.token));
         let (own_flags, n_flags, token_in) = wait.unwrap_or((null, 0, 0));
         let (inp, m, s_out) = gate.unwrap_or((null, null, null));
-        check_align("swap", &[a, b, peer_dst, inp, m, zero.unwrap_or(null)], 16)?;
+        check_all_aligned("swap", &[a, b, peer_dst, inp, m, zero.unwrap_or(null)], 16)?;
         let args = Args::new()
             .ptr(a)
             .ptr(b)
@@ -1552,7 +1544,7 @@ impl Q4Kernels {
         cap: u32,
     ) -> Result<()> {
         let (zero, zero_values) = zero.unwrap_or((DevicePtr::NULL, 0));
-        check_align("route split", &[record, own, peer.data, zero], 16)?;
+        check_all_aligned("route split", &[record, own, peer.data, zero], 16)?;
         let args = Args::new()
             .ptr(record)
             .ptr(owner)
@@ -1582,7 +1574,7 @@ impl Q4Kernels {
         slot_table: DevicePtr,
         cap: u32,
     ) -> Result<()> {
-        check_align("route record", &[arrival.data, slot_table], 4)?;
+        check_all_aligned("route record", &[arrival.data, slot_table], 4)?;
         let args = Args::new()
             .ptr(arrival.data)
             .ptr(slot_table)

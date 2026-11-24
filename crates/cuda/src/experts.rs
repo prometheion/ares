@@ -47,9 +47,9 @@
 use ares_core::GgmlType;
 
 use crate::device::Device;
-use crate::error::{Error, Result};
-use crate::kernels::MAX_BATCH;
+use crate::error::{Result, check_align, invalid};
 use crate::kernels::types::{self, TYPES, TypeInfo};
+use crate::kernels::{MAX_BATCH, MMVQ_ROWS_PER_BLOCK, MMVQ_THREADS};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
@@ -119,25 +119,6 @@ const GROUP_BYTES: usize = 48;
 /// computes (`ARES_EXPERT_GU_WARPS`).
 const GATE_UP_THREADS: u32 = 256;
 const GATE_UP_VALUES: u32 = 32;
-
-/// The launch shape of the down kernel and of the logits: that of the decode
-/// kernels (`ARES_MMVQ_WARPS`, `ARES_MMVQ_ROWS`).
-const MMVQ_THREADS: u32 = 128;
-const MMVQ_ROWS_PER_BLOCK: u32 = 8;
-
-fn invalid(what: &'static str, detail: String) -> Error {
-    Error::Invalid { what, detail }
-}
-
-fn check_align(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
-    if !ptr.as_raw().is_multiple_of(align) {
-        return Err(invalid(
-            what,
-            format!("address {:#x} is not aligned to {align} bytes", ptr.as_raw()),
-        ));
-    }
-    Ok(())
-}
 
 /// The routed experts of one layer: sizes, types, and how an expert lies in
 /// its slot.

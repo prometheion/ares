@@ -20,7 +20,7 @@
 //! [`Kernels`]: crate::Kernels
 
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{Result, invalid};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
@@ -107,10 +107,6 @@ pub struct TowerKernels {
     positions: Function,
     rotate_heads: Function,
     attention: Vec<(u32, Function)>,
-}
-
-fn invalid(what: &'static str, detail: String) -> Error {
-    Error::Invalid { what, detail }
 }
 
 fn blocks_of(values: u64, threads: u32, what: &'static str) -> Result<u32> {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use ares_core::GgmlType;
 
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, check_align};
 use crate::memory::{DeviceBuffer, DevicePtr};
 use crate::module::{Args, Function, Module};
 use crate::stream::{Event, Stream};
@@ -53,9 +53,9 @@ const REDUCE_THREADS: u32 = 256;
 
 /// The launch shape of the fast weight kernels (`ARES_MMVQ_WARPS` and
 /// `ARES_MMVQ_ROWS` in `kernels/mmvq.cuh`): a thread block of 4 warps computes 8
-/// output rows.
-const MMVQ_THREADS: u32 = 128;
-const MMVQ_ROWS_PER_BLOCK: u32 = 8;
+/// output rows. The experts' down kernel and the router's logits have it too.
+pub(crate) const MMVQ_THREADS: u32 = 128;
+pub(crate) const MMVQ_ROWS_PER_BLOCK: u32 = 8;
 
 /// A decode kernel whose codebook in shared memory takes at least this many bytes (IQ1_S and
 /// IQ1_M: 16 KiB) copies it once per thread block and then walks several tiles of rows
@@ -91,30 +91,18 @@ impl Shape {
     }
 }
 
-/// The shapes, `[int8, f16, f16 with f16 accumulation][large, medium, small]`, and the numbers of activation
-/// rows they take: up to [`MM_SMALL_ROWS`] the small one, up to [`MM_MEDIUM_ROWS`]
-/// the medium one, more the large one. The large shape is a block of 16 warps with
-/// the whole SM to itself, which is what lets the decoding of a weight tile be shared
-/// by 128 activation rows; the others are blocks of 4 warps, three (int8) or two (f16)
-/// to an SM, for the rows where there are not enough tiles to fill the large ones.
+/// The shapes, `[large, medium, small]` (the same for every path), and the numbers of
+/// activation rows they take: up to [`MM_SMALL_ROWS`] the small one, up to
+/// [`MM_MEDIUM_ROWS`] the medium one, more the large one. The large shape is a block of 16
+/// warps with the whole SM to itself, which is what lets the decoding of a weight tile be
+/// shared by 128 activation rows; the others are blocks of 4 warps, three (int8) or two
+/// (f16) to an SM, for the rows where there are not enough tiles to fill the large ones.
 const MM_SMALL_ROWS: u32 = 32;
 const MM_MEDIUM_ROWS: u32 = 64;
-const SHAPES: [[Shape; 3]; 3] = [
-    [
-        Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
-        Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
-        Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
-    ],
-    [
-        Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
-        Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
-        Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
-    ],
-    [
-        Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
-        Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
-        Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
-    ],
+const SHAPES: [Shape; 3] = [
+    Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
+    Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
+    Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
 ];
 
 /// The kernels' name part for each shape.
@@ -370,7 +358,7 @@ impl Prefill {
                 continue;
             }
             let mut shapes = Vec::new();
-            for (shape, part) in SHAPES[path].iter().zip(SHAPE_SUFFIX) {
+            for (shape, part) in SHAPES.iter().zip(SHAPE_SUFFIX) {
                 let function = module.function(&format!("ares_mm_{variant}{part}_{}", t.ty))?;
                 let bytes = shape.shared_bytes(elem, t.tile.table);
                 if bytes > limit {
@@ -646,7 +634,7 @@ impl Kernels {
         n_in: u32,
         n_batch: u32,
     ) -> Result<()> {
-        check_alignment("quantized activations", q, 16)?;
+        check_align("quantized activations", q, 16)?;
         let n_values = n_in.checked_mul(n_batch).ok_or(Error::Invalid {
             what: "activation quantization",
             detail: "size overflows u32".into(),
@@ -719,8 +707,8 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", w, align)?;
-        check_alignment("quantized activations", q, 16)?;
+        check_align("weight matrix", w, align)?;
+        check_align("quantized activations", q, 16)?;
         let tiles = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
         let blocks = if decode.walks {
             tiles.min(DECODE_WALK_BLOCKS_PER_SM * self.device.info().multiprocessors)
@@ -780,8 +768,8 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", w, align)?;
-        check_alignment("activations", q, 16)?;
+        check_align("weight matrix", w, align)?;
+        check_align("activations", q, 16)?;
         let blocks = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
         let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
         // SAFETY: the argument list matches the ares_mmv_exact_* kernels; the ranges are the
@@ -896,7 +884,7 @@ impl Kernels {
         let up_to = [u32::MAX, MM_MEDIUM_ROWS, MM_SMALL_ROWS];
         (0..3)
             .map(|shape| {
-                let info = SHAPES[path_index][shape];
+                let info = SHAPES[shape];
                 let function =
                     &kernels[path_index].as_ref().ok_or_else(|| no_variant(ty, path))?[shape];
                 let shared_bytes = info.shared_bytes(elem, table);
@@ -981,7 +969,7 @@ impl Kernels {
             // SAFETY: the caller's guarantee is the one of the function it forwards to.
             PrefillPath::Int8 => unsafe { self.quantize_rows(stream, x, out, n_in, n_rows) },
             PrefillPath::F16 | PrefillPath::F16Flush => {
-                check_alignment("prefill activations", out, 16)?;
+                check_align("prefill activations", out, 16)?;
                 n_in.checked_mul(n_rows).ok_or(Error::Invalid {
                     what: "prefill activations",
                     detail: "size overflows u32".into(),
@@ -1068,8 +1056,8 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", w, tile.align)?;
-        check_alignment("prepared activations", act, 16)?;
+        check_align("weight matrix", w, tile.align)?;
+        check_align("prepared activations", act, 16)?;
         let (path_index, elem) = (path.index(), path.value_bytes());
         // The bytes of a row of activations: the int8 codes with their pairs (8 bytes per
         // 32 values), or f16 values.
@@ -1079,7 +1067,7 @@ impl Kernels {
         };
         let shape = shape_index(n_rows);
         let function = &kernels[path_index].as_ref().ok_or_else(|| no_variant(ty, path))?[shape];
-        let shape_info = SHAPES[path_index][shape];
+        let shape_info = SHAPES[shape];
         let Shape { weight_rows, batch_rows, threads } = shape_info;
         let shared = shape_info.shared_bytes(elem, tile.table);
         let n_weight_tiles = n_out.div_ceil(weight_rows);
@@ -1138,16 +1126,6 @@ fn check_batch(n_batch: u32) -> Result<()> {
         return Err(Error::Invalid {
             what: "weight kernel batch",
             detail: format!("{n_batch} activation rows; one launch takes 1 to {MAX_BATCH}"),
-        });
-    }
-    Ok(())
-}
-
-fn check_alignment(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
-    if !ptr.as_raw().is_multiple_of(align) {
-        return Err(Error::Invalid {
-            what,
-            detail: format!("address {:#x} is not aligned to {align} bytes", ptr.as_raw()),
         });
     }
     Ok(())

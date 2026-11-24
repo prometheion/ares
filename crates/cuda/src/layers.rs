@@ -49,7 +49,7 @@
 use ares_core::GgmlType;
 
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, check_align, invalid};
 use crate::memory::DevicePtr;
 use crate::mesh::{PUSH_MAX_ROWS, PushSlot};
 use crate::module::{Args, Function, Module};
@@ -436,20 +436,6 @@ pub struct LayerKernels {
     conv_window: Function,
     conv_commit: Function,
     delta: DeltaKernels,
-}
-
-fn check_align(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
-    if !ptr.as_raw().is_multiple_of(align) {
-        return Err(Error::Invalid {
-            what,
-            detail: format!("address {:#x} is not aligned to {align} bytes", ptr.as_raw()),
-        });
-    }
-    Ok(())
-}
-
-fn invalid(what: &'static str, detail: String) -> Error {
-    Error::Invalid { what, detail }
 }
 
 impl LayerKernels {

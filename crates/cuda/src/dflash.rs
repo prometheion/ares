@@ -5,7 +5,7 @@
 //! the drafts. The products are the weight kernels of [`Kernels`](crate::Kernels).
 
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{Result, invalid};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
@@ -110,10 +110,6 @@ pub struct DflashKernels {
     swiglu: Function,
     top: Function,
     select: Function,
-}
-
-fn invalid(what: &'static str, detail: String) -> Error {
-    Error::Invalid { what, detail }
 }
 
 fn blocks(values: u32) -> u32 {

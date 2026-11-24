@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 
-use super::{DEFAULT_SHARED, Kernels, MAX_BATCH, Precision, PrefillPath, check_alignment, types};
+use super::{DEFAULT_SHARED, Kernels, MAX_BATCH, Precision, PrefillPath, types};
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, check_align};
 use crate::memory::{DeviceBuffer, DevicePtr};
 use crate::module::{Args, Function, Module};
 use crate::stream::{Event, Stream};
@@ -414,8 +414,8 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", src, 16)?;
-        check_alignment("rearranged matrix", dst, 16)?;
+        check_align("weight matrix", src, 16)?;
+        check_align("rearranged matrix", dst, 16)?;
         // One thread per 32-bit word of the layout.
         let blocks = u32::try_from((bytes / 4).div_ceil(256)).map_err(|_| Error::Invalid {
             what: "device layout",
@@ -611,8 +611,8 @@ impl Kernels {
                 ),
             });
         }
-        check_alignment("rearranged matrix", w, 16)?;
-        check_alignment("prepared activations", act, 16)?;
+        check_align("rearranged matrix", w, 16)?;
+        check_align("prepared activations", act, 16)?;
         Ok(kernels)
     }
 
