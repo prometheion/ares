@@ -1519,15 +1519,17 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       picks of a route record classified once (`routed_rows` in three parts); the draft policy in
       `ares_sched::Drafting` and the conductor split into files by concern (`RecordKind` for what
       a record is for); the old expert fill gone (`plan_listed_fill`, the bench reads ahead
-      through `ahead`). Left: admission's restore of spilled pages (its model test simulates a
-      world that brings pages back; moving it to recompute rewrites that world); the rest of the
-      store's small copies of finding 13 (running means, odds, the step clock, the profile and
-      table files, the read submission of `read` and `transit_read`); the expert store's test
-      rig, the CPU kernels' test rig and the fake executor of `tests/images.rs`; the transit
-      sizing that lives in the model (`plan_transit`) and the store config built twice (the
-      model's files); one host budget for both server loaders (the server's phase 2 merges them);
-      `write_record` and `step` of the conductor in smaller parts; the host executor's places on
-      `PlaceChunks` (its oracle plays the strictest device, which the chunks are not).
+      through `ahead`); admission without the restore of spilled pages (a spilled sequence
+      computes again, as the runtime does; the model test's world too); the store's step clock,
+      odds, power-of-two classes, read submission and key files once; the expert store's, the CPU
+      kernels' and the paused steps' test rigs shared (`testing::Pauses`). Left: the running
+      means of the store (their weights differ: one would change what the store decides early
+      on); the transit sizing that lives in the model (`plan_transit`) and the store config built
+      twice (the model's files); one host budget for both server loaders (the server's phase 2
+      merges them); `write_record` and `step` of the conductor in smaller parts; the host
+      executor's places on `PlaceChunks` (its oracle plays the strictest device, which the
+      chunks are not); the record's windows and the text half of `impl Model` in both models
+      (the model's phase 2); the cache's transfer counter kept twice (a metric's name).
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
