@@ -72,6 +72,9 @@ async fn the_member_priority_is_read_on_the_openai_routes_and_refused_on_message
         assert_eq!((status, priority), (StatusCode::OK, 3), "{path}");
         let (status, value, _) = priority_of(path, body.clone(), Some("1")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {value}");
+        let conflict = "the body asks for priority 3 and the header x-ares-priority for 1: \
+                        give one";
+        assert!(value.to_string().contains(conflict), "{path}: {value}");
         // A number outside the 32 bits of a priority, and a string, are refused.
         body["priority"] = json!(1u64 << 40);
         let (status, value, _) = priority_of(path, body.clone(), None).await;

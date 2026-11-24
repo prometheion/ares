@@ -362,7 +362,8 @@ impl<'g> Layout<'g> {
             }
             Mixer::Attention(_) if heads != (0..c.attention.n_head_kv) => {
                 return Err(invalid(format!(
-                    "{}: the KV heads {heads:?} of {}; an attention layer is not cut between                      devices yet",
+                    "{}: the KV heads {heads:?} of {}; an attention layer is not cut between \
+                     devices yet",
                     name("attn_q"),
                     c.attention.n_head_kv
                 )));

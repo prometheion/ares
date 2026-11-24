@@ -124,7 +124,8 @@ impl Parsed {
                 return Err(ApiError::invalid_param(
                     "priority",
                     format!(
-                        "the body asks for priority {body} and the header {PRIORITY_HEADER} for                          {header}: give one"
+                        "the body asks for priority {body} and the header {PRIORITY_HEADER} for \
+                         {header}: give one"
                     ),
                 ));
             }

@@ -326,7 +326,8 @@ fn encode_prompt(
                 let all: Vec<&ares_api::Image> = messages.iter().flat_map(|m| &m.images).collect();
                 if !all.is_empty() && projector.is_none() {
                     return Err(EngineError::InvalidRequest(
-                        "image input needs a projector, and this model was loaded without one                          (--mmproj)"
+                        "image input needs a projector, and this model was loaded without one \
+                         (--mmproj)"
                             .into(),
                     ));
                 }
