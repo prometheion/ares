@@ -141,7 +141,7 @@ impl Runtime {
         // also while nothing runs.
         if let Some(ram) = executor.ram() {
             let wake = Mutex::new(tx.clone());
-            ram.on_cache(move |_, _| {
+            ram.on_cache(move |_| {
                 let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(Command::Trim);
             });
         }

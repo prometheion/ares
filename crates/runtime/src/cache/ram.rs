@@ -456,16 +456,11 @@ impl RamLevel {
         }
     }
 
-    /// Gives the buffers that hold nothing back to the system, down to
-    /// `keep` of them. Returns the bytes given back.
-    pub fn shed(&mut self, keep: usize) -> u64 {
-        let mut given = 0;
-        while self.free.len() > keep {
-            let parts = self.free.pop().expect("more than `keep` are free");
+    /// Gives the buffers that hold nothing back to the system.
+    pub fn shed(&mut self) {
+        while let Some(parts) = self.free.pop() {
             self.discard(parts);
-            given += self.page_bytes();
         }
-        given
     }
 
     /// What the level holds now, for the counters.
@@ -582,7 +577,7 @@ mod tests {
             level.recycle(parts);
             true
         }));
-        assert_eq!(level.shed(0), page);
+        level.shed();
         assert_eq!((books.cache_pages(), level.bytes()), (0, 0));
         // The limit of the books holds.
         let tight = RamLevel::new(&[1 << 20], PinnedRam::new(1 << 19), false).make();

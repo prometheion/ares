@@ -135,12 +135,15 @@ impl Books {
     }
 }
 
-type Hook = Arc<dyn Fn(&PinnedRam, u64) + Send + Sync>;
+/// What the tier of experts is called with: the books and its allowance.
+type ExpertsHook = Arc<dyn Fn(&PinnedRam, u64) + Send + Sync>;
+/// What wakes the prompt cache to give memory back.
+type CacheHook = Arc<dyn Fn(&PinnedRam) + Send + Sync>;
 
 #[derive(Default)]
 struct Hooks {
-    experts: Option<Hook>,
-    cache: Option<Hook>,
+    experts: Option<ExpertsHook>,
+    cache: Option<CacheHook>,
 }
 
 /// What an engine's elastic users hold and can use, for the machine.
@@ -249,7 +252,7 @@ impl Shared {
         };
         if held > allowance {
             if let Some(hook) = cache {
-                hook(&ram, allowance);
+                hook(&ram);
             }
             ram.sweep_checkpoints();
         }
@@ -518,11 +521,12 @@ impl PinnedRam {
         self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).experts = Some(Arc::new(hook));
     }
 
-    /// `hook` is called with these books and the prompt cache's allowance
-    /// when it holds more than that, from the machine's thread: the conductor
-    /// gives checkpoints and pages up, and the chunks of the places are
-    /// released after it ([`PinnedRam::sweep_checkpoints`]).
-    pub fn on_cache(&self, hook: impl Fn(&PinnedRam, u64) + Send + Sync + 'static) {
+    /// `hook` is called with these books when the prompt cache holds more
+    /// than its allowance ([`PinnedRam::cache_allowance`]), from the
+    /// machine's thread: the conductor gives checkpoints and pages up, and
+    /// the chunks of the places are released after it
+    /// ([`PinnedRam::sweep_checkpoints`]).
+    pub fn on_cache(&self, hook: impl Fn(&PinnedRam) + Send + Sync + 'static) {
         self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).cache = Some(Arc::new(hook));
     }
 
@@ -1358,7 +1362,8 @@ mod tests {
     /// A prompt cache with a budget of `want` bytes that keeps as many
     /// checkpoints of 64 MiB as it is allowed.
     fn cache(ram: &PinnedRam, want: u64) {
-        ram.on_cache(|ram, allowance| {
+        ram.on_cache(|ram| {
+            let allowance = ram.cache_allowance();
             while ram.checkpoints() > allowance {
                 ram.release_checkpoints(PIECE.min(ram.checkpoints()));
             }

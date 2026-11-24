@@ -645,7 +645,7 @@ impl Cache {
     fn give_up_free(&mut self, dropped: &mut u32) -> bool {
         if let Some(ram) = &mut self.in_ram {
             if ram.free_bytes() > 0 {
-                ram.shed(0);
+                ram.shed();
                 return true;
             }
             if let Some((Class::Copy | Class::Free, item, hash)) = ram.first() {
