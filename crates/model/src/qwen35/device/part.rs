@@ -438,6 +438,206 @@ struct Scratch {
     len: u64,
 }
 
+/// What the blocks of a part ask of the step's buffers and of the pools, read
+/// off its weights: the widest row of each kind of buffer, where each block
+/// keeps its recurrent state or its K and V, and the bytes of the pools and of
+/// the attention's partial states.
+struct Survey {
+    /// The widest convolution, value and key rows and the most value heads of
+    /// a recurrent block, the widest query and K/V rows of an attention block,
+    /// and the widest feed-forward row.
+    cd: u64,
+    vd: u64,
+    kd: u64,
+    nv: u64,
+    hq: u64,
+    hkv: u64,
+    f: u64,
+    recurrent_at: Vec<Option<RecurrentAt>>,
+    attention_at: Vec<Option<AttentionAt>>,
+    slot: SlotLayout,
+    rec_layout: recurrent::Layout,
+    pool: u64,
+    state_slots: u64,
+}
+
+impl Survey {
+    /// The survey of the blocks of `w`, with pools of `pages` pages and
+    /// `exact_slots` exact entries for `max_slots` sequences.
+    fn of(
+        c: &Config,
+        w: &DeviceWeights,
+        opts: &Options,
+        pages: u32,
+        exact_slots: u32,
+        max_slots: u32,
+        plan_config: PlanConfig,
+    ) -> Self {
+        let mut v = Self {
+            cd: 0,
+            vd: 0,
+            kd: 0,
+            nv: 0,
+            hq: 0,
+            hkv: 0,
+            f: 0,
+            recurrent_at: Vec::new(),
+            attention_at: Vec::new(),
+            slot: SlotLayout::new(),
+            rec_layout: recurrent::Layout::new(opts.state, opts.window_rows),
+            pool: 0,
+            state_slots: 0,
+        };
+        let mut exact_at = 0u64;
+        for block in &w.blocks {
+            let (mut r_at, mut a_at) = (None, None);
+            match &block.mixer {
+                MixerW::Recurrent(r) => {
+                    let s = r.shape;
+                    v.cd = v.cd.max(u64::from(s.conv_dim()));
+                    v.vd = v.vd.max(u64::from(s.value_dim()));
+                    v.kd = v.kd.max(u64::from(s.key_dim()));
+                    v.nv = v.nv.max(u64::from(s.n_v_heads));
+                    r_at = Some(v.rec_layout.layer(s, &mut v.slot));
+                }
+                MixerW::Attention(a) => {
+                    let geo = geometry(c, opts.kv, a.n_kv);
+                    v.hq = v.hq.max(u64::from(a.n_head) * u64::from(geo.head_dim));
+                    v.hkv = v.hkv.max(u64::from(a.n_kv) * u64::from(geo.head_dim));
+                    a_at = Some(AttentionAt { geo, pool: v.pool, exact: exact_at });
+                    v.pool += u64::from(pages) * geo.converted_entry_bytes();
+                    exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
+                    let partial = partial_state_bytes(plan_config, &geo, opts, max_slots);
+                    v.state_slots = v.state_slots.max(partial);
+                }
+                MixerW::Empty => {}
+            }
+            if let Some(ffn) = &block.ffn {
+                v.f = v.f.max(u64::from(ffn.gate.n_out));
+            }
+            v.recurrent_at.push(r_at);
+            v.attention_at.push(a_at);
+        }
+        v
+    }
+}
+
+impl Scratch {
+    /// The scratch of a step of `opts.max_rows` rows for blocks as `survey`
+    /// found them (with the MTP block's needs in it), the rows the host staged
+    /// in front when the part stages them (`stage`, their bytes), and room for
+    /// the MTP block's activations (`mtp`).
+    fn lay_out(
+        c: &Config,
+        opts: &Options,
+        survey: &Survey,
+        w: &DeviceWeights,
+        stage: Option<u64>,
+        mtp: Option<&mtp::MtpSizes>,
+    ) -> Self {
+        let Survey { cd, vd, kd, nv, hq, hkv, f, state_slots, .. } = *survey;
+        let (d, rows) = (c.n_embd as u64, u64::from(opts.max_rows));
+        let mut s = Scratch::default();
+        let mut carve = Carve::default();
+        let mut take = |bytes: u64| carve.take(bytes);
+        let rope_pairs = (c.attention.rope.dim / 2) as u64;
+        // The rows of the embedding table the host staged (`blocks/rows.rs`).
+        // A part that stages none has no such buffer: nothing in front of the
+        // others.
+        s.stage = stage.map_or(0, &mut take);
+        s.x = take(rows * d * 4);
+        s.xn = take(rows * d * 4);
+        s.p = take(rows * d * 4);
+        // The buffers of a mixer (the projections, the queries and keys, the
+        // output) and the two of the feed-forward part (gate and up) are in use
+        // in turn, so they share one region: the larger of the two sets. A head
+        // in parts also computes in it, after the last block.
+        let logit_rows = u64::from(opts.logit_rows);
+        let head_rows = w.head.as_ref().map_or(0, |h| u64::from(h.n_out));
+        let in_parts = w.head.as_ref().is_some_and(|h| h.parts.len() > 1);
+        let widths = [cd.max(2 * hq), vd.max(hkv), kd.max(hq), (kd + vd).max(hq), vd.max(hq)];
+        let place = |width: u64| (rows * width * 4).next_multiple_of(64);
+        let mixer: u64 = widths.iter().map(|w| place(*w)).sum();
+        let region = take(mixer.max(2 * place(f)).max(if in_parts {
+            logit_rows * head_rows * 4
+        } else {
+            0
+        }));
+        s.w1 = region;
+        s.w2 = s.w1 + place(widths[0]);
+        s.q = s.w2 + place(widths[1]);
+        s.kv = s.q + place(widths[2]);
+        s.o = s.kv + place(widths[3]);
+        s.gate = region;
+        s.up = region + place(f);
+        s.logit_parts = region;
+        s.alpha = take(rows * nv * 4);
+        s.beta = take(rows * nv * 4);
+        s.k = take(rows * hkv * 4);
+        s.v = take(rows * hkv * 4);
+        s.rope = take(rows * rope_pairs * 8);
+        let widest = d.max(vd).max(hq).max(f);
+        // The decode kernels in several launches (`Part::in_batches`) read the rows in batches
+        // of `MAX_BATCH`, each batch with its scales behind it: room for the last, partial one
+        // as for a whole batch, and for the padding between the batches.
+        s.act_q = take(
+            Kernels::quantized_activation_bytes(
+                widest as u32,
+                opts.max_rows.next_multiple_of(MAX_BATCH),
+            )
+            .max(Kernels::quantized_activation_bytes(
+                d as u32,
+                opts.logit_rows.next_multiple_of(MAX_BATCH),
+            ))
+            .max(mtp.map_or(0, |sizes| sizes.act_q))
+                + 256,
+        );
+        s.act_h = take(
+            Kernels::prefill_activation_bytes(
+                PrefillPath::F16,
+                widest as u32,
+                opts.max_rows.max(opts.logit_rows),
+            )
+            .max(mtp.map_or(0, |sizes| sizes.act_h)),
+        );
+        s.picked = take(logit_rows * d * 4);
+        s.logits = take(logit_rows * head_rows * 4);
+        s.attn_state = take(state_slots);
+        s.attn_state_bytes = state_slots;
+        s.status = take(16);
+        s.len = carve.len;
+        s
+    }
+}
+
+/// The bytes of the records of the groups of a step: per group a header, its
+/// segments, and a token and four positions per row.
+fn group_bytes(placement: &Placement, opts: &Options, max_slots: u32) -> u64 {
+    if placement.split != Split::Single && opts.pipeline_rows > 0 {
+        let groups = u64::from(opts.max_rows.div_ceil(opts.pipeline_rows));
+        let rows = u64::from(opts.max_rows);
+        (groups * (96 + 32 * u64::from(max_slots)) + 24 * rows).next_multiple_of(64)
+    } else {
+        64
+    }
+}
+
+/// Room for the attention plans of a step: one per group of rows and number
+/// of KV heads a block of the part has (`attention_at`). A plan is a few dozen
+/// bytes per row and per item; one that does not fit is uploaded on its own
+/// (`Part::begin`), which makes the host wait for the device.
+fn plan_bytes(attention_at: &[Option<AttentionAt>], placement: &Placement, opts: &Options) -> u64 {
+    let mut heads: Vec<u32> = attention_at.iter().flatten().map(|a| a.geo.kv_heads).collect();
+    heads.sort_unstable();
+    heads.dedup();
+    let groups = match (placement.split, opts.pipeline_rows) {
+        (Split::Single, _) | (_, 0) => 1,
+        (_, per) => u64::from(opts.max_rows.div_ceil(per)),
+    };
+    let rows = u64::from(opts.max_rows);
+    (heads.len() as u64 * (groups * (64 << 10) + 96 * rows)).next_multiple_of(64).max(64)
+}
+
 /// Where a recurrent block keeps its state and what a draft window keeps: a
 /// layer of the recurrent block.
 type RecurrentAt = recurrent::Layer;
@@ -790,53 +990,18 @@ impl Part {
         )?;
 
         let (d, rows) = (c.n_embd as u64, u64::from(opts.max_rows));
-        let (mut cd, mut vd, mut kd, mut nv, mut hq, mut hkv, mut f) = (0u64, 0, 0, 0, 0, 0, 0);
-        let mut recurrent_at = Vec::new();
-        let mut attention_at = Vec::new();
-        let (mut slot, mut pool) = (SlotLayout::new(), 0u64);
-        let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
         let sizing =
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
         let exact_slots = kv::slots_for(opts.kv.0, opts.kv.1, sizing);
-        let mut exact_at = 0u64;
-        let mut state_slots = 0u64;
         let plan_config = PlanConfig::for_multiprocessors(device.info().multiprocessors);
-        for block in &w.blocks {
-            let (mut r_at, mut a_at) = (None, None);
-            match &block.mixer {
-                MixerW::Recurrent(r) => {
-                    let s = r.shape;
-                    cd = cd.max(u64::from(s.conv_dim()));
-                    vd = vd.max(u64::from(s.value_dim()));
-                    kd = kd.max(u64::from(s.key_dim()));
-                    nv = nv.max(u64::from(s.n_v_heads));
-                    r_at = Some(rec_layout.layer(s, &mut slot));
-                }
-                MixerW::Attention(a) => {
-                    let geo = geometry(c, opts.kv, a.n_kv);
-                    hq = hq.max(u64::from(a.n_head) * u64::from(geo.head_dim));
-                    hkv = hkv.max(u64::from(a.n_kv) * u64::from(geo.head_dim));
-                    a_at = Some(AttentionAt { geo, pool, exact: exact_at });
-                    pool += u64::from(pages) * geo.converted_entry_bytes();
-                    exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
-                    state_slots =
-                        state_slots.max(partial_state_bytes(plan_config, &geo, opts, max_slots));
-                }
-                MixerW::Empty => {}
-            }
-            if let Some(ffn) = &block.ffn {
-                f = f.max(u64::from(ffn.gate.n_out));
-            }
-            recurrent_at.push(r_at);
-            attention_at.push(a_at);
-        }
+        let mut survey = Survey::of(c, &w, opts, pages, exact_slots, max_slots, plan_config);
         // The K/V group of the attention blocks, with the exact pool when their
         // formats have a tile mean.
         let kv = kv::Group::new(
             device,
             ledger,
             "qwen35 attention blocks",
-            attention_at.iter().flatten().copied().collect(),
+            survey.attention_at.iter().flatten().copied().collect(),
             opts.kv,
             exact_slots,
             pages,
@@ -846,21 +1011,16 @@ impl Part {
         )?;
         // The MTP block: its pool after the blocks', and room in the step's
         // buffers for the rows it computes there (`mtp.rs`).
-        let mtp_sizes = mtp::sizes(c, &w, max_slots, pages, plan_config.target_blocks, pool);
-        let without_mtp = (hq, hkv, state_slots);
+        let mtp_sizes = mtp::sizes(c, &w, max_slots, pages, plan_config.target_blocks, survey.pool);
+        let without_mtp = (survey.hq, survey.hkv, survey.state_slots);
         if let Some(sizes) = &mtp_sizes {
-            pool += sizes.pool;
-            hq = hq.max(sizes.kv_values);
-            hkv = hkv.max(sizes.kv_values);
-            state_slots = state_slots.max(sizes.attn_state);
+            survey.pool += sizes.pool;
+            survey.hq = survey.hq.max(sizes.kv_values);
+            survey.hkv = survey.hkv.max(sizes.kv_values);
+            survey.state_slots = survey.state_slots.max(sizes.attn_state);
         }
-        let page_bytes = pool / u64::from(pages.max(1));
+        let page_bytes = survey.pool / u64::from(pages.max(1));
 
-        // The scratch of a step.
-        let mut s = Scratch::default();
-        let mut carve = Carve::default();
-        let mut take = |bytes: u64| carve.take(bytes);
-        let rope_pairs = (c.attention.rope.dim / 2) as u64;
         // The rows of the embedding table the host staged (`blocks/rows.rs`).
         // A part that stages none has no such buffer: nothing in front of the
         // others.
@@ -882,101 +1042,21 @@ impl Part {
             }
             _ => None,
         };
-        s.stage = embed.as_ref().map_or(0, |host| take(rows * host.row_bytes() as u64));
-        s.x = take(rows * d * 4);
-        s.xn = take(rows * d * 4);
-        s.p = take(rows * d * 4);
-        // The buffers of a mixer (the projections, the queries and keys, the
-        // output) and the two of the feed-forward part (gate and up) are in use
-        // in turn, so they share one region: the larger of the two sets. A head
-        // in parts also computes in it, after the last block.
-        let logit_rows = u64::from(opts.logit_rows);
-        let head_rows = w.head.as_ref().map_or(0, |h| u64::from(h.n_out));
-        let in_parts = w.head.as_ref().is_some_and(|h| h.parts.len() > 1);
-        let widths = [cd.max(2 * hq), vd.max(hkv), kd.max(hq), (kd + vd).max(hq), vd.max(hq)];
-        let place = |width: u64| (rows * width * 4).next_multiple_of(64);
-        let mixer: u64 = widths.iter().map(|w| place(*w)).sum();
-        let region = take(mixer.max(2 * place(f)).max(if in_parts {
-            logit_rows * head_rows * 4
-        } else {
-            0
-        }));
-        s.w1 = region;
-        s.w2 = s.w1 + place(widths[0]);
-        s.q = s.w2 + place(widths[1]);
-        s.kv = s.q + place(widths[2]);
-        s.o = s.kv + place(widths[3]);
-        s.gate = region;
-        s.up = region + place(f);
-        s.logit_parts = region;
-        s.alpha = take(rows * nv * 4);
-        s.beta = take(rows * nv * 4);
-        s.k = take(rows * hkv * 4);
-        s.v = take(rows * hkv * 4);
-        s.rope = take(rows * rope_pairs * 8);
-        let widest = d.max(vd).max(hq).max(f);
-        // The decode kernels in several launches (`Part::in_batches`) read the rows in batches
-        // of `MAX_BATCH`, each batch with its scales behind it: room for the last, partial one
-        // as for a whole batch, and for the padding between the batches.
-        s.act_q = take(
-            Kernels::quantized_activation_bytes(
-                widest as u32,
-                opts.max_rows.next_multiple_of(MAX_BATCH),
-            )
-            .max(Kernels::quantized_activation_bytes(
-                d as u32,
-                opts.logit_rows.next_multiple_of(MAX_BATCH),
-            ))
-            .max(mtp_sizes.as_ref().map_or(0, |sizes| sizes.act_q))
-                + 256,
-        );
-        s.act_h = take(
-            Kernels::prefill_activation_bytes(
-                PrefillPath::F16,
-                widest as u32,
-                opts.max_rows.max(opts.logit_rows),
-            )
-            .max(mtp_sizes.as_ref().map_or(0, |sizes| sizes.act_h)),
-        );
-        s.picked = take(logit_rows * d * 4);
-        s.logits = take(logit_rows * head_rows * 4);
-        s.attn_state = take(state_slots);
-        s.attn_state_bytes = state_slots;
-        s.status = take(16);
-        s.len = carve.len;
+        let stage_bytes = embed.as_ref().map(|host| rows * host.row_bytes() as u64);
+        let s = Scratch::lay_out(c, opts, &survey, &w, stage_bytes, mtp_sizes.as_ref());
 
         ledger.reserve("qwen35 step scratch", s.len)?;
         let scratch = DeviceBuffer::new(device, s.len)?;
-        let state = Arena::new(device, ledger, "qwen35 recurrent state", slot.bytes(), max_slots)?;
-        let rec = Recurrent::new(device, ledger, "qwen35", &rec_layout)?;
+        let state =
+            Arena::new(device, ledger, "qwen35 recurrent state", survey.slot.bytes(), max_slots)?;
+        let rec = Recurrent::new(device, ledger, "qwen35", &survey.rec_layout)?;
         scratch.write(s.status, &[0u8; 16])?;
 
-        // The records of the groups of a step: per group a header, its
-        // segments, and a token and four positions per row.
-        let group_bytes = if placement.split != Split::Single && opts.pipeline_rows > 0 {
-            let groups = u64::from(opts.max_rows.div_ceil(opts.pipeline_rows));
-            (groups * (96 + 32 * u64::from(max_slots)) + 24 * rows).next_multiple_of(64)
-        } else {
-            64
-        };
+        let group_bytes = group_bytes(placement, opts, max_slots);
         ledger.reserve("qwen35 group records", group_bytes)?;
-        // Room for the attention plans of a step: one per group of rows and
-        // number of KV heads a block of this part has. A plan is a few dozen
-        // bytes per row and per item; one that does not fit is uploaded on
-        // its own (`Part::begin`), which makes the host wait for the device.
-        let plan_bytes = {
-            let mut heads: Vec<u32> =
-                attention_at.iter().flatten().map(|a| a.geo.kv_heads).collect();
-            heads.sort_unstable();
-            heads.dedup();
-            let groups = match (placement.split, opts.pipeline_rows) {
-                (Split::Single, _) | (_, 0) => 1,
-                (_, per) => u64::from(opts.max_rows.div_ceil(per)),
-            };
-            (heads.len() as u64 * (groups * (64 << 10) + 96 * rows)).next_multiple_of(64).max(64)
-        };
+        let plan_bytes = plan_bytes(&survey.attention_at, placement, opts);
         ledger.reserve("qwen35 attention plans", plan_bytes)?;
-        let has_attention = attention_at.iter().any(Option::is_some) || mtp_sizes.is_some();
+        let has_attention = survey.attention_at.iter().any(Option::is_some) || mtp_sizes.is_some();
         let attention = has_attention.then(|| AttentionKernels::load(device)).transpose()?;
         let marks = opts.profile.as_ref().map(|profile| Marks {
             profile: profile.clone(),
@@ -986,8 +1066,9 @@ impl Part {
         });
         // What the step's buffers grew by for the MTP block, at most: K and
         // V of all its heads, queries as wide, partial states.
-        let mtp_growth = rows * 4 * (2 * (hkv - without_mtp.1) + 5 * (hq - without_mtp.0))
-            + (state_slots - without_mtp.2);
+        let mtp_growth =
+            rows * 4 * (2 * (survey.hkv - without_mtp.1) + 5 * (survey.hq - without_mtp.0))
+                + (survey.state_slots - without_mtp.2);
         let mtp = mtp::Mtp::open(
             c,
             device,
@@ -1033,8 +1114,8 @@ impl Part {
             attn_head_dim: c.attention.head_dim as u32,
             scratch,
             s,
-            recurrent_at,
-            attention_at,
+            recurrent_at: survey.recurrent_at,
+            attention_at: survey.attention_at,
             state,
             checkpoint,
             places,
