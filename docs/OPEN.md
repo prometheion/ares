@@ -941,6 +941,12 @@ The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history
   GitHub or in a bundle, right away with no fallback period (the owner) (Ares's own uses moved first: the draft vocabulary, the tools' default
   paths, the fork comparisons from `/var/tmp/ares-survey/src/`); llama-swap's configuration is
   cleaned up and the program updated (restarts and installs are the owner's, with sudo).
+  The history scrub, measured 2026-11-24: of 900 unpushed commits (GitHub has one), 3 to 7 hold
+  the test machine's address, `/home/<user>` or `chat.example.org` in a diff, none in a message, none in
+  today's tree. Plan: rewrite origin/main..main with `git filter-branch` (nothing to install),
+  replacing those with "the test machine", `~` and `chat.example.org`; nearly every hash
+  changes, so a script then maps the commit hashes cited in today's docs and comments to the
+  new ones in one commit; push without force, on the owner's word.
 - Take code, not ideas (the owner, 2026-11-24): where an open engine has what Ares needs, its
   code is taken and adapted instead of rebuilt from its docs. Allowed: MIT, BSD, Apache-2.0
   (Ares is Apache-2.0); not GPL, AGPL or code with no license. Kernels come over nearly as they
