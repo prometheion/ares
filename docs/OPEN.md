@@ -1585,8 +1585,9 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       of both parts, `Balance` beside `Meeting`, the record's token offset read by hand (an
       `ares-cuda` accessor), the server's draft vocabulary reader (server phase), `Qwen35::new`
       reading its tokenizer while `Qwen4Exp::new` is given one, the large functions left
-      (`Frame::widest`, `enqueue_pass`, `Part::assemble`, `open_balanced`) and the names of the
-      audit's finding 13.
+      (`enqueue_pass`, Flash-Next's `Part::assemble`, `Config::from_gguf`, `Drafter::pass_layers`;
+      `Frame::widest` and the 27B's `open_balanced` went down to 277 and 222 lines in stages) and
+      the names of the audit's finding 13.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
