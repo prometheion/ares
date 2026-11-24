@@ -1675,6 +1675,14 @@ the agents' builds):
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- Push day (the owner, 2026-11-24): when the cleanup and the docs are done, the first push and
+  the switch of the owner's production to Ares come together. Before it: the libcuda deadlock
+  of page-locked frees fixed (it reaches the 27B too, through the prompt cache's checkpoints).
+  Then: llama-swap's 27B entry runs Ares at the owner's settings with its own prompt-cache
+  directory; the owner's llama.cpp trees go once every branch, stash and local commit is on
+  GitHub or in a bundle (Ares's own uses moved first: the draft vocabulary, the tools' default
+  paths, the fork comparisons from `/var/tmp/ares-survey/src/`); llama-swap's configuration is
+  cleaned up and the program updated (restarts and installs are the owner's, with sudo).
 - Take code, not ideas (the owner, 2026-11-24): where an open engine has what Ares needs, its
   code is taken and adapted instead of rebuilt from its docs. Allowed: MIT, BSD, Apache-2.0
   (Ares is Apache-2.0); not GPL, AGPL or code with no license. Kernels come over nearly as they
