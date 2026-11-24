@@ -5,13 +5,124 @@
 
 use std::sync::Arc;
 
-use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat, ToolFormat};
-use ares_runtime::{Boundary, EncodedPrompt, ImageInput, ImageSpan};
+use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role, ThinkingFormat, ToolFormat};
+use ares_runtime::{Boundary, EncodedPrompt, ImageInput, ImageSpan, Vision};
 use ares_tokenizer::{
     ChatOptions, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
 };
 
 use crate::qwen3vl::Projector;
+
+/// What a model on devices is to the text of a request, the same for every
+/// architecture: its name and context, its tokenizer and how its chat
+/// prompts are rendered, and the projector images are read through. The
+/// models' [`ares_runtime::Model`] impls take their text half from it.
+pub(crate) struct ModelText {
+    pub name: String,
+    /// The longest sequence the model is served with.
+    pub context: u32,
+    /// When the model was set up, in seconds since the Unix epoch.
+    pub created: u64,
+    pub tokenizer: Tokenizer,
+    /// How chat prompts are rendered, and what the template declares with
+    /// them.
+    pub chat: ChatOptions,
+    pub format: ChatFormat,
+    /// The projector images are read through, and the device part that runs
+    /// its tower.
+    pub projector: Option<(Arc<Projector>, usize)>,
+    /// The values of a row of the model, which an image's rows must have.
+    pub width: u32,
+}
+
+impl ModelText {
+    /// The text half of the model `name`, served with `context` cells, rows of
+    /// `width` values, its chat prompts rendered with the default options.
+    pub(crate) fn new(name: String, context: u32, tokenizer: Tokenizer, width: u32) -> Self {
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let chat = ChatOptions::default();
+        let format = chat_format(&tokenizer, &chat);
+        Self { name, context, created, tokenizer, chat, format, projector: None, width }
+    }
+
+    /// Renders chat prompts with `options`: whether the model thinks, and
+    /// the variables a server passes to the chat template.
+    pub(crate) fn set_chat_options(&mut self, options: ChatOptions) {
+        self.format = chat_format(&self.tokenizer, &options);
+        self.chat = options;
+    }
+
+    /// Reads images through `projector`, whose tower runs on device part
+    /// `device` of `devices`; why not when its rows are not the model's width
+    /// or the part is none.
+    pub(crate) fn set_projector(
+        &mut self,
+        projector: Arc<Projector>,
+        device: usize,
+        devices: usize,
+    ) -> Result<(), String> {
+        if projector.n_out() != self.width {
+            return Err(format!(
+                "its rows have {} values and the model's have {}",
+                projector.n_out(),
+                self.width
+            ));
+        }
+        if device >= devices {
+            return Err(format!("its tower is to run on part {device} of {devices}"));
+        }
+        self.projector = Some((projector, device));
+        Ok(())
+    }
+
+    /// The token a chat writes for every cell of an image.
+    pub(crate) fn image_pad(&self) -> Option<u32> {
+        self.tokenizer.special_token_id(IMAGE_PAD)
+    }
+
+    pub(crate) fn projector(&self) -> Option<&Arc<Projector>> {
+        self.projector.as_ref().map(|(p, _)| p)
+    }
+
+    pub(crate) fn card(&self) -> ModelCard {
+        ModelCard { id: self.name.clone(), context_length: self.context, created: self.created }
+    }
+
+    pub(crate) fn ends(&self, token: u32) -> bool {
+        self.tokenizer.is_end_of_generation(token)
+    }
+
+    pub(crate) fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
+        encode(&self.tokenizer, &self.chat, self.projector(), prompt)
+    }
+
+    pub(crate) fn encode_with_boundaries(
+        &self,
+        prompt: &Prompt,
+    ) -> Result<EncodedPrompt, EngineError> {
+        encode_with_boundaries(&self.tokenizer, &self.chat, self.projector(), prompt)
+    }
+
+    pub(crate) fn vision(&self) -> Option<Vision> {
+        self.projector.as_ref().map(|(projector, device)| Vision {
+            width: self.width,
+            max_rows: projector.limits().max_rows as u32,
+            device: *device,
+            units: projector.units(),
+        })
+    }
+
+    pub(crate) fn piece(&self, token: u32, text: &mut Vec<u8>) {
+        piece(&self.tokenizer, token, text);
+    }
+
+    /// The page-locked host memory the projector keeps.
+    pub(crate) fn pinned_ram(&self) -> u64 {
+        self.projector().map_or(0, |p| p.pinned_bytes())
+    }
+}
 
 /// What the chat template of `tokenizer` declares when it is rendered with
 /// `chat`, the options the server started the model with.

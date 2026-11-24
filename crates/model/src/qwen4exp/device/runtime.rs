@@ -50,7 +50,7 @@ use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::blocks::head::HeadView;
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
-use crate::chat;
+use crate::chat::ModelText;
 use crate::qwen3vl::Projector;
 use crate::qwen4exp::reference::mtp_config;
 use crate::qwen4exp::weights::{MtpWeights, Weights};
@@ -100,13 +100,9 @@ pub struct Qwen4Exp {
     opts: ModelOptions,
     placement: Placement,
     layout: Layout,
-    tokenizer: Tokenizer,
-    name: String,
-    context: u32,
-    created: u64,
-    chat: ChatOptions,
-    /// What the chat template declares, read with `chat`.
-    format: ChatFormat,
+    /// The model's name, tokenizer and chat, and the projector images are
+    /// read through.
+    text: ModelText,
     meeting: Meeting<Build>,
     flow: OnceLock<Arc<Flow>>,
     reports: Mutex<Vec<PartReport>>,
@@ -138,15 +134,12 @@ pub struct Qwen4Exp {
     /// The order of the output head's rows and the draft head's rows, which
     /// every drafter reads (`blocks/head.rs`).
     view: HeadView,
-    /// The projector images are read through, and the device part that runs
-    /// its tower.
-    projector: Option<(Arc<Projector>, usize)>,
 }
 
 impl std::fmt::Debug for Qwen4Exp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Qwen4Exp")
-            .field("name", &self.name)
+            .field("name", &self.text.name)
             .field("devices", &self.placement.n_devices())
             .field("shared", &self.placement.tensor.is_some())
             .finish_non_exhaustive()
@@ -216,11 +209,8 @@ impl Qwen4Exp {
         if opts.part.prune.is_some() {
             pinned += PruneMask::bytes(config.n_layer, config.experts.count);
         }
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
         let n = placement.n_devices();
-        let format = chat::chat_format(&tokenizer, &ChatOptions::default());
+        let text = ModelText::new(name.into(), context, tokenizer, config.n_embd as u32);
         let gguf = Arc::new(gguf);
         let rows = Arc::new(HostTable::mapped(gguf.clone(), TOKEN_EMBD)?);
         let config_vocab = config.n_vocab as u32;
@@ -233,12 +223,7 @@ impl Qwen4Exp {
             opts,
             placement,
             layout,
-            tokenizer,
-            name: name.into(),
-            context,
-            created,
-            format,
-            chat: ChatOptions::default(),
+            text,
             meeting: parts::meeting(n),
             flow: OnceLock::new(),
             reports: Mutex::new(Vec::new()),
@@ -255,7 +240,6 @@ impl Qwen4Exp {
             lone_rows: OnceLock::new(),
             pass_span: OnceLock::new(),
             view: HeadView::new(config_vocab, config_vocab, None).map_err(OpenError::Choice)?,
-            projector: None,
         })
     }
 
@@ -269,22 +253,9 @@ impl Qwen4Exp {
         projector: Arc<Projector>,
         device: usize,
     ) -> Result<Self, OpenError> {
-        if projector.n_out() as usize != self.config.n_embd {
-            return Err(OpenError::Choice(format!(
-                "the projector's rows have {} values and the model's have {}",
-                projector.n_out(),
-                self.config.n_embd
-            )));
-        }
-        if device >= self.placement.n_devices() {
-            return Err(OpenError::Choice(format!(
-                "the image tower is to run on part {device} of {}",
-                self.placement.n_devices()
-            )));
-        }
         // The n-gram embedding hashes its image token for an image cell; the
         // record carries the pad token the chat's markers write there.
-        let pad = self.tokenizer.special_token_id("<|image_pad|>");
+        let pad = self.text.image_pad();
         if let Some(ngram) = &self.config.ngram
             && pad != Some(ngram.image_token)
         {
@@ -294,13 +265,16 @@ impl Qwen4Exp {
                 ngram.image_token
             )));
         }
-        self.projector = Some((projector, device));
+        let devices = self.placement.n_devices();
+        self.text
+            .set_projector(projector, device, devices)
+            .map_err(|why| OpenError::Choice(format!("the projector: {why}")))?;
         Ok(self)
     }
 
     /// The projector images are read through, if there is one.
     pub fn projector(&self) -> Option<&Arc<Projector>> {
-        self.projector.as_ref().map(|(p, _)| p)
+        self.text.projector()
     }
 
     /// Gives every drafter of the model a draft vocabulary (`blocks/head.rs`):
@@ -470,8 +444,7 @@ impl Qwen4Exp {
     /// Renders chat prompts with `options`: whether the model thinks, and the
     /// variables a server passes to the chat template.
     pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
-        self.format = chat::chat_format(&self.tokenizer, &options);
-        self.chat = options;
+        self.text.set_chat_options(options);
         self
     }
 
@@ -689,7 +662,7 @@ impl Qwen4Exp {
 
 impl Model for Qwen4Exp {
     fn card(&self) -> ModelCard {
-        ModelCard { id: self.name.clone(), context_length: self.context, created: self.created }
+        self.text.card()
     }
 
     fn vocab(&self) -> u32 {
@@ -697,35 +670,30 @@ impl Model for Qwen4Exp {
     }
 
     fn ends(&self, token: u32) -> bool {
-        self.tokenizer.is_end_of_generation(token)
+        self.text.ends(token)
     }
 
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        chat::encode(&self.tokenizer, &self.chat, self.projector(), prompt)
+        self.text.encode(prompt)
     }
 
     fn encode_with_boundaries(
         &self,
         prompt: &Prompt,
     ) -> Result<ares_runtime::EncodedPrompt, EngineError> {
-        chat::encode_with_boundaries(&self.tokenizer, &self.chat, self.projector(), prompt)
+        self.text.encode_with_boundaries(prompt)
     }
 
     fn vision(&self) -> Option<Vision> {
-        self.projector.as_ref().map(|(projector, device)| Vision {
-            width: self.config.n_embd as u32,
-            max_rows: projector.limits().max_rows as u32,
-            device: *device,
-            units: projector.units(),
-        })
+        self.text.vision()
     }
 
     fn chat_format(&self) -> Option<ChatFormat> {
-        Some(self.format.clone())
+        Some(self.text.format.clone())
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        chat::piece(&self.tokenizer, token, text);
+        self.text.piece(token, text);
     }
 
     fn context(&self) -> ContextSpec {
@@ -780,7 +748,7 @@ impl Model for Qwen4Exp {
     }
 
     fn pinned_ram(&self) -> u64 {
-        self.pinned + self.projector().map_or(0, |p| p.pinned_bytes())
+        self.pinned + self.text.pinned_ram()
     }
 
     fn expert_stats(&self) -> Option<ExpertStats> {

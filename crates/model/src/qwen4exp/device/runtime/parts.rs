@@ -278,7 +278,7 @@ impl Qwen4Exp {
     /// The image tower, on the part that runs it, before the part and its
     /// expert slots take what is left of the device.
     fn open_tower(&self, cx: &mut DeviceContext<'_>) -> Result<Option<TowerAt>, ModelError> {
-        match &self.projector {
+        match &self.text.projector {
             Some((projector, device)) if *device == cx.index => {
                 cx.ledger.reserve("image tower", projector.vram_bytes())?;
                 let tower = projector

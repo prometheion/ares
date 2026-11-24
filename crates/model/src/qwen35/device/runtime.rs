@@ -26,7 +26,7 @@ use super::placement::{HalfShares, Placement, PlacementError};
 use crate::blocks::rows::{self, EmbeddingReport, HostTable, Stage};
 use crate::blocks::slots::{self, Declared};
 use crate::blocks::step::{self, DrafterIds, StepInputs};
-use crate::chat;
+use crate::chat::ModelText;
 use crate::qwen3vl::{Projector, TowerAt};
 use crate::qwen35::{Config, Weights};
 
@@ -119,15 +119,9 @@ pub struct Qwen35 {
     config: Config,
     placement: Placement,
     options: Options,
-    tokenizer: Tokenizer,
-    name: String,
-    context: u32,
-    /// When the model was set up, in seconds since the Unix epoch.
-    created: u64,
-    /// How chat prompts are rendered.
-    chat: ChatOptions,
-    /// What the chat template declares, read with `chat`.
-    format: ChatFormat,
+    /// The model's name, tokenizer and chat, and the projector images are
+    /// read through.
+    text: ModelText,
     reports: Mutex<Vec<PartReport>>,
     /// Where the parts of a tensor split, which the runtime opens at the
     /// same time, tell each other what the weight products cost them.
@@ -139,15 +133,12 @@ pub struct Qwen35 {
     /// that embeds and the part of the MTP block share; read by the first
     /// of them to open.
     table: Mutex<Option<Arc<HostTable>>>,
-    /// The projector images are read through, and the device part that runs
-    /// its tower.
-    projector: Option<(Arc<Projector>, usize)>,
 }
 
 impl std::fmt::Debug for Qwen35 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Qwen35")
-            .field("name", &self.name)
+            .field("name", &self.text.name)
             .field("split", &self.placement.split)
             .field("devices", &self.placement.n_devices())
             .finish_non_exhaustive()
@@ -208,25 +199,17 @@ impl Qwen35 {
         } else {
             0
         };
-        let format = chat::chat_format(&tokenizer, &ChatOptions::default());
+        let text = ModelText::new(name.into(), context, tokenizer, config.n_embd as u32);
         Ok(Self {
             gguf,
             config,
             placement,
             options,
-            tokenizer,
-            name: name.into(),
-            context,
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs()),
-            format,
-            chat: ChatOptions::default(),
+            text,
             reports: Mutex::new(Vec::new()),
             balance,
             pinned,
             table: Mutex::new(None),
-            projector: None,
         })
     }
 
@@ -237,34 +220,21 @@ impl Qwen35 {
         projector: Arc<Projector>,
         device: usize,
     ) -> Result<Self, OpenError> {
-        if projector.n_out() as usize != self.config.n_embd {
-            return Err(OpenError::Projector(format!(
-                "its rows have {} values and the model's have {}",
-                projector.n_out(),
-                self.config.n_embd
-            )));
-        }
-        if device >= self.placement.n_devices() {
-            return Err(OpenError::Projector(format!(
-                "its tower is to run on part {device} of {}",
-                self.placement.n_devices()
-            )));
-        }
-        self.projector = Some((projector, device));
+        let devices = self.placement.n_devices();
+        self.text.set_projector(projector, device, devices).map_err(OpenError::Projector)?;
         Ok(self)
     }
 
     /// The projector images are read through, if there is one.
     pub fn projector(&self) -> Option<&Arc<Projector>> {
-        self.projector.as_ref().map(|(p, _)| p)
+        self.text.projector()
     }
 
     /// Renders chat prompts with `options`: whether the model thinks, and the
     /// variables a server passes to the chat template (`reasoning_effort`
     /// and the like).
     pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
-        self.format = chat::chat_format(&self.tokenizer, &options);
-        self.chat = options;
+        self.text.set_chat_options(options);
         self
     }
 
@@ -280,7 +250,7 @@ impl Qwen35 {
 
     /// The tokenizer of the model file.
     pub fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
+        &self.text.tokenizer
     }
 
     /// What the parts took, by part index, once the runtime has opened them.
@@ -361,7 +331,7 @@ impl Qwen35 {
 
 impl Model for Qwen35 {
     fn card(&self) -> ModelCard {
-        ModelCard { id: self.name.clone(), context_length: self.context, created: self.created }
+        self.text.card()
     }
 
     fn vocab(&self) -> u32 {
@@ -369,35 +339,30 @@ impl Model for Qwen35 {
     }
 
     fn ends(&self, token: u32) -> bool {
-        self.tokenizer.is_end_of_generation(token)
+        self.text.ends(token)
     }
 
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        chat::encode(&self.tokenizer, &self.chat, self.projector(), prompt)
+        self.text.encode(prompt)
     }
 
     fn encode_with_boundaries(
         &self,
         prompt: &Prompt,
     ) -> Result<ares_runtime::EncodedPrompt, EngineError> {
-        chat::encode_with_boundaries(&self.tokenizer, &self.chat, self.projector(), prompt)
+        self.text.encode_with_boundaries(prompt)
     }
 
     fn vision(&self) -> Option<Vision> {
-        self.projector.as_ref().map(|(projector, device)| Vision {
-            width: self.config.n_embd as u32,
-            max_rows: projector.limits().max_rows as u32,
-            device: *device,
-            units: projector.units(),
-        })
+        self.text.vision()
     }
 
     fn chat_format(&self) -> Option<ChatFormat> {
-        Some(self.format.clone())
+        Some(self.text.format.clone())
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        chat::piece(&self.tokenizer, token, text);
+        self.text.piece(token, text);
     }
 
     fn context(&self) -> ContextSpec {
@@ -447,7 +412,7 @@ impl Model for Qwen35 {
     }
 
     fn pinned_ram(&self) -> u64 {
-        self.pinned + self.projector().map_or(0, |p| p.pinned_bytes())
+        self.pinned + self.text.pinned_ram()
     }
 
     fn max_rows(&self) -> u32 {
@@ -557,7 +522,7 @@ impl Model for Qwen35 {
         };
         // The image tower, on the part that runs it, before the part takes
         // what is left of the device.
-        let tower = match &self.projector {
+        let tower = match &self.text.projector {
             Some((projector, device)) if *device == index => {
                 cx.ledger.reserve("image tower", projector.vram_bytes())?;
                 let tower = projector
