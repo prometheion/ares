@@ -1587,7 +1587,15 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       reading its tokenizer while `Qwen4Exp::new` is given one, the large functions left
       (`enqueue_pass`, Flash-Next's `Part::assemble`, `Config::from_gguf`, `Drafter::pass_layers`;
       `Frame::widest` and the 27B's `open_balanced` went down to 277 and 222 lines in stages) and
-      the names of the audit's finding 13.
+      the names of the audit's finding 13. Verified on the two local cards (2026-11-24, rebased on
+      45d2e4d6): every GPU suite of both models and the server's `real`, `real_cache`,
+      `real_devices` as on main (the known near-bound and tensor-split failures only); alternating
+      A/B against main: Flash-Next and the 27B decode, an 8k prompt and two at once as fast, the
+      same plan and the same role kept at load. One change at load: Flash-Next's dense weights now
+      come through the shared arena's ordinary reads (the 27B's way, for a machine short of
+      memory, where faulting a mapping in read 38 MB/s) and upload in 0.6 s instead of 0.3 s from a
+      warm page cache (3.3 GiB on the RTX 4070), so the role trial takes 4.2 s against 3.6 to 3.8 s.
+      Whether both models should take the mapping when the file is in the page cache is open.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
