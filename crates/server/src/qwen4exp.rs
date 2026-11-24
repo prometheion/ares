@@ -18,8 +18,8 @@ use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sam
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread,
-    TensorChoice, batch_rows, page_parts, place, profile_key, reads_layer_by_layer, step_rows,
+    ModelOptions, Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, Spread, TensorChoice,
+    batch_rows, page_parts, place, profile_key, reads_layer_by_layer, step_rows,
 };
 use ares_model::qwen4exp::{Config, MtpWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
@@ -300,8 +300,8 @@ pub(crate) fn load(
         )
         .map_err(|e| LoadError::Model(e.to_string()))?,
     };
-    let session = |context: u32, pages: u32, near: Option<u32>, spread: Spread, max_rows: u32| {
-        SessionOptions {
+    let session =
+        |context: u32, pages: u32, near: Option<u32>, spread: Spread, max_rows: u32| ModelOptions {
             part: Options {
                 kv,
                 max_rows,
@@ -317,9 +317,8 @@ pub(crate) fn load(
             },
             headroom: VRAM_HEADROOM,
             spread,
-            ..SessionOptions::default()
-        }
-    };
+            ..ModelOptions::default()
+        };
     let named_split = |e: String| {
         // A placement that does not fit is, next to other models, no room.
         let fits = !e.contains("does not fit");
@@ -463,7 +462,7 @@ pub(crate) fn load(
         &session(longest, pages, near, spread, max_rows),
     )
     .map_err(|e| named_split(e.to_string()))?;
-    let opts = SessionOptions { pass_rows, ..session(longest, pages, near, spread, max_rows) };
+    let opts = ModelOptions { pass_rows, ..session(longest, pages, near, spread, max_rows) };
     if let (Some(dir), None, Some(tensor)) = (&options.cache, &remembered, &placement.tensor) {
         Split::write(dir, &options.model, &devices, &tensor.choice);
     }

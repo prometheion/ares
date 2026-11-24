@@ -35,6 +35,7 @@ mod load;
 mod misses;
 mod mtp;
 mod ngram;
+mod options;
 mod part;
 pub mod placement;
 mod prune;
@@ -48,11 +49,13 @@ pub use board::Board;
 pub use load::{LayerShare, Role};
 pub use misses::WideStats;
 pub use mtp::{MtpDrafted, MtpReport, MtpTimes};
+pub use options::{ModelOptions, Spread};
 pub use part::{
     ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Ports, Profile, StepEnv,
 };
 pub use placement::{
     DeviceMemory, DevicePlan, PartPlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
+    read_time,
 };
 pub use prune::{PruneMask, PruneSetup, PruneStats};
 pub use roles::{RoleTime, RoleTrial};
@@ -61,8 +64,7 @@ pub use runtime::{
     step_rows,
 };
 pub use session::{
-    Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
-    read_time,
+    Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, StepTime, Wanted,
 };
 pub use usage::{IDLE_AFTER, Log, ProfileFound, ProfileReport, UsageStats, profile_key};
 

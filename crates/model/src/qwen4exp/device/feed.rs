@@ -353,16 +353,6 @@ pub(super) fn cpu_pool(workers: Option<usize>, reserved: usize) -> Result<CpuPoo
         .map_err(|e| invalid(format!("the CPU workers of the expert store: {e}")))
 }
 
-/// The part that owns each expert of each layer when the devices share every
-/// layer, `owners[layer * n_experts + expert]`: what [`Feed::set_owners`] takes.
-pub(super) fn owners(placement: &Placement, c: &Config) -> Vec<u8> {
-    (0..c.n_layer)
-        .flat_map(|layer| {
-            (0..c.experts.count as u32).map(move |expert| placement.owner(layer, expert) as u8)
-        })
-        .collect()
-}
-
 /// The expert store and the route records that feed it.
 pub(super) struct Feed {
     pub store: ExpertStore<CudaSlots>,

@@ -31,12 +31,18 @@
 //! report (free memory, multiprocessors) and the model's sizes.
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
+use ares_core::GgmlType;
+use ares_cuda::{Device, DeviceBuffer, Kernels, MixerMatrix, Q4Kernels, Stream, peer_access};
+use ares_gguf::Gguf;
 use ares_runtime::ModelError;
 
+use super::Error;
 use super::load::{LayerShare, Role, head_bytes, key_head_unit, layer_bytes};
+use super::options::{ModelOptions, Spread};
 use super::part::{Frame, Options, PartShape};
-use super::roles::RoleTrial;
+use super::roles::{self, RoleTrial};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{Mixer, Weights};
 
@@ -520,6 +526,188 @@ impl Placement {
         }
         tensor.expert_share.len() - 1
     }
+
+    /// The device that owns each expert of each layer,
+    /// `owners[layer * n_experts + expert]` ([`Placement::owner`]).
+    pub fn owners(&self, c: &Config) -> Vec<u8> {
+        (0..c.n_layer)
+            .flat_map(|layer| {
+                (0..c.experts.count as u32).map(move |expert| self.owner(layer, expert) as u8)
+            })
+            .collect()
+    }
+
+    /// Per layer and expert, 1 where a device other than `index` owns the
+    /// expert: what the mixer of two devices on every layer leaves to the
+    /// worker.
+    pub fn others(&self, c: &Config, index: usize) -> Vec<u8> {
+        self.owners(c).into_iter().map(|owner| u8::from(usize::from(owner) != index)).collect()
+    }
+}
+
+/// How long a read of a stream mixer of the model's sizes takes on `device`:
+/// the two fused launches over weights of the first layer's types, which are
+/// bound by the device's memory as the model's dense products are.
+pub fn read_time(device: &Device, c: &Config, w: &Weights<'_>) -> Result<Duration, Error> {
+    let (hc, n, rank) = (c.n_stream as u32, c.n_embd as u32, c.mixer_rank as u32);
+    let mixer = &w.layers[0].attn_mixer;
+    let wide = u64::from(hc) * u64::from(n);
+    // The bytes of a matrix of `values` values of the type it has in the file (whole blocks).
+    let bytes = |ty: GgmlType, values: u64| ty.bytes_for(values).unwrap_or(4 * values);
+    let zeroed = |bytes: u64| -> Result<DeviceBuffer, Error> {
+        let buffer = DeviceBuffer::new(device, bytes.max(64))?;
+        buffer.write(0, &vec![0u8; bytes.max(64) as usize])?;
+        Ok(buffer)
+    };
+    let kernels = Q4Kernels::load(device)?;
+    let stream = Stream::new(device, 0)?;
+    let (r, norm, xn) = (zeroed(wide * 4)?, zeroed(wide * 4)?, zeroed(wide * 4)?);
+    let down = zeroed(bytes(mixer.down.ty(), u64::from(rank) * wide))?;
+    let up = zeroed(bytes(mixer.up.ty(), wide * u64::from(rank)))?;
+    let partials = zeroed(Q4Kernels::read_partials(1, hc, rank) * 4)?;
+    let act = zeroed(Kernels::quantized_activation_bytes(n, 1))?;
+    let run = |count: u32| -> Result<(), Error> {
+        for _ in 0..count {
+            // SAFETY: every buffer is of this device and of the sizes the
+            // two launches read and write for one row.
+            unsafe {
+                kernels.read_down(
+                    &stream,
+                    r.ptr(),
+                    r.ptr(),
+                    None,
+                    Some((
+                        norm.ptr(),
+                        xn.ptr(),
+                        MixerMatrix { ptr: down.ptr(), ty: mixer.down.ty() },
+                        None,
+                    )),
+                    partials.ptr(),
+                    1,
+                    hc,
+                    n,
+                    rank,
+                    c.rms_eps,
+                )?;
+                kernels.read_up(
+                    &stream,
+                    xn.ptr(),
+                    partials.ptr(),
+                    MixerMatrix { ptr: up.ptr(), ty: mixer.up.ty() },
+                    act.ptr(),
+                    None,
+                    None,
+                    1,
+                    hc,
+                    n,
+                    rank,
+                )?;
+            }
+        }
+        stream.synchronize()?;
+        Ok(())
+    };
+    run(8)?;
+    let started = Instant::now();
+    run(64)?;
+    Ok(started.elapsed() / 64)
+}
+
+/// What [`choose`] decided and measured.
+pub(super) struct Chosen {
+    pub placement: Placement,
+    /// For two devices that share every layer: the time of a read of a stream
+    /// mixer on each, and the mixer among them.
+    pub speeds: Option<([f64; 2], usize)>,
+    /// What each device had to give the model when it was looked at.
+    pub memory: Vec<DeviceMemory>,
+}
+
+/// Where the layers of the model go on `devices`: a range each, or both
+/// devices on every layer when they can write each other's memory and the
+/// mixers run as fused reads. Measures a read of a stream mixer on each of
+/// two devices that share the layers, and, unless `spread` gives the
+/// worker's role, times both roles on them (`roles.rs`, a few seconds).
+pub(super) fn choose(
+    gguf: &Gguf,
+    c: &Config,
+    w: &Weights<'_>,
+    devices: &[Device],
+    opts: &ModelOptions,
+) -> Result<Chosen, Error> {
+    let (part, bounds) = (&opts.part, opts.bounds.as_deref());
+    let mut memory = Vec::with_capacity(devices.len());
+    for device in devices {
+        let free = device.mem_info()?.free;
+        memory.push(DeviceMemory {
+            budget: free.saturating_sub(opts.headroom),
+            multiprocessors: device.info().multiprocessors,
+        });
+    }
+    // Both devices on every layer when each can write the other's memory
+    // and the mixers run as fused reads.
+    let peers = devices.len() == 2
+        && peer_access(devices[0].ordinal(), devices[1].ordinal())?.0
+        && peer_access(devices[1].ordinal(), devices[0].ordinal())?.0;
+    let mixer = &w.layers[0].attn_mixer;
+    let fused = Q4Kernels::reads_fused(
+        c.n_stream as u32,
+        c.n_embd as u32,
+        c.mixer_rank as u32,
+        &[mixer.down.ty(), mixer.up.ty()],
+    );
+    let shared = match opts.spread {
+        Spread::Layers => None,
+        Spread::Auto if bounds.is_some() || !peers || !fused => None,
+        Spread::Auto => Some((None, None, None)),
+        Spread::Tensor { .. } if !peers => {
+            return Err(Error::Invalid(
+                "two devices share every layer only when each can write the other's memory \
+                 (peer access between exactly two devices)"
+                    .into(),
+            ));
+        }
+        Spread::Tensor { mixer, core_share, shared_on_mixer } => {
+            Some((mixer, core_share, shared_on_mixer))
+        }
+    };
+    // What is measured of two devices that share the layers: the time
+    // of a read of a stream mixer on each, and the mixer among them.
+    let mut speeds: Option<([f64; 2], usize)> = None;
+    let placement = match (shared, bounds) {
+        (Some((mixer, core_share, shared_on_mixer)), _) => {
+            devices[0].enable_peer_access(&devices[1])?;
+            devices[1].enable_peer_access(&devices[0])?;
+            let times = [
+                read_time(&devices[0], c, w)?.as_secs_f64(),
+                read_time(&devices[1], c, w)?.as_secs_f64(),
+            ];
+            let mixer = mixer.unwrap_or(usize::from(times[1] < times[0])).min(1);
+            speeds = Some((times, mixer));
+            let (fast, slow) = (times[mixer], times[1 - mixer]);
+            let share = TensorChoice {
+                mixer,
+                core_share: core_share.unwrap_or(slow / (fast + slow).max(1e-9)),
+                shared_on_mixer: shared_on_mixer.unwrap_or(false),
+            };
+            let trial = match (core_share, shared_on_mixer) {
+                (None, None) => {
+                    let alone = TensorChoice { mixer, core_share: 1.0, shared_on_mixer: true };
+                    Some(roles::trial(gguf, c, w, devices, part, &memory, &[share, alone])?)
+                }
+                _ => None,
+            };
+            let choice = trial.as_ref().map_or(share, |t| t.kept);
+            let mut placement = Placement::tensor(c, w, part, &memory, &choice)?;
+            if let Some(tensor) = &mut placement.tensor {
+                tensor.trial = trial;
+            }
+            placement
+        }
+        (None, Some(bounds)) => Placement::at(c, w, part, &memory, bounds)?,
+        (None, None) => Placement::plan(c, w, part, &memory)?,
+    };
+    Ok(Chosen { placement, speeds, memory })
 }
 
 /// The bytes of page-locked RAM for the experts' tier in host memory: `want`

@@ -28,8 +28,8 @@ use ares_cuda::{
 };
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    LayerOut, Options, PHASES, Phase, Probe, Profile, PruneSetup, Rows, Session, SessionOptions,
-    Spread, Wanted,
+    LayerOut, ModelOptions, Options, PHASES, Phase, Probe, Profile, PruneSetup, Rows, Session,
+    SessionOptions, Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
@@ -125,7 +125,7 @@ fn open(name: &str, bytes: &[u8]) -> Gguf {
 }
 
 fn options(devices: usize, n_layer: usize, kv: CacheFormat) -> SessionOptions {
-    SessionOptions {
+    let model = ModelOptions {
         part: Options {
             kv: (kv, kv),
             logit_rows: 8,
@@ -135,14 +135,14 @@ fn options(devices: usize, n_layer: usize, kv: CacheFormat) -> SessionOptions {
         },
         // The tests share the cards with whatever else runs.
         headroom: 512 << 20,
-        ram_tier: Some(64 << 20),
         spread: tensor().unwrap_or(Spread::Layers),
         bounds: (devices == 2 && tensor().is_none()).then(|| vec![0, n_layer / 2, n_layer]),
         // Every expert has a slot: none is to be evicted between steps.
         reserve: Some(0),
         cpu_workers: Some(2),
-        ..SessionOptions::default()
-    }
+        ..ModelOptions::default()
+    };
+    SessionOptions { model, ram_tier: Some(64 << 20), ..SessionOptions::default() }
 }
 
 fn session<'g>(
@@ -365,7 +365,7 @@ fn every_layer_of_wide_steps_matches_the_reference() {
         let w = Weights::load(&gguf, &c).unwrap();
         let reference = Reference::new(&c, &w);
         let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
-        opts.part.max_rows = 256;
+        opts.model.part.max_rows = 256;
         let mut session =
             Session::open(&gguf, &c, &w, devices.clone(), opts).expect("the model opens");
         let present = c.experts.count as u32 / 2;
@@ -502,9 +502,9 @@ fn the_second_devices_role_is_timed_at_load() {
     let w = Weights::load(&gguf, &c).unwrap();
     let reference = Reference::new(&c, &w);
     let mut opts = options(2, c.n_layer, CacheFormat::Q8);
-    opts.spread = Spread::Tensor { mixer: None, core_share: None, shared_on_mixer: None };
-    opts.bounds = None;
-    opts.part.max_rows = 64;
+    opts.model.spread = Spread::Tensor { mixer: None, core_share: None, shared_on_mixer: None };
+    opts.model.bounds = None;
+    opts.model.part.max_rows = 64;
     let mut session = Session::open(&gguf, &c, &w, devices, opts).expect("the model opens");
     let tensor = session.placement().tensor.clone().expect("both devices on every layer");
     let trial = tensor.trial.clone().expect("the roles were timed");
@@ -595,8 +595,8 @@ fn wide_steps(devices: &[Device], precision: Precision, slots: Slots) {
     let w = Weights::load(&gguf, &c).unwrap();
     let reference = Reference::new(&c, &w);
     let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
-    opts.part.max_rows = 256;
-    opts.part.precision = precision;
+    opts.model.part.max_rows = 256;
+    opts.model.part.precision = precision;
     if few_slots {
         // The least the store gives a layer: the experts of a step of eight rows.
         let shape = ExpertShape {
@@ -609,11 +609,11 @@ fn wide_steps(devices: &[Device], precision: Precision, slots: Slots) {
         };
         let layers = layers_per_device(c.n_layer, devices.len()) as u64;
         let transit = if slots == Slots::Transit { 4 } else { 0 };
-        opts.slot_bytes =
+        opts.model.slot_bytes =
             Some((layers * u64::from(8 * shape.top_k) + transit) * shape.slot_bytes().unwrap());
-        opts.transit = Some(transit as u32);
+        opts.model.transit = Some(transit as u32);
     }
-    opts.part.cells = 512;
+    opts.model.part.cells = 512;
     let mut session =
         Session::open(&gguf, &c, &w, devices.to_vec(), opts).expect("the model opens");
     let present = if few_slots { 6 } else { c.experts.count as u32 / 2 };
@@ -797,11 +797,9 @@ fn run_with_misses_tuned(
         down_ty: GgmlType::Q2_0,
     };
     let layers_per_device = layers_per_device(c.n_layer, devices.len());
-    let mut opts = SessionOptions {
-        slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
-        serve,
-        ..options(devices.len(), c.n_layer, CacheFormat::Q8)
-    };
+    let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+    opts.model.slot_bytes = Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap());
+    opts.model.serve = serve;
     tune(&c, &mut opts);
     let mut session = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
     let n_expert = c.experts.count as u32;
@@ -863,7 +861,7 @@ fn experts_read_ahead_of_their_router_change_nothing() {
         let (worst, stats) =
             run_with_misses_tuned(&devices, Serve::Stream, &format!("-ahead{predict}"), |c, o| {
                 small_ram(c, o);
-                o.part.predict = predict;
+                o.model.part.predict = predict;
             });
         eprintln!(
             "  predictions of {predict} layers ahead: {} named, {} of them picked; {} read \
@@ -982,11 +980,9 @@ fn layers_with_misses_of(
         down_ty,
     };
     let layers_per_device = layers_per_device(c.n_layer, devices.len());
-    let opts = SessionOptions {
-        slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
-        serve,
-        ..options(devices.len(), c.n_layer, CacheFormat::Q8)
-    };
+    let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+    opts.model.slot_bytes = Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap());
+    opts.model.serve = serve;
     let mut missing = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
     let n_expert = c.experts.count as u32;
     missing.fill(&mut |_| (0..n_expert).collect()).unwrap();
@@ -1084,7 +1080,7 @@ fn experts_a_wide_step_misses_computed_on_the_cpu_differ_by_their_rounding() {
     let w = Weights::load(&gguf, &c).unwrap();
     let text = synthetic.shape.tokens(56, 29);
     let wide_rows = |mut opts: SessionOptions| {
-        opts.part.max_rows = 64;
+        opts.model.part.max_rows = 64;
         opts
     };
     let n_expert = c.experts.count as u32;
@@ -1109,11 +1105,10 @@ fn experts_a_wide_step_misses_computed_on_the_cpu_differ_by_their_rounding() {
         )
         .unwrap();
         whole.fill(&mut |_| (0..n_expert).collect()).unwrap();
-        let opts = SessionOptions {
-            slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
-            serve,
-            ..wide_rows(options(devices.len(), c.n_layer, CacheFormat::Q8))
-        };
+        let mut opts = wide_rows(options(devices.len(), c.n_layer, CacheFormat::Q8));
+        opts.model.slot_bytes =
+            Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap());
+        opts.model.serve = serve;
         let mut missing = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
         missing.fill(&mut |_| (0..n_expert).collect()).unwrap();
         missing.take_store_stats();
@@ -1242,7 +1237,7 @@ fn expert_types_match_the_reference(part: usize) {
         let prompt = synthetic.shape.tokens(steps.iter().sum(), 9);
         let open_session = || {
             let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
-            opts.part.max_rows = 64;
+            opts.model.part.max_rows = 64;
             let mut session =
                 Session::open(&gguf, &c, &w, devices.clone(), opts).expect("the model opens");
             let n_expert = c.experts.count as u32;
@@ -1377,7 +1372,7 @@ fn float_path_types_match_the_reference(part: usize) {
         assert_eq!(w.layers[0].attn_mixer.down.ty(), ty);
         let reference = Reference::new(&c, &w);
         let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
-        opts.part.max_rows = 64;
+        opts.model.part.max_rows = 64;
         let mut session =
             Session::open(&gguf, &c, &w, devices.clone(), opts).expect("the model opens");
         let n_expert = c.experts.count as u32;
@@ -1538,7 +1533,7 @@ fn the_profile_times_steps_by_kind() {
     let w = Weights::load(&gguf, &c).unwrap();
     let profile = Arc::new(Profile::new());
     let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
-    opts.part.profile = Some(profile.clone());
+    opts.model.part.profile = Some(profile.clone());
     // With experts outside their slots: a kernel that waits for the host
     // while the host records timed events.
     let shape = ExpertShape {
@@ -1550,7 +1545,7 @@ fn the_profile_times_steps_by_kind() {
         down_ty: GgmlType::Q2_0,
     };
     let slots = (c.experts.used * 8 * layers_per_device(c.n_layer, devices.len())) as u64;
-    opts.slot_bytes = Some(slots * shape.slot_bytes().unwrap());
+    opts.model.slot_bytes = Some(slots * shape.slot_bytes().unwrap());
     let mut session = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
     let n_expert = c.experts.count as u32;
     session.fill(&mut |_| (0..n_expert).collect()).unwrap();
@@ -1601,12 +1596,10 @@ fn a_long_step_that_misses_experts_ends() {
     let slots = (c.experts.used * 8 * layers_per_device(c.n_layer, devices.len())) as u64;
     let text = synthetic.shape.tokens(96, 3);
     for serve in [Serve::Stream, Serve::Measured] {
-        let opts = SessionOptions {
-            slot_bytes: Some(slots * shape.slot_bytes().unwrap()),
-            serve,
-            stall: std::time::Duration::from_secs(20),
-            ..options(devices.len(), c.n_layer, CacheFormat::Q8)
-        };
+        let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+        opts.model.slot_bytes = Some(slots * shape.slot_bytes().unwrap());
+        opts.model.serve = serve;
+        opts.model.stall = std::time::Duration::from_secs(20);
         let mut session = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
         let n_expert = c.experts.count as u32;
         session.fill(&mut |_| (0..n_expert).collect()).unwrap();
@@ -1675,13 +1668,8 @@ fn pruning_touches_only_what_the_file_alone_holds() {
 
     // Every expert in VRAM: nothing to prune.
     let want = run(&mut session(&gguf, &c, &w, devices.clone(), CacheFormat::Q8));
-    let opts = SessionOptions {
-        part: Options {
-            prune: Some(setup(PruneRule::Skip, PruneWeights::Keep)),
-            ..base.part.clone()
-        },
-        ..base.clone()
-    };
+    let mut opts = base.clone();
+    opts.model.part.prune = Some(setup(PruneRule::Skip, PruneWeights::Keep));
     let mut pruned = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
     pruned.fill(&mut |_| (0..n_expert as u32).collect()).unwrap();
     pruned.take_prune_stats();
@@ -1711,13 +1699,11 @@ fn pruning_touches_only_what_the_file_alone_holds() {
         (PruneRule::Similar, PruneWeights::Keep),
         (PruneRule::Similar, PruneWeights::Scaled),
     ] {
-        let opts = SessionOptions {
-            part: Options { prune: Some(setup(rule, weights)), ..base.part.clone() },
-            slot_bytes: Some(slots * shape.slot_bytes().unwrap()),
-            ram_tier: Some(slots * shape.slot_bytes().unwrap() * 2),
-            serve: Serve::Stream,
-            ..base.clone()
-        };
+        let mut opts = base.clone();
+        opts.model.part.prune = Some(setup(rule, weights));
+        opts.model.slot_bytes = Some(slots * shape.slot_bytes().unwrap());
+        opts.model.serve = Serve::Stream;
+        opts.ram_tier = Some(slots * shape.slot_bytes().unwrap() * 2);
         let mut session = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
         session.fill(&mut |_| (0..n_expert as u32).collect()).unwrap();
         session.take_store_stats();

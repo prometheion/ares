@@ -33,7 +33,7 @@ use std::time::Instant;
 use ares_cuda::{Device, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    LayerOut, Options, Probe, Rows, Session, SessionOptions, Wanted,
+    LayerOut, ModelOptions, Options, Probe, Rows, Session, SessionOptions, Wanted,
 };
 use ares_model::qwen4exp::{Config, Reference, Weights};
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
@@ -137,7 +137,10 @@ fn record(args: &HashMap<String, String>) -> Result<(), AnyError> {
     let c = Config::from_gguf(&gguf)?;
     let w = Weights::load(&gguf, &c)?;
     let opts = SessionOptions {
-        part: Options { cells: 2048, ..Options::default() },
+        model: ModelOptions {
+            part: Options { cells: 2048, ..Options::default() },
+            ..ModelOptions::default()
+        },
         ram_tier: args
             .get("--ram-gib")
             .map(|g| g.parse::<f64>().map(|g| (g * (1u64 << 30) as f64) as u64))

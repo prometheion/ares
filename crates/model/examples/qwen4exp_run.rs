@@ -77,8 +77,8 @@ use std::time::{Duration, Instant};
 use ares_cuda::{CacheFormat, Device, KeyFormat, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    DeviceMemory, Options, PHASES, Placement, Profile, Rows, Session, SessionOptions, Spread,
-    TensorChoice, Wanted, read_time,
+    DeviceMemory, ModelOptions, Options, PHASES, Placement, Profile, Rows, Session, SessionOptions,
+    Spread, TensorChoice, Wanted, read_time,
 };
 use ares_model::qwen4exp::{Config, Weights};
 use ares_runtime::expert_store::{Serve, StoreStats};
@@ -462,7 +462,7 @@ fn read(
     want_last: bool,
 ) -> Result<Option<u32>, AnyError> {
     let mut pick = None;
-    let rows = session.options().part.max_rows as usize;
+    let rows = session.options().model.part.max_rows as usize;
     let chunks = tokens.chunks(rows).count();
     for (i, chunk) in tokens.chunks(rows).enumerate() {
         let wanted = if want_last && i + 1 == chunks { Wanted::Last } else { Wanted::None };
@@ -586,9 +586,7 @@ fn run() -> Result<(), AnyError> {
     for path in &args.profile {
         routing(path, &mut counts)?;
     }
-    let opts = SessionOptions {
-        routing: (!args.profile.is_empty() && args.owners == "routing").then(|| counts.clone()),
-        worker_picks: args.worker_picks,
+    let model = ModelOptions {
         part: Options {
             cells: args.cells,
             keys: args.keys,
@@ -603,7 +601,6 @@ fn run() -> Result<(), AnyError> {
             ..Options::default()
         },
         headroom: args.headroom_mib << 20,
-        ram_tier: args.ram_gib.map(|g| (g * (1u64 << 30) as f64) as u64),
         spread: match args.spread.as_str() {
             "auto" => Spread::Auto,
             "layers" => Spread::Layers,
@@ -619,7 +616,13 @@ fn run() -> Result<(), AnyError> {
         stall: Duration::from_secs(args.stall_s),
         transit: args.transit,
         read_ahead: args.read_ahead,
-        ..SessionOptions::default()
+        ..ModelOptions::default()
+    };
+    let opts = SessionOptions {
+        model,
+        ram_tier: args.ram_gib.map(|g| (g * (1u64 << 30) as f64) as u64),
+        routing: (!args.profile.is_empty() && args.owners == "routing").then(|| counts.clone()),
+        worker_picks: args.worker_picks,
     };
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Spin)).collect::<Result<_, _>>()?;
@@ -645,18 +648,18 @@ fn run() -> Result<(), AnyError> {
             .iter()
             .map(|d| {
                 Ok(DeviceMemory {
-                    budget: d.mem_info()?.free.saturating_sub(opts.headroom),
+                    budget: d.mem_info()?.free.saturating_sub(opts.model.headroom),
                     multiprocessors: d.info().multiprocessors,
                 })
             })
             .collect::<Result<_, ares_cuda::Error>>()?;
-        let placement = match (&opts.spread, &opts.bounds) {
+        let placement = match (&opts.model.spread, &opts.model.bounds) {
             // Without a session nothing is measured: what is not given is
             // the first device and an even share.
             (Spread::Tensor { mixer, core_share, shared_on_mixer }, _) => Placement::tensor(
                 &c,
                 &w,
-                &opts.part,
+                &opts.model.part,
                 &memory,
                 &TensorChoice {
                     mixer: mixer.unwrap_or(0),
@@ -664,8 +667,8 @@ fn run() -> Result<(), AnyError> {
                     shared_on_mixer: shared_on_mixer.unwrap_or(false),
                 },
             )?,
-            (_, Some(bounds)) => Placement::at(&c, &w, &opts.part, &memory, bounds)?,
-            _ => Placement::plan(&c, &w, &opts.part, &memory)?,
+            (_, Some(bounds)) => Placement::at(&c, &w, &opts.model.part, &memory, bounds)?,
+            _ => Placement::plan(&c, &w, &opts.model.part, &memory)?,
         };
         println!("placement for {} cells:", args.cells);
         for (device, plan) in devices.iter().zip(&placement.devices) {
@@ -976,7 +979,7 @@ fn run() -> Result<(), AnyError> {
              average {})",
                 args.prefill,
                 args.prefill as f64 / seconds,
-                session.options().part.max_rows,
+                session.options().model.part.max_rows,
                 load_average(),
             );
             println!("  store: {}", store_line(&stats, args.prefill.div_ceil(args.rows as usize)));

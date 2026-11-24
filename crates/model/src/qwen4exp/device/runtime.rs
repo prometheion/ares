@@ -51,20 +51,21 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::board::Board;
 use super::feed::{
-    Feed, Layout, MtpExperts, build_store, cpu_pool, device_slots, expert_map, owners, places,
+    Feed, Layout, MtpExperts, build_store, cpu_pool, device_slots, expert_map, places,
     plan_transit, reader,
 };
 use super::misses::{Misses, Progress, SpanPicks, WideStats};
 use super::mtp::{MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
+use super::options::ModelOptions;
 use super::part::{
     ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, PassSizes, Pieces,
     Ports, StepEnv,
 };
-use super::placement::{MARGIN, PartPlan, Placement};
+use super::placement::{Chosen, MARGIN, PartPlan, Placement, choose};
 use super::prune::{self, PruneMask};
 use super::resume::Resume;
-use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
+use super::session::{Fill, PartReport};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::blocks::far::FarPool;
 use crate::blocks::head::HeadView;
@@ -721,7 +722,7 @@ pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32,
 
 /// Whether a model opened with `opts` on `devices` devices, with a DFlash drafter or
 /// without (`dflash`), reads a prompt wider than the parts' own scratch layer by layer
-/// ([`SessionOptions::pass_rows`]): its micro-batches take the many-row kernels, K and V
+/// ([`ModelOptions::pass_rows`]): its micro-batches take the many-row kernels, K and V
 /// have no exact pool (whose tiles convert per step for every layer at once), no DFlash
 /// drafter reads the residual of a step's rows at some layers, and the placement is one the
 /// pass is built for.
@@ -788,7 +789,7 @@ pub fn widest_rows<E>(
 pub fn batch_rows(
     gguf: &Gguf,
     devices: &[Device],
-    opts: &SessionOptions,
+    opts: &ModelOptions,
     placement: &Placement,
     pages: u32,
     page_bytes: &[u64],
@@ -863,7 +864,7 @@ pub fn batch_rows(
 pub fn place(
     gguf: &Gguf,
     devices: &[Device],
-    opts: &SessionOptions,
+    opts: &ModelOptions,
 ) -> Result<(Placement, Vec<u64>), OpenError> {
     let config = Config::from_gguf(gguf)?;
     let weights = Weights::load(gguf, &config)?;
@@ -877,7 +878,7 @@ pub fn place(
 pub fn page_parts(
     gguf: &Gguf,
     devices: &[Device],
-    opts: &SessionOptions,
+    opts: &ModelOptions,
     placement: &Placement,
 ) -> Result<Vec<(u64, u64)>, OpenError> {
     let config = Config::from_gguf(gguf)?;
@@ -896,18 +897,9 @@ fn place_in(
     config: &Config,
     weights: &Weights<'_>,
     devices: &[Device],
-    opts: &SessionOptions,
+    opts: &ModelOptions,
 ) -> Result<(Placement, Vec<u64>), OpenError> {
-    let Chosen { placement, .. } = choose(
-        gguf,
-        config,
-        weights,
-        devices,
-        &opts.part,
-        opts.headroom,
-        &opts.spread,
-        opts.bounds.as_deref(),
-    )?;
+    let Chosen { placement, .. } = choose(gguf, config, weights, devices, opts)?;
     let pages = u64::from(opts.part.pages());
     let mut page_bytes = Vec::with_capacity(devices.len());
     for (index, device) in devices.iter().enumerate() {
@@ -923,7 +915,7 @@ fn place_in(
 pub struct Qwen4Exp {
     gguf: Arc<Gguf>,
     config: Config,
-    opts: SessionOptions,
+    opts: ModelOptions,
     placement: Placement,
     layout: Layout,
     tokenizer: Tokenizer,
@@ -990,16 +982,10 @@ impl Qwen4Exp {
         tokenizer: Tokenizer,
         name: impl Into<String>,
         devices: &[Device],
-        mut opts: SessionOptions,
+        mut opts: ModelOptions,
         context: u32,
     ) -> Result<Self, OpenError> {
         let choice = |why: &str| Err(OpenError::Choice(why.to_owned()));
-        if opts.ram_tier.is_some() || opts.routing.is_some() || opts.worker_picks.is_some() {
-            return choice(
-                "the RAM tier of a model on the runtime comes from the engine's RAM limit, and \
-                 its experts are divided by a rule, not by a recorded routing",
-            );
-        }
         if opts.part.pool_pages == 0 {
             return choice("the pools of K/V and keys need a number of pages");
         }
@@ -1853,7 +1839,7 @@ impl Qwen4Exp {
                     build.prune_mask = Some(mask);
                 }
                 if self.placement.tensor.is_some() {
-                    feed.set_owners(owners(&self.placement, c));
+                    feed.set_owners(self.placement.owners(c));
                 }
                 if build.mtp {
                     feed.set_mtp();
@@ -1950,14 +1936,7 @@ impl Qwen4Exp {
             let ports = ports.ok_or_else(|| invalid("a part that shares layers has no ports"))?;
             part.set_peer(ports, cores, peer_lent)?;
             if index == mixer {
-                let owner: Vec<u8> = (0..c.n_layer)
-                    .flat_map(|layer| {
-                        let placement = &self.placement;
-                        (0..c.experts.count as u32)
-                            .map(move |expert| u8::from(placement.owner(layer, expert) != mixer))
-                    })
-                    .collect();
-                part.set_owner(&owner)?;
+                part.set_owner(&self.placement.others(c, mixer))?;
             }
         }
         self.reports.lock().unwrap_or_else(|e| e.into_inner()).push(PartReport {

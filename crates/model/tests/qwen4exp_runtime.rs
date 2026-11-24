@@ -20,7 +20,7 @@ use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    Options, Qwen4Exp, Rows, Session, SessionOptions, Spread, Wanted,
+    ModelOptions, Options, Qwen4Exp, Rows, Session, SessionOptions, Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{
@@ -129,8 +129,8 @@ fn options(
     pages: u32,
     window_rows: u32,
     rows: u32,
-) -> SessionOptions {
-    SessionOptions {
+) -> ModelOptions {
+    ModelOptions {
         part: Options {
             kv: (CacheFormat::Q8, CacheFormat::Q8),
             max_rows: rows,
@@ -155,7 +155,7 @@ fn options(
         // Every expert has a slot: none is to be evicted between steps.
         reserve: Some(0),
         cpu_workers: Some(2),
-        ..SessionOptions::default()
+        ..ModelOptions::default()
     }
 }
 
@@ -522,13 +522,24 @@ fn submit_text(
 
 /// The greedy tokens the session writes after `prompt`.
 fn session_answer(seed: u64, placement: Placement, prompt: &[u32], n: usize) -> Vec<u32> {
+    session_answer_near(seed, placement, prompt, n, None)
+}
+
+/// [`session_answer`] with the K and V of the pages from `near` on in host memory.
+fn session_answer_near(
+    seed: u64,
+    placement: Placement,
+    prompt: &[u32],
+    n: usize,
+    near: Option<u32>,
+) -> Vec<u32> {
     let devices = open_devices(placement);
     let gguf = Gguf::open(gguf_path(seed)).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
     let w = Weights::load(&gguf, &c).unwrap();
-    let mut opts = options(placement, c.n_layer, 0, MAX_ROWS, MAX_ROWS);
-    opts.part.pool_pages = 0;
-    opts.ram_tier = Some(64 << 20);
+    let mut model = options(placement, c.n_layer, 0, MAX_ROWS, MAX_ROWS);
+    model.part.near_pages = near;
+    let opts = SessionOptions { model, ram_tier: Some(64 << 20), ..SessionOptions::default() };
     let mut session = Session::open(&gguf, &c, &w, devices, opts).expect("the session opens");
     let n_expert = c.experts.count as u32;
     session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
@@ -805,7 +816,7 @@ fn k_and_v_beyond_vram_change_no_token() {
         assert_eq!(lent[1], lent[0], "{placement:?}: lent steps with K and V beyond VRAM");
         // The session with its pages beyond the first in RAM says what the session says.
         let want = session_answer(1, placement, &prompt, 24);
-        assert_eq!(session_answer_near(placement, &prompt, 24, 1), want, "{placement:?}");
+        assert_eq!(session_answer_near(1, placement, &prompt, 24, Some(1)), want, "{placement:?}");
     }
 }
 
@@ -819,38 +830,6 @@ fn fill_every_slot(model: &Qwen4Exp) -> bool {
     let (vram_slots, _, _) = model.expert_slots().expect("the parts are open");
     model.take_store_stats();
     vram_slots >= model.config().n_layer * model.config().experts.count
-}
-
-/// [`session_answer`] with the K and V of the pages from `near` on in host memory.
-fn session_answer_near(placement: Placement, prompt: &[u32], n: usize, near: u32) -> Vec<u32> {
-    let devices = open_devices(placement);
-    let gguf = Gguf::open(gguf_path(1)).unwrap();
-    let c = Config::from_gguf(&gguf).unwrap();
-    let w = Weights::load(&gguf, &c).unwrap();
-    let mut opts = options(placement, c.n_layer, 0, MAX_ROWS, MAX_ROWS);
-    opts.part.pool_pages = 0;
-    opts.part.near_pages = Some(near);
-    opts.ram_tier = Some(64 << 20);
-    let mut session = Session::open(&gguf, &c, &w, devices, opts).expect("the session opens");
-    let n_expert = c.experts.count as u32;
-    session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
-    let mut pick = 0;
-    let chunks = prompt.chunks(MAX_ROWS as usize).count();
-    for (i, chunk) in prompt.chunks(MAX_ROWS as usize).enumerate() {
-        let wanted = if i + 1 == chunks { Wanted::Last } else { Wanted::None };
-        let picks =
-            session.step(&[Rows { slot: 0, tokens: chunk, direct: true, wanted }]).expect("a step");
-        pick = picks.first().copied().unwrap_or(pick);
-    }
-    let mut answer = vec![pick];
-    while answer.len() < n {
-        let token = [answer[answer.len() - 1]];
-        let picks = session
-            .step(&[Rows { slot: 0, tokens: &token, direct: true, wanted: Wanted::Last }])
-            .expect("a step");
-        answer.push(picks[0]);
-    }
-    answer
 }
 
 /// A prompt read in slices of up to 64 rows, on the many-row kernels, with every expert

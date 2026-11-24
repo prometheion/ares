@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use ares_cuda::{Device, Prune, PruneRule, PruneWeights, RouteRecord, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    Options, PruneSetup, Role, Rows, Session, SessionOptions, Spread, Wanted, profile_key,
-    step_rows,
+    ModelOptions, Options, PruneSetup, Role, Rows, Session, SessionOptions, Spread, Wanted,
+    profile_key, step_rows,
 };
 use ares_model::qwen4exp::{Config, Weights};
 use ares_runtime::expert_store::{ExpertNeighbours, ExpertProfile, Serve, StoreStats};
@@ -258,10 +258,13 @@ fn session_options(args: &Args, c: &Config, rows: u32) -> SessionOptions {
     };
     let _ = c;
     SessionOptions {
-        part: Options { max_rows: rows, cells: 8192, logit_rows: 8, ..Options::default() },
+        model: ModelOptions {
+            part: Options { max_rows: rows, cells: 8192, logit_rows: 8, ..Options::default() },
+            spread,
+            serve: args.serve,
+            ..ModelOptions::default()
+        },
         ram_tier: Some((args.ram_gib * (1u64 << 30) as f64) as u64),
-        spread,
-        serve: args.serve,
         ..SessionOptions::default()
     }
 }
@@ -380,7 +383,7 @@ fn open<'g>(
         None => step_rows(gguf, &devices, &Options::default())?,
     };
     let mut opts = session_options(args, c, rows);
-    opts.part.prune = prune;
+    opts.model.part.prune = prune;
     let begun = Instant::now();
     let mut session = Session::open(gguf, c, w, devices, opts)?;
     let opened = begun.elapsed();

@@ -24,10 +24,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ares_core::{GgmlType, Ledger};
+use ares_core::Ledger;
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, Kernels, Lane, MAX_BATCH, Mesh, MixerMatrix, Parcel,
-    Q4Kernels, RouteRecord, Segment, StepRecord, Stream, peer_access,
+    Device, DeviceBuffer, DevicePtr, Event, Lane, MAX_BATCH, Mesh, Parcel, RouteRecord, Segment,
+    StepRecord, Stream,
 };
 use ares_gguf::Gguf;
 use ares_io::Reader;
@@ -41,10 +41,10 @@ use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, places, pla
 use super::load::Role;
 use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
-use super::part::{Options, Part, PartSetup, StepEnv};
-use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice, ram_tier_bytes};
+use super::options::ModelOptions;
+use super::part::{Part, PartSetup, StepEnv};
+use super::placement::{Chosen, PartPlan, Placement, choose, ram_tier_bytes};
 use super::prune::{self, PruneMask, PruneStats};
-use super::roles;
 use super::usage;
 use crate::blocks::far::FarPool;
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
@@ -65,46 +65,16 @@ use crate::qwen4exp::weights::Weights;
 /// this far ahead never leaves a device without work.
 const LEAD_LAYERS: usize = 6;
 
-/// How a model is spread over two devices.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Spread {
-    /// Both devices on every layer when they can (two devices, each able to
-    /// write the other's memory, mixers the fused read takes) and no layer
-    /// bounds are given; otherwise by layers.
-    Auto,
-    /// A range of layers per device: one sequence uses one device at a time.
-    Layers,
-    /// Both devices on every layer. What is `None` is taken from a
-    /// measurement at load: the mixer is the device whose read of a stream
-    /// mixer is faster. With neither the share nor the shared expert given, a
-    /// trial at load times the worker computing a share of the recurrent
-    /// heads and the shared expert (the mixer's share the worker's read time
-    /// over the sum of both) against the worker holding experts only (share
-    /// 1, the shared expert on the mixer), and keeps the faster (`roles.rs`).
-    /// With one of them given, the share is that of the read times and the
-    /// shared expert the worker's, unless said otherwise.
-    Tensor {
-        /// The device that holds the streams and runs the mixers.
-        mixer: Option<usize>,
-        /// Its share of the key heads of the recurrent layers.
-        core_share: Option<f64>,
-        /// Whether it computes the shared expert.
-        shared_on_mixer: Option<bool>,
-    },
-}
-
-/// The choices of a session.
-#[derive(Clone, Debug)]
+/// The choices of a session: the model's, and how the session itself sets
+/// up the tier in RAM and divides the experts of two devices, which the
+/// runtime decides by its own rules.
+#[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
-    /// The choices of every part.
-    pub part: Options,
-    /// Bytes of every device that stay free.
-    pub headroom: u64,
-    /// Bytes of page-locked RAM for the experts' tier in host memory; `None`
-    /// takes a third of what the system reports available, at most 8 GiB.
+    /// The choices of the model.
+    pub model: ModelOptions,
+    /// Bytes of page-locked RAM for the experts' tier in host memory, locked
+    /// whole; `None` takes half of what the system reports available.
     pub ram_tier: Option<u64>,
-    /// How two devices share the model.
-    pub spread: Spread,
     /// How often every expert of every layer was picked in a recorded routing
     /// (`routing[layer][expert]`: a profile that ships with a model, or the
     /// heat of an earlier run). Two devices that share the layers divide the
@@ -122,71 +92,6 @@ pub struct SessionOptions {
     /// experts are divided by a routing; `None` takes the worker's share of
     /// both devices' speed, from the read times measured at load.
     pub worker_picks: Option<f64>,
-    /// The first layer of every device and the number of layers, to place
-    /// the layers by hand; `None` lets [`Placement::plan`] decide.
-    pub bounds: Option<Vec<usize>>,
-    /// Free slots the store keeps per layer in VRAM; `None` for its default.
-    pub reserve: Option<usize>,
-    /// The most bytes of expert slots on a device, whatever it has left;
-    /// `None` for all it has left.
-    pub slot_bytes: Option<u64>,
-    /// How an expert that is in no slot is served: the engine lets the
-    /// store's measured costs decide between an upload and the CPU.
-    pub serve: Serve,
-    /// Workers that compute experts on the CPU; `None` takes the cores the
-    /// system reports, less one for the thread that drives the step.
-    pub cpu_workers: Option<usize>,
-    /// Bytes of the cache of n-gram table rows.
-    pub row_cache: usize,
-    /// How long a step may stand still before the session gives up on it
-    /// with an error that says what it waited for: a device that waits for
-    /// an expert nobody brings would otherwise wait for ever.
-    pub stall: Duration,
-    /// Transit slots of every device for the experts a wide step misses, to
-    /// measure what they are worth; `None` lets the plan of the store decide
-    /// (`plan_transit`), 0 brings the misses into the tier's slots.
-    pub transit: Option<u32>,
-    /// Whether wide steps start the reads of the layers ahead on a guess: what the wide step
-    /// before missed there and no tier holds. Off unless a measurement asks for it: that
-    /// guess is mostly wrong (what a step read and the heat keeps is in RAM afterwards, so
-    /// what is left to guess is what one row used), and with it a prompt read 1.6 to 2.8 GiB
-    /// more from the file and 5 to 30 % slower (measured 2026-11-12, see ARCHITECTURE.md).
-    pub read_ahead: bool,
-    /// The bytes of a piece of the RAM tier under the runtime: what the tier
-    /// locks or gives back at a time. `None` for the store's own size; tests
-    /// of a small model name a smaller one.
-    pub ram_piece: Option<usize>,
-    /// The most rows of a prompt read layer by layer through the runtime: a step of one
-    /// prompt wider than the parts' own scratch ([`Options::own_rows`]) runs as a pass, every
-    /// row through a layer before the next layer, each expert brought once for the step, its
-    /// rows kept on VRAM the expert slots lend (as many as they can lend for: the model's
-    /// `max_rows` says). 0: none; a prompt read alone takes lent steps of up to
-    /// [`Options::max_rows`] rows.
-    pub pass_rows: u32,
-}
-
-impl Default for SessionOptions {
-    fn default() -> Self {
-        Self {
-            part: Options::default(),
-            headroom: 256 << 20,
-            ram_tier: None,
-            spread: Spread::Auto,
-            routing: None,
-            worker_picks: None,
-            bounds: None,
-            reserve: None,
-            slot_bytes: None,
-            serve: Serve::Measured,
-            cpu_workers: None,
-            row_cache: 16 << 20,
-            stall: Duration::from_secs(30),
-            transit: None,
-            read_ahead: false,
-            ram_piece: None,
-            pass_rows: 0,
-        }
-    }
 }
 
 /// The rows of one sequence in a step: they follow the sequence's cells.
@@ -340,74 +245,6 @@ fn picks_of(record: &[u8], used: usize, rows: u32) -> Result<Vec<Vec<u32>>, Erro
     Ok((0..rows as usize).map(|row| route.ids(row).collect()).collect())
 }
 
-/// How long a read of a stream mixer of the model's sizes takes on `device`:
-/// the two fused launches over weights of the first layer's types, which are
-/// bound by the device's memory as the model's dense products are.
-pub fn read_time(device: &Device, c: &Config, w: &Weights<'_>) -> Result<Duration, Error> {
-    let (hc, n, rank) = (c.n_stream as u32, c.n_embd as u32, c.mixer_rank as u32);
-    let mixer = &w.layers[0].attn_mixer;
-    let wide = u64::from(hc) * u64::from(n);
-    // The bytes of a matrix of `values` values of the type it has in the file (whole blocks).
-    let bytes = |ty: GgmlType, values: u64| ty.bytes_for(values).unwrap_or(4 * values);
-    let zeroed = |bytes: u64| -> Result<DeviceBuffer, Error> {
-        let buffer = DeviceBuffer::new(device, bytes.max(64))?;
-        buffer.write(0, &vec![0u8; bytes.max(64) as usize])?;
-        Ok(buffer)
-    };
-    let kernels = Q4Kernels::load(device)?;
-    let stream = Stream::new(device, 0)?;
-    let (r, norm, xn) = (zeroed(wide * 4)?, zeroed(wide * 4)?, zeroed(wide * 4)?);
-    let down = zeroed(bytes(mixer.down.ty(), u64::from(rank) * wide))?;
-    let up = zeroed(bytes(mixer.up.ty(), wide * u64::from(rank)))?;
-    let partials = zeroed(Q4Kernels::read_partials(1, hc, rank) * 4)?;
-    let act = zeroed(Kernels::quantized_activation_bytes(n, 1))?;
-    let run = |count: u32| -> Result<(), Error> {
-        for _ in 0..count {
-            // SAFETY: every buffer is of this device and of the sizes the
-            // two launches read and write for one row.
-            unsafe {
-                kernels.read_down(
-                    &stream,
-                    r.ptr(),
-                    r.ptr(),
-                    None,
-                    Some((
-                        norm.ptr(),
-                        xn.ptr(),
-                        MixerMatrix { ptr: down.ptr(), ty: mixer.down.ty() },
-                        None,
-                    )),
-                    partials.ptr(),
-                    1,
-                    hc,
-                    n,
-                    rank,
-                    c.rms_eps,
-                )?;
-                kernels.read_up(
-                    &stream,
-                    xn.ptr(),
-                    partials.ptr(),
-                    MixerMatrix { ptr: up.ptr(), ty: mixer.up.ty() },
-                    act.ptr(),
-                    None,
-                    None,
-                    1,
-                    hc,
-                    n,
-                    rank,
-                )?;
-            }
-        }
-        stream.synchronize()?;
-        Ok(())
-    };
-    run(8)?;
-    let started = Instant::now();
-    run(64)?;
-    Ok(started.elapsed() / 64)
-}
-
 /// How long the upload of `bytes` bytes from page-locked memory to `device`
 /// takes: what an expert that is in host memory costs when a step misses it.
 fn upload_time(device: &Device, bytes: u64) -> Result<Duration, Error> {
@@ -428,105 +265,6 @@ fn upload_time(device: &Device, bytes: u64) -> Result<Duration, Error> {
     let started = Instant::now();
     run(8)?;
     Ok(started.elapsed() / 8)
-}
-
-/// What [`choose`] decided and measured.
-pub(super) struct Chosen {
-    pub placement: Placement,
-    /// For two devices that share every layer: the time of a read of a stream
-    /// mixer on each, and the mixer among them.
-    pub speeds: Option<([f64; 2], usize)>,
-    /// What each device had to give the model when it was looked at.
-    pub memory: Vec<DeviceMemory>,
-}
-
-/// Where the layers of the model go on `devices`: a range each, or both
-/// devices on every layer when they can write each other's memory and the
-/// mixers run as fused reads. Measures a read of a stream mixer on each of
-/// two devices that share the layers, and, unless `spread` gives the
-/// worker's role, times both roles on them (`roles.rs`, a few seconds).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn choose(
-    gguf: &Gguf,
-    c: &Config,
-    w: &Weights<'_>,
-    devices: &[Device],
-    part: &Options,
-    headroom: u64,
-    spread: &Spread,
-    bounds: Option<&[usize]>,
-) -> Result<Chosen, Error> {
-    let mut memory = Vec::with_capacity(devices.len());
-    for device in devices {
-        let free = device.mem_info()?.free;
-        memory.push(DeviceMemory {
-            budget: free.saturating_sub(headroom),
-            multiprocessors: device.info().multiprocessors,
-        });
-    }
-    // Both devices on every layer when each can write the other's memory
-    // and the mixers run as fused reads.
-    let peers = devices.len() == 2
-        && peer_access(devices[0].ordinal(), devices[1].ordinal())?.0
-        && peer_access(devices[1].ordinal(), devices[0].ordinal())?.0;
-    let mixer = &w.layers[0].attn_mixer;
-    let fused = Q4Kernels::reads_fused(
-        c.n_stream as u32,
-        c.n_embd as u32,
-        c.mixer_rank as u32,
-        &[mixer.down.ty(), mixer.up.ty()],
-    );
-    let shared = match *spread {
-        Spread::Layers => None,
-        Spread::Auto if bounds.is_some() || !peers || !fused => None,
-        Spread::Auto => Some((None, None, None)),
-        Spread::Tensor { .. } if !peers => {
-            return Err(invalid(
-                "two devices share every layer only when each can write the other's memory \
-                 (peer access between exactly two devices)",
-            ));
-        }
-        Spread::Tensor { mixer, core_share, shared_on_mixer } => {
-            Some((mixer, core_share, shared_on_mixer))
-        }
-    };
-    // What is measured of two devices that share the layers: the time
-    // of a read of a stream mixer on each, and the mixer among them.
-    let mut speeds: Option<([f64; 2], usize)> = None;
-    let placement = match (shared, bounds) {
-        (Some((mixer, core_share, shared_on_mixer)), _) => {
-            devices[0].enable_peer_access(&devices[1])?;
-            devices[1].enable_peer_access(&devices[0])?;
-            let times = [
-                read_time(&devices[0], c, w)?.as_secs_f64(),
-                read_time(&devices[1], c, w)?.as_secs_f64(),
-            ];
-            let mixer = mixer.unwrap_or(usize::from(times[1] < times[0])).min(1);
-            speeds = Some((times, mixer));
-            let (fast, slow) = (times[mixer], times[1 - mixer]);
-            let share = TensorChoice {
-                mixer,
-                core_share: core_share.unwrap_or(slow / (fast + slow).max(1e-9)),
-                shared_on_mixer: shared_on_mixer.unwrap_or(false),
-            };
-            let trial = match (core_share, shared_on_mixer) {
-                (None, None) => {
-                    let alone = TensorChoice { mixer, core_share: 1.0, shared_on_mixer: true };
-                    Some(roles::trial(gguf, c, w, devices, part, &memory, &[share, alone])?)
-                }
-                _ => None,
-            };
-            let choice = trial.as_ref().map_or(share, |t| t.kept);
-            let mut placement = Placement::tensor(c, w, part, &memory, &choice)?;
-            if let Some(tensor) = &mut placement.tensor {
-                tensor.trial = trial;
-            }
-            placement
-        }
-        (None, Some(bounds)) => Placement::at(c, w, part, &memory, bounds)?,
-        (None, None) => Placement::plan(c, w, part, &memory)?,
-    };
-    Ok(Chosen { placement, speeds, memory })
 }
 
 /// A model on its devices, stepped by hand.
@@ -583,16 +321,7 @@ impl<'g> Session<'g> {
         if devices.is_empty() {
             return Err(invalid("a session needs a device"));
         }
-        let Chosen { mut placement, speeds, memory } = choose(
-            gguf,
-            c,
-            w,
-            &devices,
-            &opts.part,
-            opts.headroom,
-            &opts.spread,
-            opts.bounds.as_deref(),
-        )?;
+        let Chosen { mut placement, speeds, memory } = choose(gguf, c, w, &devices, &opts.model)?;
 
         let mut ledgers: Vec<Ledger> = devices
             .iter()
@@ -609,7 +338,7 @@ impl<'g> Session<'g> {
             let mut part = Part::open(
                 c,
                 w,
-                &opts.part,
+                &opts.model.part,
                 PartSetup { index, role, first, shares, head, device, ledger: &mut ledgers[index] },
             )?;
             part.set_token_rows(table.clone());
@@ -658,30 +387,30 @@ impl<'g> Session<'g> {
         let vram: Vec<u64> = placement
             .devices
             .iter()
-            .map(|d| d.slots.min(opts.slot_bytes.unwrap_or(u64::MAX)))
+            .map(|d| d.slots.min(opts.model.slot_bytes.unwrap_or(u64::MAX)))
             .collect();
         let ram_bytes = ram_tier_bytes(opts.ram_tier, layout.ram_wanted(vram.iter().sum()));
         let mut config = StoreConfig::new(
-            opts.part.max_rows.min(MAX_BATCH),
+            opts.model.part.max_rows.min(MAX_BATCH),
             c.experts.used as u32,
             vram,
             ram_bytes,
         );
-        if let Some(reserve) = opts.reserve {
+        if let Some(reserve) = opts.model.reserve {
             config.vram_reserve = reserve;
         }
-        config.cpu_serves = opts.serve != Serve::Stream;
-        if opts.part.max_rows > MAX_BATCH {
+        config.cpu_serves = opts.model.serve != Serve::Stream;
+        if opts.model.part.max_rows > MAX_BATCH {
             // What each device has left beside its parts, less what the
             // store keeps besides its slots: its tables, the host shares and
             // the margin `Placement` counts.
             let tables = 4 * layout.specs.len() as u64 * c.experts.count as u64;
-            let shares = if opts.serve == Serve::Stream {
+            let shares = if opts.model.serve == Serve::Stream {
                 0
             } else {
                 layout.specs.len() as u64
                     * layout.shapes[0]
-                        .host_share_bytes(opts.part.max_rows.min(MAX_BATCH))
+                        .host_share_bytes(opts.model.part.max_rows.min(MAX_BATCH))
                         .next_multiple_of(16)
             };
             let room: Vec<u64> = ledgers
@@ -689,10 +418,10 @@ impl<'g> Session<'g> {
                 .map(|l| {
                     l.free()
                         .saturating_sub(super::placement::MARGIN + tables + shares)
-                        .min(opts.slot_bytes.unwrap_or(u64::MAX))
+                        .min(opts.model.slot_bytes.unwrap_or(u64::MAX))
                 })
                 .collect();
-            plan_transit(&mut config, &layout, &reader, opts.transit, &room);
+            plan_transit(&mut config, &layout, &reader, opts.model.transit, &room);
         }
         let reserve = config.vram_reserve;
         let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)?;
@@ -724,14 +453,7 @@ impl<'g> Session<'g> {
                     [upload_time(&devices[0], expert)?, upload_time(&devices[1], expert)?];
                 placement.assign(routing, &slots, picks, usize::from(uploads[1] < uploads[0]));
             }
-            let owner: Vec<u8> = (0..c.n_layer)
-                .flat_map(|layer| {
-                    let placement = &placement;
-                    (0..c.experts.count as u32)
-                        .map(move |expert| u8::from(placement.owner(layer, expert) != mixer))
-                })
-                .collect();
-            parts[mixer].set_owner(&owner)?;
+            parts[mixer].set_owner(&placement.others(c, mixer))?;
         }
         let mut pinned = Ledger::new("pinned RAM", ram_bytes + (1 << 30));
         let mut slots = Vec::with_capacity(devices.len());
@@ -742,15 +464,15 @@ impl<'g> Session<'g> {
                 &mut pinned,
                 &plan.device_pools(index),
                 &layout,
-                opts.serve,
-                opts.part.max_rows.min(MAX_BATCH),
+                opts.model.serve,
+                opts.model.part.max_rows.min(MAX_BATCH),
             )?);
         }
         debug_assert_eq!(plan.n_layers(), store_layers);
         let region = HostRegion::pinned(&devices[0], &mut pinned, plan.ram_bytes())?;
         // One core stays with the thread that drives the step.
-        let cpu = (opts.serve != Serve::Stream)
-            .then(|| cpu_pool(opts.cpu_workers, 1).map(|pool| (pool, opts.serve)))
+        let cpu = (opts.model.serve != Serve::Stream)
+            .then(|| cpu_pool(opts.model.cpu_workers, 1).map(|pool| (pool, opts.model.serve)))
             .transpose()?;
         let store = build_store(plan, &layout, map, reader, slots, region, cpu)?;
         for (index, part) in parts.iter_mut().enumerate() {
@@ -760,8 +482,8 @@ impl<'g> Session<'g> {
         let boards = parts.iter().map(Part::board).collect();
         let firsts = parts.iter().map(|part| part.layer_range().start).collect();
         let mut feed = Feed::new(store, boards, firsts, layout, c.experts.used as u32);
-        feed.set_read_ahead(opts.read_ahead);
-        if opts.part.prune.is_some() {
+        feed.set_read_ahead(opts.model.read_ahead);
+        if opts.model.part.prune.is_some() {
             pinned
                 .reserve("qwen4exp pruning mask", PruneMask::bytes(c.n_layer, c.experts.count))?;
             let mask = Arc::new(PruneMask::new(&devices[0], c.n_layer, c.experts.count)?);
@@ -771,14 +493,14 @@ impl<'g> Session<'g> {
             feed.set_prune(mask, prune::owners(&placement, c), c.experts.count);
         }
         if placement.tensor.is_some() {
-            feed.set_owners(super::feed::owners(&placement, c));
+            feed.set_owners(placement.owners(c));
         }
 
-        let ngram = NgramFeed::open(gguf, c, opts.row_cache, opts.part.max_slots)?;
+        let ngram = NgramFeed::open(gguf, c, opts.model.row_cache, opts.model.part.max_slots)?;
 
         let wide = c.wide() as u32;
         let (mesh, lanes) = if devices.len() > 1 && placement.tensor.is_none() {
-            let values = opts.part.max_rows * wide;
+            let values = opts.model.part.max_rows * wide;
             let mesh = Mesh::new(&devices, values)?;
             let lanes = (1..devices.len())
                 .map(|to| Lane::new(&mesh, to - 1, to, 2, values))
@@ -1028,7 +750,7 @@ impl<'g> Session<'g> {
     /// An error when the session has waited since `started` for longer than
     /// a step may stand still, with what it knows of the step.
     fn watch(&self, started: Instant, what: &str) -> Result<(), Error> {
-        if started.elapsed() < self.opts.stall {
+        if started.elapsed() < self.opts.model.stall {
             return Ok(());
         }
         let done: Vec<bool> = self.done.iter().map(|e| e.is_done().unwrap_or(false)).collect();
@@ -1036,7 +758,7 @@ impl<'g> Session<'g> {
             "step {} of {} rows stood still for {:.0?} while {what}: {}, devices done: {done:?}",
             self.step,
             self.step_rows,
-            self.opts.stall,
+            self.opts.model.stall,
             self.feed.standing_still(&self.enqueued),
         )))
     }
@@ -1071,7 +793,7 @@ impl<'g> Session<'g> {
         let mut tokens = Vec::new();
         let mut out_rows = Vec::new();
         for part in rows {
-            if part.slot >= self.opts.part.max_slots {
+            if part.slot >= self.opts.model.part.max_slots {
                 return Err(invalid(format!("slot {} of the session", part.slot)));
             }
             if part.tokens.is_empty() {

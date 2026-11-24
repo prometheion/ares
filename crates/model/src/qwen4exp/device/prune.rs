@@ -258,11 +258,5 @@ impl PruneStats {
 /// layers per device.
 pub(super) fn owners(placement: &Placement, c: &Config) -> Option<(usize, Vec<u8>)> {
     let mixer = placement.tensor.as_ref()?.mixer;
-    let owner = (0..c.n_layer)
-        .flat_map(|layer| {
-            (0..c.experts.count as u32)
-                .map(move |expert| u8::from(placement.owner(layer, expert) != mixer))
-        })
-        .collect();
-    Some((mixer, owner))
+    Some((mixer, placement.others(c, mixer)))
 }

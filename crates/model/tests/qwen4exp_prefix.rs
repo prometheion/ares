@@ -28,7 +28,7 @@ use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::Config;
-use ares_model::qwen4exp::device::{Options, Qwen4Exp, SessionOptions, Spread};
+use ares_model::qwen4exp::device::{ModelOptions, Options, Qwen4Exp, Spread};
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Snapshot, SsdConfig};
 use common::gpu::enabled;
@@ -129,8 +129,8 @@ fn options(
     n_layer: usize,
     kv: (CacheFormat, CacheFormat),
     pages: u32,
-) -> SessionOptions {
-    SessionOptions {
+) -> ModelOptions {
+    ModelOptions {
         part: Options {
             kv,
             max_rows: MAX_ROWS,
@@ -155,7 +155,7 @@ fn options(
         // Every expert has a slot: none is to be evicted between steps.
         reserve: Some(0),
         cpu_workers: Some(2),
-        ..SessionOptions::default()
+        ..ModelOptions::default()
     }
 }
 

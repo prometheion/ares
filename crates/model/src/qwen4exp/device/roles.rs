@@ -209,12 +209,7 @@ fn time_choice(
     let (mixer_cores, worker_cores) = (cores(&parts[mixer]), cores(&parts[worker]));
     parts[mixer].set_peer(to_worker, worker_cores, None)?;
     parts[worker].set_peer(to_mixer, mixer_cores, None)?;
-    let owner: Vec<u8> = (0..c.n_layer)
-        .flat_map(|layer| {
-            (0..c.experts.count as u32).map(move |e| u8::from(placement.owner(layer, e) != mixer))
-        })
-        .collect();
-    parts[mixer].set_owner(&owner)?;
+    parts[mixer].set_owner(&placement.others(c, mixer))?;
 
     // The pools of K/V, and every expert of a layer in one of a few slots of
     // zeros: expert `e` in slot `e` modulo their number.
