@@ -4,10 +4,10 @@
 //!
 //! These tests open GPUs, so like the other GPU tests they run only with
 //! `ARES_TEST_VULKAN=1`. The ones on the real 0.8B also need
-//! `ARES_TEST_QWEN35_MODEL=<Qwen3.5-0.8B-Q4_K_M.gguf>` and say so when they skip:
+//! `ARES_TEST_QWEN35_0_8B=<Qwen3.5-0.8B-Q4_K_M.gguf>` and say so when they skip:
 //!
 //! ```sh
-//! ARES_TEST_VULKAN=1 ARES_TEST_QWEN35_MODEL=/path/Qwen3.5-0.8B-Q4_K_M.gguf \
+//! ARES_TEST_VULKAN=1 ARES_TEST_QWEN35_0_8B=/path/Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test -p ares-model --test layers_vulkan -- --nocapture
 //! ```
 //!

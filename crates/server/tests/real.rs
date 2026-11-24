@@ -5,13 +5,13 @@
 //! asks of the sampler. `real_drafts.rs` has the drafts, `real_flash_next.rs`
 //! Qwen3.8-Flash-Next.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B` (a small `qwen35`
 //! file, Qwen3.5-0.8B); `ARES_TEST_DEVICE` names the device (default 0) and
 //! `ARES_TEST_PORT` the first of the ten ports on 127.0.0.1 the tests
 //! listen on (default 18951). Every test starts its own server.
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_0_8B=Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test -p ares-server --test real -- --test-threads=1
 //! ```
 //!
@@ -33,7 +33,7 @@ mod common;
 
 /// The model to serve, or `None` (and a note) when the tests are not enabled.
 fn model() -> Option<PathBuf> {
-    model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file")
+    model_file("ARES_TEST_QWEN35_0_8B", "a small qwen35 model file")
 }
 
 fn port(offset: u16) -> u16 {
@@ -737,8 +737,8 @@ fn refused(model: &PathBuf, flags: &[&str]) -> (ExitStatus, String) {
 
 #[test]
 fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
-    let Some(model) = std::env::var_os("ARES_TEST_QWEN35_MODEL").map(PathBuf::from) else {
-        eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to a small qwen35 model file");
+    let Some(model) = std::env::var_os("ARES_TEST_QWEN35_0_8B").map(PathBuf::from) else {
+        eprintln!("skipped: set ARES_TEST_QWEN35_0_8B to a small qwen35 model file");
         return;
     };
     // A drafter from a file that is not there is refused by its name.

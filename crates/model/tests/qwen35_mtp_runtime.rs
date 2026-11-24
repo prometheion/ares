@@ -1,7 +1,7 @@
 //! The model's own drafts through the whole engine, on the real 27B.
 //!
 //! Needs two GPUs (`ARES_TEST_CUDA=1`) and the model
-//! (`ARES_TEST_QWEN35_27B`); `ARES_TEST_DRAFT_VOCAB` names a draft vocabulary
+//! (`ARES_TEST_QWEN38_27B`); `ARES_TEST_DRAFT_VOCAB` names a draft vocabulary
 //! (a token id per line). The model is split by tensor over both devices
 //! with exact products (the fast kernels are held to the same in
 //! `qwen35_windows.rs`, `qwen35_device_runtime.rs` and the server's
@@ -168,7 +168,7 @@ fn the_text_with_the_models_own_drafts_is_the_text_without() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return;
     }
-    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
     if device_count().unwrap() < 2 {
         eprintln!("skipped: the 27B needs two devices");
         return;
@@ -219,7 +219,7 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return;
     }
-    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
     let Some(file) = env_path("ARES_TEST_DFLASH_27B") else { return };
     if device_count().unwrap() < 2 {
         eprintln!("skipped: the 27B needs two devices");
@@ -281,7 +281,7 @@ fn the_text_with_mtp_drafts_is_the_text_without_under_a_layer_split_and_from_a_f
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return;
     }
-    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
     if device_count().unwrap() < 2 {
         eprintln!("skipped: the 27B needs two devices");
         return;

@@ -7,14 +7,14 @@
 //! quantization of the 27B that fits one card, such as
 //! `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf` (served with the fast
 //! kernels: it has no exact prefill kernels), and for the tests on both cards
-//! `ARES_TEST_QWEN35_27B`, the Q4_K_S file; `ARES_TEST_DFLASH_27B` is the
+//! `ARES_TEST_QWEN38_27B`, the Q4_K_S file; `ARES_TEST_DFLASH_27B` is the
 //! 27B's DFlash2 file. The test of a model without an MTP block needs
-//! `ARES_TEST_QWEN35_MODEL` (Qwen3.5-0.8B). `ARES_TEST_PORT` is the port the
+//! `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B). `ARES_TEST_PORT` is the port the
 //! servers listen on, one after the other (default 18960).
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_DRAFT_MODEL=Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf \
-//!     ARES_TEST_QWEN35_27B=Qwen3.8-27B-UD-Q4_K_S.gguf \
+//!     ARES_TEST_QWEN38_27B=Qwen3.8-27B-UD-Q4_K_S.gguf \
 //!     cargo test -p ares-server --test real_drafts -- --test-threads=1
 //! ```
 
@@ -29,7 +29,7 @@ mod common;
 
 /// The 0.8B, which has no MTP block.
 fn model() -> Option<PathBuf> {
-    model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file")
+    model_file("ARES_TEST_QWEN35_0_8B", "a small qwen35 model file")
 }
 
 /// The port of every server: one runs at a time.
@@ -42,10 +42,10 @@ fn draft_model() -> Option<PathBuf> {
 }
 
 /// The 27B with its MTP block for the tests that need exact products and so
-/// a type of weights with a prefill kernel for them: `ARES_TEST_QWEN35_27B`
+/// a type of weights with a prefill kernel for them: `ARES_TEST_QWEN38_27B`
 /// (Qwen3.8-27B-UD-Q4_K_S.gguf), served on both cards.
 fn two_card_model() -> Option<PathBuf> {
-    model_file("ARES_TEST_QWEN35_27B", "the 27B Q4_K_S file (two GPUs)")
+    model_file("ARES_TEST_QWEN38_27B", "the 27B Q4_K_S file (two GPUs)")
 }
 
 /// The reply to `question`, greedy, with drafts or without (`"draft": false`):

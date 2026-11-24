@@ -3,7 +3,7 @@
 //! message unless it is told where it is:
 //!
 //! ```sh
-//! ARES_TEST_QWEN4EXP_MODEL=<...>/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+//! ARES_TEST_FLASH_NEXT=<...>/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
 //!   cargo test --release -p ares-model --test qwen4exp_real -- --nocapture
 //! ```
 //!
@@ -32,8 +32,8 @@ const CONTINUATION: [u32; 4] = [248068, 198, 760, 1156];
 
 #[test]
 fn flash_next_continues_a_german_prompt_as_strata_does() {
-    let Some(path) = std::env::var_os("ARES_TEST_QWEN4EXP_MODEL") else {
-        eprintln!("skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of the model file");
+    let Some(path) = std::env::var_os("ARES_TEST_FLASH_NEXT") else {
+        eprintln!("skipped: set ARES_TEST_FLASH_NEXT to the first part of the model file");
         return;
     };
     let started = std::time::Instant::now();
@@ -92,8 +92,8 @@ const ENGLISH_GIVEN: usize = 19;
 /// block reports 0.89, 0.86 and 0.85 for the three links (its `mtp.hpp`).
 ///
 /// ```sh
-/// ARES_TEST_QWEN4EXP_MODEL=<first part of the model> \
-/// ARES_TEST_QWEN4EXP_DRAFT=<...>/mtp-q2_0.gguf \
+/// ARES_TEST_FLASH_NEXT=<first part of the model> \
+/// ARES_TEST_FLASH_NEXT_MTP=<...>/mtp-q2_0.gguf \
 ///   cargo test --release -p ares-model --test qwen4exp_real draft -- --nocapture
 /// ```
 ///
@@ -101,13 +101,12 @@ const ENGLISH_GIVEN: usize = 19;
 /// the trunk takes about nine seconds on a machine that is busy).
 #[test]
 fn the_mtp_block_guesses_what_the_trunk_writes() {
-    let (Some(path), Some(draft)) = (
-        std::env::var_os("ARES_TEST_QWEN4EXP_MODEL"),
-        std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT"),
-    ) else {
+    let (Some(path), Some(draft)) =
+        (std::env::var_os("ARES_TEST_FLASH_NEXT"), std::env::var_os("ARES_TEST_FLASH_NEXT_MTP"))
+    else {
         eprintln!(
-            "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of the model file and \
-             ARES_TEST_QWEN4EXP_DRAFT to the file of its MTP block"
+            "skipped: set ARES_TEST_FLASH_NEXT to the first part of the model file and \
+             ARES_TEST_FLASH_NEXT_MTP to the file of its MTP block"
         );
         return;
     };

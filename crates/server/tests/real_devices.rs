@@ -8,7 +8,7 @@
 //! are there:
 //!
 //! ```text
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_27B=<Q4_K_S file> \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN38_27B=<Q4_K_S file> \
 //!   cargo test --release -p ares-server --test real_devices -- --nocapture
 //! ```
 
@@ -60,7 +60,7 @@ fn answer(engine: &Arc<dyn Engine>, model: &str, text: &str, max_tokens: u32) ->
 
 #[test]
 fn the_attention_heads_go_where_the_room_is_and_the_context_grows() {
-    let Some(model) = common::model_file("ARES_TEST_QWEN35_27B", "the 27B Q4_K_S file") else {
+    let Some(model) = common::model_file("ARES_TEST_QWEN38_27B", "the 27B Q4_K_S file") else {
         return;
     };
     if ares_cuda::devices().map_or(0, |d| d.len()) < 2 {

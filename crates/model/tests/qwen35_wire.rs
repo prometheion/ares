@@ -1,8 +1,8 @@
 //! The conductor's bookkeeping on the real models: which drafter is worth
 //! what, and requests that wait in line.
 //!
-//! Needs GPUs (`ARES_TEST_CUDA=1`) and the models (`ARES_TEST_QWEN35_MODEL`
-//! for the small one on one device, `ARES_TEST_QWEN35_27B` for the large one
+//! Needs GPUs (`ARES_TEST_CUDA=1`) and the models (`ARES_TEST_QWEN35_0_8B`
+//! for the small one on one device, `ARES_TEST_QWEN38_27B` for the large one
 //! on two).
 //!
 //! The measurement of the drafters runs only when `ARES_WIRE_CASE` names
@@ -253,7 +253,7 @@ fn what_each_drafter_is_worth_on_the_27b() {
     if !enabled() {
         return;
     }
-    let Some(path) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(path) = env_path("ARES_TEST_QWEN38_27B") else { return };
     if device_count().unwrap() < 2 {
         eprintln!("skipped: the 27B needs two devices");
         return;
@@ -342,7 +342,7 @@ fn what_each_drafter_is_worth_on_the_27b() {
 /// several sequences round differently from those of one).
 #[test]
 fn more_requests_than_fit_wait_in_line_and_all_answer() {
-    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_MODEL")) else {
+    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_0_8B")) else {
         return;
     };
     let options = Options {

@@ -46,15 +46,15 @@ use axum::Router;
 
 use crate::common::{body_text, model_file, post, router_of, test_device};
 
-/// The 0.8B (`ARES_TEST_QWEN35_MODEL`).
+/// The 0.8B (`ARES_TEST_QWEN35_0_8B`).
 pub fn small() -> Option<PathBuf> {
-    model_file("ARES_TEST_QWEN35_MODEL", "the Qwen3.5-0.8B model file")
+    model_file("ARES_TEST_QWEN35_0_8B", "the Qwen3.5-0.8B model file")
 }
 
-/// The 27B in Q4_K_S with its MTP block (`ARES_TEST_QWEN35_27B`), which needs
+/// The 27B in Q4_K_S with its MTP block (`ARES_TEST_QWEN38_27B`), which needs
 /// both cards.
 pub fn large() -> Option<PathBuf> {
-    model_file("ARES_TEST_QWEN35_27B", "the 27B Q4_K_S file (two GPUs)")
+    model_file("ARES_TEST_QWEN38_27B", "the 27B Q4_K_S file (two GPUs)")
 }
 
 /// The 0.8B on the test device as the suites run it: exact products, so that

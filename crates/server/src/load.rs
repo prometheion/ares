@@ -1926,7 +1926,7 @@ mod tests {
 
     /// The owner's production settings on the two development cards, as the
     /// owner's fork serves them (2026-11-22): Qwen3.8-27B UD-Q4_K_S
-    /// (`ARES_TEST_QWEN35_27B`), a tensor split of the weights 0.625 / 0.375,
+    /// (`ARES_TEST_QWEN38_27B`), a tensor split of the weights 0.625 / 0.375,
     /// 262 144 tokens of context for two sequences, K and V in `q5`, the MTP
     /// block drafting with a draft vocabulary (`ARES_TEST_DRAFT_VOCAB`, else the
     /// head's rows), and the free memory the cards had: 11.52 and 11.57 GiB.
@@ -1937,8 +1937,8 @@ mod tests {
     /// loaded (here with K and V in `f16`).
     #[test]
     fn the_27b_at_the_owners_settings_plans_within_free_memory() {
-        let Some(path) = std::env::var_os("ARES_TEST_QWEN35_27B") else {
-            eprintln!("skipped: set ARES_TEST_QWEN35_27B");
+        let Some(path) = std::env::var_os("ARES_TEST_QWEN38_27B") else {
+            eprintln!("skipped: set ARES_TEST_QWEN38_27B");
             return;
         };
         let gguf = Gguf::open(&path).unwrap();

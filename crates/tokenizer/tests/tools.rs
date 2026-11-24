@@ -1,6 +1,6 @@
 //! How the real chat templates write the calls of tools.
 //!
-//! The templates are read from the model files named by `ARES_TEST_GGUF`
+//! The templates are read from the model files named by `ARES_TEST_QWEN35_0_8B`
 //! (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and
 //! `ARES_TEST_FLASH_NEXT` (Qwen3.8-Flash-Next, first part); a test says so and
 //! passes when a file is not named. Reading the metadata of a file needs no GPU.
@@ -11,7 +11,7 @@ use ares_tokenizer::{
 };
 
 const FILES: [(&str, &str); 3] = [
-    ("ARES_TEST_GGUF", "Qwen3.5-0.8B"),
+    ("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B"),
     ("ARES_TEST_QWEN38_27B", "Qwen3.8-27B"),
     ("ARES_TEST_FLASH_NEXT", "Qwen3.8-Flash-Next"),
 ];

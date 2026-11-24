@@ -1,6 +1,6 @@
 //! The MTP block on a device against its CPU reference, on the real 27B.
 //!
-//! Needs a GPU (`ARES_TEST_CUDA=1`), the model (`ARES_TEST_QWEN35_27B`) and a
+//! Needs a GPU (`ARES_TEST_CUDA=1`), the model (`ARES_TEST_QWEN38_27B`) and a
 //! capture of it made by `tools/capture` (`ARES_TEST_QWEN35_CAPTURE27`, with
 //! `german/base` and `english/base`): the tokens of a prompt and of what
 //! follows it, and the model's final hidden state of every position. Only the
@@ -269,7 +269,7 @@ fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return;
     }
-    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
     let Some(capture) = env_path("ARES_TEST_QWEN35_CAPTURE27") else { return };
     let fork = std::env::var_os("ARES_TEST_QWEN35_MTP_CAPTURE").map(PathBuf::from);
     let vocabulary =

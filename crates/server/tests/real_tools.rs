@@ -9,16 +9,16 @@
 //!
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
-//! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
+//! `ARES_TEST_QWEN35_0_8B` (the 0.8B); `ARES_TEST_DEVICE` names the device
 //! (default 0). With `ARES_TEST_API_MODEL` the tests that are not about one
 //! model run on that file instead, loaded as `ares --model` loads it
 //! (Flash-Next, the 27B: see `gpu/mod.rs`). The tests on the 27B with
-//! its drafts need `ARES_TEST_QWEN35_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf) and
+//! its drafts need `ARES_TEST_QWEN38_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf) and
 //! two GPUs.
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
-//!     ARES_TEST_QWEN35_27B=Qwen3.8-27B-UD-Q4_K_S.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_0_8B=Qwen3.5-0.8B-Q4_K_M.gguf \
+//!     ARES_TEST_QWEN38_27B=Qwen3.8-27B-UD-Q4_K_S.gguf \
 //!     cargo test --release -p ares-server --test real_tools -- --test-threads=1 --nocapture
 //! ```
 

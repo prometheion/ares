@@ -14,12 +14,12 @@
 //! read from the file, not copied), a short one written for this test if not.
 //! A test with the 0.8B's own template shows what that costs.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (the 0.8B);
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B` (the 0.8B);
 //! `ARES_TEST_DEVICE` names the device (default 0). Lines that start with
 //! `RES` are measurements.
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_0_8B=Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test --release -p ares-server --test real_reasoning_cache -- --test-threads=1
 //! ```
 

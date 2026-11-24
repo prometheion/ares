@@ -11,7 +11,7 @@
 //! vocabulary of a model file, and counts the tokens of the previous sequence
 //! (prompt and reply) that the next prompt does not repeat: the tokens the
 //! cache cannot give. The models say what they say in the tests; the engine is
-//! not run. The model files are named by `ARES_TEST_GGUF` (Qwen3.5-0.8B),
+//! not run. The model files are named by `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B),
 //! `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and `ARES_TEST_FLASH_NEXT`
 //! (Qwen3.8-Flash-Next, first part); a test says so and passes when the file
 //! it needs is not named.
@@ -209,7 +209,7 @@ fn preserving() -> Vec<Rig> {
 
 #[test]
 fn the_models_template_declares_the_thinking_the_splitter_needs() {
-    for rig in preserving().iter().chain(&rig("ARES_TEST_GGUF", "Qwen3.5-0.8B")) {
+    for rig in preserving().iter().chain(&rig("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B")) {
         let chat = ares_model::chat::chat_format(&rig.tokenizer, &rig.options(true));
         let format: ThinkingFormat = chat.thinking.expect(rig.name);
         assert_eq!(format.prompt_on, "<think>\n", "{}", rig.name);
@@ -417,7 +417,7 @@ fn a_client_that_sends_only_the_content_back_parts_where_the_reasoning_began() {
 /// it is and whatever the client sends back.
 #[test]
 fn the_template_of_qwen35_0_8b_never_repeats_the_thinking_of_an_earlier_turn() {
-    let Some(rig) = rig("ARES_TEST_GGUF", "Qwen3.5-0.8B") else { return };
+    let Some(rig) = rig("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B") else { return };
     for say in [
         stops("The user asks for a sum.\n2 and 2 are 4.\n</think>\n\nThe answer is 4."),
         stops("\n</think>\n\nThe answer is 4."),

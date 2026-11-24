@@ -5,12 +5,12 @@
 //!
 //! - `ARES_TEST_CUDA=1` alone runs the kernels' test (`ARES_TEST_DEVICE`
 //!   picks the GPU, default 0).
-//! - With `ARES_TEST_QWEN35_MODEL` (the 0.8B file) and
+//! - With `ARES_TEST_QWEN35_0_8B` (the 0.8B file) and
 //!   `ARES_TEST_QWEN35_CAPTURE` (the capture directory of `tools/capture`)
 //!   the model is run with every matrix in the file's layout, with every
 //!   matrix that can have it in its device layout, and with the measured
 //!   choice.
-//! - With two GPUs and `ARES_TEST_QWEN35_27B` the text with the model's own
+//! - With two GPUs and `ARES_TEST_QWEN38_27B` the text with the model's own
 //!   drafts is compared with the text without, with the default products
 //!   (`ARES_TEST_DRAFT_VOCAB` names a draft vocabulary).
 //!
@@ -430,7 +430,7 @@ fn direct(n: usize, pos0: usize) -> [Segment; 1] {
 #[test]
 fn the_0_8b_in_either_layout_matches_the_reference() {
     let (Some(device), Some(path), Some(capture)) =
-        (gpu(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (gpu(), env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };
@@ -690,7 +690,7 @@ fn the_text_with_drafts_and_fast_products() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return;
     }
-    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
     if device_count().unwrap() < 2 {
         eprintln!("skipped: the 27B needs two devices");
         return;

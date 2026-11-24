@@ -4,7 +4,7 @@
 //! batched, and a draft chain is the block run on its own output.
 //!
 //! On the real 27B against the fork (llama.cpp-native), on the same hidden
-//! states: `ARES_TEST_QWEN35_27B` is the model file,
+//! states: `ARES_TEST_QWEN38_27B` is the model file,
 //! `ARES_TEST_QWEN35_CAPTURE27` a directory with `german/base` and
 //! `english/base` made by `tools/capture` for it (tokens and the output of the
 //! final norm of every position), and `ARES_TEST_QWEN35_MTP_CAPTURE` a
@@ -162,7 +162,7 @@ fn rows_rel(a: &[f32], b: &[f32], width: usize) -> (f64, f64) {
 
 #[test]
 fn the_block_of_the_27b_computes_what_the_fork_computes_on_the_same_hidden_states() {
-    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
     let Some(capture) = env_path("ARES_TEST_QWEN35_CAPTURE27") else { return };
     let Some(fork) = env_path("ARES_TEST_QWEN35_MTP_CAPTURE") else { return };
     let gguf = Gguf::open(&model).unwrap();

@@ -3,17 +3,17 @@
 //! for another that needs its room and one that was idle for its time, and
 //! gives the memory back, by what the devices report.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B` (a small `qwen35`
 //! file, Qwen3.5-0.8B). `ARES_TEST_DEVICE` names the device of the small
 //! models (default 0) and `ARES_TEST_PORT` the first of the ports on
 //! 127.0.0.1 the tests listen on (default 18980). The test that replaces a
-//! model needs two devices, `ARES_TEST_QWEN35_27B` (a file both devices
+//! model needs two devices, `ARES_TEST_QWEN38_27B` (a file both devices
 //! hold together and one alone does not, Qwen3.8-27B Q4_K_S) and
-//! `ARES_TEST_QWEN35_27B_SMALL` (a file one device holds that leaves the two
+//! `ARES_TEST_QWEN38_27B_IQ2` (a file one device holds that leaves the two
 //! too little room for the other, Qwen3.8-27B IQ2_XXS).
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_0_8B=Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test --release -p ares-server --test real_router -- --test-threads=1 --nocapture
 //! ```
 //!
@@ -76,7 +76,7 @@ fn print_times(what: &str, log: &[String]) {
 
 #[test]
 fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
-    let Some(small) = model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else {
+    let Some(small) = model_file("ARES_TEST_QWEN35_0_8B", "a small qwen35 model file") else {
         return;
     };
     let ordinal = test_device();
@@ -174,12 +174,12 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
 
 #[test]
 fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
-    let Some(large) = model_file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices")
+    let Some(large) = model_file("ARES_TEST_QWEN38_27B", "a qwen35 file that needs two devices")
     else {
         return;
     };
     let Some(medium) =
-        model_file("ARES_TEST_QWEN35_27B_SMALL", "a qwen35 file that fills most of one device")
+        model_file("ARES_TEST_QWEN38_27B_IQ2", "a qwen35 file that fills most of one device")
     else {
         return;
     };
@@ -238,15 +238,15 @@ fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
 /// loaded once more. Every load locks the tier of experts in a new range of
 /// addresses, often where the last one was: a lock that outlived its model
 /// would make the next load fail (`cuMemHostRegister`). Needs
-/// `ARES_TEST_QWEN4EXP_MODEL` (the first part of Flash-Next),
-/// `ARES_TEST_QWEN35_27B` and two devices; `ARES_TEST_FLASH_RAM` is the limit
+/// `ARES_TEST_FLASH_NEXT` (the first part of Flash-Next),
+/// `ARES_TEST_QWEN38_27B` and two devices; `ARES_TEST_FLASH_RAM` is the limit
 /// of Flash-Next's RAM (default `8G`).
 #[test]
 fn flash_next_is_loaded_again_after_an_unload_and_after_the_27b() {
-    let Some(flash) = model_file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next") else {
+    let Some(flash) = model_file("ARES_TEST_FLASH_NEXT", "the first part of Flash-Next") else {
         return;
     };
-    let Some(large) = model_file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices")
+    let Some(large) = model_file("ARES_TEST_QWEN38_27B", "a qwen35 file that needs two devices")
     else {
         return;
     };

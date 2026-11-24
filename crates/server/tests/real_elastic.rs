@@ -8,7 +8,7 @@
 //! Skipped unless `ARES_TEST_CUDA=1` and the model are set:
 //!
 //! ```text
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN4EXP_MODEL=<file.gguf> \
+//! ARES_TEST_CUDA=1 ARES_TEST_FLASH_NEXT=<file.gguf> \
 //!   ARES_TEST_HOG="<helper> <total MiB> <step MiB> <interval ms> <hold s> <guard MiB>" \
 //!   [ARES_TEST_DEVICES=0,1] [ARES_TEST_HIDE=<bytes hidden, default 4 GiB>] \
 //!   [ARES_TEST_RAM=<the engine's limit in bytes>] \
@@ -112,8 +112,7 @@ fn generate(
 
 #[test]
 fn the_tier_of_flash_next_follows_the_memory_of_a_smaller_machine() {
-    let Some(model) =
-        common::model_file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next")
+    let Some(model) = common::model_file("ARES_TEST_FLASH_NEXT", "the first part of Flash-Next")
     else {
         return;
     };

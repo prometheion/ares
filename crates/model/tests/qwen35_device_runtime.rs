@@ -2,7 +2,7 @@
 //! Qwen3.5-0.8B on one GPU, and split over two in both ways, through the
 //! device threads, the step record and the links.
 //!
-//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN35_MODEL` and
+//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN35_0_8B` and
 //! `ARES_TEST_QWEN35_CAPTURE`; the split tests need two GPUs. Lines that start
 //! with `RES` are the measurements.
 
@@ -83,7 +83,7 @@ fn run(session: &mut Session, ids: &[u32]) -> (Vec<(u32, f32)>, Vec<u32>) {
 #[test]
 fn every_placement_of_the_0_8b_agrees_with_the_reference() {
     let (true, Some(path), Some(capture)) =
-        (enabled(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (enabled(), env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };
@@ -252,7 +252,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
 /// 27B are checked in `qwen35_mtp_runtime`.)
 #[test]
 fn the_engine_answers_alone_and_two_at_once() {
-    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_MODEL")) else {
+    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_0_8B")) else {
         return;
     };
     let questions = [
@@ -400,7 +400,7 @@ fn check_probabilities(name: &str, probs: &[TokenProbs], top: Option<usize>) {
 /// `qwen35_mtp_runtime`.)
 #[test]
 fn every_kind_of_sampler_setting_answers_on_the_real_model() {
-    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_MODEL")) else {
+    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_0_8B")) else {
         return;
     };
     let question =
@@ -624,7 +624,7 @@ fn windows_against_single_rows(
 fn a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement() {
     use ares_cuda::CacheFormat;
     let (true, Some(path), Some(capture)) =
-        (enabled(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (enabled(), env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };

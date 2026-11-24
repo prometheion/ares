@@ -3,7 +3,7 @@
 //! image stage is, at the rotary positions llama.cpp's `mtmd` gives an image
 //! and the text after it, on the real Qwen3.5-0.8B with made-up rows.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (the 0.8B file), and
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B` (the 0.8B file), and
 //! says so when it skips. `ARES_TEST_DEVICE` picks the GPU (default 0).
 
 use std::sync::Arc;
@@ -23,8 +23,8 @@ mod common;
 #[test]
 fn an_image_s_rows_at_their_rotary_positions_match_the_reference() {
     let Some(device) = gpu() else { return };
-    let Some(path) = std::env::var_os("ARES_TEST_QWEN35_MODEL") else {
-        eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to run this test");
+    let Some(path) = std::env::var_os("ARES_TEST_QWEN35_0_8B") else {
+        eprintln!("skipped: set ARES_TEST_QWEN35_0_8B to run this test");
         return;
     };
     let gguf = Gguf::open(path).unwrap();

@@ -1559,11 +1559,11 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         `LOGPROBS_MAX`/`BIAS_MAX` beside the API's limits; the mask-bit test three times
         (grammar, sampler), llama.cpp's defaults in the sampler and the runtime; test-only
         public code (`Breakers::of_tokens`, `keeps_history`/`opens` computed and dropped).
-  - [ ] The owner to decide: one variable name per test model file (`ARES_TEST_GGUF`,
-        `ARES_TEST_QWEN38_27B` and `ARES_TEST_FLASH_NEXT` in the tokenizer, vulkan and server
-        template tests beside `ARES_TEST_QWEN35_MODEL`, `ARES_TEST_QWEN35_27B`,
-        `ARES_TEST_QWEN4EXP_MODEL`); `Question::option_texts` is used by its tests only (System
-        One's groundwork, kept).
+  - [x] One variable name per test model file across the workspace (the owner, 2026-11-24):
+        the table in README.md's "Tests" (`ARES_TEST_QWEN35_0_8B`, `ARES_TEST_QWEN38_27B`,
+        `ARES_TEST_QWEN38_27B_IQ2`, `ARES_TEST_FLASH_NEXT`, `ARES_TEST_FLASH_NEXT_MTP`; the
+        kernels' `ARES_TEST_GGUF` is any file). `Question::option_texts` is used by its tests
+        only (System One's groundwork, kept).
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from

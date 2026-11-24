@@ -1,10 +1,10 @@
 //! The two real models and what llama.cpp computed for them. These tests need
 //! files that are not in the repository and say so when they skip:
 //!
-//! - `ARES_TEST_QWEN35_MODEL`: Qwen3.5-0.8B-Q4_K_M.gguf (configuration, table, a run);
+//! - `ARES_TEST_QWEN35_0_8B`: Qwen3.5-0.8B-Q4_K_M.gguf (configuration, table, a run);
 //! - `ARES_TEST_QWEN35_CAPTURE`: a directory made by `tools/capture` for that model
 //!   (`english/base`, `german/base`, `code/base`), see its README;
-//! - `ARES_TEST_QWEN35_27B`: Qwen3.8-27B-UD-Q4_K_S.gguf (configuration and
+//! - `ARES_TEST_QWEN38_27B`: Qwen3.8-27B-UD-Q4_K_S.gguf (configuration and
 //!   table only; the reference is not run on it).
 
 use std::path::Path;
@@ -31,7 +31,7 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
 
 #[test]
 fn the_small_model_is_configured_as_its_file_says() {
-    let Some(path) = env_path("ARES_TEST_QWEN35_MODEL") else { return };
+    let Some(path) = env_path("ARES_TEST_QWEN35_0_8B") else { return };
     let gguf = Gguf::open(path).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
     assert_eq!(
@@ -57,7 +57,7 @@ fn the_small_model_is_configured_as_its_file_says() {
 
 #[test]
 fn the_large_model_is_configured_as_its_file_says() {
-    let Some(path) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(path) = env_path("ARES_TEST_QWEN38_27B") else { return };
     let gguf = Gguf::open(path).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
     assert_eq!((c.n_layer, c.n_embd, c.n_ff, c.n_vocab), (64, 5120, 17408, 248_320));
@@ -83,7 +83,7 @@ fn the_large_model_is_configured_as_its_file_says() {
 #[test]
 fn the_small_model_stays_within_the_measured_distance_of_llama_cpp() {
     let (Some(model), Some(captures)) =
-        (env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };

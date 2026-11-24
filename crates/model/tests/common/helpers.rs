@@ -16,9 +16,9 @@ pub fn env_path(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// The real 0.8B (`ARES_TEST_QWEN35_MODEL`, Qwen3.5-0.8B-Q4_K_M.gguf).
+/// The real 0.8B (`ARES_TEST_QWEN35_0_8B`, Qwen3.5-0.8B-Q4_K_M.gguf).
 pub fn model_path() -> Option<PathBuf> {
-    env_path("ARES_TEST_QWEN35_MODEL")
+    env_path("ARES_TEST_QWEN35_0_8B")
 }
 
 /// The `f32` values of a file, as a capture writes them.

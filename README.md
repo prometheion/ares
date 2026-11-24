@@ -280,8 +280,21 @@ ARES_TEST_VULKAN=1 cargo test -p ares-vulkan --test gpu -- --test-threads=1
 ```
 
 Tests against real models skip with a message unless their model files are
-named: `git grep ARES_TEST_` lists the variables (`ARES_TEST_GGUF`,
-`ARES_TEST_QWEN35_MODEL`, `ARES_TEST_QWEN38_27B` and others).
+named, one variable for each file, the same in every crate:
+
+| Variable | Model file |
+| --- | --- |
+| `ARES_TEST_QWEN35_0_8B` | Qwen3.5-0.8B (`Qwen3.5-0.8B-Q4_K_M.gguf`) |
+| `ARES_TEST_QWEN38_27B` | Qwen3.8-27B in Q4_K_S (`Qwen3.8-27B-UD-Q4_K_S.gguf`), on two cards |
+| `ARES_TEST_QWEN38_27B_IQ2` | Qwen3.8-27B in IQ2_XXS (`Qwen3.8-27B-UD-IQ2_XXS.gguf`), on one card |
+| `ARES_TEST_DRAFT_MODEL` | that IQ2_XXS file with its MTP block (`...-with-draft-block.gguf`) |
+| `ARES_TEST_DFLASH_27B` | the 27B's DFlash2 drafter |
+| `ARES_TEST_FLASH_NEXT` | Qwen3.8-Flash-Next, the first part of its split file |
+| `ARES_TEST_FLASH_NEXT_MTP` | Flash-Next's MTP block (`mtp-q2_0.gguf`) |
+| `ARES_TEST_GGUF` | any model file whose tensors the kernel tests of `ares-cuda` and `ares-vulkan` check |
+
+`git grep ARES_TEST_` lists the others (directories of captures, devices,
+ports, limits).
 
 ## Layout
 

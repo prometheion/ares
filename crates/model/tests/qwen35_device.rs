@@ -1,7 +1,7 @@
 //! The device implementation of `qwen35` on one GPU against the CPU reference
 //! and against what llama.cpp computed, on the real Qwen3.5-0.8B.
 //!
-//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN35_MODEL` (the 0.8B file) and
+//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN35_0_8B` (the 0.8B file) and
 //! `ARES_TEST_QWEN35_CAPTURE` (the capture directory of `tools/capture`), and
 //! says so when it skips. `ARES_TEST_DEVICE` picks the GPU (default 0). Lines
 //! that start with `ERR` or `RES` are the measurements.
@@ -40,7 +40,7 @@ fn direct(n: usize, pos0: usize) -> [Segment; 1] {
 #[test]
 fn every_block_of_the_0_8b_matches_the_reference() {
     let (Some(device), Some(path), Some(capture)) =
-        (gpu(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (gpu(), env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };
@@ -169,7 +169,7 @@ fn feed(
 #[test]
 fn the_forward_pass_agrees_with_the_reference_and_llama_cpp() {
     let (Some(device), Some(path), Some(capture)) =
-        (gpu(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (gpu(), env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };
@@ -269,7 +269,7 @@ fn the_forward_pass_agrees_with_the_reference_and_llama_cpp() {
 #[test]
 fn a_draft_window_and_its_commit_equal_the_direct_steps() {
     let (Some(device), Some(path), Some(capture)) =
-        (gpu(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+        (gpu(), env_path("ARES_TEST_QWEN35_0_8B"), env_path("ARES_TEST_QWEN35_CAPTURE"))
     else {
         return;
     };

@@ -5,19 +5,19 @@
 //! from the drive after a restart of the server, and after the model was
 //! unloaded and loaded again in router mode, with the reply of the first run.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B` (a small `qwen35`
 //! file, Qwen3.5-0.8B). `ARES_TEST_DEVICE` names the device of the small model
 //! (default 0), `ARES_TEST_PORT` the first of the ports on 127.0.0.1 the tests
 //! listen on (default 18970) and `ARES_TEST_CACHE_DIR` the directory the
 //! stores are made in (default: the tests' directory under the build's). The
-//! test over two devices needs `ARES_TEST_QWEN35_27B_SMALL` (Qwen3.8-27B
+//! test over two devices needs `ARES_TEST_QWEN38_27B_IQ2` (Qwen3.8-27B
 //! IQ2_XXS), which it splits over devices 0 and 1 with K and V in `q5`, the
 //! formats that keep new pages in another form than old ones. The test of
-//! Qwen3.8-Flash-Next needs `ARES_TEST_QWEN4EXP_MODEL` (the first of its two
+//! Qwen3.8-Flash-Next needs `ARES_TEST_FLASH_NEXT` (the first of its two
 //! files) and both devices.
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_0_8B=Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test --release -p ares-server --test real_cache -- --test-threads=1 --nocapture
 //! ```
 //!
@@ -215,7 +215,7 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
 
 #[test]
 fn a_conversation_resumes_from_ssd_after_a_restart_and_after_eviction() {
-    let Some(small) = model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else {
+    let Some(small) = model_file("ARES_TEST_QWEN35_0_8B", "a small qwen35 model file") else {
         return;
     };
     let device = test_device().to_string();
@@ -226,7 +226,7 @@ fn a_conversation_resumes_from_ssd_after_a_restart_and_after_eviction() {
 
 #[test]
 fn pages_in_two_forms_on_two_devices_resume_from_ssd() {
-    let Some(model) = model_file("ARES_TEST_QWEN35_27B_SMALL", "a qwen35 file two devices split")
+    let Some(model) = model_file("ARES_TEST_QWEN38_27B_IQ2", "a qwen35 file two devices split")
     else {
         return;
     };
@@ -247,7 +247,7 @@ fn pages_in_two_forms_on_two_devices_resume_from_ssd() {
 
 #[test]
 fn a_model_that_was_unloaded_resumes_from_ssd_when_it_is_loaded_again() {
-    let Some(small) = model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else {
+    let Some(small) = model_file("ARES_TEST_QWEN35_0_8B", "a small qwen35 model file") else {
         return;
     };
     let dir = scratch("cache-router");
@@ -287,8 +287,7 @@ fn a_model_that_was_unloaded_resumes_from_ssd_when_it_is_loaded_again() {
 /// first token of each is reported.
 #[test]
 fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
-    let Some(model) =
-        model_file("ARES_TEST_QWEN4EXP_MODEL", "the first file of Qwen3.8-Flash-Next")
+    let Some(model) = model_file("ARES_TEST_FLASH_NEXT", "the first file of Qwen3.8-Flash-Next")
     else {
         return;
     };

@@ -8,7 +8,7 @@
 //! before it has enqueued its half leaves the kernel of the other waiting for
 //! a flag nobody sets, and the step, the start and the shutdown with it.
 //!
-//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN35_MODEL` and two GPUs
+//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN35_0_8B` and two GPUs
 //! (`ARES_LIBCUDA` with the patched driver library makes them exchange
 //! directly, which is the path that hangs).
 
@@ -39,10 +39,10 @@ fn model_path() -> Option<PathBuf> {
         eprintln!("skipped: the tensor split needs two devices");
         return None;
     }
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
+    match std::env::var_os("ARES_TEST_QWEN35_0_8B") {
         Some(path) => Some(path.into()),
         None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to run this test");
+            eprintln!("skipped: set ARES_TEST_QWEN35_0_8B to run this test");
             None
         }
     }

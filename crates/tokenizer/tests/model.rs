@@ -1,10 +1,11 @@
 //! The tokenizer of a real model against llama.cpp's results.
 //!
-//! These tests need a model file, so they run only when `ARES_TEST_GGUF` names one
-//! and say so otherwise:
+//! These tests need a model file, so they run only when `ARES_TEST_QWEN35_0_8B`
+//! names one and say so otherwise:
 //!
 //! ```text
-//! ARES_TEST_GGUF=/path/to/Qwen3.5-0.8B-Q4_K_M.gguf cargo test -p ares-tokenizer --test model
+//! ARES_TEST_QWEN35_0_8B=/path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
+//!     cargo test -p ares-tokenizer --test model
 //! ```
 //!
 //! The expected results are in `tests/golden/`, written by llama.cpp's own tools (see
@@ -20,9 +21,10 @@ use ares_tokenizer::{
 };
 
 fn model() -> Option<(Gguf, Tokenizer)> {
-    let Some(path) = std::env::var_os("ARES_TEST_GGUF") else {
+    let Some(path) = std::env::var_os("ARES_TEST_QWEN35_0_8B") else {
         eprintln!(
-            "skipped: set ARES_TEST_GGUF=<model.gguf> to compare a real tokenizer with llama.cpp"
+            "skipped: set ARES_TEST_QWEN35_0_8B=<model.gguf> to compare a real tokenizer with \
+             llama.cpp"
         );
         return None;
     };
@@ -239,7 +241,8 @@ fn renders_the_prompts_of_llama_cpp() {
 fn agrees_with_llama_tokenize() {
     let Some(binary) = std::env::var_os("ARES_TEST_LLAMA_TOKENIZE") else {
         eprintln!(
-            "skipped: set ARES_TEST_LLAMA_TOKENIZE=<llama-tokenize> (and ARES_TEST_GGUF) to compare with the program"
+            "skipped: set ARES_TEST_LLAMA_TOKENIZE=<llama-tokenize> (and ARES_TEST_QWEN35_0_8B) \
+             to compare with the program"
         );
         return;
     };

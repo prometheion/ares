@@ -2,16 +2,16 @@
 //! in both placements and on one card, drafts with its MTP block, and starts
 //! from the usage profile of its experts.
 //!
-//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_QWEN4EXP_MODEL` (the first part of its
+//! Needs `ARES_TEST_CUDA=1`, `ARES_TEST_FLASH_NEXT` (the first part of its
 //! split file) and two devices (`ARES_TEST_DEVICES`, default `0,1`); the test
-//! of drafts needs its MTP block, `ARES_TEST_QWEN4EXP_DRAFT`. `ARES_TEST_FLASH_RAM`
+//! of drafts needs its MTP block, `ARES_TEST_FLASH_NEXT_MTP`. `ARES_TEST_FLASH_RAM`
 //! is the RAM limit of its servers (default `8G`), `ARES_TEST_PORT` the first
 //! of the ports on 127.0.0.1 the tests listen on (default 18951). The tests are
 //! slow: a server loads in about 15 seconds, and the first answer comes from
 //! experts that are still being fetched.
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN4EXP_MODEL=Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_FLASH_NEXT=Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
 //!     cargo test --release -p ares-server --test real_flash_next -- --test-threads=1 --nocapture
 //! ```
 
@@ -38,7 +38,7 @@ const SLOW: Duration = Duration::from_secs(900);
 /// The first part of the split file of Qwen3.8-Flash-Next, or `None` (and a
 /// note) when the tests of it are not enabled.
 fn flash_model() -> Option<PathBuf> {
-    model_file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next")
+    model_file("ARES_TEST_FLASH_NEXT", "the first part of Flash-Next")
 }
 
 /// The RAM limit of the servers of Flash-Next (`ARES_TEST_FLASH_RAM`, default
@@ -180,7 +180,7 @@ fn flash_next_answers_in_both_placements() {
     }
 }
 
-/// Flash-Next with its MTP block (`ARES_TEST_QWEN4EXP_DRAFT` names the
+/// Flash-Next with its MTP block (`ARES_TEST_FLASH_NEXT_MTP` names the
 /// block's file; without it the test is skipped): the plan says that the
 /// block drafts and what it took, the answer to the question the reference
 /// answered starts as the reference's does, drafts are verified and some are
@@ -188,8 +188,8 @@ fn flash_next_answers_in_both_placements() {
 #[test]
 fn flash_next_drafts_with_its_mtp_block() {
     let Some(model) = flash_model() else { return };
-    let Some(block) = std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT") else {
-        eprintln!("skipped: set ARES_TEST_QWEN4EXP_DRAFT to the file of Flash-Next's MTP block");
+    let Some(block) = std::env::var_os("ARES_TEST_FLASH_NEXT_MTP") else {
+        eprintln!("skipped: set ARES_TEST_FLASH_NEXT_MTP to the file of Flash-Next's MTP block");
         return;
     };
     let block = block.to_str().expect("a path in UTF-8").to_owned();

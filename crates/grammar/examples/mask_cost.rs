@@ -1,7 +1,7 @@
 //! What a step of a grammar costs on the vocabulary of a real model: the time
 //! to compile, and the time of a mask along a random walk through the grammar.
 //!
-//! `ARES_TEST_QWEN35_MODEL=<model.gguf> cargo run --release -p ares-grammar \
+//! `ARES_TEST_QWEN35_0_8B=<model.gguf> cargo run --release -p ares-grammar \
 //!  --example mask_cost -- [steps]`
 
 use std::time::Instant;
@@ -71,7 +71,7 @@ fn calls(text: bool) -> String {
 
 fn main() {
     let steps: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(400);
-    let path = std::env::var("ARES_TEST_QWEN35_MODEL").expect("ARES_TEST_QWEN35_MODEL");
+    let path = std::env::var("ARES_TEST_QWEN35_0_8B").expect("ARES_TEST_QWEN35_0_8B");
     let tokenizer = Tokenizer::from_gguf(&Gguf::open(&path).unwrap()).unwrap();
     let n = tokenizer.n_tokens() as u32;
     let pieces: Vec<Vec<u8>> =

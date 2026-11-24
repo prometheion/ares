@@ -3,7 +3,7 @@
 //! templates of three model files.
 //!
 //! The real templates are read from the model files named by
-//! `ARES_TEST_GGUF` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and
+//! `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and
 //! `ARES_TEST_FLASH_NEXT` (Qwen3.8-Flash-Next, first part); a test says so and
 //! passes when a file is not named. Reading the metadata of a file needs no GPU.
 
@@ -198,7 +198,7 @@ fn qwen_format() -> ReasoningFormat {
 
 #[test]
 fn the_template_of_qwen35_0_8b_has_the_same_tags_but_drops_the_thinking_of_earlier_turns() {
-    let Some(tokenizer) = tokenizer_of("ARES_TEST_GGUF", "Qwen3.5-0.8B") else { return };
+    let Some(tokenizer) = tokenizer_of("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B") else { return };
     // It is the first template of the family: the reasoning of a turn stays in the prompt
     // only after the last user message, whatever `preserve_reasoning` says, and the
     // template does not read an effort.

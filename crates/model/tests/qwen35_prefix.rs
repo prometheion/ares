@@ -23,7 +23,7 @@
 //! steps of the same sizes, in `qwen35_prefix_part.rs` and
 //! `qwen35_prefix_mtp.rs`.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL`. Lines that start
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B`. Lines that start
 //! with `RES` are measurements.
 
 use std::path::PathBuf;
@@ -58,10 +58,10 @@ fn model_path() -> Option<PathBuf> {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return None;
     }
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
+    match std::env::var_os("ARES_TEST_QWEN35_0_8B") {
         Some(path) => Some(path.into()),
         None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to run this test");
+            eprintln!("skipped: set ARES_TEST_QWEN35_0_8B to run this test");
             None
         }
     }

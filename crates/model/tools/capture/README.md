@@ -91,8 +91,8 @@ $C --captures $W/english/base $W/english/t3  # llama.cpp against itself
 The tests that use these files skip with a message unless the variables are set:
 
 ```sh
-ARES_TEST_QWEN35_MODEL=$M ARES_TEST_QWEN35_CAPTURE=$W \
-ARES_TEST_QWEN35_27B=$HOME/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_S.gguf \
+ARES_TEST_QWEN35_0_8B=$M ARES_TEST_QWEN35_CAPTURE=$W \
+ARES_TEST_QWEN38_27B=$HOME/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_S.gguf \
   cargo test --release -p ares-model --test real_models
 ```
 

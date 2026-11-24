@@ -3,7 +3,7 @@
 //! model's template declares. Nothing here touches a device: the model is set
 //! up (`Qwen35::new`) and asked for tokens.
 //!
-//! Needs `ARES_TEST_QWEN35_MODEL`, the Qwen3.5-0.8B file. Its template writes
+//! Needs `ARES_TEST_QWEN35_0_8B`, the Qwen3.5-0.8B file. Its template writes
 //! the thinking of an assistant turn into the prompt only after the last user
 //! message, so the tests put the reply last.
 
@@ -16,10 +16,10 @@ use ares_runtime::Model;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Json, Tokenizer};
 
 fn path() -> Option<PathBuf> {
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
+    match std::env::var_os("ARES_TEST_QWEN35_0_8B") {
         Some(path) => Some(path.into()),
         None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to run this test");
+            eprintln!("skipped: set ARES_TEST_QWEN35_0_8B to run this test");
             None
         }
     }

@@ -8,16 +8,16 @@
 //! engine a rule about the tokens of a reply, which is the hook the grammars
 //! will use. `real.rs` runs the binary over sockets.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (the 0.8B);
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_0_8B` (the 0.8B);
 //! `ARES_TEST_DEVICE` names the device (default 0). The 0.8B has no draft
 //! block, so nothing is drafted for it: the tests of drafts need
-//! `ARES_TEST_QWEN35_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf) and two GPUs, and
+//! `ARES_TEST_QWEN38_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf) and two GPUs, and
 //! compare the reply to a request with the reply to the same request that says
 //! `"draft": false`. Lines that start with `RES` are measurements.
 //!
 //! ```sh
-//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
-//!     ARES_TEST_QWEN35_27B=Qwen3.8-27B-UD-Q4_K_S.gguf \
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_0_8B=Qwen3.5-0.8B-Q4_K_M.gguf \
+//!     ARES_TEST_QWEN38_27B=Qwen3.8-27B-UD-Q4_K_S.gguf \
 //!     cargo test --release -p ares-server --test real_sampling -- --test-threads=1
 //! ```
 

@@ -8,7 +8,7 @@
 //! file: what the template declares, what the server makes of the tokens,
 //! what the next prompt looks like, and how much of the generated sequence it
 //! repeats. The engine is not run. The model files are named by
-//! `ARES_TEST_GGUF` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and
+//! `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and
 //! `ARES_TEST_FLASH_NEXT` (Qwen3.8-Flash-Next, first part); the test says so
 //! and passes when a file is not named.
 
@@ -22,7 +22,7 @@ use crate::reasoning::templates::streamed;
 use crate::sorter::{Piece, Sorter};
 
 const FILES: [(&str, &str); 3] = [
-    ("ARES_TEST_GGUF", "Qwen3.5-0.8B"),
+    ("ARES_TEST_QWEN35_0_8B", "Qwen3.5-0.8B"),
     ("ARES_TEST_QWEN38_27B", "Qwen3.8-27B"),
     ("ARES_TEST_FLASH_NEXT", "Qwen3.8-Flash-Next"),
 ];

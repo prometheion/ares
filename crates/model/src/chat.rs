@@ -826,7 +826,7 @@ mod tests {
 
     /// The tools of a request, the calls of an assistant message and their
     /// results come out of the chat template of a model file, when one is
-    /// named: `ARES_TEST_GGUF` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` or
+    /// named: `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` or
     /// `ARES_TEST_FLASH_NEXT`. Reading the metadata of a file needs no GPU.
     #[test]
     fn tools_calls_and_results_reach_the_template_of_a_model_file() {
@@ -866,7 +866,7 @@ mod tests {
             variables: Vec::new(),
             continue_final: false,
         };
-        for variable in ["ARES_TEST_GGUF", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
+        for variable in ["ARES_TEST_QWEN35_0_8B", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
             let Some(path) = std::env::var_os(variable) else {
                 eprintln!("skipped: set {variable} to a model file");
                 continue;
@@ -888,11 +888,11 @@ mod tests {
     }
 
     /// The tokenizers of the model files the tests name, with the name of
-    /// the variable: `ARES_TEST_GGUF` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B`,
+    /// the variable: `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B`,
     /// `ARES_TEST_FLASH_NEXT`. Reading the metadata of a file needs no GPU.
     fn model_tokenizers() -> Vec<(&'static str, Tokenizer)> {
         let mut found = Vec::new();
-        for variable in ["ARES_TEST_GGUF", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
+        for variable in ["ARES_TEST_QWEN35_0_8B", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
             match std::env::var_os(variable) {
                 Some(path) => found.push((
                     variable,
@@ -1016,16 +1016,16 @@ mod tests {
     }
 
     /// A conversation with an image, on the 27B's tokenizer and projector
-    /// (`ARES_TEST_QWEN35_27B`, `ARES_TEST_QWEN3VL_27B`): the image is its start
+    /// (`ARES_TEST_QWEN38_27B`, `ARES_TEST_QWEN3VL_27B`): the image is its start
     /// marker, a pad token for each of its rows and its end marker, where the
     /// template put the message's text; the text after it is tokenized on its
     /// own; the boundaries lie behind the rows; counting gives as many tokens.
     #[test]
     fn an_image_becomes_its_markers_and_a_pad_token_per_row() {
         let (Some(model), Some(mmproj)) =
-            (std::env::var_os("ARES_TEST_QWEN35_27B"), std::env::var_os("ARES_TEST_QWEN3VL_27B"))
+            (std::env::var_os("ARES_TEST_QWEN38_27B"), std::env::var_os("ARES_TEST_QWEN3VL_27B"))
         else {
-            eprintln!("skipped: set ARES_TEST_QWEN35_27B and ARES_TEST_QWEN3VL_27B");
+            eprintln!("skipped: set ARES_TEST_QWEN38_27B and ARES_TEST_QWEN3VL_27B");
             return;
         };
         let gguf = ares_gguf::Gguf::open(std::path::Path::new(&model)).unwrap();

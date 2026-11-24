@@ -1359,7 +1359,7 @@ impl ares_model::qwen4exp::Observer for Lists {
 /// rows of a prompt piece can share attention items. Needs no GPU:
 ///
 /// ```sh
-/// ARES_TEST_QWEN4EXP_MODEL=<first part of the model> ARES_TEST_QWEN4EXP_TOKENS=<file of token ids> \
+/// ARES_TEST_FLASH_NEXT=<first part of the model> ARES_TEST_QWEN4EXP_TOKENS=<file of token ids> \
 ///   cargo test -p ares-model --test qwen4exp_gpu neighbouring -- --nocapture
 /// ```
 ///
@@ -1367,11 +1367,10 @@ impl ares_model::qwen4exp::Observer for Lists {
 /// of the attention layers among them are measured.
 #[test]
 fn neighbouring_rows_of_a_real_model_select_overlapping_cells() {
-    let (Some(model), Some(tokens)) = (
-        std::env::var_os("ARES_TEST_QWEN4EXP_MODEL"),
-        std::env::var_os("ARES_TEST_QWEN4EXP_TOKENS"),
-    ) else {
-        eprintln!("skipped: set ARES_TEST_QWEN4EXP_MODEL and ARES_TEST_QWEN4EXP_TOKENS");
+    let (Some(model), Some(tokens)) =
+        (std::env::var_os("ARES_TEST_FLASH_NEXT"), std::env::var_os("ARES_TEST_QWEN4EXP_TOKENS"))
+    else {
+        eprintln!("skipped: set ARES_TEST_FLASH_NEXT and ARES_TEST_QWEN4EXP_TOKENS");
         return;
     };
     let depth =

@@ -15,7 +15,7 @@
 //! - **a replay writes none of the block's cells** and still leaves the carry
 //!   the next row starts from.
 //!
-//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_27B`; `ARES_TEST_DEVICE`
+//! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN38_27B`; `ARES_TEST_DEVICE`
 //! names the device (default 0).
 
 use std::ops::Range;
@@ -264,8 +264,8 @@ fn setup() -> Option<Setup> {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return None;
     }
-    let Some(path) = std::env::var_os("ARES_TEST_QWEN35_27B").map(PathBuf::from) else {
-        eprintln!("skipped: set ARES_TEST_QWEN35_27B to run this test");
+    let Some(path) = std::env::var_os("ARES_TEST_QWEN38_27B").map(PathBuf::from) else {
+        eprintln!("skipped: set ARES_TEST_QWEN38_27B to run this test");
         return None;
     };
     let ordinal = std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

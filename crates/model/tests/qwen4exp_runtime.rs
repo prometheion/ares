@@ -2399,19 +2399,19 @@ fn start_flash_with(
 /// start to start (0.733 to 0.751 of the key heads on the faster card in eight
 /// starts), and with it how the sums of a layer are cut between the cards, so
 /// the comparison would be one of two arithmetics, which a near tie tells
-/// apart. Needs `ARES_TEST_QWEN4EXP_MODEL` and `ARES_TEST_QWEN4EXP_DRAFT`.
+/// apart. Needs `ARES_TEST_FLASH_NEXT` and `ARES_TEST_FLASH_NEXT_MTP`.
 #[test]
 fn flash_next_writes_with_drafts_what_it_writes_without() {
     if !enabled() {
         return;
     }
     let (Some(path), Some(draft)) = (
-        std::env::var_os("ARES_TEST_QWEN4EXP_MODEL").map(PathBuf::from),
-        std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT").map(PathBuf::from),
+        std::env::var_os("ARES_TEST_FLASH_NEXT").map(PathBuf::from),
+        std::env::var_os("ARES_TEST_FLASH_NEXT_MTP").map(PathBuf::from),
     ) else {
         eprintln!(
-            "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next and \
-             ARES_TEST_QWEN4EXP_DRAFT to the file of its MTP block"
+            "skipped: set ARES_TEST_FLASH_NEXT to the first part of Flash-Next and \
+             ARES_TEST_FLASH_NEXT_MTP to the file of its MTP block"
         );
         return;
     };
@@ -2476,11 +2476,11 @@ fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
         return;
     }
     let (Some(path), Some(file)) = (
-        std::env::var_os("ARES_TEST_QWEN4EXP_MODEL").map(PathBuf::from),
+        std::env::var_os("ARES_TEST_FLASH_NEXT").map(PathBuf::from),
         std::env::var_os("ARES_TEST_DFLASH_FLASHNEXT").map(PathBuf::from),
     ) else {
         eprintln!(
-            "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next and \
+            "skipped: set ARES_TEST_FLASH_NEXT to the first part of Flash-Next and \
              ARES_TEST_DFLASH_FLASHNEXT to its DFlash2 file"
         );
         return;
