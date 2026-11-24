@@ -378,6 +378,24 @@ impl std::fmt::Debug for PrefixIndex {
     }
 }
 
+/// Of `tails` (each named by a `T` and given by its tokens), the one that
+/// shares the most leading tokens with `rest`, with how many it shares and
+/// whether that is all of it; among equals the one that ends there, whose
+/// checkpoint can be used. `None` when none shares a token. The index and the
+/// level in RAM choose their tails by this.
+pub fn best_tail<'a, T>(
+    tails: impl Iterator<Item = (T, &'a [u64])>,
+    rest: &[u64],
+) -> Option<(T, usize, bool)> {
+    tails
+        .map(|(tail, tokens)| {
+            let shared = tokens.iter().zip(rest).take_while(|(a, b)| a == b).count();
+            (tail, shared, shared == tokens.len())
+        })
+        .filter(|(_, shared, _)| *shared > 0)
+        .max_by_key(|(_, shared, whole)| (*shared, *whole))
+}
+
 impl PrefixIndex {
     /// An index that knows nothing.
     pub fn new() -> Self {
@@ -502,18 +520,7 @@ impl PrefixIndex {
     /// `rest`, if any shares one.
     fn match_tail(&mut self, prior: ChainHash, rest: &[u64]) -> Option<TailMatch> {
         let tails = self.tails.get(&prior)?;
-        let (best, cells) = tails
-            .iter()
-            .map(|tail| {
-                let shared = tail.tokens.iter().zip(rest).take_while(|(a, b)| a == b).count();
-                (tail, shared)
-            })
-            // The most cells; among equals the tail that ends there, whose
-            // checkpoint can be used.
-            .max_by_key(|(tail, shared)| (*shared, *shared == tail.tokens.len()))?;
-        if cells == 0 {
-            return None;
-        }
+        let (best, cells, _) = best_tail(tails.iter().map(|tail| (tail, &tail.tokens[..])), rest)?;
         let found = TailMatch {
             page: best.page,
             cells: cells as u32,

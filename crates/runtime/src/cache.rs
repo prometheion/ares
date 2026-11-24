@@ -64,7 +64,7 @@ use std::time::Instant;
 
 use ares_state::{
     Boundary, Chain, ChainHash, CheckpointId, CheckpointPolicy, Evicted, Owner, PageId, PagePool,
-    PageState, PrefixIndex, PrefixMatch, Priority, Resume, Sequence,
+    PageState, PrefixIndex, PrefixMatch, Priority, Resume, Sequence, best_tail,
 };
 use ares_store::Kind;
 
@@ -1372,16 +1372,13 @@ impl Cache {
         let rest = &looked[(have + run) * per_page..];
         let tail = (found.tail.is_none() || run > 0)
             .then(|| {
-                ram.tails_under(chain.before(have + run))
-                    .map(|(hash, entry)| {
-                        let tokens = entry.tail.as_deref().unwrap_or(&[]);
-                        let shared = tokens.iter().zip(rest).take_while(|(a, b)| a == b).count();
-                        (shared, shared == tokens.len(), entry.checkpoint.is_some(), hash)
-                    })
-                    .filter(|(shared, ..)| *shared > 0)
-                    .max_by_key(|(shared, whole, ..)| (*shared, *whole))
+                let tails = ram.tails_under(chain.before(have + run)).map(|(hash, entry)| {
+                    ((hash, entry.checkpoint.is_some()), entry.tail.as_deref().unwrap_or(&[]))
+                });
+                best_tail(tails, rest)
             })
-            .flatten();
+            .flatten()
+            .map(|((hash, checkpoint), shared, whole)| (shared, whole, checkpoint, hash));
         let (run, tail) = if self.recurrent {
             let deepest = (0..run)
                 .rev()
