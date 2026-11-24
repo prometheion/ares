@@ -379,9 +379,6 @@ pub struct SamplerKernels {
     invert: Function,
     draft_put: Function,
     draft_rows: Function,
-    draft_shift: Function,
-    draft_keep: Function,
-    draft_commit: Function,
 }
 
 impl SamplerKernels {
@@ -415,9 +412,6 @@ impl SamplerKernels {
             invert: module.function("ares_sample_invert")?,
             draft_put: module.function("ares_draft_put")?,
             draft_rows: module.function("ares_draft_rows")?,
-            draft_shift: module.function("ares_draft_shift")?,
-            draft_keep: module.function("ares_draft_keep")?,
-            draft_commit: module.function("ares_draft_commit")?,
         })
     }
 
@@ -1080,91 +1074,5 @@ impl SamplerKernels {
         let args = Args::new().ptr(dst).ptr(src).ptr(index).u32(d);
         // SAFETY: the arguments match ares_draft_rows; the memory is the caller's guarantee.
         unsafe { self.draft_rows.launch(stream, [n, 1, 1], [THREADS, 1, 1], 0, args) }
-    }
-
-    /// For every row of the step at `step` (a record in the layout of the
-    /// layer kernels, with `segments` segments of at most `max_seg_rows`
-    /// rows), the final hidden state of the position before it: `out[r]` is
-    /// `hidden[r - 1]` inside a segment and the sequence's carry (zeros at
-    /// position 0) for a segment's first row.
-    ///
-    /// # Safety
-    ///
-    /// `step` must address the uploaded record, `hidden` and `out` a row of
-    /// `d` f32 per row of the step, `carry` `carry_rows * d` f32 per slot the
-    /// record names, on the stream's device.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn shift_hidden(
-        &self,
-        stream: &Stream,
-        step: DevicePtr,
-        segments: u32,
-        max_seg_rows: u32,
-        hidden: DevicePtr,
-        carry: DevicePtr,
-        carry_rows: u32,
-        out: DevicePtr,
-        d: u32,
-    ) -> Result<()> {
-        if segments == 0 || max_seg_rows == 0 {
-            return Ok(());
-        }
-        let args = Args::new().ptr(step).ptr(hidden).ptr(carry).u32(carry_rows).ptr(out).u32(d);
-        let grid = [max_seg_rows, segments, 1];
-        // SAFETY: the arguments match ares_draft_shift; the memory is the caller's guarantee.
-        unsafe { self.draft_shift.launch(stream, grid, [THREADS, 1, 1], 0, args) }
-    }
-
-    /// Keeps the final hidden state of the step's rows in the carries of
-    /// their sequences.
-    ///
-    /// # Safety
-    ///
-    /// As [`SamplerKernels::shift_hidden`]; a segment that is not direct has
-    /// at most `carry_rows` rows.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn keep_hidden(
-        &self,
-        stream: &Stream,
-        step: DevicePtr,
-        segments: u32,
-        max_seg_rows: u32,
-        hidden: DevicePtr,
-        carry: DevicePtr,
-        carry_rows: u32,
-        d: u32,
-    ) -> Result<()> {
-        if segments == 0 || max_seg_rows == 0 {
-            return Ok(());
-        }
-        let args = Args::new().ptr(step).ptr(hidden).ptr(carry).u32(carry_rows).u32(d);
-        let grid = [max_seg_rows, segments, 1];
-        // SAFETY: the arguments match ares_draft_keep; the memory is the caller's guarantee.
-        unsafe { self.draft_keep.launch(stream, grid, [THREADS, 1, 1], 0, args) }
-    }
-
-    /// The commit of the windows of the last step, whose record with the
-    /// accepted rows is at `commit` (`segments` segments): row 0 of each
-    /// sequence's carry becomes the hidden state of its last accepted row.
-    ///
-    /// # Safety
-    ///
-    /// `commit` must address the uploaded commit record and `carry` the
-    /// carries of every slot it names, on the stream's device.
-    pub unsafe fn commit_hidden(
-        &self,
-        stream: &Stream,
-        commit: DevicePtr,
-        segments: u32,
-        carry: DevicePtr,
-        carry_rows: u32,
-        d: u32,
-    ) -> Result<()> {
-        if segments == 0 {
-            return Ok(());
-        }
-        let args = Args::new().ptr(commit).ptr(carry).u32(carry_rows).u32(d);
-        // SAFETY: the arguments match ares_draft_commit; the memory is the caller's guarantee.
-        unsafe { self.draft_commit.launch(stream, [segments, 1, 1], [THREADS, 1, 1], 0, args) }
     }
 }
