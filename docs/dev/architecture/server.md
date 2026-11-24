@@ -496,14 +496,15 @@ loaded holds no device memory. The unload compares what every device reports
 as free before and after with what the model had taken at its load, logs
 both, and warns when less came back than was taken.
 
-The prefix cache does not outlive its model. Its cells are pages of K and V
-in VRAM and its checkpoints are page-locked RAM, both the engine's, and a
-checkpoint without the pages it belongs to resumes nothing; keeping either
-across an unload would keep the memory the unload is for. A model that is
-loaded again starts with an empty cache, and the first request of a
-conversation computes its prompt again. Keeping a conversation across an
-unload needs the pages on the SSD, written as they are produced (see
-"Loading and unloading"), which is not built.
+Without `--cache` the prefix cache does not outlive its model. Its cells are
+pages of K and V in VRAM and its checkpoints are page-locked RAM, both the
+engine's, and a checkpoint without the pages it belongs to resumes nothing;
+keeping either across an unload would keep the memory the unload is for. A model
+that is loaded again starts with an empty cache, and the first request of a
+conversation computes its prompt again. With `--cache` the unload writes what is
+worth keeping of RAM and the devices to the store on the SSD before the memory
+goes, and a load of the same model file with the same formats and split resumes
+a conversation from there (see "On SSD" in [Prompt cache](prompt-cache.md)).
 
 *Endpoints.*
 

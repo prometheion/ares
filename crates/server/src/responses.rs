@@ -42,15 +42,19 @@
 //! (`generate::place_system_messages`). The items one reply returned for a
 //! turn (reasoning, message, calls) are one message of the assistant again.
 //!
-//! Anything else is refused with a 400 that names it: `input_image`,
-//! `input_file` and `input_audio` parts (input other than text is not
-//! built), tools that are not functions (`web_search`, `file_search`,
-//! `code_interpreter`, `computer_use`, `mcp`, `local_shell`, `custom` and
-//! the like) and the items they leave in a history, `prompt` templates,
-//! `top_logprobs`, `text.verbosity`, `reasoning.summary` of a given kind,
-//! the sampler's fields of the chat route (only
-//! members of this API are read here), and every member this module does not
-//! know.
+//! A message of the user may have `input_image` parts, an image given by a
+//! data URL in `image_url` (`detail` is accepted), which become `image_url`
+//! parts of the chat body.
+//!
+//! Anything else is refused with a 400 that names it: `input_file` and
+//! `input_audio` parts (input other than text and images is not built), an
+//! `input_image` elsewhere or given by `file_id`, tools that are not
+//! functions (`web_search`, `file_search`, `code_interpreter`,
+//! `computer_use`, `mcp`, `local_shell`, `custom` and the like) and the items
+//! they leave in a history, `prompt` templates, `top_logprobs`,
+//! `text.verbosity`, `reasoning.summary` of a given kind, the sampler's
+//! fields of the chat route (only members of this API are read here), and
+//! every member this module does not know.
 //!
 //! # Decisions
 //!

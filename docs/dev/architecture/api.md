@@ -422,7 +422,7 @@ events.
 | --- | --- |
 | `model`, `max_tokens` (required), `temperature`, `top_p`, `top_k`, `stream` | as on the chat route |
 | `system` | a string or text blocks: one system message |
-| `messages` | turns of `user`, `assistant` and `system`, a string or blocks. User: `text`, and `tool_result` (a string or text blocks), which becomes a message of the role `tool` where it stands. Assistant: `text`, `thinking`, `redacted_thinking`, `tool_use`. System: text; before every other turn it joins the system prompt, after one it is a user turn with its text (below) |
+| `messages` | turns of `user`, `assistant` and `system`, a string or blocks. User: `text`, `image` (a `base64` source with an `image/` media type, an `image_url` part of the chat body; a model loaded with `--mmproj` reads it), and `tool_result` (a string, or text and image blocks), which becomes a message of the role `tool` where it stands. Assistant: `text`, `thinking`, `redacted_thinking`, `tool_use`. System: text; before every other turn it joins the system prompt, after one it is a user turn with its text (below) |
 | `tools` | `name`, `description`, `input_schema` (and `type: custom`, `strict`, `eager_input_streaming`, which ask for what is always done) |
 | `tool_choice` | `auto`, `any` (the chat route's `required`), `tool` with a name, `none`; `disable_parallel_tool_use` allows one call |
 | `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; a request without it leaves it to `--reasoning`; `display: "omitted"` gives thinking blocks an empty text and a signature that carries the thinking (below), `summarized` and `updates` the thinking whole |
@@ -436,8 +436,10 @@ The text blocks of one message are joined with a line break. A result that says
 `is_error` has `Error: ` before its text, because the chat template has no
 other place for it. Everything else is refused with a 400 that names it, in
 Anthropic's shape of an error (`{"type": "error", "error": {"type",
-"message"}}`, with the status the chat route gives): `image` and `document`
-blocks (input other than text is not built), tools of a `type` that Anthropic's
+"message"}}`, with the status the chat route gives): `document` blocks (input
+other than text and images is not built), an image anywhere but in a turn of
+the user or the result of a tool, an image at a URL (images are not fetched),
+tools of a `type` that Anthropic's
 service defines or runs (`web_search_...`, `bash_...`) and the blocks they
 leave in a history, `defer_loading`, `mcp_servers`, `container`, other edits of
 `context_management` (compaction), citations, and any member the module does not know. A
@@ -592,7 +594,7 @@ response object with its output items, or as the typed events of the API.
 | --- | --- |
 | `model`, `temperature`, `top_p`, `stream` | as on the chat route |
 | `instructions` | a system message |
-| `input` | a string (one message of the user), or items: messages (`user`, `assistant`, `system`, `developer`; a string or `input_text` and `output_text` parts), `function_call`, `function_call_output` (a string or `input_text` parts), `reasoning` |
+| `input` | a string (one message of the user), or items: messages (`user`, `assistant`, `system`, `developer`; a string or `input_text` and `output_text` parts, and in a message of the user `input_image` parts with a data URL in `image_url`, `detail` accepted), `function_call`, `function_call_output` (a string or `input_text` parts), `reasoning` |
 | `tools` | functions in the shape of this API: `type: "function"`, `name`, `description`, `parameters`, `strict` (the arguments are held to the schema either way) |
 | `tool_choice` | `auto`, `none`, `required`, `{"type": "function", "name"}` |
 | `parallel_tool_calls` | as on the chat route |
@@ -625,8 +627,9 @@ the others. A template that takes a system message anywhere gets it where the
 client put it.
 
 Everything else is refused with a 400 that names it, in OpenAI's shape of an
-error, as on the chat route: `input_image`, `input_file` and `input_audio`
-parts (input other than text is not built), tools that are not functions
+error, as on the chat route: `input_file` and `input_audio` parts (input
+other than text and images is not built), an `input_image` outside a message of
+the user or one given by `file_id` (the server keeps no files), tools that are not functions
 (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `mcp`,
 `local_shell`, `custom` and the like), the items such tools leave in a
 history and a `tool_choice` that names one or a subset (`allowed_tools`),
@@ -773,19 +776,29 @@ sends was read in its source and not tried against a running Codex. The
 tests with a real model (`crates/server/tests/real_responses.rs`, the 0.8B on
 one card) pass.
 
-For a mixture of experts (`qwen4exp`) the plan is another one: where the
-layers go (`--split tensor`: both devices on every layer, `layer`: a range
-each, by default the first when each device can write the other's memory), the
-context (without `--context`, the model's own as far as VRAM holds it beside
-the fewest expert slots and the drafters), and the RAM (`--ram`, whose limit less what the engine needs is the
-tier of experts). The server reads a short text of German, English and code
-before it listens, so that the first request does not find every slot empty. It
-has no prefix cache, no `--shares`, no `--precision exact`, no `--draft-vocab`,
-no `--window` and no model drafter (`--drafters mtp`), and it does not
-speculate; asking for one of the options is an error that names it. Thinking is handled as for the
+For a mixture of experts (`qwen4exp`) the plan is another one
+(`crates/server/src/load/qwen4exp.rs`): where the layers go (`--split tensor`:
+both devices on every layer, `layer`: a range each, by default the first when
+there are two devices and each can write the other's memory), the context
+(without `--context`, the model's own: the indexer's keys of every page in VRAM,
+the K and V of the first pages up to a share of the room for expert slots, those
+of the pages beyond in page-locked RAM as the sequences grow into them; a
+context that is named lies in VRAM), and the RAM (`--ram`, whose limit less
+what the engine needs is the tier of experts, and what the tier leaves the
+prompt cache's). Before it listens the server fills the tiers of experts from
+the usage profile kept for the model file (in `--cache`, else the user's cache
+directory), or without one reads a short text of German, English and code, so
+that the first request does not find every slot empty. It has the prefix cache
+and the prompt cache on SSD as the 27B has them; it speculates only with a model
+drafter that `--drafters` names (its MTP block, from the model file or a file of
+its own, and a DFlash drafter), whose window is 4 rows by default and at most 8,
+and takes `--draft-vocab` with one. It has no `--shares` and no `--precision
+exact`; asking for either is an error that names it. Thinking is handled as for the
 27B: the model declares what its chat template says (`Model::chat_format`), so
 the reasoning of a reply comes apart from the content, in streams too, and
 `--reasoning` and the controls of a request work the same way; a reply that
 `max_tokens` cuts inside the thinking has reasoning and no content.
 
-Multimodal input is not built.
+Images are read by both models through a projector (`--mmproj`, see
+[Images](images.md)): an `image_url` part with a data URL on the chat route, an
+`image` block on Messages and an `input_image` part on Responses.

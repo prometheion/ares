@@ -30,8 +30,10 @@
 //! also the fields this API has no member for, and `max_tokens` is held to
 //! the most the model allows, as on the chat route (the `defaults` module).
 //!
-//! Blocks of a user turn: `text`, and `tool_result` (with a string or text
-//! blocks), which becomes a message of the role `tool` where it stands. Blocks
+//! Blocks of a user turn: `text`, `image` (a `base64` source, which becomes an
+//! `image_url` part of the chat body), and `tool_result` (with a string, or
+//! text and image blocks), which becomes a message of the role `tool` where it
+//! stands. Blocks
 //! of an assistant turn: `text`, `thinking`, `redacted_thinking` and
 //! `tool_use`. The text blocks of one message are joined with a line break.
 //! A system turn (a string or text blocks) before every other turn joins the
@@ -40,8 +42,9 @@
 //! message anywhere but first (Claude Code sends its environment after the
 //! first question that way, and the tokens it has left as the last turn).
 //!
-//! Anything else is refused with a 400 that names it: `image` and `document`
-//! blocks (input other than text is not built), tools of a `type` that
+//! Anything else is refused with a 400 that names it: `document` blocks
+//! (input other than text and images is not built), an image elsewhere or at
+//! a URL (images are not fetched), tools of a `type` that
 //! Anthropic's service defines or runs (`web_search_...`, `bash_...` and the
 //! like) and the blocks they leave in a history, `defer_loading`,
 //! `mcp_servers`, `container`, other edits of `context_management`
