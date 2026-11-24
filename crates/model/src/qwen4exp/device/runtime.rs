@@ -48,6 +48,7 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::board::Board;
+use super::feed::Fill;
 use super::feed::{
     Feed, Layout, MtpExperts, build_store, cpu_pool, device_slots, expert_map, places,
     plan_transit, reader,
@@ -57,6 +58,7 @@ use super::invalid;
 use super::misses::{SpanPicks, WideStats};
 use super::mtp::{MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
+use super::open::PartReport;
 use super::options::ModelOptions;
 use super::part::{
     ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, PassSizes, Pieces,
@@ -65,7 +67,6 @@ use super::part::{
 use super::placement::{Chosen, MARGIN, PartPlan, Placement, choose};
 use super::prune::{self, PruneMask};
 use super::resume::Resume;
-use super::session::{Fill, PartReport};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::blocks::far::FarPool;
 use crate::blocks::head::HeadView;
@@ -1476,21 +1477,8 @@ impl Qwen4Exp {
                 part.set_owner(&self.placement.others(c, mixer))?;
             }
         }
-        self.reports.lock().unwrap_or_else(|e| e.into_inner()).push(PartReport {
-            index,
-            device: cx.device.info().name.clone(),
-            role: part.role(),
-            layers: part.layer_range(),
-            weights: part.weight_bytes(),
-            slots: slot_bytes,
-            n_slots,
-            state_per_slot: part.state_bytes_per_slot(),
-            kv_per_1000: part.page_bytes() * 1000 / u64::from(ENTRY_CELLS),
-            keys_per_1000: part.key_page_bytes() * 1000 / u64::from(ENTRY_CELLS),
-            scratch: part.scratch_bytes(),
-            reserved: cx.ledger.reserved(),
-            upload: part.upload_time(),
-        });
+        let report = PartReport::of(&part, index, slot_bytes, n_slots, cx.ledger.reserved());
+        self.reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
         // The checkpoints of this device: what the model said it keeps of a
         // sequence here is what it copies.
         let feeds = part.ngram_layer().map_or(0, |_| ngram::saved_bytes(c.ngram.as_ref()));

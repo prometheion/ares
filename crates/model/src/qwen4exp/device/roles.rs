@@ -35,8 +35,9 @@ use ares_gguf::Gguf;
 
 use super::Error;
 use super::feed::Layout;
-use super::part::{ExpertAt, Options, Part, PartSetup, StepEnv, ngram_shape};
-use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice};
+use super::open;
+use super::part::{ExpertAt, Options, Part, StepEnv, ngram_shape};
+use super::placement::{DeviceMemory, Placement, TensorChoice};
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
@@ -185,7 +186,7 @@ fn time_choice(
 ) -> Result<RoleTime, Error> {
     let started = Instant::now();
     let tensor = placement.tensor.as_ref().ok_or_else(|| invalid("a trial of no tensor split"))?;
-    let (mixer, worker) = (tensor.mixer, 1 - tensor.mixer);
+    let mixer = tensor.mixer;
     let mut ledgers: Vec<Ledger> = devices
         .iter()
         .zip(memory)
@@ -193,23 +194,10 @@ fn time_choice(
         .collect();
     let mut parts = Vec::with_capacity(2);
     for (index, device) in devices.iter().enumerate() {
-        let PartPlan { role, first, shares, head } = placement.part(c, index);
-        let mut part = Part::open(
-            c,
-            w,
-            opts,
-            PartSetup { index, role, first, shares, head, device, ledger: &mut ledgers[index] },
-        )?;
-        part.set_token_rows(table.clone());
-        parts.push(part);
+        let ledger = &mut ledgers[index];
+        parts.push(open::open_part(c, w, opts, placement, index, device, ledger, table)?);
     }
-    let ports = |part: &Part| part.ports().ok_or_else(|| invalid("a shared part without ports"));
-    let cores = |part: &Part| (0..c.n_layer).map(|i| part.has_core(i)).collect::<Vec<_>>();
-    let (to_mixer, to_worker) = (ports(&parts[mixer])?, ports(&parts[worker])?);
-    let (mixer_cores, worker_cores) = (cores(&parts[mixer]), cores(&parts[worker]));
-    parts[mixer].set_peer(to_worker, worker_cores, None)?;
-    parts[worker].set_peer(to_mixer, mixer_cores, None)?;
-    parts[mixer].set_owner(&placement.others(c, mixer))?;
+    open::connect_all(&mut parts, placement, c)?;
 
     // The pools of K/V, and every expert of a layer in one of a few slots of
     // zeros: expert `e` in slot `e` modulo their number.

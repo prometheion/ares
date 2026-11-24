@@ -27,7 +27,6 @@ use super::misses::WideStats;
 use super::part::ExpertAt;
 use super::placement::Placement;
 use super::prune::{PruneMask, PruneStats};
-use super::session::Fill;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{Moe, MtpWeights, Weights};
 
@@ -351,6 +350,17 @@ pub(super) fn cpu_pool(workers: Option<usize>, reserved: usize) -> Result<CpuPoo
     };
     CpuPool::new(&placement, Duration::from_millis(20))
         .map_err(|e| invalid(format!("the CPU workers of the expert store: {e}")))
+}
+
+/// What filling the tiers took.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fill {
+    /// Experts uploaded to VRAM slots.
+    pub uploads: u64,
+    /// Bytes read from the file.
+    pub read_bytes: u64,
+    /// How long it took.
+    pub time: Duration,
 }
 
 /// The expert store and the route records that feed it.
@@ -871,11 +881,6 @@ impl Feed {
     /// What wide steps found and waited for since the last call.
     pub(super) fn take_wide(&mut self) -> WideStats {
         std::mem::take(&mut self.wide)
-    }
-
-    /// Whether every route record of the `enqueued` layers is with the store.
-    pub(super) fn is_followed(&self, enqueued: &[usize]) -> bool {
-        self.followed == enqueued
     }
 
     /// The step has ended on the devices.

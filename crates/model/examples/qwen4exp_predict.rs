@@ -201,6 +201,7 @@ fn record(args: &HashMap<String, String>) -> Result<(), AnyError> {
                             };
                     }
                 }
+                drop(store);
                 let mut keep = Keep {
                     dims,
                     rows: tokens.len(),

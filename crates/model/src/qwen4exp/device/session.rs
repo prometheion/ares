@@ -1,27 +1,31 @@
-//! A model on its devices, driven one step at a time from one host thread.
+//! A model on its devices, driven one step at a time from one host thread:
+//! how the tests and the tools step it by hand and look at every layer.
 //!
-//! The session owns what a step needs besides the parts: the expert store
-//! with its tiers, the reader of the n-gram table, the hand-over between
-//! devices, and the least bookkeeping a few sequences need (every sequence
-//! owns its pages from the start). A step is enqueued layer by layer; between
-//! layers and while the devices run, the session follows the route records
-//! that arrive on the parts' side streams and lets the store bring the
-//! experts a layer picked that are in no slot, for which the layer's kernels
-//! wait on the device. The host itself waits for the device in one place per
-//! step: its end.
+//! The parts open through the stages every opening goes through (`open.rs`)
+//! and a step drives them through the runtime's own [`Flow`]: the lead over
+//! the route records, the rows of the n-gram table, the rounds of a wide
+//! step's missed experts and the waits all serve the expert store as the
+//! runtime's device threads do. What the session does itself is what a hand
+//! needs: one host thread for every part (by layers one part after the other,
+//! the residual handed over in its own lanes; on two devices that share every
+//! layer each layer on both, the mixer first), every sequence owning its pages
+//! from the start, the tier in RAM locked whole, the experts of two devices
+//! divided by a recorded routing when asked ([`SessionOptions::routing`]), a
+//! hook that sees every layer ([`Probe`]) and the logits on the host.
 //!
-//! Two devices that can write each other's memory work on every layer
-//! together ([`Spread`]): the session then enqueues each layer on both, the
-//! mixer first, and the devices exchange what they need on their own. The
-//! expert store sees every layer once per device, with the experts that
-//! device owns.
+//! It is not a face over the runtime's executor, as the 27B's session is: the
+//! probe stops both devices at every layer and reads both parts, which the
+//! runtime's device threads could only do with a barrier between them inside
+//! the production step, and the tests compare the logits, which the runtime
+//! samples on the device.
 //!
 //! The rows of the n-gram table that a token needs depend on the token and
 //! the two before it, so they are asked for the moment a step has picked its
 //! token ([`Session::expect`] for a caller that knows better), not when the
 //! next step reaches the layer that reads them.
 
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ares_core::Ledger;
@@ -31,39 +35,26 @@ use ares_cuda::{
 };
 use ares_gguf::Gguf;
 use ares_io::Reader;
+use ares_runtime::PinnedRam;
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertProfile, ExpertStore, FillStats, HostRegion, Serve, StoreConfig, StorePlan,
-    StoreStats,
+    CudaSlots, ExpertProfile, ExpertStore, FillStats, HostRegion, StorePlan, StoreStats,
 };
 
 use super::Error;
-use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, places, plan_transit};
-use super::load::Role;
-use super::misses::{Misses, Progress, WideStats};
+use super::feed::{Feed, Fill, Layout, build_store, cpu_pool, device_slots, places};
+use super::flow::{Flow, Routing, Turn, wide_layer};
+use super::misses::WideStats;
 use super::ngram::NgramFeed;
+use super::open::{self, PartReport};
 use super::options::ModelOptions;
-use super::part::{Part, PartSetup, StepEnv};
-use super::placement::{Chosen, PartPlan, Placement, choose, ram_tier_bytes};
-use super::prune::{self, PruneMask, PruneStats};
+use super::part::{Part, StepEnv};
+use super::placement::{Chosen, Placement, choose, ram_tier_bytes};
+use super::prune::{PruneMask, PruneStats};
 use super::usage;
 use crate::blocks::far::FarPool;
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
-
-/// How many layers the host enqueues ahead of the last layer whose route
-/// record it has handled.
-///
-/// A step is not enqueued blind to its end: a layer that misses an expert
-/// makes the device wait for the host, and the driver's queue of commands for
-/// a device is finite. A host that goes on enqueuing the rest of the step (a
-/// layer is about 30 launches, a step of 48 layers 1 300) fills that queue,
-/// blocks inside a launch, and can then no longer bring the expert the device
-/// waits for. Seen as a step that never ends, on one device from the first
-/// prompt step on, on two devices with a few hundred timed events more per
-/// step. The host enqueues much faster than a device computes, so staying
-/// this far ahead never leaves a device without work.
-const LEAD_LAYERS: usize = 6;
 
 /// The choices of a session: the model's, and how the session itself sets
 /// up the tier in RAM and divides the experts of two devices, which the
@@ -158,46 +149,6 @@ pub trait Probe {
     fn after(&mut self, layer: usize, out: LayerOut<'_>);
 }
 
-/// What filling the tiers took.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Fill {
-    /// Experts uploaded to VRAM slots.
-    pub uploads: u64,
-    /// Bytes read from the file.
-    pub read_bytes: u64,
-    /// How long it took.
-    pub time: Duration,
-}
-
-/// The memory of one part, for reports.
-#[derive(Clone, Debug)]
-pub struct PartReport {
-    /// The part's index in the placement.
-    pub index: usize,
-    /// The device's name.
-    pub device: String,
-    /// What the part is to the residual streams.
-    pub role: Role,
-    /// The layers on it.
-    pub layers: std::ops::Range<usize>,
-    /// Bytes of dense weights.
-    pub weights: u64,
-    /// Bytes of expert slots, and how many slots that is.
-    pub slots: u64,
-    pub n_slots: usize,
-    /// Bytes of recurrent state per sequence.
-    pub state_per_slot: u64,
-    /// Bytes of K, V and pooled keys per 1000 cells, and of the keys alone.
-    pub kv_per_1000: u64,
-    pub keys_per_1000: u64,
-    /// Bytes of scratch, route records and step inputs.
-    pub scratch: u64,
-    /// Everything the session reserved on the device.
-    pub reserved: u64,
-    /// How long the upload of the dense weights took.
-    pub upload: Duration,
-}
-
 /// What every part sees of a step.
 struct Step<'a> {
     record: &'a StepRecord,
@@ -267,6 +218,24 @@ fn upload_time(device: &Device, bytes: u64) -> Result<Duration, Error> {
     Ok(started.elapsed() / 8)
 }
 
+/// The expert store of a session, held while it is looked at: no step runs
+/// meanwhile.
+pub struct StoreRef<'a>(MutexGuard<'a, Feed>);
+
+impl std::fmt::Debug for StoreRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreRef").finish_non_exhaustive()
+    }
+}
+
+impl Deref for StoreRef<'_> {
+    type Target = ExpertStore<CudaSlots>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.store
+    }
+}
+
 /// A model on its devices, stepped by hand.
 pub struct Session<'g> {
     c: Config,
@@ -279,19 +248,17 @@ pub struct Session<'g> {
     done: Vec<Event>,
     probe_done: Vec<Event>,
     parts: Vec<Part>,
+    /// Per part: who routes for it and which experts it computes.
+    routing: Vec<Routing>,
     /// The pools of K/V and keys of every part, and the K and V of the pages
     /// beyond VRAM.
     pools: Vec<DeviceBuffer>,
     _far: Vec<FarPool>,
     ledgers: Vec<Ledger>,
-    feed: Feed,
+    flow: Flow,
     lanes: Vec<Lane>,
     _mesh: Option<Mesh>,
-    ngram: NgramFeed,
     step: u32,
-    step_rows: u32,
-    /// Per part: its layers of the running step that were enqueued.
-    enqueued: Vec<usize>,
     picks: Vec<u32>,
     n_out: usize,
     last: StepTime,
@@ -321,8 +288,8 @@ impl<'g> Session<'g> {
         if devices.is_empty() {
             return Err(invalid("a session needs a device"));
         }
-        let Chosen { mut placement, speeds, memory } = choose(gguf, c, w, &devices, &opts.model)?;
-
+        let model = &opts.model;
+        let Chosen { mut placement, speeds, memory } = choose(gguf, c, w, &devices, model)?;
         let mut ledgers: Vec<Ledger> = devices
             .iter()
             .zip(&memory)
@@ -334,28 +301,17 @@ impl<'g> Session<'g> {
         let table = Arc::new(HostTable::mapped(Arc::new(mapped), TOKEN_EMBD)?);
         let mut parts = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter().enumerate() {
-            let PartPlan { role, first, shares, head } = placement.part(c, index);
-            let mut part = Part::open(
+            let ledger = &mut ledgers[index];
+            parts.push(open::open_part(
                 c,
                 w,
-                &opts.model.part,
-                PartSetup { index, role, first, shares, head, device, ledger: &mut ledgers[index] },
-            )?;
-            part.set_token_rows(table.clone());
-            parts.push(part);
-        }
-        if let Some(tensor) = &placement.tensor {
-            // Each part learns where the other receives, the mixer which
-            // experts are the worker's.
-            let (mixer, worker) = (tensor.mixer, 1 - tensor.mixer);
-            let ports = |part: &Part| {
-                part.ports().ok_or_else(|| invalid("a part that shares layers has no ports"))
-            };
-            let (to_mixer, to_worker) = (ports(&parts[mixer])?, ports(&parts[worker])?);
-            let cores = |part: &Part| (0..c.n_layer).map(|i| part.has_core(i)).collect::<Vec<_>>();
-            let (mixer_cores, worker_cores) = (cores(&parts[mixer]), cores(&parts[worker]));
-            parts[mixer].set_peer(to_worker, worker_cores, None)?;
-            parts[worker].set_peer(to_mixer, mixer_cores, None)?;
+                &model.part,
+                &placement,
+                index,
+                device,
+                ledger,
+                &table,
+            )?);
         }
 
         // The pools of K/V and keys, whose pages every sequence slot owns, and
@@ -363,7 +319,7 @@ impl<'g> Session<'g> {
         // RAM limit to keep.
         let mut pools = Vec::with_capacity(parts.len());
         let mut far = Vec::new();
-        let ram = ares_runtime::PinnedRam::new(u64::MAX / 4);
+        let ram = PinnedRam::new(u64::MAX / 4);
         for (index, part) in parts.iter_mut().enumerate() {
             ledgers[index].reserve("qwen4exp K/V and key pools", part.pool_bytes())?;
             pools.push(DeviceBuffer::new(&devices[index], part.pool_bytes())?);
@@ -378,83 +334,49 @@ impl<'g> Session<'g> {
         }
 
         // The expert store: slots from what the placement left, a tier in
-        // page-locked RAM, reads from the file.
-        // When the devices share the layers, the store sees every layer once
-        // per device: the experts of the layer that the device owns.
+        // page-locked RAM, reads from the file. When the devices share the
+        // layers, the store sees every layer once per device: the experts of
+        // the layer that the device owns.
         let (layout, map) = Layout::new(gguf, c, w, &placement, None)?;
-        let store_layers = c.n_layer * layout.per_layer;
         let reader = Reader::open_gguf(gguf, ares_io::Config::default())?;
         let vram: Vec<u64> = placement
             .devices
             .iter()
-            .map(|d| d.slots.min(opts.model.slot_bytes.unwrap_or(u64::MAX)))
+            .map(|d| d.slots.min(model.slot_bytes.unwrap_or(u64::MAX)))
             .collect();
         let ram_bytes = ram_tier_bytes(opts.ram_tier, layout.ram_wanted(vram.iter().sum()));
-        let mut config = StoreConfig::new(
-            opts.model.part.max_rows.min(MAX_BATCH),
-            c.experts.used as u32,
-            vram,
-            ram_bytes,
-        );
-        if let Some(reserve) = opts.model.reserve {
-            config.vram_reserve = reserve;
-        }
-        config.cpu_serves = opts.model.serve != Serve::Stream;
-        if opts.model.part.max_rows > MAX_BATCH {
-            // What each device has left beside its parts, less what the
-            // store keeps besides its slots: its tables, the host shares and
-            // the margin `Placement` counts.
-            let tables = 4 * layout.specs.len() as u64 * c.experts.count as u64;
-            let shares = if opts.model.serve == Serve::Stream {
-                0
-            } else {
-                layout.specs.len() as u64
-                    * layout.shapes[0]
-                        .host_share_bytes(opts.model.part.max_rows.min(MAX_BATCH))
-                        .next_multiple_of(16)
-            };
-            let room: Vec<u64> = ledgers
-                .iter()
-                .map(|l| {
-                    l.free()
-                        .saturating_sub(super::placement::MARGIN + tables + shares)
-                        .min(opts.model.slot_bytes.unwrap_or(u64::MAX))
-                })
-                .collect();
-            plan_transit(&mut config, &layout, &reader, opts.model.transit, &room);
-        }
+        let room: Vec<u64> =
+            ledgers.iter().map(|l| open::slot_room(l.free(), &layout, c, model)).collect();
+        let config = open::store_config(c, model, &layout, &reader, vram, ram_bytes, &room);
         let reserve = config.vram_reserve;
         let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)?;
-        if let Some((times, mixer)) = speeds {
+        if let Some((times, mixer)) = speeds
+            && let Some(routing) = opts.routing.as_ref().filter(|r| r.len() == c.n_layer)
+        {
             // With a recorded routing the experts are divided by it: each
             // device gets the share of the picks that its speed is of both,
             // and what a step can miss is owned where an upload is faster.
-            if let Some(routing) = opts.routing.as_ref().filter(|r| r.len() == c.n_layer) {
-                let slots: Vec<Vec<usize>> = (0..layout.per_layer)
-                    .map(|device| {
-                        (0..c.n_layer)
-                            .map(|layer| {
-                                plan.slots(layout.store_layer(device, layer))
-                                    .0
-                                    .saturating_sub(reserve)
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let worker = 1 - mixer;
-                let worker_picks = opts
-                    .worker_picks
-                    .unwrap_or(times[mixer] / (times[0] + times[1]).max(1e-9))
-                    .clamp(0.0, 1.0);
-                let mut picks = [1.0 - worker_picks; 2];
-                picks[worker] = worker_picks;
-                let expert = layout.shapes[0].slot_bytes().unwrap_or(1 << 20);
-                let uploads =
-                    [upload_time(&devices[0], expert)?, upload_time(&devices[1], expert)?];
-                placement.assign(routing, &slots, picks, usize::from(uploads[1] < uploads[0]));
-            }
-            parts[mixer].set_owner(&placement.others(c, mixer))?;
+            let slots: Vec<Vec<usize>> = (0..layout.per_layer)
+                .map(|device| {
+                    (0..c.n_layer)
+                        .map(|layer| {
+                            plan.slots(layout.store_layer(device, layer)).0.saturating_sub(reserve)
+                        })
+                        .collect()
+                })
+                .collect();
+            let worker = 1 - mixer;
+            let worker_picks = opts
+                .worker_picks
+                .unwrap_or(times[mixer] / (times[0] + times[1]).max(1e-9))
+                .clamp(0.0, 1.0);
+            let mut picks = [1.0 - worker_picks; 2];
+            picks[worker] = worker_picks;
+            let expert = layout.shapes[0].slot_bytes().unwrap_or(1 << 20);
+            let uploads = [upload_time(&devices[0], expert)?, upload_time(&devices[1], expert)?];
+            placement.assign(routing, &slots, picks, usize::from(uploads[1] < uploads[0]));
         }
+        open::connect_all(&mut parts, &placement, c)?;
         let mut pinned = Ledger::new("pinned RAM", ram_bytes + (1 << 30));
         let mut slots = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter().enumerate() {
@@ -464,43 +386,40 @@ impl<'g> Session<'g> {
                 &mut pinned,
                 &plan.device_pools(index),
                 &layout,
-                opts.model.serve,
-                opts.model.part.max_rows.min(MAX_BATCH),
+                model.serve,
+                model.part.max_rows.min(MAX_BATCH),
             )?);
         }
-        debug_assert_eq!(plan.n_layers(), store_layers);
         let region = HostRegion::pinned(&devices[0], &mut pinned, plan.ram_bytes())?;
         // One core stays with the thread that drives the step.
-        let cpu = (opts.model.serve != Serve::Stream)
-            .then(|| cpu_pool(opts.model.cpu_workers, 1).map(|pool| (pool, opts.model.serve)))
+        let cpu = (model.serve != ares_runtime::expert_store::Serve::Stream)
+            .then(|| cpu_pool(model.cpu_workers, 1).map(|pool| (pool, model.serve)))
             .transpose()?;
         let store = build_store(plan, &layout, map, reader, slots, region, cpu)?;
         for (index, part) in parts.iter_mut().enumerate() {
             let layers = part.layer_range();
             part.set_experts(places(&store, layers, &layout, index))?;
         }
-        let boards = parts.iter().map(Part::board).collect();
-        let firsts = parts.iter().map(|part| part.layer_range().start).collect();
-        let mut feed = Feed::new(store, boards, firsts, layout, c.experts.used as u32);
-        feed.set_read_ahead(opts.model.read_ahead);
-        if opts.model.part.prune.is_some() {
+        if model.part.prune.is_some() {
             pinned
                 .reserve("qwen4exp pruning mask", PruneMask::bytes(c.n_layer, c.experts.count))?;
-            let mask = Arc::new(PruneMask::new(&devices[0], c.n_layer, c.experts.count)?);
+        }
+        let boards = parts.iter().map(Part::board).collect();
+        let (feed, mask) =
+            open::open_feed(store, boards, &placement, &layout, c, model, &devices[0])?;
+        if let Some(mask) = mask {
             for part in &mut parts {
                 part.set_prune_mask(mask.clone());
             }
-            feed.set_prune(mask, prune::owners(&placement, c), c.experts.count);
         }
-        if placement.tensor.is_some() {
-            feed.set_owners(placement.owners(c));
-        }
-
-        let ngram = NgramFeed::open(gguf, c, opts.model.row_cache, opts.model.part.max_slots)?;
+        let ngram = NgramFeed::open(gguf, c, model.row_cache, model.part.max_slots)?;
+        let used = c.experts.used as u32;
+        let own = model.part.own_rows();
+        let flow = Flow::new(feed, ngram, parts.len(), model.stall, own, used, ram);
 
         let wide = c.wide() as u32;
         let (mesh, lanes) = if devices.len() > 1 && placement.tensor.is_none() {
-            let values = opts.model.part.max_rows * wide;
+            let values = model.part.max_rows * wide;
             let mesh = Mesh::new(&devices, values)?;
             let lanes = (1..devices.len())
                 .map(|to| Lane::new(&mesh, to - 1, to, 2, values))
@@ -512,7 +431,7 @@ impl<'g> Session<'g> {
         let events = || -> Result<Vec<Event>, Error> {
             devices.iter().map(|d| Event::new(d).map_err(Error::from)).collect()
         };
-        let n_parts = parts.len();
+        let routing = (0..parts.len()).map(|index| Routing::of(&placement, c, index)).collect();
         Ok(Self {
             c: c.clone(),
             _weights: w,
@@ -523,16 +442,14 @@ impl<'g> Session<'g> {
             placement,
             devices,
             parts,
+            routing,
             pools,
             _far: far,
             ledgers,
-            feed,
+            flow,
             lanes,
             _mesh: mesh,
-            ngram,
             step: 0,
-            step_rows: 0,
-            enqueued: vec![0; n_parts],
             picks: Vec::new(),
             n_out: 0,
             last: StepTime::default(),
@@ -549,60 +466,48 @@ impl<'g> Session<'g> {
         &self.parts
     }
 
-    /// The expert store.
-    pub fn store(&self) -> &ExpertStore<CudaSlots> {
-        &self.feed.store
+    /// The expert store. No step runs while it is held.
+    pub fn store(&self) -> StoreRef<'_> {
+        StoreRef(self.flow.lock_feed())
     }
 
     /// What wide steps found missing and waited for since the last call.
     pub fn take_wide_stats(&mut self) -> WideStats {
-        self.feed.take_wide()
+        self.flow.lock_feed().take_wide()
     }
 
     /// What the store counted since the last call.
     pub fn take_store_stats(&mut self) -> StoreStats {
-        self.feed.store.take_stats()
+        self.flow.lock_feed().store.take_stats()
     }
 
-    /// What the routers pruned since the last call (`SessionOptions::part`'s
-    /// `prune`).
+    /// What the routers pruned since the last call (the `prune` of the
+    /// parts' options).
     pub fn take_prune_stats(&mut self) -> PruneStats {
-        self.feed.take_prune()
+        self.flow.lock_feed().take_prune()
     }
 
     /// Whether the steps from the next on prune, for a session opened with
     /// pruning (they do until told not to): a measurement reads the prompt the
     /// same way for every rule.
     pub fn set_pruning(&mut self, on: bool) {
-        self.feed.set_pruning(on);
+        self.flow.lock_feed().set_pruning(on);
     }
 
     /// The memory of every part.
     pub fn report(&self) -> Vec<PartReport> {
+        let feed = self.flow.lock_feed();
+        let layout = feed.layout();
         self.parts
             .iter()
             .enumerate()
             .map(|(index, part)| {
-                let layers = part.layer_range();
-                let per_1000 = |bytes: u64| bytes * 1000 / u64::from(ares_cuda::ENTRY_CELLS);
-                PartReport {
-                    index,
-                    device: part.device().info().name.clone(),
-                    role: part.role(),
-                    n_slots: layers
-                        .clone()
-                        .map(|l| self.feed.store.slots(self.store_layer(index, l)).0)
-                        .sum(),
-                    layers,
-                    weights: part.weight_bytes(),
-                    slots: self.placement.devices[index].slots,
-                    state_per_slot: part.state_bytes_per_slot(),
-                    kv_per_1000: per_1000(part.page_bytes()),
-                    keys_per_1000: per_1000(part.key_page_bytes()),
-                    scratch: part.scratch_bytes(),
-                    reserved: self.ledgers[index].reserved(),
-                    upload: part.upload_time(),
-                }
+                let n_slots = part
+                    .layer_range()
+                    .map(|l| feed.store.slots(layout.store_layer(index, l)).0)
+                    .sum();
+                let slots = self.placement.devices[index].slots;
+                PartReport::of(part, index, slots, n_slots, self.ledgers[index].reserved())
             })
             .collect()
     }
@@ -610,23 +515,18 @@ impl<'g> Session<'g> {
     /// The slots of the experts' tier in host memory, over all layers.
     pub fn ram_slots(&self) -> usize {
         let per_layer = if self.placement.tensor.is_some() { self.parts.len() } else { 1 };
-        (0..self.c.n_layer * per_layer).map(|at| self.feed.store.slots(at).1).sum()
-    }
-
-    /// The store's number for the experts of `layer` that the part `part`
-    /// owns: the layer itself when the model is split by layers.
-    fn store_layer(&self, part: usize, layer: usize) -> usize {
-        self.feed.layout().store_layer(part, layer)
+        let feed = self.flow.lock_feed();
+        (0..self.c.n_layer * per_layer).map(|at| feed.store.slots(at).1).sum()
     }
 
     /// The cell the next row of the sequence in `slot` takes.
     pub fn position(&self, slot: u32) -> u32 {
-        self.ngram.position(slot)
+        self.flow.lock_ngram().position(slot)
     }
 
     /// Starts the sequence in `slot` over: its next row is cell 0.
     pub fn restart(&mut self, slot: u32) -> Result<(), Error> {
-        self.ngram.restart(slot)
+        self.flow.lock_ngram().restart(slot)
     }
 
     /// Seeds the store's heat with a usage `profile` of the model and fills
@@ -638,7 +538,7 @@ impl<'g> Session<'g> {
         &mut self,
         profile: &ExpertProfile,
     ) -> Result<(FillStats, Duration), Error> {
-        let feed = &mut self.feed;
+        let mut feed = self.flow.lock_feed();
         let layout = feed.layout().clone();
         Ok(usage::seed_and_fill(&mut feed.store, &layout, &self.placement, profile)?)
     }
@@ -649,118 +549,12 @@ impl<'g> Session<'g> {
     /// moves any more.
     pub fn fill(&mut self, experts_of: &mut dyn FnMut(usize) -> Vec<u32>) -> Result<Fill, Error> {
         let placement = &self.placement;
-        self.feed.fill(
+        self.flow.lock_feed().fill(
             self.c.n_layer,
             self.c.experts.count,
             &|layer, expert| placement.owner(layer, expert),
             experts_of,
         )
-    }
-
-    /// Hands the route records that have arrived to the store and lets the
-    /// store and the reads of table rows work. Never waits.
-    fn pump(&mut self) -> Result<(), Error> {
-        self.feed.pump(&self.enqueued)?;
-        self.ngram.poll();
-        Ok(())
-    }
-
-    /// The most layers any part is enqueued ahead of its route records.
-    fn lead(&self) -> usize {
-        self.enqueued.iter().zip(self.feed.followed()).map(|(e, f)| e - f).max().unwrap_or(0)
-    }
-
-    /// Spins until `event` has happened on its device, following the route
-    /// records meanwhile.
-    fn wait(&mut self, device: usize, probe: bool) -> Result<(), Error> {
-        let started = Instant::now();
-        loop {
-            let event = if probe { &self.probe_done[device] } else { &self.done[device] };
-            if event.is_done()? {
-                return Ok(());
-            }
-            self.pump()?;
-            self.watch(started, "a device ran the step")?;
-            std::hint::spin_loop();
-        }
-    }
-
-    /// The experts of layer `layer` of `devices` in a wide step: enqueues the first rounds,
-    /// then serves the store until the misses are brought and computed.
-    fn wide_layer(
-        &mut self,
-        step: &Step<'_>,
-        layer: usize,
-        fetched: &Option<Vec<u8>>,
-        devices: &[usize],
-    ) -> Result<(), Error> {
-        let mixer = self.placement.tensor.as_ref().map(|t| t.mixer);
-        let owners: Vec<usize> =
-            (0..self.c.experts.count as u32).map(|e| self.placement.owner(layer, e)).collect();
-        let owned =
-            |device: usize, expert: u32| mixer.is_none() || owners[expert as usize] == device;
-        let started = Instant::now();
-        let mut misses = Vec::with_capacity(devices.len());
-        for &device in devices {
-            let env = step_env!(self, step, device, fetched, None);
-            let source = mixer.filter(|m| *m != device).map(|m| self.parts[m].board());
-            misses.push(Misses::begin(
-                &mut self.parts[device],
-                &env,
-                &self.feed,
-                device,
-                layer,
-                source,
-                &|expert| owned(device, expert),
-            )?);
-        }
-        loop {
-            let mut done = true;
-            for (misses, &device) in misses.iter_mut().zip(devices) {
-                let env = step_env!(self, step, device, fetched, None);
-                let progress = misses.advance(
-                    &mut self.parts[device],
-                    &env,
-                    &mut self.feed,
-                    true,
-                    &|expert| owned(device, expert),
-                )?;
-                done &= progress == Progress::Done;
-            }
-            if done {
-                return Ok(());
-            }
-            self.pump()?;
-            self.watch(started, "the experts of a wide step were brought")?;
-            std::hint::spin_loop();
-        }
-    }
-
-    /// Hands every route record of the layers enqueued so far to the store,
-    /// waiting for those that have not arrived.
-    fn follow(&mut self) -> Result<(), Error> {
-        let started = Instant::now();
-        while !self.feed.is_followed(&self.enqueued) {
-            self.pump()?;
-            self.watch(started, "route records were on their way")?;
-        }
-        Ok(())
-    }
-
-    /// An error when the session has waited since `started` for longer than
-    /// a step may stand still, with what it knows of the step.
-    fn watch(&self, started: Instant, what: &str) -> Result<(), Error> {
-        if started.elapsed() < self.opts.model.stall {
-            return Ok(());
-        }
-        let done: Vec<bool> = self.done.iter().map(|e| e.is_done().unwrap_or(false)).collect();
-        Err(invalid(format!(
-            "step {} of {} rows stood still for {:.0?} while {what}: {}, devices done: {done:?}",
-            self.step,
-            self.step_rows,
-            self.opts.model.stall,
-            self.feed.standing_still(&self.enqueued),
-        )))
     }
 
     /// Runs one step with the rows of `rows` and returns the most likely
@@ -783,7 +577,7 @@ impl<'g> Session<'g> {
     }
 
     fn run(&mut self, rows: &[Rows<'_>], probe: Option<&mut dyn Probe>) -> Result<(), Error> {
-        if self.ngram.has_windows() {
+        if self.flow.lock_ngram().has_windows() {
             return Err(invalid("the draft windows of the last step were not settled"));
         }
         let started = Instant::now();
@@ -808,7 +602,7 @@ impl<'g> Session<'g> {
                 row0,
                 n_rows: count,
                 slot: part.slot,
-                pos0: self.ngram.position(part.slot) as i32,
+                pos0: self.position(part.slot) as i32,
                 direct: part.direct,
             });
             match part.wanted {
@@ -826,14 +620,27 @@ impl<'g> Session<'g> {
         // The rows of the table: those asked for when the tokens were first
         // known, when these are the tokens; otherwise they are read now.
         let asked: Vec<(u32, &[u32])> = rows.iter().map(|p| (p.slot, p.tokens)).collect();
-        self.ngram.ask(&asked)?;
+        self.flow.lock_ngram().ask(&asked)?;
         let prepared = Instant::now();
         let mut waited_rows = Duration::ZERO;
 
+        // The step begins for the store, as the runtime's does: its windows
+        // verify drafts (no row is worth less than its expert here).
         self.step += 1;
-        self.step_rows = dims.n_rows;
-        self.enqueued.fill(0);
-        self.feed.begin_step(dims.n_rows)?;
+        let windows: Vec<(u32, u32)> =
+            segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect();
+        for (index, stream) in self.streams.iter().enumerate() {
+            let windows = Some((windows.as_slice(), None));
+            self.flow.begin(
+                u64::from(self.step),
+                dims.n_rows,
+                windows,
+                &[],
+                index,
+                stream,
+                None,
+            )?;
+        }
         // The exchanges between a mixer and its worker are numbered through
         // the steps: eight per layer.
         let per_step = 8 * (self.c.n_layer as u32 + 1);
@@ -852,7 +659,7 @@ impl<'g> Session<'g> {
         // The device with the head ends the step with the logits.
         let head = self.parts.iter().position(|part| part.has_head());
         if let Some(head) = head {
-            self.wait(head, false)?;
+            self.flow.wait_for(&self.done[head], "a device ran the step")?;
         }
 
         // The picks, and where the sequences are now.
@@ -867,11 +674,14 @@ impl<'g> Session<'g> {
                 self.picks.push(best.0 as u32);
             }
         }
-        for part in rows {
-            if part.direct {
-                self.ngram.advance(part.slot, part.tokens);
-            } else {
-                self.ngram.hold(part.slot, part.tokens);
+        {
+            let mut ngram = self.flow.lock_ngram();
+            for part in rows {
+                if part.direct {
+                    ngram.advance(part.slot, part.tokens);
+                } else {
+                    ngram.hold(part.slot, part.tokens);
+                }
             }
         }
         // Every sequence most likely goes on with the token it just picked:
@@ -887,12 +697,12 @@ impl<'g> Session<'g> {
             self.expect(&next)?;
         }
 
-        for device in 0..self.parts.len() {
-            self.wait(device, false)?;
+        for (index, done) in self.done.iter().enumerate() {
+            self.flow.wait_for(done, "a device ran the step")?;
+            self.flow.follow(index)?;
         }
-        self.follow()?;
-        self.feed.end_step()?;
         for part in &mut self.parts {
+            self.flow.finish(true)?;
             part.flush_profile()?;
         }
         let ended = Instant::now();
@@ -903,6 +713,21 @@ impl<'g> Session<'g> {
             enqueue: (enqueued - prepared).saturating_sub(waited_rows),
             wait: ended - enqueued,
         };
+        Ok(())
+    }
+
+    /// Waits for the rows of the n-gram table of the step the first time a
+    /// layer needs them, and for how long into `waited`.
+    fn fetch_rows(
+        flow: &Flow,
+        fetched: &mut Option<Vec<u8>>,
+        waited: &mut Duration,
+    ) -> Result<(), Error> {
+        if fetched.is_none() {
+            let waiting = Instant::now();
+            *fetched = Some(flow.await_rows()?);
+            *waited = waiting.elapsed();
+        }
         Ok(())
     }
 
@@ -926,7 +751,6 @@ impl<'g> Session<'g> {
                 inbound =
                     Some(unsafe { self.lanes[device - 1].receive(&self.streams[device], parcel)? });
             }
-            self.feed.store.device_mut(device).fence(&self.streams[device])?;
             self.parts[device].begin(&step_env!(self, step, device, fetched, inbound))?;
             if let Some(parcel) = parcel.take() {
                 self.lanes[device - 1].release(&self.streams[device], parcel)?;
@@ -934,37 +758,27 @@ impl<'g> Session<'g> {
             inbound = None;
             let first_layer = self.parts[device].layer_range().start;
             for i in 0..self.parts[device].n_layers() {
-                if self.parts[device].ngram_layer() == Some(i) && fetched.is_none() {
-                    let waiting = Instant::now();
-                    self.await_rows()?;
-                    *waited_rows = waiting.elapsed();
-                    fetched = Some(self.ngram.rows()?.to_vec());
+                if self.parts[device].ngram_layer() == Some(i) {
+                    Self::fetch_rows(&self.flow, &mut fetched, waited_rows)?;
                 }
                 if let Some(probe) = probe.as_deref_mut() {
-                    self.parts[device].flush(&step_env!(self, step, device, fetched, inbound))?;
-                    self.probe_done[device].record(&self.streams[device])?;
-                    self.wait(device, true)?;
+                    self.settle(step, &fetched, &[device])?;
                     if let Some(r) = probe.before(first_layer + i) {
                         self.parts[device].write_residual(&r)?;
                     }
                 }
-                let held = Instant::now();
-                while self.lead() >= LEAD_LAYERS {
-                    self.pump()?;
-                    self.watch(held, "the host held back the next layer")?;
-                }
-                self.parts[device]
-                    .enqueue_layer(&step_env!(self, step, device, fetched, inbound), i)?;
+                let env = step_env!(self, step, device, fetched, inbound);
+                let part = &mut self.parts[device];
+                self.flow.enqueue_layer(part, device, &env, i)?;
                 if dims.n_rows > MAX_BATCH {
-                    self.wide_layer(step, i, &fetched, &[device])?;
+                    let routing = &self.routing[device];
+                    let turn = Turn { part, index: device, env: &env, routing, pass: false };
+                    wide_layer(&self.flow, i, &mut [turn])?;
                 }
-                self.enqueued[device] += 1;
-                self.pump()?;
+                self.flow.pump()?;
                 if let Some(probe) = probe.as_deref_mut() {
-                    self.parts[device].flush(&step_env!(self, step, device, fetched, inbound))?;
-                    self.probe_done[device].record(&self.streams[device])?;
-                    self.wait(device, true)?;
-                    self.follow()?;
+                    self.settle(step, &fetched, &[device])?;
+                    self.flow.follow(device)?;
                     let part = &self.parts[device];
                     let rows = dims.n_rows as usize;
                     let out = LayerOut {
@@ -994,6 +808,25 @@ impl<'g> Session<'g> {
         Ok(n_out)
     }
 
+    /// Brings the parts of `devices` to rest for a probe: each enqueues what
+    /// it has deferred (a worker sends what it has, a mixer writes it to the
+    /// streams), and the host waits until every one has run it.
+    fn settle(
+        &mut self,
+        step: &Step<'_>,
+        fetched: &Option<Vec<u8>>,
+        devices: &[usize],
+    ) -> Result<(), Error> {
+        for &device in devices {
+            self.parts[device].flush(&step_env!(self, step, device, fetched, None))?;
+            self.probe_done[device].record(&self.streams[device])?;
+        }
+        for &device in devices {
+            self.flow.wait_for(&self.probe_done[device], "a device ran a probed layer")?;
+        }
+        Ok(())
+    }
+
     /// The step of two devices that share every layer: each layer is
     /// enqueued on the mixer and on the worker, which exchange what they
     /// need between themselves.
@@ -1009,52 +842,57 @@ impl<'g> Session<'g> {
         let rows = dims.n_rows as usize;
         let mut fetched: Option<Vec<u8>> = None;
         for device in [mixer, worker] {
-            self.feed.store.device_mut(device).fence(&self.streams[device])?;
             self.parts[device].begin(&step_env!(self, step, device, fetched, None))?;
         }
-        // In front of and behind a probed layer both devices come to rest:
-        // the worker sends what it has, the mixer writes it to the streams.
-        macro_rules! settle {
-            () => {
-                for device in [worker, mixer] {
-                    self.parts[device].flush(&step_env!(self, step, device, fetched, None))?;
-                    self.probe_done[device].record(&self.streams[device])?;
-                }
-                for device in [worker, mixer] {
-                    self.wait(device, true)?;
-                }
-            };
-        }
+        // In front of and behind a probed layer both devices come to rest.
+        let both = [worker, mixer];
         for i in 0..self.c.n_layer {
-            if self.parts[mixer].ngram_layer() == Some(i) && fetched.is_none() {
-                let waiting = Instant::now();
-                self.await_rows()?;
-                *waited_rows = waiting.elapsed();
-                fetched = Some(self.ngram.rows()?.to_vec());
+            if self.parts[mixer].ngram_layer() == Some(i) {
+                Self::fetch_rows(&self.flow, &mut fetched, waited_rows)?;
             }
             if let Some(probe) = probe.as_deref_mut() {
-                settle!();
+                self.settle(step, &fetched, &both)?;
                 if let Some(r) = probe.before(i) {
                     self.parts[mixer].write_residual(&r)?;
                 }
             }
-            let held = Instant::now();
-            while self.lead() >= LEAD_LAYERS {
-                self.pump()?;
-                self.watch(held, "the host held back the next layer")?;
-            }
-            for device in [mixer, worker] {
-                self.parts[device]
-                    .enqueue_layer(&step_env!(self, step, device, fetched, None), i)?;
-                self.enqueued[device] += 1;
-            }
+            let (m_env, w_env) = (
+                step_env!(self, step, mixer, fetched, None),
+                step_env!(self, step, worker, fetched, None),
+            );
+            let (first, second) = self.parts.split_at_mut(1);
+            let (m_part, w_part) = if mixer == 0 {
+                (&mut first[0], &mut second[0])
+            } else {
+                (&mut second[0], &mut first[0])
+            };
+            self.flow.enqueue_layer(m_part, mixer, &m_env, i)?;
+            self.flow.enqueue_layer(w_part, worker, &w_env, i)?;
             if dims.n_rows > MAX_BATCH {
-                self.wide_layer(step, i, &fetched, &[mixer, worker])?;
+                let (m_routing, w_routing) = (&self.routing[mixer], &self.routing[worker]);
+                let mut turns = [
+                    Turn {
+                        part: m_part,
+                        index: mixer,
+                        env: &m_env,
+                        routing: m_routing,
+                        pass: false,
+                    },
+                    Turn {
+                        part: w_part,
+                        index: worker,
+                        env: &w_env,
+                        routing: w_routing,
+                        pass: false,
+                    },
+                ];
+                wide_layer(&self.flow, i, &mut turns)?;
             }
-            self.pump()?;
+            self.flow.pump()?;
             if let Some(probe) = probe.as_deref_mut() {
-                settle!();
-                self.follow()?;
+                self.settle(step, &fetched, &both)?;
+                self.flow.follow(mixer)?;
+                self.flow.follow(worker)?;
                 let (m, w) = (&self.parts[mixer], &self.parts[worker]);
                 let sum = |mut a: Vec<f32>, b: Vec<f32>| {
                     a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
@@ -1094,30 +932,23 @@ impl<'g> Session<'g> {
     /// with the picks; a caller that samples otherwise, or drafts, says so
     /// here once it knows.
     pub fn expect(&mut self, next: &[(u32, &[u32])]) -> Result<(), Error> {
-        self.ngram.expect(next)
-    }
-
-    /// Waits for the rows of the n-gram table of the step, following the
-    /// route records meanwhile.
-    fn await_rows(&mut self) -> Result<(), Error> {
-        let started = Instant::now();
-        while !self.ngram.is_done() {
-            self.watch(started, "rows of the n-gram table were read")?;
-            self.pump()?;
-        }
-        self.ngram.rows().map(|_| ())
+        self.flow.lock_ngram().expect(next)
     }
 
     /// Settles the draft windows of the last step: `accepted[i]` rows of the
     /// `i`-th of them count. The commit is enqueued at once and runs before
     /// the next step.
     pub fn accept(&mut self, accepted: &[u32]) -> Result<(), Error> {
-        if !self.ngram.has_windows() {
-            return self.ngram.settle(accepted);
-        }
-        self.ngram.settle(accepted)?;
-        for (part, stream) in self.parts.iter_mut().zip(&self.streams) {
-            part.enqueue_commit(stream, accepted)?;
+        let windows = {
+            let mut ngram = self.flow.lock_ngram();
+            let windows = ngram.has_windows();
+            ngram.settle(accepted)?;
+            windows
+        };
+        if windows {
+            for (part, stream) in self.parts.iter_mut().zip(&self.streams) {
+                part.enqueue_commit(stream, accepted)?;
+            }
         }
         Ok(())
     }
@@ -1151,13 +982,8 @@ impl Drop for Session<'_> {
         // runs, and nothing may synchronise with a device while a kernel
         // there waits for the host: let the store serve what a broken step
         // left waiting, for a while, before the buffers go.
-        let started = Instant::now();
         let idle = |streams: &[Stream]| streams.iter().all(|s| s.is_idle().unwrap_or(true));
-        while !idle(&self.streams) && started.elapsed() < Duration::from_secs(5) {
-            if self.feed.store.poll().is_err() {
-                break;
-            }
-        }
+        self.flow.drain(|| idle(&self.streams));
         if idle(&self.streams) {
             for stream in &self.streams {
                 let _ = stream.synchronize();

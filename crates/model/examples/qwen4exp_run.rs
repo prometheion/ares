@@ -769,18 +769,21 @@ fn run() -> Result<(), AnyError> {
         );
     }
     println!("  RAM tier: {ram_slots} slots");
-    let store = session.store();
-    let transit: Vec<String> = (0..session.devices().len())
-        .map(|device| {
-            let layer = (0..store.n_layers()).find(|layer| store.place(*layer).0 == device);
-            layer.and_then(|layer| store.transit_pool(layer)).map_or(0, |pool| pool.2).to_string()
-        })
-        .collect();
-    println!(
-        "  transit: {} slots per device, staging {} slots",
-        transit.join(" | "),
-        store.staging_slots()
-    );
+    {
+        let store = session.store();
+        let transit: Vec<String> = (0..session.devices().len())
+            .map(|device| {
+                let layer = (0..store.n_layers()).find(|layer| store.place(*layer).0 == device);
+                let pool = layer.and_then(|layer| store.transit_pool(layer));
+                pool.map_or(0, |pool| pool.2).to_string()
+            })
+            .collect();
+        println!(
+            "  transit: {} slots per device, staging {} slots",
+            transit.join(" | "),
+            store.staging_slots()
+        );
+    }
 
     if !args.profile.is_empty() {
         let mut counts = vec![vec![0u32; c.experts.count]; c.n_layer];
@@ -1072,7 +1075,7 @@ fn run() -> Result<(), AnyError> {
                 tokens.push(picks[0]);
                 let time = session.last_time();
                 ms.push(time.wall.as_secs_f64() * 1e3);
-                let after = session.store().stats();
+                let after = session.store().stats().clone();
                 kinds.push(StepKind {
                     ms: time.wall.as_secs_f64() * 1e3,
                     misses: (after.picks - after.hits) - (before.picks - before.hits),

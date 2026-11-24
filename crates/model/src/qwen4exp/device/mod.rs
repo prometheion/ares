@@ -36,6 +36,7 @@ mod load;
 mod misses;
 mod mtp;
 mod ngram;
+mod open;
 mod options;
 mod part;
 pub mod placement;
@@ -47,9 +48,11 @@ mod session;
 mod usage;
 
 pub use board::Board;
+pub use feed::Fill;
 pub use load::{LayerShare, Role};
 pub use misses::WideStats;
 pub use mtp::{MtpDrafted, MtpReport, MtpTimes};
+pub use open::PartReport;
 pub use options::{ModelOptions, Spread};
 pub use part::{
     ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Ports, Profile, StepEnv,
@@ -64,9 +67,7 @@ pub use runtime::{
     ExpertCosts, OpenError, Qwen4Exp, batch_rows, page_parts, place, reads_layer_by_layer,
     step_rows,
 };
-pub use session::{
-    Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, StepTime, Wanted,
-};
+pub use session::{LayerOut, Probe, Rows, Session, SessionOptions, StepTime, StoreRef, Wanted};
 pub use usage::{IDLE_AFTER, Log, ProfileFound, ProfileReport, UsageStats, profile_key};
 
 /// Why a model could not be opened on its devices or a step could not run.
