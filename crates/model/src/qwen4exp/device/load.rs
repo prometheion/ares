@@ -22,6 +22,7 @@ use ares_core::{GgmlType, Ledger};
 use ares_cuda::{Device, DeviceBuffer, DevicePtr, ExpertShape, RecurrentShape, WeightRange};
 use ares_runtime::ModelError;
 
+use crate::blocks::arena::{self, ALIGN, Ranges, Reader, Source, columns_in, gather};
 use crate::blocks::head::runs_of;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{
@@ -62,10 +63,6 @@ impl LayerShare {
         Self { heads: 0..heads as u32, shared: true }
     }
 }
-
-/// Every tensor starts at a multiple of this in the arena: more than any
-/// weight kernel asks for (16 bytes).
-const ALIGN: u64 = 64;
 
 /// A matrix on a device: `n_out` rows of `n_in` values of type `ty`, at
 /// offset `at` of the arena.
@@ -202,75 +199,10 @@ pub(crate) struct MtpInW {
 /// (the output head, which an MTP block shares with the model).
 const BORROWED: u64 = u64::MAX;
 
-/// What goes to one place of the arena.
-enum Source<'g> {
-    /// Bytes of the mapped file.
-    File(&'g [u8]),
-    /// Values the reference decoded.
-    Floats(Vec<f32>),
-    /// Rows of a matrix, range after range.
-    Rows(Matrix<'g>, Vec<Range<usize>>),
-    /// The same columns of every row of a matrix, range after range, in
-    /// whole blocks of the matrix's type.
-    Columns(Matrix<'g>, Vec<Range<usize>>),
-}
-
-fn row_bytes(m: &Matrix<'_>) -> usize {
-    m.bytes().len() / m.rows().max(1)
-}
-
-impl Source<'_> {
-    fn len(&self) -> u64 {
-        (match self {
-            Source::File(bytes) => bytes.len(),
-            Source::Floats(values) => values.len() * 4,
-            Source::Rows(m, ranges) => ranges.iter().map(Range::len).sum::<usize>() * row_bytes(m),
-            Source::Columns(m, ranges) => {
-                let (bv, bb) = (m.ty().block_values() as usize, m.ty().block_bytes() as usize);
-                m.rows() * ranges.iter().map(|r| r.len() / bv * bb).sum::<usize>()
-            }
-        }) as u64
-    }
-
-    /// The bytes as they go to the arena; `staging` holds them when they are
-    /// gathered.
-    fn bytes<'a>(&'a self, staging: &'a mut Vec<u8>) -> &'a [u8] {
-        staging.clear();
-        match self {
-            Source::File(bytes) => return bytes,
-            Source::Floats(values) => staging.extend(values.iter().flat_map(|v| v.to_le_bytes())),
-            Source::Rows(m, ranges) => {
-                let size = row_bytes(m);
-                for r in ranges {
-                    staging.extend_from_slice(&m.bytes()[r.start * size..r.end * size]);
-                }
-            }
-            Source::Columns(m, ranges) => {
-                let (bv, bb) = (m.ty().block_values() as usize, m.ty().block_bytes() as usize);
-                for row in m.bytes().chunks_exact(row_bytes(m)) {
-                    for r in ranges {
-                        staging.extend_from_slice(&row[r.start / bv * bb..r.end / bv * bb]);
-                    }
-                }
-            }
-        }
-        staging
-    }
-}
-
 /// The ranges of the value heads that read the key heads `keys`, each head
-/// `per_head` items wide: value head `h` reads key head `h mod n_k_heads`.
+/// `per_head` items wide.
 fn value_ranges(c: &Config, keys: &Range<usize>, per_head: usize) -> Vec<Range<usize>> {
-    let r = &c.recurrent;
-    (0..r.n_v_heads / r.n_k_heads)
-        .map(|tile| {
-            (tile * r.n_k_heads + keys.start) * per_head..(tile * r.n_k_heads + keys.end) * per_head
-        })
-        .collect()
-}
-
-fn gather(values: &[f32], ranges: &[Range<usize>]) -> Vec<f32> {
-    ranges.iter().flat_map(|r| values[r.clone()].iter().copied()).collect()
+    arena::value_ranges(c.recurrent.n_k_heads, c.recurrent.n_v_heads, keys, per_head)
 }
 
 /// The key heads a recurrent layer can be cut at: the fewest whose value
@@ -289,10 +221,10 @@ pub(crate) fn key_head_unit(c: &Config, r: &RecurrentWeights<'_>) -> usize {
 struct Layout<'g> {
     len: u64,
     parts: Vec<(u64, Source<'g>)>,
-    /// Whether the float matrices are read for the range of their weights: for the layout
-    /// that is uploaded, not for the ones that only measure sizes (a pass over the bytes
-    /// of every float matrix).
-    ranges: bool,
+    /// The range of the weights of every float matrix, read for the layout that is
+    /// uploaded, not for the ones that only measure sizes (a pass over the bytes of every
+    /// float matrix).
+    ranges: Option<Ranges>,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -313,34 +245,30 @@ impl<'g> Layout<'g> {
 
     /// The range of the weights of `m`: of the whole matrix, also where a part holds some
     /// of its rows or columns (no part of it is larger than the whole).
-    fn range(&self, m: &Matrix<'_>) -> WeightRange {
-        if self.ranges { WeightRange::of(m.ty(), m.bytes()) } else { WeightRange::Any }
+    fn range(&mut self, m: &Matrix<'_>) -> WeightRange {
+        self.ranges.as_mut().map_or(WeightRange::Any, |ranges| ranges.of(m))
     }
 
     fn matrix(&mut self, m: &Matrix<'g>) -> Mat {
-        let at = self.push(Source::File(m.bytes()));
-        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out: m.rows() as u32, at, range: self.range(m) }
+        let at = self.push(Source::Bytes(m.bytes()));
+        let range = self.range(m);
+        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out: m.rows() as u32, at, range }
     }
 
     /// Rows `rows` of `m`, range after range, as a matrix of their own.
     fn rows(&mut self, m: &Matrix<'g>, rows: Vec<Range<usize>>) -> Mat {
         let n_out = rows.iter().map(Range::len).sum::<usize>() as u32;
         let at = self.push(Source::Rows(*m, rows));
-        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out, at, range: self.range(m) }
+        let range = self.range(m);
+        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out, at, range }
     }
 
     /// Columns `columns` of every row of `m` as a matrix of their own.
     fn columns(&mut self, m: &Matrix<'g>, columns: Vec<Range<usize>>) -> Result<Mat, ModelError> {
-        let bv = m.ty().block_values() as usize;
-        if columns.iter().any(|r| !r.start.is_multiple_of(bv) || !r.end.is_multiple_of(bv)) {
-            return Err(invalid(format!(
-                "columns {columns:?} of a {} matrix are not whole blocks of {bv} values",
-                m.ty()
-            )));
-        }
-        let n_in = columns.iter().map(Range::len).sum::<usize>() as u32;
+        let n_in = columns_in(m, &columns)?;
         let at = self.push(Source::Columns(*m, columns));
-        Ok(Mat { ty: m.ty(), n_in, n_out: m.rows() as u32, at, range: self.range(m) })
+        let range = self.range(m);
+        Ok(Mat { ty: m.ty(), n_in, n_out: m.rows() as u32, at, range })
     }
 
     /// The key heads `heads` of a recurrent layer with their value heads: a
@@ -476,7 +404,7 @@ impl<'g> Layout<'g> {
         let mut router_range = if streams { self.range(&moe.router) } else { WeightRange::Any };
         let router = match moe.router.ty() {
             _ if !streams => None,
-            GgmlType::F32 => Some(self.push(Source::File(moe.router.bytes()))),
+            GgmlType::F32 => Some(self.push(Source::Bytes(moe.router.bytes()))),
             // The router kernels (the decode step's, the prediction's, the wide step's) multiply
             // f32 rows: a router in another type (the MTP block's file has BF16; quantizers
             // keep it F32 as a rule) is decoded once, here, at four bytes a weight.
@@ -486,7 +414,7 @@ impl<'g> Layout<'g> {
                 for (row, out) in values.chunks_exact_mut(cols).enumerate() {
                     moe.router.decode_row(row, out);
                 }
-                if self.ranges {
+                if self.ranges.is_some() {
                     let largest = values.iter().fold(0.0f32, |m, v| {
                         if v.is_nan() { f32::INFINITY } else { m.max(v.abs()) }
                     });
@@ -622,7 +550,7 @@ impl DeviceWeights {
         head: bool,
         order: Option<&[u32]>,
     ) -> Result<Self, ModelError> {
-        let mut layout = Layout { ranges: true, ..Layout::default() };
+        let mut layout = Layout { ranges: Some(Ranges::default()), ..Layout::default() };
         let on_device = shares
             .iter()
             .enumerate()
@@ -633,9 +561,9 @@ impl DeviceWeights {
         ledger.reserve("qwen4exp dense weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
         let started = Instant::now();
-        let mut staging = Vec::new();
+        let mut reader = Reader::new();
         for (at, source) in &layout.parts {
-            arena.write(*at, source.bytes(&mut staging))?;
+            source.write(&arena, *at, &mut reader)?;
         }
         Ok(Self {
             arena,
@@ -658,7 +586,7 @@ impl DeviceWeights {
         w: &MtpWeights<'_>,
         output: (Mat, DevicePtr),
     ) -> Result<Self, ModelError> {
-        let mut layout = Layout { ranges: true, ..Layout::default() };
+        let mut layout = Layout { ranges: Some(Ranges::default()), ..Layout::default() };
         let layer = layout.layer(c, 0, &w.layer, Role::Whole, &LayerShare::whole(c, 0))?;
         let mixer = layout.mixer(&w.output_mixer);
         let mtp_in = layout.mtp_in(w);
@@ -666,9 +594,9 @@ impl DeviceWeights {
         ledger.reserve("qwen4exp MTP block weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
         let started = Instant::now();
-        let mut staging = Vec::new();
+        let mut reader = Reader::new();
         for (at, source) in &layout.parts {
-            arena.write(*at, source.bytes(&mut staging))?;
+            source.write(&arena, *at, &mut reader)?;
         }
         Ok(Self {
             arena,

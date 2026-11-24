@@ -13,6 +13,8 @@
 //! norms and gates, the activation forms, which kernel runs at which row count,
 //! fused launches and the exchanges between devices.
 //!
+//! - [`arena`]: a device's arena of weights, laid out and uploaded the same
+//!   way for every model.
 //! - [`kv`]: the K/V group, attention layers that share a pair of K/V formats,
 //!   with their pages and the pool of exact entries of the formats with a tile
 //!   mean ([`forms`]), and the pages that lie in host memory when the context
@@ -32,6 +34,7 @@
 //!   replays, rotary positions, the drafters' windows, table updates,
 //!   commits) and how the drafters of a part hand out their drafts.
 
+pub(crate) mod arena;
 pub mod far;
 pub(crate) mod forms;
 pub(crate) mod head;
