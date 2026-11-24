@@ -176,7 +176,7 @@ impl Tracker {
 
 /// See the module documentation.
 #[derive(Debug)]
-pub struct Watch {
+pub(crate) struct Watch {
     stop: StopMatcher,
     thinking: Option<(Thinking, Tracker)>,
     submitted: Instant,

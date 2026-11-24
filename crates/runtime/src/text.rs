@@ -35,7 +35,7 @@ pub fn unprintable(ch: char) -> Option<u8> {
 /// began. So text is released only when it can no longer be the start of a
 /// stop string; the rest waits for the next token.
 #[derive(Debug, Default)]
-pub struct StopMatcher {
+pub(crate) struct StopMatcher {
     /// The stop strings with their places in the list the matcher was given.
     stops: Vec<(usize, String)>,
     /// Text that has been generated and not released: it is a prefix of at
@@ -60,11 +60,6 @@ impl StopMatcher {
     /// once one has.
     pub fn matched(&self) -> Option<usize> {
         self.matched
-    }
-
-    /// Whether there are stop strings at all.
-    pub fn is_empty(&self) -> bool {
-        self.stops.is_empty()
     }
 
     /// Feeds one character of generated text. Text that is safe to send is

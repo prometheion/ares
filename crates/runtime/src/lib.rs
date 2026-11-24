@@ -86,9 +86,7 @@ pub use exec::{
     TransitPart,
 };
 pub use gpu::{GpuConfig, GpuExecutor, required_ram};
-pub use image::{
-    ImageInput, ImageName, ImageRows, ImageSpan, ImageStore, Spans, cell_name, short_name,
-};
+pub use image::{ImageInput, ImageName, ImageSpan, Spans, cell_name};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
@@ -96,8 +94,8 @@ pub use model::{
     StepContext, TowerJob, TransferContext, Vision,
 };
 pub use ram::{
-    CacheBuffer, ContextLock, ContextRegion, ContextShort, Follow, LockedChunk, Look, Machine,
-    Meminfo, MemorySource, PinnedRam, PlaceChunks, Rule, Verdict, high_watermarks,
+    CacheBuffer, ContextLock, ContextRegion, ContextShort, LockedChunk, Look, Machine, Meminfo,
+    MemorySource, PinnedRam, PlaceChunks, Rule, Verdict,
 };
 pub use record::{
     Commit, DraftChances, FREED_PER_RECORD, ImageRun, InnerSave, PageCopy, RecordFull, RecordView,
@@ -106,9 +104,9 @@ pub use record::{
 pub use sampling::TokenFilter;
 pub use sync::{WakeCounts, Woke};
 pub use synthetic::{SyntheticConfig, SyntheticModel};
-pub use text::{StopMatcher, printable, unprintable};
+pub use text::{printable, unprintable};
 pub use timing::{
     Calibration, Counters, DEFAULT_WINDOW, DRAFT_POSITIONS, DRAFT_SOURCES, DevicePhase,
-    DeviceTimes, Phase, REPORTED_REQUESTS, RequestReport, Series, Snapshot, Stats, Summary,
+    DeviceTimes, Phase, RequestReport, Snapshot, Stats, Summary,
 };
-pub use watch::{Thinking, Watch};
+pub use watch::Thinking;

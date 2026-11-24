@@ -77,7 +77,7 @@ impl MemorySource for Meminfo {
 /// The free memory the kernel keeps for itself before it stops reclaiming:
 /// the high watermarks of all zones in the text of `/proc/zoneinfo`, in
 /// bytes of pages of `page` bytes.
-pub fn high_watermarks(zoneinfo: &str, page: u64) -> u64 {
+pub(crate) fn high_watermarks(zoneinfo: &str, page: u64) -> u64 {
     zoneinfo
         .lines()
         .filter_map(|line| line.trim_start().strip_prefix("high "))
@@ -109,7 +109,8 @@ pub fn high_watermarks(zoneinfo: &str, page: u64) -> u64 {
 pub struct Rule {
     /// How often the machine is looked at.
     pub period: Duration,
-    /// What the kernel keeps free for itself ([`high_watermarks`]).
+    /// What the kernel keeps free for itself (the high watermarks of its
+    /// zones).
     pub reserve: u64,
     /// The growth of other programs, in bytes per second, that is assumed
     /// until a faster one was seen.
@@ -182,7 +183,7 @@ pub enum Verdict {
 /// The policy: when to give memory back and when to take it. It keeps no
 /// clock and reads no memory; [`Rule`] says what it decides by.
 #[derive(Clone, Debug)]
-pub struct Follow {
+pub(crate) struct Follow {
     rule: Rule,
     /// The fastest growth of the others seen, bytes per second.
     speed: f64,

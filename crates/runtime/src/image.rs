@@ -77,7 +77,7 @@ pub fn cell_name(name: &ImageName, row: u32) -> u64 {
 
 /// The first eight bytes of a name, as hex: enough to tell images apart in a
 /// log.
-pub fn short_name(name: &ImageName) -> String {
+pub(crate) fn short_name(name: &ImageName) -> String {
     name[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -190,22 +190,14 @@ impl Spans {
     }
 }
 
-/// The rows of one image: `nx * ny` rows of `width` `f32` values.
+/// The rows of one image, one after the other: as many as the image has
+/// cells, each as wide as the model's rows.
 #[derive(Debug)]
-pub struct ImageRows {
-    pub nx: u32,
-    pub ny: u32,
-    pub width: u32,
+pub(crate) struct ImageRows {
     pub values: Vec<f32>,
 }
 
 impl ImageRows {
-    /// Row `j`.
-    pub fn row(&self, j: u32) -> &[f32] {
-        let w = self.width as usize;
-        &self.values[j as usize * w..(j as usize + 1) * w]
-    }
-
     pub fn bytes(&self) -> u64 {
         self.values.len() as u64 * 4
     }
@@ -215,21 +207,18 @@ impl ImageRows {
 /// bytes: the least recently used go first. An image whose rows are asked for
 /// and gone is computed again.
 #[derive(Debug)]
-pub struct ImageStore {
+pub(crate) struct ImageStore {
     limit: u64,
     held: u64,
     clock: u64,
     images: HashMap<ImageName, (Arc<ImageRows>, u64)>,
-    /// How often rows were found and how often they were put in.
-    pub hits: u64,
-    pub computed: u64,
 }
 
 impl ImageStore {
     /// A store of at most `limit` bytes. It keeps the last image it was given
     /// even when that one alone is larger.
     pub fn new(limit: u64) -> Self {
-        Self { limit, held: 0, clock: 0, images: HashMap::new(), hits: 0, computed: 0 }
+        Self { limit, held: 0, clock: 0, images: HashMap::new() }
     }
 
     /// The rows of `name`, if the store has them.
@@ -250,7 +239,6 @@ impl ImageStore {
     /// until the store is within its limit again.
     pub fn put(&mut self, name: ImageName, rows: Arc<ImageRows>) {
         self.clock += 1;
-        self.computed += 1;
         self.held += rows.bytes();
         if let Some((old, _)) = self.images.insert(name, (rows, self.clock)) {
             self.held -= old.bytes();
@@ -268,17 +256,9 @@ impl ImageStore {
         }
     }
 
-    /// The bytes the store holds.
-    pub fn bytes(&self) -> u64 {
-        self.held
-    }
-
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.images.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.images.is_empty()
     }
 }
 
@@ -363,7 +343,7 @@ mod tests {
 
     #[test]
     fn the_store_lets_the_least_recently_used_images_go() {
-        let rows = |n: usize| Arc::new(ImageRows { nx: 1, ny: 1, width: 1, values: vec![0.0; n] });
+        let rows = |n: usize| Arc::new(ImageRows { values: vec![0.0; n] });
         let mut store = ImageStore::new(100);
         store.put([1; 32], rows(10));
         store.put([2; 32], rows(10));

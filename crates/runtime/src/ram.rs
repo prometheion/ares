@@ -56,7 +56,7 @@ use ares_core::{Broker, Class, Consumer, Growth};
 use ares_cuda::{Device, DevicePtr, HostRegistration, PinnedBuffer};
 use ares_store::Aligned;
 
-pub use machine::{Follow, Look, Machine, Meminfo, MemorySource, Rule, Verdict, high_watermarks};
+pub use machine::{Look, Machine, Meminfo, MemorySource, Rule, Verdict};
 
 use crate::error::RuntimeError;
 use crate::expert_store::{Locker, StoreError};
@@ -346,11 +346,6 @@ impl PinnedRam {
 
     fn books(&self) -> MutexGuard<'_, Books> {
         self.shared.books()
-    }
-
-    /// The watch over the machine this engine follows, if it follows one.
-    pub fn machine(&self) -> Option<&Arc<Machine>> {
-        self.shared.machine.as_ref()
     }
 
     /// The most the engine may lock.

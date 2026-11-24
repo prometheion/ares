@@ -2567,8 +2567,7 @@ impl Conductor {
         if pass.next >= vision.units {
             let image = pass.image.clone();
             self.pass = None;
-            let rows =
-                ImageRows { nx: image.nx, ny: image.ny, width: vision.width, values: job.rows };
+            let rows = ImageRows { values: job.rows };
             if rows.values.len() != (image.rows() * vision.width) as usize {
                 return Err(format!(
                     "the image tower gave {} values for an image of {} rows of {}",

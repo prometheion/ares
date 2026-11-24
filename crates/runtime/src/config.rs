@@ -43,7 +43,7 @@ pub struct RuntimeConfig {
     /// machine (see "Host memory" in `docs/ARCHITECTURE.md`).
     pub cache_ram: u64,
     /// The most bytes the rows of images take that the image tower has
-    /// computed (ordinary memory, by image; see [`crate::ImageStore`]): a
+    /// computed (ordinary memory, by image, in the conductor's image store): a
     /// prompt that sends an image again, and a replay of cached cells of an
     /// image, take them from there instead of running the tower again. The
     /// least recently used image goes first.

@@ -14,7 +14,6 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::time::Duration;
 
 use ares_api::RequestId;
 
@@ -24,7 +23,7 @@ pub const DEFAULT_WINDOW: usize = 8192;
 /// A series of durations: totals over everything recorded, and the last
 /// `window` samples for percentiles.
 #[derive(Clone, Debug)]
-pub struct Series {
+pub(crate) struct Series {
     /// Nanoseconds, saturating at about 4.3 s, which no phase of a step
     /// reaches.
     samples: Vec<u32>,
@@ -59,15 +58,6 @@ impl Series {
         self.max_ns = 0;
     }
 
-    /// Total of everything recorded since the last [`Series::clear`].
-    pub fn total(&self) -> Duration {
-        Duration::from_nanos(self.total_ns)
-    }
-
-    pub fn count(&self) -> u64 {
-        self.count
-    }
-
     /// Totals and percentiles. The percentiles are over the last
     /// `window` samples.
     pub fn summary(&self) -> Summary {
@@ -97,7 +87,8 @@ impl Series {
     }
 }
 
-/// What a [`Series`] came to.
+/// What a series of samples of one phase came to: their count and total, and
+/// percentiles over the most recent ones.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Summary {
     pub count: u64,
@@ -351,7 +342,7 @@ pub struct Counters {
 }
 
 /// How many requests that ended a [`Snapshot`] reports.
-pub const REPORTED_REQUESTS: usize = 256;
+pub(crate) const REPORTED_REQUESTS: usize = 256;
 
 /// What one request that ended took from the prefix cache and what it
 /// computed itself.
@@ -465,8 +456,7 @@ pub struct Snapshot {
     pub checkpoint_ram: u64,
     pub active: u32,
     pub waiting: u32,
-    /// The last requests that ended, the oldest first: at most
-    /// [`REPORTED_REQUESTS`].
+    /// The last requests that ended, the oldest first: at most 256.
     pub requests: Vec<RequestReport>,
     /// What the warm-up measured; `None` for a runtime that ran none.
     pub calibration: Option<Calibration>,
