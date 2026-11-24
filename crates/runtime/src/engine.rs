@@ -496,6 +496,10 @@ impl Engine for Runtime {
             .collect()
     }
 
+    fn reads_images(&self, model: &str) -> bool {
+        model == self.card.id && self.model.vision().is_some()
+    }
+
     fn chat_template(&self, model: &str) -> Option<String> {
         (model == self.card.id).then(|| self.template.clone()).flatten()
     }

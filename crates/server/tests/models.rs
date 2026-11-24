@@ -837,10 +837,12 @@ async fn props_of_a_model_that_is_not_loaded_are_read_from_its_preset_and_file()
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("props-unloaded");
     std::fs::create_dir_all(&dir).unwrap();
     let path = tiny_model_file(&dir);
+    // A projector's file is not opened before a load.
     let ini = format!(
-        "[t]\nmodel = {}\ntemperature = 0.5\n[u]\nmodel = {}\ncontext = 2048\n",
+        "[t]\nmodel = {}\ntemperature = 0.5\n[u]\nmodel = {}\ncontext = 2048\nmmproj = {}\n",
         path.display(),
-        path.display()
+        path.display(),
+        dir.join("mmproj.gguf").display()
     );
     let w = world(&ini, &[10, 10]);
     let app = router_over(w.models.clone(), Config::default());
@@ -852,9 +854,11 @@ async fn props_of_a_model_that_is_not_loaded_are_read_from_its_preset_and_file()
     assert_eq!(props["default_generation_settings"]["params"]["temperature"], 0.5);
     assert!(props["chat_template"].as_str().unwrap().contains("<|im_start|>"), "{props}");
     assert_eq!(props["chat_template_caps"]["supports_tools"], false);
-    // A context the preset names is what it says.
+    assert_eq!(props["modalities"]["vision"], false);
+    // A context the preset names is what it says, and so is a projector.
     let (_, props) = json(get(&app, "/props?model=u").await).await;
     assert_eq!(props["context_length"], 2048);
+    assert_eq!(props["modalities"]["vision"], true, "{props}");
     // Nothing was loaded for it.
     assert!(w.is("t", "unloaded") && w.is("u", "unloaded"));
     // A name no preset has is not found.

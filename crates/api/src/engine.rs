@@ -86,6 +86,13 @@ pub trait Engine: Send + Sync + 'static {
         None
     }
 
+    /// Whether `model` reads images: it was loaded with an image tower (a
+    /// projector). `false` for a model the engine does not serve, or an
+    /// engine that does not say. Must not block.
+    fn reads_images(&self, _model: &str) -> bool {
+        false
+    }
+
     /// Starts a request.
     ///
     /// Must return without waiting for the work. On `Ok` the engine owns the

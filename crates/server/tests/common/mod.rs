@@ -160,6 +160,8 @@ struct Book {
     counting: bool,
     /// Why the engine serves no more requests, once a test broke it.
     failure: Option<String>,
+    /// Whether `mock` reads images.
+    images: bool,
 }
 
 /// The part of the engine its threads share with the test.
@@ -322,6 +324,11 @@ impl MockEngine {
         self
     }
 
+    /// Makes `mock` a model that reads images, loaded with a projector.
+    pub fn set_reads_images(&self) {
+        self.shared.book.lock().unwrap().images = true;
+    }
+
     /// Breaks the engine: it reports `why` as its failure.
     pub fn set_failure(&self, why: &str) {
         self.shared.book.lock().unwrap().failure = Some(why.to_owned());
@@ -335,6 +342,10 @@ impl Engine for MockEngine {
 
     fn chat_format(&self, model: &str) -> Option<ChatFormat> {
         (model == "mock").then(|| self.shared.book.lock().unwrap().format.clone()).flatten()
+    }
+
+    fn reads_images(&self, model: &str) -> bool {
+        model == "mock" && self.shared.book.lock().unwrap().images
     }
 
     fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {

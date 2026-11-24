@@ -185,7 +185,10 @@ gets for the fields it leaves out (`default_generation_settings.params`, the
 text of the template in effect, from `Engine::chat_template`),
 `chat_template_caps` (tools and calls, thinking, whether `reasoning_effort` and
 `enable_thinking` change the prompt, whether it thinks by default),
-`reasoning` (its tags) and `modalities` (text alone: images are not built).
+`reasoning` (its tags) and `modalities`: `vision` when the model reads images
+(`Engine::reads_images`, a model loaded with a projector; for a model that is not
+loaded, a preset that names `mmproj`), as llama-server says it and Open WebUI reads
+it to offer an upload; `audio` is always false.
 
 **The stop string and the thinking of a reply** (`crates/runtime/src/watch.rs`).
 The conductor matches stop strings where it turns tokens into text. It carries

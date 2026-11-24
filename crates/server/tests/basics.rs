@@ -162,6 +162,18 @@ async fn props_say_what_the_model_is() {
 }
 
 #[tokio::test]
+async fn props_say_vision_for_a_model_loaded_with_a_projector() {
+    let engine = instant();
+    let app = app(&engine).await;
+    let (_, body) = json(get(&app, "/props").await).await;
+    assert_eq!(body["modalities"], json!({"vision": false, "audio": false}), "{body}");
+    engine.set_reads_images();
+    let (status, body) = json(get(&app, "/props").await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["modalities"], json!({"vision": true, "audio": false}), "{body}");
+}
+
+#[tokio::test]
 async fn the_stop_string_that_ended_a_reply_is_named() {
     let runtime = synthetic(None, None);
     let app = served(&runtime).await;

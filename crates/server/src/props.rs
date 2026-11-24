@@ -21,7 +21,9 @@
 //! `/props` (`?model=<id>` when the server has several) says what a loaded
 //! model is: its context, its chat template, what a request gets for the
 //! fields it leaves out, what its template can do (tools, thinking and its
-//! switches), and what input it takes (text alone: images are not built).
+//! switches), and what input it takes: images when it was loaded with a
+//! projector (`--mmproj`), as llama-server says it, which clients such as
+//! Open WebUI read to offer an upload; never audio.
 
 use ares_api::{Json, Prompt};
 use axum::extract::{Request, State};
@@ -60,7 +62,8 @@ async fn describe(app: &App, asked: Option<String>) -> Result<serde_json::Value,
     let id = lease.id().to_owned();
     let engine = lease.engine();
     let card = engine.models().into_iter().find(|card| card.id == id);
-    let mut body = body_of(&id, lease.defaults(), engine.chat_format(&id).as_ref());
+    let format = engine.chat_format(&id);
+    let mut body = body_of(&id, lease.defaults(), format.as_ref(), engine.reads_images(&id));
     body["loaded"] = true.into();
     if let Some(card) = &card {
         body["context_length"] = card.context_length.into();
@@ -72,12 +75,13 @@ async fn describe(app: &App, asked: Option<String>) -> Result<serde_json::Value,
     Ok(body)
 }
 
-/// The members of `/props` that the model's defaults and what its template
-/// declares give, loaded or not.
+/// The members of `/props` that the model's defaults, what its template
+/// declares and whether it reads images (`vision`) give, loaded or not.
 fn body_of(
     id: &str,
     defaults: &crate::defaults::Defaults,
     format: Option<&ares_api::ChatFormat>,
+    vision: bool,
 ) -> serde_json::Value {
     let thinking = format.and_then(|format| format.thinking.as_ref());
     let tools = format.is_some_and(|format| format.tools.is_some());
@@ -87,7 +91,7 @@ fn body_of(
     }
     let mut body = serde_json::json!({
         "model": id,
-        "modalities": {"vision": false, "audio": false},
+        "modalities": {"vision": vision, "audio": false},
         "default_generation_settings": {"params": params},
         "chat_template_caps": {
             "supports_tools": tools,
@@ -110,8 +114,9 @@ fn body_of(
 
 /// What `/props` says of a model that is not loaded, read from its preset and
 /// its file without loading it: the same members as for a loaded model, with
-/// `"loaded": false`, and as `context_length` the context its preset names or
-/// else the longest its file declares (a load decides what fits).
+/// `"loaded": false`, as `context_length` the context its preset names or else
+/// the longest its file declares (a load decides what fits), and images read
+/// when the preset names a projector.
 async fn unloaded(app: &App, name: &str) -> Result<serde_json::Value, ApiError> {
     let preset = app.models.preset(name).ok_or_else(|| ApiError::not_found(name))?;
     let options = preset.options.load.clone();
@@ -120,7 +125,8 @@ async fn unloaded(app: &App, name: &str) -> Result<serde_json::Value, ApiError> 
         .map_err(|e| ApiError::internal(format!("the description was lost: {e}")))?
         .map_err(|e| ApiError::internal(format!("model {}: {e}", preset.id)))?;
     let defaults = &preset.options.defaults;
-    let mut body = body_of(&preset.id, defaults, Some(&described.format));
+    let vision = preset.options.load.mmproj.is_some();
+    let mut body = body_of(&preset.id, defaults, Some(&described.format), vision);
     body["loaded"] = false.into();
     if let Some(context) = described.context_length {
         body["context_length"] = context.into();

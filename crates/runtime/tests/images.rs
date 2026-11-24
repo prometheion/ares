@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ares_api::{ChatFormat, EngineError, GenerateRequest, ModelCard, Prompt, Sampling};
+use ares_api::{ChatFormat, Engine, EngineError, GenerateRequest, ModelCard, Prompt, Sampling};
 use ares_runtime::testing::Pauses;
 use ares_runtime::{
     Clock, ContextSpec, DeviceContext, DeviceModel, EncodedPrompt, ExecError, Executor, ImageInput,
@@ -376,6 +376,8 @@ fn image_rows_are_staged_at_their_cells_and_every_row_has_its_rotary_position() 
     // A stage of 5 rows: a piece reads at most that many image rows, so the
     // images of 12 and 6 rows are read in parts.
     let (runtime, seen) = runtime(5);
+    // The engine says the model reads images (`/props` of the server).
+    assert!(runtime.reads_images("pictures") && !runtime.reads_images("another"));
     let a = "w w [1,4,3] w w w";
     let done = ask(&runtime, a, 6);
     assert_eq!(done.usage.completion_tokens, 6);
