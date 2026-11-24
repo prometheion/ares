@@ -387,9 +387,6 @@ static __device__ void attn_direct_body(
         n_cell = CELL_NONE;
         if (j < j_end) {
             n_cell = map_cell(j);
-#ifdef ATTN_SAME_ROWS
-            n_cell = rg[0] + (lane & (ATTN_SAME_ROWS - 1));  // timing only: every unit reads the same rows
-#endif
             n_ent = attn_entry(it, tables, n_cell) & ~ATTN_CONVERTED_BIT;
             const uint8_t* head = conv_entry(conv_pool, far_pool, n_ent, g.entry_c) + head_c;
             const uint32_t r = n_cell % ATTN_TILE_CELLS;
@@ -400,13 +397,6 @@ static __device__ void attn_direct_body(
         }
     };
     unit_at(j_begin);
-#ifdef ATTN_PROBE
-    unsigned long long pr[4] = {0, 0, 0, 0}, t0 = clock64(), t1 = 0;
-    unsigned units = 0;
-#define ATTN_TICK(i) t1 = clock64(); pr[i] += t1 - t0; t0 = t1;
-#else
-#define ATTN_TICK(i)
-#endif
     for (uint32_t j0 = j_begin; j0 < j_end; j0 += 32) {
         const uint32_t cell = n_cell, ent = n_ent;
         const uint8_t* kp = n_kp;
@@ -421,7 +411,6 @@ static __device__ void attn_direct_body(
         const uint32_t ent0 = __shfl_sync(0xffffffffu, ent, 0);
         ents[lane] = valid ? ent : ent0;
         unit_at(j0 + 32);
-        ATTN_TICK(0)
 
         // ---- the K mean of every entry of the unit against every vector (lanes hold values)
         int eidx = 0;
@@ -481,7 +470,6 @@ static __device__ void attn_direct_body(
             }
         }
 
-        ATTN_TICK(1)
         // ---- online softmax: the scores of the lane's cell, the maximum of the warp
         float alpha[NV], p[8];
         bool settled = true;
@@ -513,7 +501,6 @@ static __device__ void attn_direct_body(
         if constexpr (NV > 4) *reinterpret_cast<float4*>(Pt + lane * 8 + 4) = make_float4(p[4], p[5], p[6], p[7]);
         __syncwarp();
 
-        ATTN_TICK(2)
         // ---- O += P V: one cell per step (two for a head of 128), the lane's 8 codes of the
         // row, a contiguous read for the warp
         const int steps = (n_valid + CPI - 1) / CPI;
@@ -554,15 +541,7 @@ static __device__ void attn_direct_body(
                 for (int v = 0; v < NV; ++v) o[v][t] = fmaf(w[v], val, o[v][t]);
             }
         }
-        ATTN_TICK(3)
-#ifdef ATTN_PROBE
-        ++units;
-#endif
     }
-#ifdef ATTN_PROBE
-    if (blockIdx.x == 0 && tid == 0 && units)
-        printf("PROBE units %u meta+touch %llu K %llu softmax %llu V %llu\n", units, pr[0] / units, pr[1] / units, pr[2] / units, pr[3] / units);
-#endif
     if (v_mean) v_mean_flush();
 
     // ---- end of the item: merge the warps, normalise, un-rotate, write

@@ -89,11 +89,7 @@ static __device__ void attn_body(
     const int mt = warp % MT, cg = warp / MT;
     const int gq = lane >> 2, tq = lane & 3;
     const bool conv = (it.flags & ITEM_CONVERTED) != 0;
-#ifdef ATTN_FIX_Q8
-    constexpr int kf = FMT_Q8, vf = FMT_Q8;
-#else
     const int kf = conv ? g.kf : FMT_F16, vf = conv ? g.vf : FMT_F16;
-#endif
     const int rbk = D / 32 * fmt_group_bytes(kf), rbv = D / 32 * fmt_group_bytes(vf);
     const int G = g.G;
     const int nvec = (int)it.n_rows * G;
@@ -239,19 +235,10 @@ static __device__ void attn_body(
     }
     uint32_t cached_ent = 0xffffffffu;
 
-#ifdef ATTN_PROBE
-    unsigned long long pr[6] = {0, 0, 0, 0, 0, 0}, t0 = clock64(), t1 = 0;
-#endif
     issue(0, true);
     for (int c = 0; c < n_chunks; ++c) {
-#ifdef ATTN_PROBE
-        t0 = clock64();
-#endif
         cp_async_wait<0>();
         __syncthreads();  // chunk c's raw rows are in shared memory; the metadata of c + 1 is visible
-#ifdef ATTN_PROBE
-        t1 = clock64(); pr[0] += t1 - t0; t0 = t1;
-#endif
         if (warp == 0) meta_load(c + 2);
 
         const uint32_t* m = meta + (c % 3) * CHUNK * 3;
@@ -259,13 +246,8 @@ static __device__ void attn_body(
         const int nent = (int)el[ME];
 
         // decode the chunk to f16 tiles
-#ifndef ATTN_NO_DECODE
         decode_side_any<D, NT, CHUNK>(kf, raw + (size_t)((c & 1) * 2) * rawcap, rbk, m, nc, Kt, QS, tid);
         decode_side_any<D, NT, CHUNK>(vf, raw + (size_t)((c & 1) * 2 + 1) * rawcap, rbv, m, nc, Vt, QS, tid);
-#endif
-#ifdef ATTN_PROBE
-        t1 = clock64(); pr[1] += t1 - t0; t0 = t1;
-#endif
         // the mean of the K tile(s) against every vector
         if (k_mean) {
             const bool same = (nent == 1 && el[0] == cached_ent);
@@ -291,20 +273,12 @@ static __device__ void attn_body(
             }
             cached_ent = (nent == 1) ? el[0] : 0xffffffffu;
         }
-#ifdef ATTN_PROBE
-        t1 = clock64(); pr[2] += t1 - t0; t0 = t1;
-#endif
         if (mma_warp) {
             asm volatile("bar.sync 1, %0;" ::"n"(NT));
         } else {
             asm volatile("bar.arrive 1, %0;" ::"n"(NT));
-#ifndef ATTN_NO_LOAD
             if (c + 1 < n_chunks) issue(c + 1, false);
-#endif
         }
-#ifdef ATTN_PROBE
-        t1 = clock64(); pr[3] += t1 - t0; t0 = t1;
-#endif
 
         // the slices of this chunk that belong to this warp
         if constexpr (SWAP) {
@@ -363,11 +337,6 @@ static __device__ void attn_body(
                         pa[j][col] = p0;
                         pa[j][2 + col] = p1;
                         lc[j][col] = lc[j][col] * alpha[j][col] + p0 + p1;
-#ifdef ATTN_DEBUG
-                        if (blockIdx.x == 0 && warp == 0 && lane == 0 && c < 2) {
-                            printf("DBG c %d cb %d j %d col %d vec %d s %g s2 %g a %g b %g cmax %g u %g alpha %g p0 %g p1 %g l %g\n", c, cb, j, col, vec, s[j][col], s2[j][col], a, b, cmax, u, alpha[j][col], p0, p1, lc[j][col]);
-                        }
-#endif
                         settled = settled && alpha[j][col] == 1.0f;
                         const int vl = 8 * j + 2 * tq + col;
                         Pw[vl * PSTR + gq] = __float2half_rn(p0);
@@ -440,11 +409,7 @@ static __device__ void attn_body(
                 }
             }
         } else {
-#ifdef ATTN_NO_MMA
-        for (int cb = 0; false; ) {
-#else
         for (int cb = 16 * cg; mma_warp && cb < nc; cb += 16 * CG) {
-#endif
             // S^T tile: 16 vectors x 16 cells; even and odd k steps accumulate apart (a chain of
             // 8 dependent products instead of 16), added at the end
             float s[2][4], s2[2][4];
@@ -569,22 +534,11 @@ static __device__ void attn_body(
             }
         }
         }
-#ifdef ATTN_PROBE
-        t1 = clock64(); pr[4] += t1 - t0; t0 = t1;
-#endif
         if (warp == 0) meta_store(c + 2);
-#ifdef ATTN_PROBE
-        t1 = clock64(); pr[5] += t1 - t0; t0 = t1;
-#endif
         // the barrier at the top of the next iteration protects the tiles and the metadata
     }
     cp_async_wait<0>();
     __syncthreads();
-#ifdef ATTN_PROBE
-    if (blockIdx.x == 0 && tid == 0) {
-        printf("PROBE chunks %d wait %llu decode %llu meandot %llu sync %llu mma %llu meta %llu\n", n_chunks, pr[0] / n_chunks, pr[1] / n_chunks, pr[2] / n_chunks, pr[3] / n_chunks, pr[4] / n_chunks, pr[5] / n_chunks);
-    }
-#endif
 
     // ---- end of the item: merge the cell groups, un-rotate, write
     constexpr int OS = D + 4;
