@@ -35,7 +35,7 @@ use super::super::part::{
     MicroPlan, Part, PassAt, PassLayout, PassSizes, StepEnv, chunk_rows, chunks_of,
     micro_batches_at,
 };
-use super::Qwen4ExpDevice;
+use super::device::Qwen4ExpDevice;
 use crate::blocks::rows;
 
 /// The prompt rows a pass reads: its sequence's slot, its first position and its rows, and
