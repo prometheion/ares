@@ -56,7 +56,7 @@ What is left out is decided from the devices and the model, and the log says how
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--devices <LIST>` | CUDA devices to use, by the driver's index, such as `0,1`. A GPU of a class this build does not run is skipped. | all devices the driver reports |
-| `--split <KIND>` | `single`: one device holds the model. `tensor`: every device holds a slice of every block (Flash-Next: exactly two devices on every layer). `layer`: every device holds a range of blocks. | 27B: `single` when one device holds the model with a context of at least 8192 tokens (or the model's own, if less), else `tensor`. Flash-Next on two devices: both on every layer when each device can write the other's memory (peer access), else a range of layers each |
+| `--split <KIND>` | `single`: one device holds the model (of several devices, the 27B takes the first that holds it, Flash-Next the one with the most free memory; `--devices` may not name several). `tensor`: every device holds a slice of every block (Flash-Next: exactly two devices on every layer). `layer`: every device holds a range of blocks. | `single` on one device. 27B: `single` when one device holds the model with the context `--context` names, or without it 8192 tokens (the model's own, if less); else `tensor`. Flash-Next: `tensor` on two devices that can write each other's memory (peer access), else `layer` |
 | `--shares <LIST>` | Each device's share of the weights under a split, such as `0.625,0.375`. Refused for Flash-Next, whose split of each layer is measured at load. | in proportion to the memory bandwidth each device reports, lowered where a device's memory is too small for its share |
 
 ## Sequence state

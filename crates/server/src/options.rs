@@ -268,9 +268,12 @@ pub const OPTIONS: &[Opt] = &[
         "--split",
         "<KIND>",
         "single: one device holds the model\n\
-         tensor: every device holds a slice of every block\n\
+         tensor: every device holds a slice of every block (Qwen3.8-Flash-Next: two devices)\n\
          layer: every device holds a range of blocks\n\
-         [default: single if one device holds the model, else tensor]",
+         [default: single on one device. For the 27B single if one device holds the model \
+         with the context named (8192 tokens without --context), else tensor; for \
+         Qwen3.8-Flash-Next tensor on two devices that can write each other's memory, else \
+         layer]",
     ),
     Opt::model(
         "--shares",
