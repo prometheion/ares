@@ -2,81 +2,12 @@
 //! document. Shapes in comments are `[rows, ...]` with the window's rows first.
 
 use crate::qwen35::config::Recurrent;
-use crate::qwen35::reference::ops::{
-    dot_f32, l2_norm, par_ranges, rms_norm, rms_scale, sigmoid, silu, softplus, widen,
-};
 use crate::qwen35::reference::{LayerRows, Reference};
 use crate::qwen35::weights::{AttentionWeights, RecurrentWeights};
-
-/// One token for one value head of the delta rule, changing the matrix `s`
-/// (`head_v_dim` rows of `head_k_dim` values, stored as `f32`):
-///
-/// ```text
-/// S      = exp(g) * S
-/// delta  = beta * (v - S k)            one value per row of S
-/// S      = S + delta k^T
-/// out    = S q / sqrt(head_k_dim)
-/// ```
-///
-/// Sums run over `head_k_dim` in index order, in `f64`. The matrix is rounded
-/// to `f32` after the update and the output is computed from the rounded
-/// matrix, so a state that was stored and loaded again gives the same output.
-pub fn delta_step(
-    s: &mut [f32],
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    g: f32,
-    beta: f32,
-    mut out: Option<&mut [f32]>,
-) {
-    let (dk, dv) = (k.len(), v.len());
-    let decay = f64::from(g).exp();
-    let scale = 1.0 / (dk as f64).sqrt();
-    for j in 0..dv {
-        let row = &mut s[j * dk..(j + 1) * dk];
-        let mut sk = 0.0f64;
-        for i in 0..dk {
-            sk += f64::from(row[i]) * decay * f64::from(k[i]);
-        }
-        let delta = (f64::from(v[j]) - sk) * f64::from(beta);
-        let mut o = 0.0f64;
-        for i in 0..dk {
-            row[i] = (f64::from(row[i]) * decay + f64::from(k[i]) * delta) as f32;
-            o += f64::from(row[i]) * f64::from(q[i]);
-        }
-        if let Some(out) = out.as_deref_mut() {
-            out[j] = (o * scale) as f32;
-        }
-    }
-}
-
-/// The causal convolution of a recurrent block with `silu`: `n` rows of the
-/// projection `qkv` (`[n, cd]`), preceded by the committed window `window`
-/// (`[cd][kk]`, the last `kk` inputs of every channel, oldest first), with the
-/// taps `taps` (`[cd][kk + 1]`, tap `kk` on the newest input). Returns `[n, cd]`.
-/// The sums are in `f64`.
-pub fn conv_silu(
-    taps: &[f32],
-    kk: usize,
-    window: &[f32],
-    qkv: &[f32],
-    cd: usize,
-    n: usize,
-) -> Vec<f32> {
-    let mut mixed = vec![0.0f32; n * cd];
-    for ch in 0..cd {
-        let tap = &taps[ch * (kk + 1)..(ch + 1) * (kk + 1)];
-        let input = |i: usize| -> f64 {
-            f64::from(if i < kk { window[ch * kk + i] } else { qkv[(i - kk) * cd + ch] })
-        };
-        for t in 0..n {
-            let sum: f64 = (0..=kk).map(|i| f64::from(tap[i]) * input(t + i)).sum();
-            mixed[t * cd + ch] = silu(sum) as f32;
-        }
-    }
-    mixed
-}
+use crate::reference::{
+    conv_silu, delta_step, dot, l2_norm, par_ranges, rms_norm, rms_scale, sigmoid, silu, softplus,
+    widen,
+};
 
 /// Advances all value heads of one recurrent block over row `t` of the kept
 /// inputs, without computing outputs. This is what a commit does.
@@ -277,7 +208,7 @@ impl Reference<'_, '_> {
                         &v_all[(j - start) * kv_dim + kv_head * hd..][..hd]
                     }
                 };
-                let scores: Vec<f64> = (0..visible).map(|j| dot_f32(&qh, key(j)) * scale).collect();
+                let scores: Vec<f64> = (0..visible).map(|j| dot(&qh, key(j)) * scale).collect();
                 let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
                 let total: f64 = weights.iter().sum();

@@ -1,112 +1,10 @@
-//! The elementary operations of the forward pass, in `f64` where a sum or a
-//! transcendental function is involved and rounded to `f32` once per result.
-//!
-//! Every function does its sums in one fixed order that depends only on the
-//! length of the data, never on how many rows are processed together or on the
-//! number of threads, so a row has the same bits alone and inside a batch.
-//! The scalar functions and the norms are those of the `qwen35` reference.
+//! The operations of the forward pass that are Flash-Next's own; the others
+//! are every model's (`crate::reference`), with the same fixed orders of
+//! summation.
 
-use std::ops::Range;
-
-use crate::qwen4exp::weights::Matrix;
-pub use crate::qwen35::reference::pieces::{l2_norm, rms_norm, rms_scale, sigmoid, silu, softplus};
-
-/// The dot product of an `f64` vector with a stored `f32` vector, summed in
-/// four interleaved `f64` accumulators: element `i` goes to accumulator
-/// `i % 4` over the whole multiples of four, the accumulators are added as
-/// `(0 + 1) + (2 + 3)`, and the remaining elements follow in order. A product
-/// of two `f32` is exact in `f64`.
-pub fn dot(a: &[f64], b: &[f32]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut acc = [0.0f64; 4];
-    let ((a4, a_tail), (b4, b_tail)) = (a.as_chunks::<4>(), b.as_chunks::<4>());
-    for (x, y) in a4.iter().zip(b4) {
-        for lane in 0..4 {
-            acc[lane] += x[lane] * f64::from(y[lane]);
-        }
-    }
-    let tail: f64 = a_tail.iter().zip(b_tail).map(|(x, y)| x * f64::from(*y)).sum();
-    (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
-}
-
-/// `f32` values widened to `f64`.
-pub fn widen(x: &[f32]) -> Vec<f64> {
-    x.iter().map(|&v| f64::from(v)).collect()
-}
-
-/// Runs `work` on contiguous ranges of `0..n` on up to `threads` threads and
-/// concatenates what the ranges return, in order. With little work, or one
-/// thread, nothing is spawned.
-pub(crate) fn par_ranges<T: Send>(
-    threads: usize,
-    n: usize,
-    cost: usize,
-    work: impl Fn(Range<usize>) -> Vec<T> + Sync,
-) -> Vec<T> {
-    // Spawning a thread costs about as much as 20 000 multiply-adds.
-    let threads = threads.min(n).min(n.saturating_mul(cost) / 20_000).max(1);
-    if threads == 1 {
-        return work(0..n);
-    }
-    let per = n.div_ceil(threads);
-    std::thread::scope(|scope| {
-        let work = &work;
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let (start, end) = ((t * per).min(n), ((t + 1) * per).min(n));
-                scope.spawn(move || work(start..end))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| match h.join() {
-                Ok(part) => part,
-                Err(panic) => std::panic::resume_unwind(panic),
-            })
-            .collect()
-    })
-}
-
-/// The outputs `range` of `W x[t]` for `n` rows, as `[output][row]`: every
-/// stored row is decoded once ([`ares_quant::dequantize`]) and multiplied
-/// with each input row by [`dot`].
-fn matmul_range(w: &Matrix<'_>, xs: &[f64], n: usize, range: Range<usize>) -> Vec<f32> {
-    let cols = w.cols();
-    let mut stored = vec![0.0f32; cols];
-    let mut out = Vec::with_capacity(range.len() * n);
-    for r in range {
-        w.decode_row(r, &mut stored);
-        for t in 0..n {
-            out.push(dot(&xs[t * cols..(t + 1) * cols], &stored) as f32);
-        }
-    }
-    out
-}
-
-/// A matrix times rows: `y[t] = W x[t]` for `n` rows. Row `t` of `x` has
-/// `w.cols()` values and row `t` of the result `w.rows()`. Every output is one
-/// [`dot`] of the input row with the dequantized weight row, rounded to `f32`;
-/// the result does not depend on `threads`.
-///
-/// # Panics
-///
-/// Panics when `x` is not `n` rows of `w.cols()` values.
-pub fn matmul(threads: usize, w: &Matrix<'_>, x: &[f32], n: usize) -> Vec<f32> {
-    let (rows, cols) = (w.rows(), w.cols());
-    assert_eq!(x.len(), n * cols, "x must be {n} rows of {cols} values");
-    let xs = widen(x);
-    let by_row = par_ranges(threads, rows, cols * n.max(1), |range| matmul_range(w, &xs, n, range));
-    if n == 1 {
-        return by_row;
-    }
-    let mut y = vec![0.0f32; n * rows];
-    for (r, per_token) in by_row.chunks_exact(n).enumerate() {
-        for (t, &value) in per_token.iter().enumerate() {
-            y[t * rows + r] = value;
-        }
-    }
-    y
-}
+pub use crate::reference::{
+    dot, l2_norm, matmul, par_ranges, rms_norm, rms_scale, sigmoid, silu, softplus, widen,
+};
 
 /// The causal convolution over a history: for each of `n` rows and each of
 /// `d` channels
@@ -150,21 +48,6 @@ pub fn conv_dilated(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dot_sums_every_element_including_the_tail() {
-        let a: Vec<f64> = (1..=11).map(f64::from).collect();
-        let b32 = vec![2.0f32; 11];
-        assert_eq!(dot(&a, &b32), 132.0);
-    }
-
-    #[test]
-    fn par_ranges_keeps_the_order_for_any_thread_count() {
-        let one = par_ranges(1, 1000, 1_000_000, |r| r.map(|i| i * i).collect());
-        let many = par_ranges(7, 1000, 1_000_000, |r| r.map(|i| i * i).collect());
-        assert_eq!(one, many);
-        assert_eq!(many.len(), 1000);
-    }
 
     #[test]
     fn the_dilated_convolution_reads_the_cells_its_taps_name() {

@@ -40,7 +40,7 @@ mod blocks;
 mod mtp;
 mod ops;
 
-pub use crate::qwen35::reference::Inputs;
+pub use crate::reference::Inputs;
 pub(crate) use mtp::mtp_config;
 pub use mtp::{MtpState, MtpWindow};
 
@@ -56,7 +56,7 @@ pub mod pieces {
     pub use super::ops::{
         conv_dilated, dot, l2_norm, matmul, rms_norm, rms_scale, sigmoid, silu, softplus, widen,
     };
-    pub use crate::qwen35::reference::pieces::{conv_silu, delta_step};
+    pub use crate::reference::{conv_silu, delta_step};
 }
 
 use std::collections::BTreeMap;

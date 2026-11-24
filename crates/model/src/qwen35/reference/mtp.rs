@@ -30,9 +30,9 @@
 //!   block's own `out` of link `j - 1`. Nothing a chain computes is kept.
 
 use crate::qwen35::error::{Error, Result};
-use crate::qwen35::reference::ops::rms_norm;
 use crate::qwen35::reference::{LayerRows, Reference};
 use crate::qwen35::weights::{Matrix, NextnWeights};
+use crate::reference::rms_norm;
 
 /// What the block keeps of a sequence: its keys and values of every position
 /// the model has committed.

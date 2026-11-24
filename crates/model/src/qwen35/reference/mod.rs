@@ -25,7 +25,6 @@
 
 mod blocks;
 mod mtp;
-mod ops;
 
 pub use mtp::{MtpDraft, MtpRows, MtpState};
 
@@ -33,15 +32,18 @@ pub use mtp::{MtpDraft, MtpRows, MtpState};
 /// functions of the recurrent block (`delta_step`, `conv_silu`) and the scalar
 /// operations with their `f64` arithmetic.
 pub mod pieces {
-    pub use super::blocks::{conv_silu, delta_step};
-    pub use super::ops::{l2_norm, rms_norm, rms_scale, sigmoid, silu, softplus};
+    pub use crate::reference::{
+        conv_silu, delta_step, l2_norm, rms_norm, rms_scale, sigmoid, silu, softplus,
+    };
 }
+
+pub use crate::reference::Inputs;
 
 use crate::qwen35::config::Config;
 use crate::qwen35::error::{Error, Result};
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
 
-use ops::{dot_f32, par_ranges, rms_norm, widen};
+use crate::reference::rms_norm;
 
 /// What a sequence carries from token to token.
 #[derive(Clone, Debug, PartialEq)]
@@ -241,17 +243,6 @@ impl StateStorage {
             }
         }
     }
-}
-
-/// What a window takes besides its tokens ([`Reference::window_with`]).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Inputs {
-    /// Rows of the window whose input is these `n_embd` values in place of
-    /// their token's embedding (an image's rows).
-    pub rows: Vec<(usize, Vec<f32>)>,
-    /// Per row of the window its rotary position `(time, height, width)`;
-    /// `None`: the row's cell for all three.
-    pub rotary: Option<Vec<[usize; 3]>>,
 }
 
 /// The forward pass of a model.
@@ -492,31 +483,7 @@ impl<'a, 'g> Reference<'a, 'g> {
     /// `y[t] = W x[t]` for `n` rows: row `t` of `x` has `w.cols()` values and
     /// row `t` of the result `w.rows()`.
     fn matmul(&self, w: &Matrix<'_>, x: &[f32], n: usize) -> Vec<f32> {
-        let (rows, cols) = (w.rows(), w.cols());
-        assert_eq!(x.len(), n * cols);
-        let xs = widen(x);
-        // `[output row][token]` from the workers, transposed below.
-        let by_row = par_ranges(self.threads, rows, cols * n.max(1), |range| {
-            let mut stored = vec![0.0f32; cols];
-            let mut out = Vec::with_capacity(range.len() * n);
-            for r in range {
-                w.decode_row(r, &mut stored);
-                for t in 0..n {
-                    out.push(dot_f32(&xs[t * cols..(t + 1) * cols], &stored) as f32);
-                }
-            }
-            out
-        });
-        if n == 1 {
-            return by_row;
-        }
-        let mut y = vec![0.0f32; n * rows];
-        for (r, per_token) in by_row.chunks_exact(n).enumerate() {
-            for (t, &value) in per_token.iter().enumerate() {
-                y[t * rows + r] = value;
-            }
-        }
-        y
+        crate::reference::matmul(self.threads, w, x, n)
     }
 
     /// The feed-forward part: `down(silu(gate(x)) * up(x))`.
@@ -526,7 +493,7 @@ impl<'a, 'g> Reference<'a, 'g> {
         let act: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(&g, &u)| (ops::silu(f64::from(g)) * f64::from(u)) as f32)
+            .map(|(&g, &u)| (crate::reference::silu(f64::from(g)) * f64::from(u)) as f32)
             .collect();
         self.matmul(&block.ffn_down, &act, n)
     }
