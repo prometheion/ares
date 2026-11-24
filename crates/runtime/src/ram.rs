@@ -1,10 +1,10 @@
-//! The engine's page-locked host memory, kept in one broker.
+//! The engine's page-locked host memory, kept in one set of books.
 //!
 //! The engine has one limit of host RAM (see "Host memory" in
 //! `docs/ARCHITECTURE.md`), and the users of that memory make room for each
-//! other through an [`ares_core::Broker`]. Page-locked memory is what the
-//! devices copy to and from without a bounce buffer, so it is where state that
-//! lives in RAM has to be; today there are three users:
+//! other by rank. Page-locked memory is what the devices copy to and from
+//! without a bounce buffer, so it is where state that lives in RAM has to be;
+//! today there are four users:
 //!
 //! - the step record and the read-back buffers, which the executor needs to
 //!   run at all (required), and whatever else a model's parts must have
@@ -32,28 +32,31 @@
 //!
 //! # The limit and the allowances
 //!
-//! The limit is the most the engine may ever lock: a grant beyond it is
-//! refused. Below it the elastic users keep to an **allowance**, which says
-//! how much each may hold now. With a fixed limit ([`PinnedRam::new`]) the
-//! allowances are what the limit leaves: all of it to the tier of experts as
-//! far as the tier can use it, the rest to the prompt cache. An engine that
-//! follows the machine ([`PinnedRam::following`]) has its allowances set by
-//! the [`Machine`], look by look, from the memory the machine really has; the
-//! tier and the prompt cache then give memory back to the system when their
-//! allowance falls and take it again when it rises (the tier through the hook
-//! of [`PinnedRam::on_experts`], the prompt cache through
-//! [`PinnedRam::on_cache`] and [`PinnedRam::sweep_checkpoints`]).
+//! The limit is the most the engine may ever lock: a booking beyond it is
+//! refused, and the refusal says who holds what. Below it the elastic users
+//! keep to an **allowance**, which says how much each may hold now. The rank
+//! decides it: the required users take what they need, the tier of experts
+//! may hold all the limit leaves but the prompt cache's floor, and the prompt
+//! cache what the tier does not want, at least its floor. An engine that
+//! follows the machine ([`PinnedRam::following`]) is also held to what the
+//! [`Machine`] lets each have, look by look, from the memory the machine
+//! really has (the machine shares it out by the same rank, the tiers of all
+//! engines first); the tier and the prompt cache then give memory back to the
+//! system when their allowance falls and take it again when it rises (the
+//! tier through the hook of [`PinnedRam::on_experts`], the prompt cache
+//! through [`PinnedRam::on_cache`] and [`PinnedRam::sweep_checkpoints`]).
+//! With a fixed limit ([`PinnedRam::new`]) nothing else bounds them.
 //!
 //! The books are shared by the executor and the device threads, so they sit
-//! behind a lock; a grant is recorded in the same call that makes it, and a
-//! chunk gives its bytes back when it is dropped.
+//! behind a lock; a booking is recorded in the same call that grants it, and
+//! a chunk gives its bytes back when it is dropped.
 
 mod machine;
 
 use std::any::Any;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use ares_core::{Broker, Class, Consumer, Growth};
+use ares_core::units::Bytes;
 use ares_cuda::{Device, DevicePtr, HostRegistration, PinnedBuffer};
 use ares_store::Aligned;
 
@@ -63,33 +66,32 @@ use crate::error::RuntimeError;
 use crate::expert_store::{Locker, StoreError};
 use crate::model::ModelError;
 
-/// The prompt cache is a cache of the lowest kind: a prompt that finds less
-/// of itself there computes more rows, and nothing else suffers.
-const CACHE_PRIORITY: u32 = 1;
-
-/// The tier of experts ranks above every cache: a step that misses an expert
-/// waits for the drive, which is the one thing that makes such a model slow.
-const EXPERT_PRIORITY: u32 = 100;
-
+/// Who holds the engine's page-locked memory, by rank: what the executor
+/// cannot run without and the K/V of running sequences beyond VRAM first,
+/// then the tier of experts (a step that misses an expert waits for the
+/// drive, which is the one thing that makes such a model slow), then the
+/// prompt cache (a prompt that finds less of itself there computes more rows,
+/// and nothing else suffers).
 struct Books {
-    broker: Broker,
+    /// The most the engine may lock.
+    limit: u64,
     /// The step record and the read-back buffers.
-    required: Consumer,
+    required: u64,
     /// The K/V of the context beyond VRAM, and what it will hold once the
     /// pieces of the step that begins are locked: the elastic users make room
     /// for that much before the pieces are booked. Of it, `context_cached`
     /// are pages that only the prompt cache holds: they rank as prompt cache
     /// (the owner's rule of 2026-11-22), so they count in the prompt cache's
     /// share and not against the tier of experts.
-    context: Consumer,
+    context: u64,
     context_target: u64,
     context_cached: u64,
     /// The prompt cache in RAM: checkpoints of recurrent state and pages.
-    cache: Consumer,
+    cache: u64,
     /// The bytes of `cache` that are pages; the rest are checkpoints.
     pages: u64,
     /// The tier of experts.
-    experts: Consumer,
+    experts: u64,
     /// The most the tier of experts can use, and the part of it the tier
     /// cannot work without (its staging slots and a few slots per layer).
     experts_want: u64,
@@ -102,7 +104,7 @@ struct Books {
     place_floor: u64,
     pages_floor: u64,
     /// What the machine lets the tier and the prompt cache hold above their
-    /// floors; not used with a fixed limit.
+    /// floors; no bound with a fixed limit.
     experts_allow: u64,
     cache_allow: u64,
     /// A release that is being timed: when the machine asked for it, and
@@ -110,29 +112,106 @@ struct Books {
     asked: Option<(std::time::Duration, u64)>,
 }
 
+/// A user of the books.
+#[derive(Clone, Copy, Debug)]
+enum User {
+    Required,
+    Context,
+    Cache,
+    Experts,
+}
+
 impl Books {
-    fn usage(&self, consumer: &Consumer) -> u64 {
-        self.broker.info(consumer.id()).map_or(0, |info| info.usage)
+    fn used(&self) -> u64 {
+        self.required + self.context + self.cache + self.experts
+    }
+
+    fn held(&mut self, user: User) -> &mut u64 {
+        match user {
+            User::Required => &mut self.required,
+            User::Context => &mut self.context,
+            User::Cache => &mut self.cache,
+            User::Experts => &mut self.experts,
+        }
+    }
+
+    /// Books `bytes` for `user` when the limit has room for them, or says
+    /// how many bytes it lacks.
+    fn grow(&mut self, user: User, bytes: u64) -> Result<(), u64> {
+        let missing = self.used().saturating_add(bytes).saturating_sub(self.limit);
+        if missing > 0 {
+            return Err(missing);
+        }
+        *self.held(user) += bytes;
+        Ok(())
+    }
+
+    /// `user` gave `bytes` back.
+    fn shrink(&mut self, user: User, bytes: u64) {
+        let held = self.held(user);
+        *held = held.saturating_sub(bytes);
+    }
+
+    /// Why `bytes` more for `what` do not fit: who holds the limit.
+    fn refusal(&self, bytes: u64, what: &str) -> String {
+        format!(
+            "the RAM limit of {} has no room for {} more of {what}: the step record and \
+             read-back hold {}, the K/V beyond VRAM {}, the tier of experts {}, the prompt \
+             cache {}",
+            Bytes(self.limit),
+            Bytes(bytes),
+            Bytes(self.required),
+            Bytes(self.context),
+            Bytes(self.experts),
+            Bytes(self.cache),
+        )
     }
 
     /// What the limit leaves for the elastic users: the K/V of running
     /// sequences beyond VRAM is not theirs; that of pages only the prompt
     /// cache holds is the prompt cache's.
     fn elastic_room(&self) -> u64 {
-        let context = self.usage(&self.context).max(self.context_target);
+        let context = self.context.max(self.context_target);
         let running = context.saturating_sub(self.context_cached);
-        self.broker.capacity().saturating_sub(self.usage(&self.required) + running)
+        self.limit.saturating_sub(self.required + running)
     }
 
     /// What the prompt cache holds: its own bookings and the K/V beyond
     /// VRAM of the pages only it holds.
     fn cache_usage(&self) -> u64 {
-        self.usage(&self.cache) + self.context_cached
+        self.cache + self.context_cached
     }
 
     /// The prompt cache's floor, never more than it can use.
     fn cache_floor(&self) -> u64 {
         (self.place_floor + self.pages_floor).min(self.cache_want)
+    }
+
+    /// What the tier of experts and the prompt cache may hold now, by rank:
+    /// the tier all the room the limit leaves the two but the prompt cache's
+    /// floor, the prompt cache what the tier does not want (or holds), at
+    /// least its floor; each no more than the machine lets it hold above its
+    /// floor.
+    fn allowances(&self) -> (u64, u64) {
+        let room = self.elastic_room();
+        let cache_floor = self.cache_floor();
+        let experts = self
+            .experts_floor
+            .saturating_add(self.experts_allow)
+            .min(room.saturating_sub(cache_floor));
+        let tier = self.experts_want.max(self.experts);
+        let left = room.saturating_sub(tier).saturating_sub(cache_floor);
+        (experts, cache_floor + self.cache_allow.min(left))
+    }
+
+    /// What the tier of experts and the prompt cache can use above their
+    /// floors within the room the limit leaves them, by the same rank: what
+    /// the machine shares out.
+    fn wants(&self) -> (u64, u64) {
+        let floors = self.experts_floor + self.cache_floor();
+        let room = self.elastic_room().saturating_sub(floors);
+        let experts = self.experts_want.saturating_sub(self.experts_floor).min(room);
+        (experts, self.cache_want.saturating_sub(self.cache_floor()).min(room - experts))
     }
 }
 
@@ -182,27 +261,15 @@ impl Shared {
         self.books.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What the prompt cache's floor holds locked: its pages and its one
-    /// place, which lies alone in the first chunk of every device part (see
-    /// [`PlaceChunks`]). Nothing without a floor.
-    fn floor_held(&self) -> u64 {
-        let books = self.books();
-        books.cache_floor()
-    }
-
     pub(crate) fn wants(&self) -> Wants {
-        let floor_held = self.floor_held();
         let books = self.books();
-        let floors = books.experts_floor + books.cache_floor();
-        let room = books.elastic_room().saturating_sub(floors);
-        let experts_want = books.experts_want.saturating_sub(books.experts_floor).min(room);
-        let cache_want = books.cache_want.saturating_sub(books.cache_floor());
+        let (experts_want, cache_want) = books.wants();
         Wants {
-            locked: books.broker.used(),
-            experts_held: books.usage(&books.experts).saturating_sub(books.experts_floor),
+            locked: books.used(),
+            experts_held: books.experts.saturating_sub(books.experts_floor),
             experts_want,
-            cache_held: books.cache_usage().saturating_sub(floor_held),
-            cache_want: cache_want.min(room - experts_want),
+            cache_held: books.cache_usage().saturating_sub(books.cache_floor()),
+            cache_want,
         }
     }
 
@@ -245,11 +312,9 @@ impl Shared {
         if let Some(hook) = experts {
             hook(&ram, ram.experts_allowance());
         }
-        // The chunk that the floor's place lies in is not more than allowed.
-        let allowance = ram.cache_allowance().max(self.floor_held());
-        let held = {
+        let (held, allowance) = {
             let books = self.books();
-            books.cache_usage()
+            (books.cache_usage(), books.allowances().1)
         };
         if held > allowance {
             if let Some(hook) = cache {
@@ -270,8 +335,8 @@ impl std::fmt::Debug for PinnedRam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let books = self.books();
         f.debug_struct("PinnedRam")
-            .field("limit", &books.broker.capacity())
-            .field("used", &books.broker.used())
+            .field("limit", &books.limit)
+            .field("used", &books.used())
             .field("follows", &self.shared.machine.is_some())
             .finish()
     }
@@ -293,40 +358,25 @@ impl PinnedRam {
     }
 
     fn build(limit: u64, machine: Option<Arc<Machine>>) -> Self {
-        let mut broker = Broker::new("pinned RAM", limit);
-        // Three consumers of a fresh broker with distinct names and no floor
-        // cannot be refused.
-        let required = broker
-            .register("step record and read-back", Class::Required)
-            .expect("a fresh broker takes a consumer");
-        let context = broker
-            .register("K/V of the context beyond VRAM", Class::Required)
-            .expect("a fresh broker takes a consumer");
-        let cache = broker
-            .register(
-                "prompt cache in RAM: checkpoints of recurrent state and pages",
-                Class::Elastic { priority: CACHE_PRIORITY, floor: 0 },
-            )
-            .expect("a fresh broker takes a consumer");
-        let experts = broker
-            .register("RAM tier of experts", Class::Elastic { priority: EXPERT_PRIORITY, floor: 0 })
-            .expect("a fresh broker takes a consumer");
+        // Without a machine nothing but the limit bounds the elastic users;
+        // with one they hold nothing until its first look.
+        let allow = if machine.is_some() { 0 } else { u64::MAX };
         let books = Books {
-            broker,
-            required,
-            context,
+            limit,
+            required: 0,
+            context: 0,
             context_target: 0,
             context_cached: 0,
-            cache,
+            cache: 0,
             pages: 0,
-            experts,
+            experts: 0,
             experts_want: 0,
             experts_floor: 0,
             cache_want: 0,
             place_floor: 0,
             pages_floor: 0,
-            experts_allow: 0,
-            cache_allow: 0,
+            experts_allow: allow,
+            cache_allow: allow,
             asked: None,
         };
         Self {
@@ -354,19 +404,18 @@ impl PinnedRam {
 
     /// The most the engine may lock.
     pub fn limit(&self) -> u64 {
-        self.books().broker.capacity()
+        self.books().limit
     }
 
     /// Bytes locked now, by everyone.
     pub fn used(&self) -> u64 {
-        self.books().broker.used()
+        self.books().used()
     }
 
     /// Bytes the prompt cache holds in RAM now: its checkpoints and its
     /// pages.
     pub fn prompt_cache(&self) -> u64 {
-        let books = self.books();
-        books.usage(&books.cache)
+        self.books().cache
     }
 
     /// Bytes of the K/V beyond VRAM that only the prompt cache holds
@@ -378,7 +427,7 @@ impl PinnedRam {
     /// Bytes the prompt cache's checkpoints hold now.
     pub fn checkpoints(&self) -> u64 {
         let books = self.books();
-        books.usage(&books.cache).saturating_sub(books.pages)
+        books.cache.saturating_sub(books.pages)
     }
 
     /// Bytes the prompt cache's pages hold now.
@@ -388,14 +437,12 @@ impl PinnedRam {
 
     /// Bytes the tier of experts holds now.
     pub fn experts(&self) -> u64 {
-        let books = self.books();
-        books.broker.info(books.experts.id()).map_or(0, |info| info.usage)
+        self.books().experts
     }
 
     /// Bytes the K/V of the context beyond VRAM holds now.
     pub fn context(&self) -> u64 {
-        let books = self.books();
-        books.usage(&books.context)
+        self.books().context
     }
 
     /// The K/V of the context beyond VRAM will hold `bytes` once the pieces
@@ -423,56 +470,35 @@ impl PinnedRam {
     }
 
     fn book_context(&self, bytes: u64) -> Result<(), u64> {
-        let mut books = self.books();
-        let Books { broker, context, .. } = &mut *books;
-        match broker.grow(context, bytes) {
-            Ok(Growth::Granted) => Ok(()),
-            Ok(Growth::Reclaim(plan)) => Err(plan.total()),
-            Err(_) => Err(bytes),
-        }
+        self.books().grow(User::Context, bytes)
     }
 
     fn release_context(&self, bytes: u64) {
-        let mut books = self.books();
-        let Books { broker, context, .. } = &mut *books;
-        let _ = broker.shrink(context, bytes);
+        self.books().shrink(User::Context, bytes);
     }
 
     /// The most the tier of experts could lock now: what the limit leaves
-    /// after the required users, counting what the prompt cache could give
-    /// back.
+    /// after the required users, counting what the prompt cache, which ranks
+    /// below it, could give back.
     pub fn obtainable_experts(&self) -> u64 {
         let books = self.books();
-        books.broker.obtainable(&books.experts).unwrap_or(0)
+        books.limit.saturating_sub(books.required + books.context + books.experts)
     }
 
-    /// What the tier of experts may hold now: with a fixed limit all that
-    /// the limit leaves after the required memory and the floor of the
-    /// prompt cache, otherwise what the machine lets it have, and always the
-    /// part it cannot work without.
+    /// What the tier of experts may hold now: all that the limit leaves
+    /// after the required memory and the floor of the prompt cache, and no
+    /// more than the machine lets it have above the part it cannot work
+    /// without.
     pub fn experts_allowance(&self) -> u64 {
-        let books = self.books();
-        let room = books.elastic_room().saturating_sub(books.cache_floor());
-        match self.shared.machine {
-            None => room,
-            Some(_) => (books.experts_floor + books.experts_allow).min(room),
-        }
+        self.books().allowances().0
     }
 
     /// What the prompt cache may hold in RAM now, its checkpoints and its
-    /// pages together: with a fixed limit what the limit leaves after the
-    /// required memory and all the tier of experts can use, otherwise what
-    /// the machine lets it have, and always its floor
-    /// ([`PinnedRam::want_cache`]).
+    /// pages together: what the limit leaves after the required memory and
+    /// all the tier of experts can use, no more than the machine lets it
+    /// have above its floor, and always its floor ([`PinnedRam::want_cache`]).
     pub fn cache_allowance(&self) -> u64 {
-        let books = self.books();
-        match self.shared.machine {
-            None => {
-                let experts = books.experts_want.max(books.usage(&books.experts));
-                books.elastic_room().saturating_sub(experts).max(books.cache_floor())
-            }
-            Some(_) => books.cache_floor() + books.cache_allow,
-        }
+        self.books().allowances().1
     }
 
     /// Says what the tier of experts can use at most and what it cannot
@@ -538,55 +564,31 @@ impl PinnedRam {
         Box::new(ExpertPieces { ram: self.clone(), device: device.clone() })
     }
 
-    fn book_experts(&self, bytes: u64) -> Result<(), String> {
+    /// Books `bytes` for `user`, or says why the limit has no room for them
+    /// (`what` names them).
+    fn book(&self, user: User, bytes: u64, what: &str) -> Result<(), String> {
         let mut books = self.books();
-        let Books { broker, experts, .. } = &mut *books;
-        match broker.grow(experts, bytes) {
-            Ok(Growth::Granted) => Ok(()),
-            Ok(Growth::Reclaim(plan)) => Err(format!(
-                "the RAM limit of {} bytes has no room for {bytes} bytes for the tier of experts: \
-                 {} would have to come from others",
-                broker.capacity(),
-                plan.total()
-            )),
-            Err(error) => Err(error.to_string()),
-        }
+        books.grow(user, bytes).map_err(|_| books.refusal(bytes, what))
+    }
+
+    fn book_experts(&self, bytes: u64) -> Result<(), String> {
+        self.book(User::Experts, bytes, "the tier of experts")
     }
 
     fn release_experts(&self, bytes: u64) {
-        let mut books = self.books();
-        let Books { broker, experts, .. } = &mut *books;
-        let _ = broker.shrink(experts, bytes);
+        self.books().shrink(User::Experts, bytes);
     }
 
     /// Books `bytes` for what the executor cannot run without.
     pub(crate) fn require(&self, bytes: u64) -> Result<(), RuntimeError> {
-        let mut books = self.books();
-        let Books { broker, required, .. } = &mut *books;
-        match broker.grow(required, bytes) {
-            Ok(Growth::Granted) => Ok(()),
-            Ok(Growth::Reclaim(_)) => unreachable!("nobody else holds page-locked memory yet"),
-            Err(error) => Err(RuntimeError::Pinned(error)),
-        }
+        self.book(User::Required, bytes, "the step record and read-back")
+            .map_err(RuntimeError::Pinned)
     }
 
     /// Books `bytes` for the prompt cache, or says why the limit has no
     /// room for them.
     fn book_cache(&self, bytes: u64, what: &str) -> Result<(), String> {
-        let mut books = self.books();
-        let Books { broker, cache, .. } = &mut *books;
-        match broker.grow(cache, bytes) {
-            Ok(Growth::Granted) => Ok(()),
-            // Nothing ranks below the prompt cache, so there is nobody to
-            // take from; a plan would be a refusal.
-            Ok(Growth::Reclaim(plan)) => Err(format!(
-                "the RAM limit of {} bytes has no room for {bytes} more bytes of {what}, and {} \
-                 would have to come from others",
-                broker.capacity(),
-                plan.total()
-            )),
-            Err(error) => Err(error.to_string()),
-        }
+        self.book(User::Cache, bytes, what)
     }
 
     pub(crate) fn book_checkpoints(&self, bytes: u64) -> Result<(), ModelError> {
@@ -612,10 +614,7 @@ impl PinnedRam {
     }
 
     pub(crate) fn release_checkpoints(&self, bytes: u64) {
-        let mut books = self.books();
-        let Books { broker, cache, .. } = &mut *books;
-        // The bytes were granted by `book_checkpoints`, so the books hold them.
-        let _ = broker.shrink(cache, bytes);
+        self.books().shrink(User::Cache, bytes);
     }
 
     /// One device share of a page of the prompt cache in RAM: `bytes` (at
@@ -645,8 +644,7 @@ impl PinnedRam {
     fn release_cache_pages(&self, bytes: u64) {
         let mut books = self.books();
         books.pages = books.pages.saturating_sub(bytes);
-        let Books { broker, cache, .. } = &mut *books;
-        let _ = broker.shrink(cache, bytes);
+        books.shrink(User::Cache, bytes);
     }
 
     /// The places of a device part's checkpoints: `capacity` places of
@@ -762,14 +760,14 @@ impl PinnedRam {
     /// The bytes the limit leaves unbooked now.
     pub(crate) fn unbooked(&self) -> u64 {
         let books = self.books();
-        books.broker.capacity().saturating_sub(books.broker.used())
+        books.limit.saturating_sub(books.used())
     }
 
     /// Releases chunks of checkpoint places in which the conductor has no
     /// checkpoint, until the prompt cache holds no more than its allowance.
     /// Returns the bytes released.
     pub fn sweep_checkpoints(&self) -> u64 {
-        let allowance = self.cache_allowance().max(self.shared.floor_held());
+        let allowance = self.cache_allowance();
         let mut held = self.prompt_cache();
         let tables: Vec<Arc<PlaceChunks>> = {
             let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
@@ -1202,19 +1200,10 @@ mod tests {
         // A model without experts leaves all of it to the checkpoints.
         assert_eq!((ram.experts_allowance(), ram.cache_allowance()), (90 * MIB, 90 * MIB));
         // The checkpoints hold 40 MiB; the tier of experts, which ranks above
-        // them, could still have all 90.
+        // them, could still have all 90, once they give back what they hold.
         ram.book_checkpoints(40 * MIB).unwrap();
         assert_eq!(ram.obtainable_experts(), 90 * MIB);
-        {
-            let mut books = ram.books();
-            let Books { broker, experts, .. } = &mut *books;
-            match broker.grow(experts, 90 * MIB).unwrap() {
-                Growth::Reclaim(plan) => {
-                    assert_eq!(plan.total(), 40 * MIB, "the checkpoints give back what they hold");
-                }
-                other => panic!("the checkpoints hold memory the tier needs: {other:?}"),
-            }
-        }
+        assert_eq!(ram.books().grow(User::Experts, 90 * MIB), Err(40 * MIB));
         // A tier that can use 70 MiB leaves the checkpoints 20, and one that
         // can use everything leaves them nothing.
         ram.want_experts(70 * MIB, 0);

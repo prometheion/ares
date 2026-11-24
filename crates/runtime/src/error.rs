@@ -1,6 +1,6 @@
 //! Why the runtime could not start or had to stop.
 
-use ares_core::{BrokerError, LedgerError};
+use ares_core::LedgerError;
 
 use crate::model::ModelError;
 
@@ -14,8 +14,10 @@ pub enum RuntimeError {
     Model(#[from] ModelError),
     #[error("device memory: {0}")]
     Memory(#[from] LedgerError),
+    /// The limit of page-locked memory has no room for what the executor
+    /// cannot run without.
     #[error("page-locked memory: {0}")]
-    Pinned(#[from] BrokerError),
+    Pinned(String),
     /// The configuration cannot be run.
     #[error("{0}")]
     Config(String),
