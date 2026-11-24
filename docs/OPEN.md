@@ -1680,7 +1680,9 @@ the agents' builds):
   (Ares is Apache-2.0); not GPL, AGPL or code with no license. Kernels come over nearly as they
   are, host logic (C++, Python) is translated into Rust from the source. Every piece names its
   origin (repository, file, commit) in a header comment and in THIRD-PARTY-NOTICES with the
-  license text. A/B and the owner's rules apply as to any change.
+  license text. A/B and the owner's rules apply as to any change. Taken first, then improved
+  (the owner): the port is its own commit, adapted to Ares's structures, and every improvement
+  after it is a commit of its own measured against the port.
 - A named `--context` overflows like the model's own (the owner, 2026-11-24: an operator always
   names it, e.g. 4 sequences of 128k = `--context 524288` for all together). For Flash-Next the
   indexer's keys and the near pages stay in VRAM and the rest lies in RAM, whether the context
