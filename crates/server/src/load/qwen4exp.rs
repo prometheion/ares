@@ -39,7 +39,7 @@ use super::devices::{Held, describe_links, hold_devices, ordinals, tower_of};
 use super::files::{chat_options, drafter_files, open_projector, read_vocabulary};
 use super::ram::{Budget, Rest};
 use super::start::{self, Engine, log_started};
-use super::{LoadError, Loaded, VRAM_HEADROOM, join, log_context, refuse, short};
+use super::{LoadError, Loaded, VRAM_HEADROOM, join, log_context, model_error, refuse, short};
 use crate::models::Site;
 use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, Drafter, LoadOptions, SplitKind};
 use tiers::{fill_tiers, log_expert_costs, profile_dir};
@@ -73,10 +73,6 @@ const DRAFT_WINDOW: u32 = 4;
 /// The tokens of K/V a first plan counts with to learn what a page costs on
 /// each device, before the context is decided.
 const TRIAL_CONTEXT: u32 = 8192;
-
-fn model_error(e: impl ToString) -> LoadError {
-    LoadError::Model(e.to_string())
-}
 
 /// Loads the model of `options`, whose file `gguf` is open, at `site`, and
 /// starts the runtime over it; `begun` is when the load began.

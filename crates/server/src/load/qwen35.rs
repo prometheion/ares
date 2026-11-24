@@ -30,16 +30,14 @@ use super::devices::{
 use super::files::{chat_options, drafter_files, mtp_takes_part, open_projector, read_vocabulary};
 use super::ram::{Budget, Rest};
 use super::start::{self, Engine, log_started};
-use super::{LoadError, Loaded, VRAM_HEADROOM, join, log_context, refuse, shares_text, short};
+use super::{
+    LoadError, Loaded, VRAM_HEADROOM, join, log_context, model_error, refuse, shares_text, short,
+};
 use crate::models::Site;
 use crate::plan::{
     self, AttentionShares, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, LoadOptions, Room,
     SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
 };
-
-fn model_error(e: impl ToString) -> LoadError {
-    LoadError::Model(e.to_string())
-}
 
 /// Loads a `qwen35` model from `gguf`, which is open, with `options` at
 /// `site`; `begun` is when the load began.

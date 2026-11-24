@@ -101,6 +101,11 @@ pub(crate) fn refuse(message: impl Into<String>) -> LoadError {
     LoadError::Options(message.into())
 }
 
+/// An error of the model as the load reports it.
+fn model_error(e: impl ToString) -> LoadError {
+    LoadError::Model(e.to_string())
+}
+
 /// A model on the devices, being served.
 pub struct Loaded {
     runtime: Arc<Runtime>,
