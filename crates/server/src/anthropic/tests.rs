@@ -6,7 +6,7 @@ use super::reply::{Block, BlockEvent, Blocks, Content, Head, SIGNATURE, block_ev
 use super::request::{Asked, to_chat};
 use crate::chat_body::Purpose;
 use crate::reasoning::Split;
-use crate::reply::Piece;
+use crate::sorter::Piece;
 
 fn read(body: Value) -> Json {
     serde_json::from_value(body).unwrap()
@@ -245,8 +245,12 @@ fn a_turn_of_the_system_joins_the_system_prompt_or_is_read_as_a_turn_of_the_user
     // The reader of the chat body, the rule of every route, makes the later
     // ones turns of the user.
     let json: Json = serde_json::from_value(got.clone()).unwrap();
-    let parsed =
-        crate::wire::from_json(crate::wire::Endpoint::Chat, &json, ares_api::RequestId(1)).unwrap();
+    let parsed = crate::openai::request::from_json(
+        crate::openai::request::Endpoint::Chat,
+        &json,
+        ares_api::RequestId(1),
+    )
+    .unwrap();
     let ares_api::Prompt::Chat { messages, .. } = &parsed.request.prompt else { panic!() };
     let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
     assert_eq!(roles, ["system", "user", "user", "assistant", "tool", "user"]);

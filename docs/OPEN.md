@@ -896,7 +896,7 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       are refused there.
 - [x] Chat and Responses routes: a system or developer message inside a conversation is a turn
       of the user, as on the Messages route (one rule in the reader of the chat body,
-      `wire::place_system_messages`); an effort the template refuses is detected with its
+      `openai::request::place_system_messages`); an effort the template refuses is detected with its
       thinking (`refused_efforts`: Flash-Next `minimal` and `high`, the 27B `minimal`), `high`
       is then the template's default and another one a 400 that says so (2026-11-22,
       `server/priorities`).

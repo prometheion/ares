@@ -14,9 +14,9 @@
 use ares_api::{Json, Message, Prompt, Role};
 
 use crate::error::ApiError;
+use crate::generate;
 use crate::models::Lease;
-use crate::routes;
-use crate::wire::Parsed;
+use crate::openai::request::Parsed;
 
 /// What a result of a tool that is cleared becomes: Anthropic's service
 /// writes "placeholder text indicating to Claude that it was removed" and does
@@ -210,7 +210,7 @@ fn messages(parsed: &mut Parsed) -> Result<&mut Vec<Message>, ApiError> {
 async fn count(lease: &Lease, parsed: &Parsed, prompt: Prompt) -> Result<u32, ApiError> {
     let mut request = parsed.request.clone();
     request.prompt = prompt;
-    routes::count_prompt(lease, request).await
+    generate::count_prompt(lease, request).await
 }
 
 /// Takes the thinking out of the messages of the assistant whose turn is

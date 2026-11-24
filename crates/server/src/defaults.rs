@@ -15,7 +15,7 @@
 //! `null`, takes the model's default, and without a default the engine's
 //! built-in value, as it did before there were defaults. The defaults are
 //! filled in where every route that generates takes its model
-//! (`routes::prepare`), so they hold on `/v1/chat/completions`,
+//! (`generate::prepare`), so they hold on `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/messages` and `/v1/responses` alike, also for the
 //! fields the API of a route has no member for (`min_p` on `/v1/messages`).
 //! `seed: -1`, llama.cpp's word for a seed of the request's own draw, is a
@@ -51,8 +51,8 @@
 
 use ares_api::Sampling;
 
+use crate::openai::request::Parsed;
 use crate::options::{Invalid, OPTIONS};
-use crate::wire::Parsed;
 
 /// The header of a response whose request asked for more tokens than the
 /// model's `--max-tokens-limit`: its value is the limit the reply got.

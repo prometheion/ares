@@ -18,8 +18,8 @@ use super::request::Echo;
 use crate::answer::Written;
 use crate::bridge::Timings;
 use crate::error::ApiError;
-use crate::reply::Piece;
-use crate::wire::TimingsBody;
+use crate::openai::reply::TimingsBody;
+use crate::sorter::Piece;
 
 /// `[]`: a list this server never has anything for (the summary of a
 /// reasoning item, the annotations and the probabilities of a text).

@@ -1,11 +1,11 @@
 //! What the readers of the Messages and the Responses bodies share: both
 //! write a body of their API over into the body of a chat request, which
-//! `wire::from_json` then reads as it reads every chat request.
+//! `openai::request::from_json` then reads as it reads every chat request.
 
 use ares_api::Json;
 
 use crate::error::ApiError;
-use crate::wire::Fields;
+use crate::openai::request::Fields;
 
 /// What a body is read for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

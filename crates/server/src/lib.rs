@@ -24,7 +24,7 @@
 //!
 //! A request is served in full or refused: a field that asks for something
 //! the server or the engine does not do is an error that names the field,
-//! never dropped (the `wire` module). A sampling field it leaves out takes
+//! never dropped (`openai::request`). A sampling field it leaves out takes
 //! the default its model was given, and its reply is held to the length the
 //! model allows (the [`defaults`] module).
 //!
@@ -55,25 +55,26 @@ mod bridge;
 mod chat_body;
 pub mod defaults;
 mod error;
+mod generate;
 mod images;
 pub mod ini;
-mod latency;
 mod listen;
 pub mod load;
+mod metrics;
 pub mod models;
+mod openai;
 pub mod options;
 pub mod plan;
 pub mod preset;
 mod props;
 mod qwen4exp;
 mod reasoning;
-mod reply;
 mod responses;
 mod routes;
+mod sorter;
 mod structured;
 mod systemone;
 mod tools;
-mod wire;
 
 use std::future::Future;
 use std::io;
@@ -121,7 +122,7 @@ pub struct Config {
     /// (`--log-text`).
     pub log_text: bool,
     /// How long a streamed reply waits for the engine's first step before
-    /// its response starts without it (see `routes::Reply::first`).
+    /// its response starts without it (see `generate::Generation::first`).
     pub stream_wait: Duration,
 }
 
@@ -173,7 +174,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
     let access = Arc::new(config.access.clone());
     Router::new()
         .route("/health", get(routes::health))
-        .route("/metrics", get(routes::metrics))
+        .route("/metrics", get(metrics::metrics))
         .route("/v1/models", get(routes::models))
         .route("/props", get(props::props))
         .route("/tokenize", post(props::tokenize))
@@ -181,15 +182,15 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
         .route("/models/load", post(routes::load_model))
         .route("/models/unload", post(routes::unload_model))
         .route("/models/sse", get(routes::model_events))
-        .route("/v1/chat/completions", post(routes::chat_completions))
-        .route("/v1/completions", post(routes::completions))
-        .route("/v1/systemone", post(routes::systemone))
+        .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/completions", post(openai::completions))
+        .route("/v1/systemone", post(systemone::decide))
         .route("/v1/messages", post(anthropic::messages).fallback(anthropic::method_not_allowed))
         .route(
             "/v1/messages/count_tokens",
             post(anthropic::count_tokens).fallback(anthropic::method_not_allowed),
         )
-        .route("/v1/chat/completions/input_tokens", post(routes::chat_input_tokens))
+        .route("/v1/chat/completions/input_tokens", post(openai::chat_input_tokens))
         .route("/v1/responses", post(responses::create))
         .route("/v1/responses/input_tokens", post(responses::input_tokens))
         .route("/v1/responses/{id}", any(responses::stored))

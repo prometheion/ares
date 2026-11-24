@@ -19,7 +19,7 @@ use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer, ToolCall};
 use super::*;
 use crate::reasoning::Splitter;
 use crate::reasoning::templates::streamed;
-use crate::reply::{Piece, Sorter};
+use crate::sorter::{Piece, Sorter};
 
 const FILES: [(&str, &str); 3] = [
     ("ARES_TEST_GGUF", "Qwen3.5-0.8B"),

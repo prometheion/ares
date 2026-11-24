@@ -56,8 +56,8 @@ use ares_grammar::calls::{CallRule, Callable};
 use serde_json::Value;
 
 use crate::error::ApiError;
+use crate::openai::request::{Fields, Parsed, wrong_type};
 use crate::reasoning::Applied;
-use crate::wire::{Fields, Parsed, wrong_type};
 
 pub(crate) use split::{CallSplitter, Part};
 

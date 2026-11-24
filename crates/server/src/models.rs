@@ -166,7 +166,9 @@ enum Phase {
     Unloading,
 }
 
-struct Loaded {
+/// A model that is loaded: its unit, the engine it serves, the record of
+/// its requests in flight, and the RAM it holds.
+struct Running {
     unit: Box<dyn Unit>,
     engine: Arc<dyn Engine>,
     flight: Arc<Flight>,
@@ -178,7 +180,7 @@ struct Entry {
     /// The preset's, for the requests to take with their hold.
     defaults: Arc<Defaults>,
     phase: Phase,
-    loaded: Option<Loaded>,
+    loaded: Option<Running>,
     card: Option<ModelCard>,
     /// Requests that hold the model.
     leases: usize,
@@ -449,7 +451,7 @@ impl Shared {
                     let engine = unit.engine();
                     // The engine's totals are read where waiting is allowed.
                     let flight = Arc::new(Flight::new(&*engine));
-                    Ok(Loaded { ram: unit.ram(), unit, engine, flight })
+                    Ok(Running { ram: unit.ram(), unit, engine, flight })
                 };
                 tokio::task::spawn_blocking(load).await.unwrap_or_else(|lost| {
                     Err(LoadFailure::Failed(format!("the load ended without a result: {lost}")))
@@ -584,7 +586,9 @@ impl Drop for Waiter<'_> {
     }
 }
 
-struct Held {
+/// What the clones of one [`Lease`] share, which gives the model back when
+/// the last is dropped.
+struct Hold {
     engine: Option<Arc<dyn Engine>>,
     flight: Arc<Flight>,
     /// The id of the model in its engine, when it is not the name a request
@@ -595,7 +599,7 @@ struct Held {
     home: Option<(Arc<Shared>, usize)>,
 }
 
-impl Drop for Held {
+impl Drop for Hold {
     fn drop(&mut self) {
         let engine = self.engine.take();
         let Some((shared, index)) = &self.home else { return };
@@ -617,7 +621,7 @@ impl Drop for Held {
 /// A request's hold on a loaded model: while a lease or a clone of it lives,
 /// the model is not unloaded.
 #[derive(Clone)]
-pub struct Lease(Arc<Held>);
+pub struct Lease(Arc<Hold>);
 
 impl std::fmt::Debug for Lease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -748,7 +752,7 @@ impl Models {
     async fn take(&self, name: &str, load: bool) -> Result<Lease, AcquireError> {
         let shared = match &self.0 {
             Kind::Fixed { engine, flight, reasoning_format, defaults } => {
-                return Ok(Lease(Arc::new(Held {
+                return Ok(Lease(Arc::new(Hold {
                     engine: Some(engine.clone()),
                     flight: flight.clone(),
                     id: None,
@@ -785,7 +789,7 @@ impl Models {
                 if let (Phase::Loaded, true, Some(loaded)) = (entry.phase, free, &entry.loaded) {
                     entry.leases += 1;
                     entry.last_used = now;
-                    return Ok(Lease(Arc::new(Held {
+                    return Ok(Lease(Arc::new(Hold {
                         engine: Some(loaded.engine.clone()),
                         flight: loaded.flight.clone(),
                         id: Some(entry.preset.id.clone()),

@@ -7602,6 +7602,25 @@ A client that disconnects frees its sequence. The
 first signal lets running requests finish, the second ends them, and the
 devices are released before the process exits.
 
+**Where the server's code is** (`crates/server/src`). Each API has a module
+of its own: `openai.rs` (the chat and completion routes, with
+`openai/request.rs`, the reader of a chat or completion body, which every
+other API writes its body over into, and `openai/reply.rs`, the answers and
+the model list), `anthropic.rs` and `anthropic/` (Messages), `responses.rs`
+and `responses/` (Responses), `systemone.rs` and `props.rs` (`/props`,
+`/tokenize`, `/detokenize`). They share `chat_body.rs` (the toolkit of the
+readers that write a chat body), `generate.rs` (preparing a request for its
+model, its run in the engine, the count of a prompt), `sorter.rs` with
+`reasoning.rs` and `tools.rs` (the reply's text sorted into reasoning,
+content and calls), `answer.rs` (the answer of Messages and Responses, whole
+or streamed), and `bridge.rs` (the hand-over between the engine's threads and
+the handlers). `routes.rs` has the routes that are no API's own (health, the
+model list, the loads and events of router mode) and what every handler
+uses; `metrics.rs` is `/metrics`, with `metrics/latency.rs`. The options are
+`options.rs` (the table), `defaults.rs`, `ini.rs`, `preset.rs` and the
+binary's `cli.rs`; `models.rs` keeps the models of router mode, and
+`load.rs`, `qwen4exp.rs` and `plan.rs` load one onto the devices.
+
 **The defaults of a model's requests.** A model has its own value for every
 sampling field a request can leave out, and its own limits for the length of
 a reply (`crates/server/src/defaults.rs`). They are options of the model, on
@@ -7628,7 +7647,7 @@ A request's own value always holds, also one that switches a sampler off
 (`top_k: 0`). A field it leaves out or writes as `null` takes the model's
 default, and without one the engine's own value (see [Sampling](#sampling)).
 The defaults are filled in where every generating route takes its model
-(`routes::prepare`), so they are the same on `/v1/chat/completions`,
+(`generate::prepare`), so they are the same on `/v1/chat/completions`,
 `/v1/completions`, `/v1/messages` and `/v1/responses`, also for a field the API
 of a route has no member for: a Messages request has no `min_p`, and gets the
 model's. A logit bias, `ignore_eos`, the probabilities to report, `n` and the
@@ -8085,7 +8104,7 @@ a field of a beta is served or refused by its name in the body.
   for notes of progress between calls, which the server does not have; the
   thinking comes back whole, which is also what writes it into the next prompt
   as the model generated it. A system turn after another turn is a turn of the
-  user by the rule of every route (`wire::place_system_messages`, see "The
+  user by the rule of every route (`openai::request::place_system_messages`, see "The
   Responses API").
 - **`thinking.display: "omitted"`.** Anthropic's API answers it with thinking
   blocks whose `thinking` is the empty text and whose signature carries the
@@ -8142,7 +8161,7 @@ prompt when the reply ends, so the usage of `message_start` is zeros and
 `message_delta` has all of it. While the engine has nothing to say the stream
 sends `ping`. The response starts when the engine has produced its first step,
 so that a request the engine refuses gets an HTTP status, or after
-`Config::stream_wait` (10 s) without it (`Reply::first`, on all three routes
+`Config::stream_wait` (10 s) without it (`Generation::first`, on all three routes
 that stream): Flash-Next computed the 16 thousand tokens of Claude Code's first
 prompt for three and a half minutes, and Claude Code gave up on a response that
 had not started after six and sent the request again. A failure after the
@@ -8160,10 +8179,10 @@ prompt, so the count is the prompt a run of the same request reports (computed
 plus cached), which a host test checks through the real runtime. An engine that
 cannot count answers 501.
 
-Both routes run on the core of the chat route in `routes.rs`: `prepare`
+Both routes run on the core of the chat route in `generate.rs`: `prepare`
 applies what a parsed chat request says about thinking and tools and returns
-the sorter of its reply, `Reply::start` hands the request to the engine, and
-`Reply::next` gives the reply as pieces (reasoning, content, the start of a
+the sorter of its reply, `Generation::start` hands the request to the engine, and
+`Generation::next` gives the reply as pieces (reasoning, content, the start of a
 call, fragments of its arguments) and its end (reason, usage, timings). A
 route of another API writes its body over into the chat body, calls these, and
 writes the pieces in its own format.
@@ -8213,7 +8232,7 @@ and the chat template of Qwen3.5-0.8B refuses a system message that is not
 the first one (`System message must be at the beginning.`, read in the model
 file). Such a message inside a conversation is a message of the user with its
 text, by the rule of every route: the reader of the chat body
-(`wire::place_system_messages`) makes the system messages before every other
+(`openai::request::place_system_messages`) makes the system messages before every other
 message one system message (joined by an empty line) and a later one a turn
 of the user, which is where the Messages route always put a system turn
 between the others.
@@ -8675,7 +8694,7 @@ drafts, the seed it asked for). `--log-text` adds the prompt and the reply,
 which a log otherwise never holds. `--log-format json` writes every line as a
 JSON object for collectors, `--log-file <FILE>` appends to a file instead of
 standard error; the level is `RUST_LOG`. `/metrics` has, for every model, the
-histograms of the requests that ended with a reply (`crates/server/src/latency.rs`):
+histograms of the requests that ended with a reply (`crates/server/src/metrics/latency.rs`):
 the wait in the engine's line (`ares_request_queue_seconds`, from the watch),
 the prompt after it, the time to the first token, the time per token after the
 first, and the whole request, all from the hand-over to the engine.

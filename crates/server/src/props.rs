@@ -28,9 +28,10 @@ use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
+use crate::generate::prepare;
 use crate::models::{AcquireError, Lease};
-use crate::routes::{App, json_response, next_request_id, prepare, read_body};
-use crate::wire::{self, Endpoint, Fields};
+use crate::openai::request::{self, Endpoint, Fields};
+use crate::routes::{App, json_response, next_request_id, read_body};
 
 /// `GET /props`.
 pub(crate) async fn props(State(app): State<App>, request: Request) -> Response {
@@ -173,8 +174,8 @@ pub(crate) async fn tokenize(State(app): State<App>, request: Request) -> Respon
 
 async fn try_tokenize(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
-    let json = wire::read_json(&body)?;
-    let mut members = wire::members(&json)?.to_vec();
+    let json = request::read_json(&body)?;
+    let mut members = request::members(&json)?.to_vec();
     let with_pieces = take_bool(&mut members, "with_pieces")?;
     // llama-server's default, which is what is done.
     members.retain(|(key, value)| !(key == "parse_special" && *value == Json::Bool(true)));
@@ -227,7 +228,7 @@ async fn chat_prompt(
         let (_, id) = loaded(app, None).await?;
         members.push(("model".to_owned(), Json::String(id)));
     }
-    let mut parsed = wire::from_json(Endpoint::Chat, &Json::Object(members), next_request_id())?;
+    let mut parsed = request::from_json(Endpoint::Chat, &Json::Object(members), next_request_id())?;
     let (_, lease) = prepare(app, &mut parsed, None, "chat").await?;
     Ok((lease, parsed.request.prompt, parsed.request.model))
 }
@@ -268,8 +269,8 @@ pub(crate) async fn detokenize(State(app): State<App>, request: Request) -> Resp
 
 async fn try_detokenize(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
-    let json = wire::read_json(&body)?;
-    let members = wire::members(&json)?;
+    let json = request::read_json(&body)?;
+    let members = request::members(&json)?;
     refuse_others(members, &["tokens", "model"])?;
     let fields = Fields(members);
     let wrong = || ApiError::invalid_param("tokens", "tokens must be an array of token ids");

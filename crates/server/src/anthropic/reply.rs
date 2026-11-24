@@ -12,7 +12,7 @@ use ares_api::Usage;
 use serde::Serialize;
 
 use crate::answer::Written;
-use crate::reply::Piece;
+use crate::sorter::Piece;
 
 /// What every thinking block of a reply carries as its signature, unless the
 /// request asked for the thinking to be omitted.

@@ -2,7 +2,7 @@
 //! request that asks the same.
 //!
 //! Everything that has Anthropic's shape is checked here, under Anthropic's
-//! names, so that the reader of the chat body (`wire::from_json`) finds
+//! names, so that the reader of the chat body (`openai::request::from_json`) finds
 //! nothing to refuse in what this module wrote; the fields that go by the same
 //! name in both APIs (`model`, `max_tokens`, `temperature`, `top_p`, `top_k`,
 //! `stream`) are handed over as they are and checked there.
@@ -12,8 +12,8 @@ use ares_api::Json;
 use super::edits::{Edit, Keep, ToolUses, Trigger, Turns};
 use crate::chat_body::{self, Chat, Purpose, known, object, refuse, string, text_member};
 use crate::error::ApiError;
+use crate::openai::request::{Fields, members, wrong_type};
 use crate::reasoning::DEFAULT_EFFORT;
-use crate::wire::{Fields, members, wrong_type};
 
 /// The members of a body that are served.
 const SERVED: &[&str] = &[
@@ -321,7 +321,7 @@ fn steady_billing_header(text: &str) -> String {
 /// prompt, as its blocks are joined. One between other turns (Claude Code
 /// sends its environment and the tokens left that way) stays a system message
 /// where it stands, which the reader of the chat body gives to the template
-/// as a turn of the user (`wire::place_system_messages`, the rule of every
+/// as a turn of the user (`openai::request::place_system_messages`, the rule of every
 /// route).
 ///
 fn conversation(

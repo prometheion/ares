@@ -38,9 +38,13 @@ use ares_api::{
     ChoiceOption, DecisionRequest, DecisionResult, Json, Prompt, Question, QuestionKind, RequestId,
     Verdict,
 };
+use axum::extract::{Request, State};
+use axum::response::{IntoResponse, Response};
 
+use crate::bridge::DecisionRun;
 use crate::error::ApiError;
-use crate::wire::{self, Fields, expect_str, wrong_type};
+use crate::openai::request::{self, Fields, expect_str, wrong_type};
+use crate::routes::{App, json_response, model_of, next_request_id, read_body};
 
 /// A request body, understood.
 #[derive(Debug)]
@@ -54,8 +58,8 @@ pub(crate) struct Parsed {
 ///
 /// `models` are the ids that are served, to default `model`.
 pub(crate) fn parse(body: &[u8], id: RequestId, models: &[String]) -> Result<Parsed, ApiError> {
-    let json = wire::read_json(body)?;
-    let fields = Fields(wire::members(&json)?);
+    let json = request::read_json(body)?;
+    let fields = Fields(request::members(&json)?);
 
     let model = model_to_ask(&fields, models)?;
     let state = read_state(&fields)?;
@@ -460,4 +464,35 @@ fn body_of(asked: &Asked, verdict: &Verdict) -> Result<Json, ApiError> {
         ])),
         _ => Err(mismatch(format!("a verdict of the wrong kind for '{}'", asked.id))),
     }
+}
+
+/// `POST /v1/systemone`.
+pub(crate) async fn decide(State(app): State<App>, request: Request) -> Response {
+    match try_decide(app, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `POST /v1/systemone`: one JSON answer, no streaming (the API has none).
+///
+/// Nothing here waits on the generation endpoints or on other decisions: the
+/// handler hands the request to the engine and awaits its own outcome, and
+/// the engine runs decision rows in the same steps as everything else.
+async fn try_decide(app: App, request: Request) -> Result<Response, ApiError> {
+    let body = read_body(request, &app.config).await?;
+    let id = next_request_id();
+    let served: Vec<_> = app.models.list().into_iter().map(|listed| listed.id).collect();
+    let mut parsed = parse(&body, id, &served)?;
+    let lease = model_of(&app, &mut parsed.request.model).await?;
+    tracing::info!(
+        %id,
+        model = %parsed.request.model,
+        questions = parsed.request.questions.len(),
+        "decision request"
+    );
+
+    let result =
+        DecisionRun::start(lease.engine(), parsed.request, app.stop.clone())?.finish().await?;
+    Ok(json_response(parsed.reply.render(&result)?))
 }

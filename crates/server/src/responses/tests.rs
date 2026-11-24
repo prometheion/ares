@@ -10,7 +10,7 @@ use crate::bridge::Timings;
 use crate::chat_body::Purpose;
 use crate::error::ApiError;
 use crate::reasoning::Split;
-use crate::reply::Piece;
+use crate::sorter::Piece;
 
 fn read(body: Value) -> Json {
     serde_json::from_value(body).unwrap()

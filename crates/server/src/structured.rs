@@ -20,7 +20,7 @@
 use ares_api::{Json, Shape, Structure};
 
 use crate::error::ApiError;
-use crate::wire::{Fields, wrong_type};
+use crate::openai::request::{Fields, wrong_type};
 
 /// The members of a request body that ask for structured output.
 pub(crate) const FIELDS: &[&str] = &["grammar", "json_schema", "response_format"];

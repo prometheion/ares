@@ -8,9 +8,9 @@ use ares_api::{RequestId, SamplerKind, Sampling};
 use serde_json::{Value, json};
 
 use super::*;
+use crate::openai::request::{self, Endpoint};
 use crate::options::{self, Kind, ModelOptions};
 use crate::preset::{Preset, Presets};
-use crate::wire::{self, Endpoint};
 
 /// Every setting with three values its option takes, all different. A
 /// number that may have a fraction is written with one, as the listing
@@ -71,10 +71,10 @@ fn with(options: &[(&str, &str)]) -> Defaults {
 
 /// A chat request with `members` next to its model and its message, as the
 /// reader of bodies understands it.
-fn request(members: Value) -> wire::Parsed {
+fn request(members: Value) -> request::Parsed {
     let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
     body.as_object_mut().unwrap().extend(members.as_object().unwrap().clone());
-    wire::parse(Endpoint::Chat, body.to_string().as_bytes(), RequestId(1)).expect("a request")
+    request::parse(Endpoint::Chat, body.to_string().as_bytes(), RequestId(1)).expect("a request")
 }
 
 fn shown(setting: &Setting, sampling: &Sampling) -> Option<Value> {

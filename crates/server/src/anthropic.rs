@@ -3,8 +3,8 @@
 //!
 //! A Messages request is served as the chat request that asks the same, on the
 //! same path through the engine: [`request`] writes its body over into a chat
-//! body, the reader of chat bodies (`wire::from_json`) and the core of the
-//! routes (`routes::prepare`, `routes::Reply`) do the rest, and [`reply`]
+//! body, the reader of chat bodies (`openai::request::from_json`) and the core of the
+//! routes (`generate::prepare`, `generate::Generation`) do the rest, and [`reply`]
 //! writes what comes back as content blocks and as Anthropic's events. A
 //! reply is therefore the reply `/v1/chat/completions` gives, with the same
 //! prefix cache, the same rule for the calls of tools and the same end when
@@ -132,10 +132,11 @@ use crate::ReasoningFormat;
 use crate::answer::{Writer, Written, answer};
 use crate::chat_body::Purpose;
 use crate::error::{Anthropic, ApiError};
+use crate::generate::{self, End};
 use crate::models::Lease;
-use crate::reply::{Piece, Sorter};
-use crate::routes::{self, App, End, json_response, next_request_id, read_body};
-use crate::wire::{self, Endpoint, Parsed};
+use crate::openai::request::{Endpoint, PRIORITY_HEADER, Parsed, from_json, read_json};
+use crate::routes::{App, json_response, next_request_id, read_body};
+use crate::sorter::{Piece, Sorter};
 
 /// `POST /v1/messages`.
 pub(crate) async fn messages(State(app): State<App>, request: Request) -> Response {
@@ -172,11 +173,11 @@ async fn read(
     id: RequestId,
     purpose: Purpose,
 ) -> Result<Read, ApiError> {
-    let (chat, asked) = request::to_chat(&wire::read_json(body)?, purpose)?;
-    let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
+    let (chat, asked) = request::to_chat(&read_json(body)?, purpose)?;
+    let mut parsed = from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
     parsed.take_priority(priority)?;
     let (sorter, lease) =
-        routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto), "messages")
+        generate::prepare(app, &mut parsed, Some(ReasoningFormat::Auto), "messages")
             .await
             .map_err(request::renamed)?;
     let edits = match &asked.edits {
@@ -199,7 +200,7 @@ struct Read {
 }
 
 async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> {
-    let priority = request.headers().get(wire::PRIORITY_HEADER).cloned();
+    let priority = request.headers().get(PRIORITY_HEADER).cloned();
     let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let Read { parsed, sorter, lease, omit_thinking, edits } =
@@ -221,7 +222,7 @@ async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
     let Read { parsed, lease, edits, .. } =
         read(&app, &body, None, next_request_id(), Purpose::Count).await?;
-    let tokens = routes::count_prompt(&lease, parsed.request).await?;
+    let tokens = generate::count_prompt(&lease, parsed.request).await?;
     // With edits, the tokens before them too, as Anthropic counts them.
     Ok(json_response(match edits {
         Some(outcome) => format!(

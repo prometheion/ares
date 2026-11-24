@@ -2,7 +2,7 @@
 //! request that asks the same, and what the response says back about it.
 //!
 //! Everything that has the shape of this API is checked here, under its
-//! names, so that the reader of the chat body (`wire::from_json`) finds
+//! names, so that the reader of the chat body (`openai::request::from_json`) finds
 //! nothing to refuse in what this module wrote; `model`, `temperature` and
 //! `top_p` go by the same name in both APIs, are handed over as they are and
 //! checked there.
@@ -14,7 +14,7 @@ use crate::chat_body::{
 };
 use crate::defaults::decimal;
 use crate::error::ApiError;
-use crate::wire::{Fields, members, wrong_type};
+use crate::openai::request::{Fields, members, wrong_type};
 
 /// The members of a body that are served.
 const SERVED: &[&str] = &[

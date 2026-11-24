@@ -30,7 +30,7 @@ use ares_api::ToolFormat;
 use ares_grammar::calls::ValueTypes;
 use serde_json::Value;
 
-use crate::reply::{is_space, partial_suffix};
+use crate::sorter::{is_space, partial_suffix};
 
 /// What a splitter found in a piece of the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]

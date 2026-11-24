@@ -10,10 +10,11 @@ use axum::response::Response;
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 
 use crate::error::ApiError;
+use crate::generate::{End, Generation, Step};
 use crate::models::Lease;
-use crate::reply::{Piece, Sorter};
-use crate::routes::{App, End, Reply, Step, json_response, sse_response, with_limit};
-use crate::wire::Parsed;
+use crate::openai::request::Parsed;
+use crate::routes::{App, json_response, sse_response, with_limit};
+use crate::sorter::{Piece, Sorter};
 
 /// One event of a stream: its name and its data.
 pub(crate) type Written = (&'static str, String);
@@ -47,7 +48,7 @@ pub(crate) async fn answer<W: Writer>(
     keep_alive: KeepAlive,
 ) -> Result<Response, ApiError> {
     let (streamed, lowered) = (parsed.stream, parsed.lowered);
-    let reply = Reply::start(app, lease, parsed.request, sorter)?;
+    let reply = Generation::start(app, lease, parsed.request, sorter)?;
     let response = if streamed {
         stream(reply, writer, app, keep_alive).await
     } else {
@@ -58,7 +59,7 @@ pub(crate) async fn answer<W: Writer>(
 
 /// The answer that is not streamed. Neither API has a field that asks for
 /// the probabilities of tokens.
-async fn whole<W: Writer>(mut reply: Reply, mut writer: W) -> Result<Response, ApiError> {
+async fn whole<W: Writer>(mut reply: Generation, mut writer: W) -> Result<Response, ApiError> {
     loop {
         match reply.next().await? {
             Step::Pieces(pieces) => writer.take(pieces),
@@ -72,12 +73,12 @@ async fn whole<W: Writer>(mut reply: Reply, mut writer: W) -> Result<Response, A
 ///
 /// As on the chat route the response starts when the engine has produced its
 /// first step, so that a request the engine refuses gets an HTTP status, or
-/// when `--stream-wait` has passed without it (`Reply::first`): then the
+/// when `--stream-wait` has passed without it (`Generation::first`): then the
 /// opening events and the keep-alives go out while the prompt is computed. A
 /// failure after the start is the writer's error event, and the stream ends
 /// with it.
 async fn stream<W: Writer>(
-    mut reply: Reply,
+    mut reply: Generation,
     mut writer: W,
     app: &App,
     keep_alive: KeepAlive,
@@ -96,7 +97,7 @@ async fn stream<W: Writer>(
 /// The state of a stream.
 #[derive(Debug)]
 struct Events<W> {
-    reply: Reply,
+    reply: Generation,
     writer: W,
     /// Events that are ready and have not gone out.
     queue: VecDeque<Written>,

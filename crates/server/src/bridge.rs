@@ -64,7 +64,7 @@ use ares_api::{
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::error::ApiError;
-use crate::latency::{Latency, Took};
+use crate::metrics::latency::{Latency, Took};
 
 /// What a request produces, minus the failures.
 #[derive(Debug)]

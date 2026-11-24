@@ -3,8 +3,8 @@
 //!
 //! A Responses request is served as the chat request that asks the same, on
 //! the same path through the engine: [`request`] writes its body over into a
-//! chat body, the reader of chat bodies (`wire::from_json`) and the core of
-//! the routes (`routes::prepare`, `routes::Reply`) do the rest, and [`reply`]
+//! chat body, the reader of chat bodies (`openai::request::from_json`) and the core of
+//! the routes (`generate::prepare`, `generate::Generation`) do the rest, and [`reply`]
 //! writes what comes back as output items and as the typed events of a
 //! stream. A reply is therefore the reply `/v1/chat/completions` gives, with
 //! the same prefix cache, the same rule for the calls of tools and the same
@@ -39,7 +39,7 @@
 //! `input`, and the chat template of Qwen3.5-0.8B refuses a system message
 //! that is not the first one. Such a message inside a conversation is a
 //! message of the user with its text, as on every route
-//! (`wire::place_system_messages`). The items one reply returned for a turn (reasoning,
+//! (`openai::request::place_system_messages`). The items one reply returned for a turn (reasoning,
 //! message, calls) are one message of the assistant again.
 //!
 //! Anything else is refused with a 400 that names it: `input_image`,
@@ -138,10 +138,11 @@ use crate::ReasoningFormat;
 use crate::answer::{Writer, Written, answer};
 use crate::chat_body::Purpose;
 use crate::error::ApiError;
+use crate::generate::{self, End};
 use crate::models::Lease;
-use crate::reply::{Piece, Sorter};
-use crate::routes::{self, App, End, json_response, next_request_id, read_body};
-use crate::wire::{self, Endpoint, Parsed};
+use crate::openai::request::{Endpoint, PRIORITY_HEADER, Parsed, from_json, read_json};
+use crate::routes::{App, json_response, next_request_id, read_body};
+use crate::sorter::{Piece, Sorter};
 
 /// `POST /v1/responses`.
 pub(crate) async fn create(State(app): State<App>, request: Request) -> Response {
@@ -191,11 +192,11 @@ async fn read(
     id: RequestId,
     purpose: Purpose,
 ) -> Result<(Parsed, Sorter, Echo, Lease), ApiError> {
-    let (chat, mut echo) = request::to_chat(&wire::read_json(body)?, purpose)?;
-    let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
+    let (chat, mut echo) = request::to_chat(&read_json(body)?, purpose)?;
+    let mut parsed = from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
     parsed.take_priority(priority)?;
     let (sorter, lease) =
-        routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto), "responses")
+        generate::prepare(app, &mut parsed, Some(ReasoningFormat::Auto), "responses")
             .await
             .map_err(request::renamed)?;
     echo.applied(&parsed.request);
@@ -225,7 +226,7 @@ async fn truncate(parsed: &mut Parsed, lease: &Lease) -> Result<(), ApiError> {
         if let Prompt::Chat { messages, .. } = &mut request.prompt {
             drop_turns(messages, dropped);
         }
-        routes::count_prompt(lease, request)
+        generate::count_prompt(lease, request)
     };
     let turns = match &parsed.request.prompt {
         Prompt::Chat { messages, .. } => starts(messages).len(),
@@ -272,7 +273,7 @@ fn drop_turns(messages: &mut Vec<ares_api::Message>, n: usize) {
 }
 
 async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
-    let priority = request.headers().get(wire::PRIORITY_HEADER).cloned();
+    let priority = request.headers().get(PRIORITY_HEADER).cloned();
     let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let (parsed, sorter, echo, lease) =
@@ -280,7 +281,7 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
     let head = Head {
         id: format!("resp_{id}"),
         model: parsed.request.model.clone(),
-        created_at: wire::unix_time(),
+        created_at: crate::openai::reply::unix_time(),
         echo,
     };
     let writer = Created { head, output: Output::new(id.to_string()), sequence: 0 };
@@ -292,8 +293,8 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
     let (parsed, _, _, lease) = read(&app, &body, None, next_request_id(), Purpose::Count).await?;
-    let tokens = routes::count_prompt(&lease, parsed.request).await?;
-    Ok(json_response(wire::input_tokens(tokens)))
+    let tokens = generate::count_prompt(&lease, parsed.request).await?;
+    Ok(json_response(crate::openai::reply::input_tokens(tokens)))
 }
 
 /// A Responses reply as it is written: the events of its items, or the

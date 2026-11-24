@@ -54,8 +54,8 @@
 use ares_api::{Engine, GenerateRequest, Json, Prompt, Start, ThinkingFormat};
 
 use crate::error::ApiError;
-use crate::reply::{is_space, partial_suffix};
-use crate::wire::{Fields, Parsed, wrong_type};
+use crate::openai::request::{Fields, Parsed, wrong_type};
+use crate::sorter::{is_space, partial_suffix};
 
 /// The members of a request body that are about thinking.
 pub(crate) const FIELDS: &[&str] = &[
