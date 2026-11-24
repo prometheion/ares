@@ -1538,6 +1538,32 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       prompt's first token another), which passed alone three times on this branch and on main
       and in the whole suite again. Speed, VRAM and the plans as on main (27B at the owner's
       settings, Flash-Next IQ2_XS at `--ram 8G`, alternating).
+      Server part on `cleanup2/server` (all but the loaders): one harness that starts the `ares`
+      binary in every test (`tests/common/process.rs`, `socket.rs`); one table of options
+      (`options::OPTIONS`: names, spellings, scope, help, and the defaults' readers) that
+      `--help`, the environment and both files come from, and one reader of the two files
+      (`ini.rs`); `wire.rs`/`routes.rs` split into `openai.rs` with `openai/{request,reply}.rs`,
+      `generate.rs`, `metrics.rs`, `routes.rs`, `crate::reply` renamed `sorter`; one way to
+      serve (`Models::fixed`, `router`, `router_with`, `serve`, `serve_until` and two `Config`
+      fields gone: tests serve their engine as presets); one segmenter for the blocks of
+      Messages and the items of Responses (`answer::Segments`); the in-process GPU suites'
+      runtimes, router and gate once (`tests/gpu`, `common::model_file`); `real.rs` split into
+      `real`, `real_drafts`, `real_flash_next`. Left, with the reason:
+  - [ ] The loaders (finding 1: `load.rs` and `qwen4exp.rs`, their copied tail, the qwen35
+        memory estimate in the server), with them the names `qwen4exp::Split` (a saved spread)
+        and `load::watch` beside `Models::watch`: after the model crate's phase 2 merges.
+  - [ ] Other crates' parts of the audit (`server.md`), not this branch's crates: `ToolFormat`
+        and the thinking format written in `ares-tokenizer` and `ares-api` (and copied in
+        `ares-model`'s `chat.rs`), three JSON value types, tools as raw JSON across the API,
+        the order rule of the samplers and the mirostat range checked in the runtime as well,
+        `LOGPROBS_MAX`/`BIAS_MAX` beside the API's limits; the mask-bit test three times
+        (grammar, sampler), llama.cpp's defaults in the sampler and the runtime; test-only
+        public code (`Breakers::of_tokens`, `keeps_history`/`opens` computed and dropped).
+  - [ ] The owner to decide: one variable name per test model file (`ARES_TEST_GGUF`,
+        `ARES_TEST_QWEN38_27B` and `ARES_TEST_FLASH_NEXT` in the tokenizer, vulkan and server
+        template tests beside `ARES_TEST_QWEN35_MODEL`, `ARES_TEST_QWEN35_27B`,
+        `ARES_TEST_QWEN4EXP_MODEL`); `Question::option_texts` is used by its tests only (System
+        One's groundwork, kept).
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
