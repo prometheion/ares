@@ -27,10 +27,13 @@ pub const CELLS_PER_PAGE: u32 = ares_cuda::ENTRY_CELLS;
 /// step from the measured price and acceptance.
 pub const DEFAULT_WINDOW: u32 = ares_cuda::MAX_BATCH;
 
-/// The sequences that run at once when the operator names no number: one
-/// conversation and one request next to it. Every sequence takes memory for
-/// its recurrent state on the devices; further requests wait in line.
-pub const DEFAULT_PARALLEL: u32 = 2;
+/// The sequences that run at once when the operator names no number: an agent
+/// and the sub-agents it starts beside it (the owner, 2026-11-24). Every
+/// sequence takes memory for its recurrent state on the devices; further
+/// requests wait in line. Measured on the 27B at 262144 cells over an RTX 4070
+/// and an RTX 3060: four sequences cost 80 / 440 MiB more than two, and three to
+/// eight requests at once all had their first token within 0.33 s.
+pub const DEFAULT_PARALLEL: u32 = 4;
 
 /// A single device is chosen for a model when it holds the weights and at
 /// least this much context (or the model's own context, if that is less).

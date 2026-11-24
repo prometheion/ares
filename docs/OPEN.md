@@ -1410,6 +1410,10 @@ the agents' builds):
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- `--parallel` defaults to 4 (the owner, 2026-11-24; was 2). At the owner's settings (27B,
+  262144 cells, two cards) four cost +80 / +440 MiB on the RTX 4070 / 3060 and gave 133 / 127 /
+  125 tokens/s for 3 / 4 / 8 requests at once with every first token within 0.33 s; eight gave
+  136 / 150 / 210 tokens/s for +170 / +1340 MiB (the RTX 3060 at 11,425 MiB).
 - Greedy output need not be the same from run to run (the owner, 2026-11-23): Strata's is not
   either; a divergence for speed is fine as long as the output is not wrong. So the expert rows
   keep their atomic sums, and the unused ordered sum (`Accumulate::Ordered`, `rows_combine`) goes
@@ -1475,8 +1479,4 @@ the agents' builds):
   rule stays only for a type nobody measured (tests and benches).
 
 ## Questions to the owner
-- The `--parallel` default (today 2). Measured with the parallel-request fixes at the owner's
-  settings (27B, 262144 cells): `--parallel 4` gives 133 / 127 / 125 tokens/s for 3 / 4 / 8
-  requests at once, every first token within 0.33 s, for +80 / +440 MiB on the RTX 4070 / 3060;
-  `--parallel 8` 136 / 150 / 210 tokens/s, first tokens within 0.51 s, +170 / +1340 MiB (the
-  RTX 3060 at 11,425 MiB). The agent recommends 4.
+- None open.

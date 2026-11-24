@@ -84,7 +84,7 @@ OPTIONS:
                                free memory holds]
         --parallel <N>         Sequences that run at once; each takes memory for
                                its recurrent state, further requests wait
-                               [default: 2]
+                               [default: 4]
         --kv <FORMAT>          Storage format of K and V: f16, q8, q7, q6, q5 or q4,
                                or two names (K,V). The formats from q7 on store a
                                tile of 128 cells relative to its mean and keep the

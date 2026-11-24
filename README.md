@@ -219,7 +219,7 @@ The main options (`ares --help` lists them all):
 | `--devices <LIST>` | CUDA devices by the driver's index, such as `0,1`. Default: all. |
 | `--split single\|tensor\|layer`, `--shares <LIST>` | How the model is spread over the devices, and each device's share. |
 | `--context <TOKENS>` | K/V cells for all sequences together. Default: what the free VRAM holds. |
-| `--parallel <N>` | Sequences that run at once. Default: 2. |
+| `--parallel <N>` | Sequences that run at once. Default: 4. |
 | `--kv <FORMAT>` | K and V in `f16`, `q8`, `q7`, `q6`, `q5` or `q4`, or two of them (K,V). Default: `q8`. |
 | `--ram <SIZE>` | The most host RAM the engine may use. Default: all the machine has. |
 | `--cache <DIR>`, `--cache-size <SIZE>` | The prompt cache on the SSD. Default: none; 32G. |
