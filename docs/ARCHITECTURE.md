@@ -5485,7 +5485,7 @@ beside the CPU where that is sooner:
   by every job; an upload by device, timed by every upload), so that the later of the two ends
   first; on a slow link the CPU takes more. An upload becomes a member only when it takes a
   free slot or beats the coldest member the step did not pick by the rule of a promotion
-  (`PromoteRule`: more than 1.25 times its heat and one pick more). Otherwise it goes up *on
+  (`SwapRule`: more than 1.25 times its heat and one pick more). Otherwise it goes up *on
   loan* (`SlotSet::lend`): into the slot of a member on loan, or of the coldest member, which
   is how the slots on loan come to be. A member on loan is worth nothing, also when a step
   uses it again: its slot is the first any upload takes, so the slots on loan pass from miss

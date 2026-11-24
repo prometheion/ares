@@ -1212,7 +1212,7 @@ mod hybrid {
 
     /// The link is made far sooner than the CPU here, so the split gives it every miss; but an
     /// upload becomes a member only by a free slot or by beating the coldest member as a
-    /// promotion would (`PromoteRule`). The others go up on loan: into the slot of a member on
+    /// promotion would (`SwapRule`). The others go up on loan: into the slot of a member on
     /// loan, or of the coldest member, which is how the slots on loan come to be. The hot
     /// members keep their slots, and a miss that comes back often enough becomes a member.
     #[test]

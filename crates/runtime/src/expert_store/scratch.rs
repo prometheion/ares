@@ -258,9 +258,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let vacated = self.vram.vacate(members, &lent, &floor, self.step, |l| self.heat.layer(l));
         // What the slots given held leaves as any evicted expert does.
         for (layer, expert, slot) in vacated.evicted {
-            self.stats.evictions += 1;
-            self.devices[device].set_entry(layer, expert, -1)?;
-            self.demote(layer, expert, slot)?;
+            self.evict_vram(layer, expert, slot)?;
         }
         for layer in members {
             self.worth_stale[*layer] = true;

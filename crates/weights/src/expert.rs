@@ -78,12 +78,18 @@ impl ExpertHeat {
     }
 }
 
-/// When a hotter expert replaces a colder one.
+/// When a hotter expert replaces a colder one: in an election, and in the
+/// expert store when a promotion or the upload of a miss takes a member's slot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SwapRule {
-    /// A swap needs `heat_in > margin * heat_out + bonus`. The margin and the
-    /// bonus keep two experts of similar heat from trading places back and
-    /// forth, which would cost an upload each time for nothing.
+    /// A swap needs `heat_in > margin * heat_out + bonus` ([`SwapRule::beats`]).
+    /// The margin and the bonus keep two experts of similar heat from trading
+    /// places back and forth, which would cost an upload each time for
+    /// nothing: an expert must have been used more often than the member it
+    /// replaces, over the window the heat's decay gives, and once more.
+    /// Without the bonus an expert that was just used takes the slot of one
+    /// that was not for some hundred steps: on recorded routing a third of a
+    /// token's picks are picks of the token before it.
     pub margin: f32,
     pub bonus: f32,
     /// The most swaps one election starts, which bounds the upload traffic
@@ -94,6 +100,14 @@ pub struct SwapRule {
 impl Default for SwapRule {
     fn default() -> Self {
         Self { margin: 1.25, bonus: 1.0, max_swaps: 8 }
+    }
+}
+
+impl SwapRule {
+    /// Whether an expert of heat `heat_in` takes the slot of a member worth
+    /// `heat_out`.
+    pub fn beats(&self, heat_in: f32, heat_out: f32) -> bool {
+        heat_in > self.margin * heat_out + self.bonus
     }
 }
 
@@ -567,7 +581,7 @@ impl SlotSet {
             let Some(&candidate) = outsiders.peek() else { break };
             let (heat_in, heat_out) =
                 (heat[candidate as usize], self.worth(slot as usize, member, heat));
-            if heat_in <= rule.margin * heat_out + rule.bonus {
+            if !rule.beats(heat_in, heat_out) {
                 break;
             }
             outsiders.next();

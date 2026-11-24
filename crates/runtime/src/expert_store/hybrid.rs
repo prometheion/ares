@@ -14,13 +14,15 @@
 //! half ends first.
 //!
 //! Serving a miss and deciding what VRAM holds are separate. An expert the
-//! CPU served stays where it was. An upload takes a slot of VRAM for good, so
-//! a miss the link would serve sooner is uploaded only into a free slot or in
-//! place of a member that it beats by the rule of a promotion
-//! ([`PromoteRule`]); the CPU takes the others, whatever the link would take.
-//! Otherwise every miss a step uploads evicts a member that later steps
-//! need: a step of a few rows misses tens of experts, and VRAM followed the
-//! last few tokens instead of the text.
+//! CPU served stays where it was. A miss the link would serve sooner becomes
+//! a member of VRAM only where it takes a free slot or beats a member by the
+//! rule of a swap ([`ares_weights::SwapRule`]); the others go up on loan, into the
+//! slot of a member on loan or of the coldest member
+//! ([`ares_weights::SlotSet::lend`]); one for which the layer has no slot
+//! left to lend goes to the CPU instead. Otherwise every miss a step uploads
+//! would evict a member that later steps need: a step of a few rows misses
+//! tens of experts, and VRAM followed the last few tokens instead of the
+//! text.
 //!
 //! What moves into VRAM is decided between steps, from the heat
 //! ([`ExpertStore::promote_hot`]): the bytes are uploaded into the victim's
@@ -37,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 use ares_cuda::{ExpertShape, RouteGroup};
-use ares_weights::{SPARE_WORTH, Start, Swap, Want};
+use ares_weights::{SPARE_WORTH, Start, Swap, SwapRule, Want};
 
 use super::cpu::{CpuExpert, CpuPool, LayerJob, MAX_ROWS, act_bytes};
 use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted};
@@ -277,35 +279,6 @@ impl CostModel {
     }
 }
 
-/// When a hot expert takes a VRAM slot from a cold one: by a promotion
-/// between steps, or by the upload of a miss.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PromoteRule {
-    /// A promotion needs `heat_in > margin * heat_out + bonus`, so that two
-    /// experts of similar heat do not trade places and an expert must have
-    /// been used more often than the member it replaces, over the window the
-    /// heat's decay gives (half of it is from the last 210 steps or so), and
-    /// once more. Without the bonus an expert that was just used takes the
-    /// slot of one that was not for some hundred steps: on recorded routing a
-    /// third of a token's picks are picks of the token before it.
-    pub margin: f32,
-    pub bonus: f32,
-}
-
-impl Default for PromoteRule {
-    fn default() -> Self {
-        Self { margin: 1.25, bonus: 1.0 }
-    }
-}
-
-impl PromoteRule {
-    /// Whether an expert of heat `heat_in` takes the slot of a member worth
-    /// `heat_out`.
-    pub fn beats(&self, heat_in: f32, heat_out: f32) -> bool {
-        heat_in > self.margin * heat_out + self.bonus
-    }
-}
-
 /// An expert the CPU will compute for an open layer once its bytes are in RAM.
 #[derive(Clone, Copy, Debug)]
 struct Late {
@@ -335,7 +308,7 @@ pub(super) struct Hybrid {
     pool: CpuPool,
     shapes: Vec<ExpertShape>,
     serve: Serve,
-    rule: PromoteRule,
+    rule: SwapRule,
     pub(super) model: CostModel,
     /// The layers of the running step that wait for the host's sums.
     open: Vec<Claims>,
@@ -391,7 +364,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             pool,
             shapes,
             serve,
-            rule: PromoteRule::default(),
+            rule: SwapRule::default(),
             model,
             open: Vec::new(),
             promoting: HashSet::new(),
@@ -855,7 +828,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Between steps: lets the hottest experts take VRAM slots from members
-    /// that are colder by the rule ([`PromoteRule`]). A member on loan that
+    /// that are colder by the rule ([`SwapRule`]). A member on loan that
     /// beats the coldest member becomes a member and that one goes on loan in
     /// its place, without a copy. An expert that RAM holds is uploaded into a
     /// free slot or the slot that leaves, while the next steps run; the entry
@@ -1021,9 +994,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         // The RAM copy stays where it is until the device has read it.
         self.ram.sets[layer].hold(expert);
         if let Some(evicted) = swap.evict {
-            self.stats.evictions += 1;
-            self.devices[g.device].set_entry(layer, evicted, -1)?;
-            self.demote(layer, evicted, slot)?;
+            self.evict_vram(layer, evicted, slot)?;
         }
         let Some(ram_slot) = self.ram.sets[layer].slot(expert) else {
             return Err(StoreError::Plan("a held expert left the RAM tier".into()));

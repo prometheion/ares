@@ -44,12 +44,12 @@
 //! a promotion; otherwise it goes up on loan, into a slot that the next such
 //! upload takes again ([`ares_weights::SlotSet::lend`]). What VRAM holds is
 //! decided apart from that, between steps, from the heat, and never makes a
-//! step wait. Whatever
-//! names experts before their layer runs (the routers of later layers applied
-//! early, the token table) calls [`ExpertStore::predicted`], and the store
-//! starts on them at lower priority. The routers of later layers applied on the
-//! device call [`ExpertStore::ahead`]: only what no tier holds is read, within
-//! bounds that keep the drive for the reads a step waits for (`ahead.rs`).
+//! step wait. The routers of later layers applied on the device name the
+//! experts of a layer before it runs ([`ExpertStore::ahead`]): only what no
+//! tier holds is read, within bounds that keep the drive for the reads a step
+//! waits for (`ahead.rs`). [`ExpertStore::predicted`] is the older way in,
+//! which also uploads what RAM holds: the tests' and the bench's predictors
+//! and a fill from a list ([`ExpertStore::fill`]) use it.
 //!
 //! What keeps this safe without a lock or a host wait is the order of the
 //! table: an entry appears on the device after the expert's bytes, and an
@@ -96,7 +96,7 @@ use ares_weights::{ExpertHeat, GuessQueue, LayerNeed, SplitRule, Start, Swap, Wa
 pub use device::{CudaSlots, SlotDevice};
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
-pub use hybrid::{CostModel, ExpertTypes, Miss, PromoteRule, Serve, WideCpu, WidePick};
+pub use hybrid::{CostModel, ExpertTypes, Miss, Serve, WideCpu, WidePick};
 pub use near::{ExpertNeighbours, NEAR_FORMAT, Near};
 pub use profile::{ExpertProfile, Ignored, PROFILE_FORMAT, ProfileKey};
 pub use region::{HostRegion, Locker, PIECE, Released};
@@ -117,6 +117,17 @@ pub enum StoreError {
     Ledger(#[from] LedgerError),
     #[error("expert store: {0}")]
     Plan(String),
+}
+
+/// The key at the reader of part `part` (a matrix) of read `read`: an expert
+/// is read in three parts.
+fn part_key(read: u64, part: usize) -> u64 {
+    read * 4 + part as u64
+}
+
+/// The read that the reader's key `key` is a part of ([`part_key`]).
+fn read_of(key: u64) -> u64 {
+    key / 4
 }
 
 /// Where a layer's experts are computed and how an expert lies in a slot
@@ -1225,7 +1236,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         // Reads that finished.
         self.reader.poll(&mut self.completions);
         for done in std::mem::take(&mut self.completions) {
-            let Some(op) = self.reads.get_mut(&(done.key / 4)) else {
+            let Some(op) = self.reads.get_mut(&read_of(done.key)) else {
                 self.transit_read_done(done.key, done.result.is_err());
                 continue;
             };
@@ -1234,9 +1245,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             if op.parts_left > 0 {
                 continue;
             }
-            let Some(op) = self.reads.remove(&(done.key / 4)) else { continue };
+            let Some(op) = self.reads.remove(&read_of(done.key)) else { continue };
             if op.ahead {
-                self.ahead_read_done(done.key / 4, op.layer, op.expert, op.failed);
+                self.ahead_read_done(read_of(done.key), op.layer, op.expert, op.failed);
             }
             if op.failed {
                 // A read ahead that the layer's record did not need was cancelled.
@@ -1299,16 +1310,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 if self.ram.sets[layer].is_loading(expert) {
                     self.hurry(layer, expert);
                 } else {
-                    self.refresh_worth(layer);
-                    let started = self.ram.sets[layer].start_read(
-                        expert,
-                        Want::Demand,
-                        self.step,
-                        self.ram_worth.layer(layer),
-                    );
-                    if let Start::Slot(swap) = started {
-                        self.read(layer, swap, true)?;
-                    }
+                    self.read_demanded(layer, expert)?;
                 }
                 at += 1;
                 continue;
@@ -1334,16 +1336,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                         self.hurry(layer, expert);
                     }
                 } else if want.demand {
-                    self.refresh_worth(layer);
-                    let started = self.ram.sets[layer].start_read(
-                        expert,
-                        Want::Demand,
-                        self.step,
-                        self.ram_worth.layer(layer),
-                    );
-                    if let Start::Slot(swap) = started {
-                        self.read(layer, swap, true)?;
-                    }
+                    self.read_demanded(layer, expert)?;
                 }
             }
             at += 1;
@@ -1447,7 +1440,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 unsafe { Buffer::from_raw(self.ram_part(layer, swap.slot, part), span.len) };
             let class = if demand { Class::Demand } else { Class::Prefetch };
             let read = Read {
-                key: id * 4 + part as u64,
+                key: part_key(id, part),
                 file: range.file,
                 offset: range.offset,
                 len: range.len,
@@ -1482,6 +1475,22 @@ impl<D: SlotDevice> ExpertStore<D> {
         Ok(())
     }
 
+    /// Starts a read of `expert` of `layer` into the RAM tier that a step
+    /// waits for, if the tier has a slot for it.
+    fn read_demanded(&mut self, layer: usize, expert: u32) -> Result<(), StoreError> {
+        self.refresh_worth(layer);
+        let started = self.ram.sets[layer].start_read(
+            expert,
+            Want::Demand,
+            self.step,
+            self.ram_worth.layer(layer),
+        );
+        if let Start::Slot(swap) = started {
+            self.read(layer, swap, true)?;
+        }
+        Ok(())
+    }
+
     /// A guess that is being read turned out to be needed: its read goes
     /// ahead of the other guesses.
     fn hurry(&mut self, layer: usize, expert: u32) {
@@ -1491,10 +1500,24 @@ impl<D: SlotDevice> ExpertStore<D> {
             .find(|(_, op)| op.layer == layer && op.expert == expert && !op.demand);
         if let Some((id, op)) = found {
             op.demand = true;
-            for part in 0..3 {
-                // A read that has finished meanwhile is fine as it is.
-                let _ = self.reader.promote(id * 4 + part);
-            }
+            let id = *id;
+            self.promote_read(id);
+        }
+    }
+
+    /// Read `read` goes ahead of the guesses at the reader; a part that has
+    /// finished meanwhile is fine as it is.
+    fn promote_read(&self, read: u64) {
+        for part in 0..3 {
+            let _ = self.reader.promote(part_key(read, part));
+        }
+    }
+
+    /// Read `read` is cancelled: what is at the drive comes back, the rest is
+    /// not started.
+    fn cancel_read(&self, read: u64) {
+        for part in 0..3 {
+            let _ = self.reader.cancel(part_key(read, part));
         }
     }
 
@@ -1517,6 +1540,14 @@ impl<D: SlotDevice> ExpertStore<D> {
             self.stats.loans += 1;
         }
         Ok(())
+    }
+
+    /// `expert` of `layer` has left VRAM slot `slot` (of the layer's pool):
+    /// its table entry goes, and it comes down to RAM ([`ExpertStore::demote`]).
+    fn evict_vram(&mut self, layer: usize, expert: u32, slot: u32) -> Result<(), StoreError> {
+        self.stats.evictions += 1;
+        self.devices[self.layers[layer].device].set_entry(layer, expert, -1)?;
+        self.demote(layer, expert, slot)
     }
 
     /// Copies an expert that VRAM evicts from its slot (`slot` of the
@@ -1620,10 +1651,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                         self.vram.sets[*layer].give_back(1, self.step, self.heat.layer(*layer));
                     let Some(slot) = given.first() else { break };
                     if let Some(evicted) = slot.evicted {
-                        self.stats.evictions += 1;
-                        let device = self.layers[*layer].device;
-                        self.devices[device].set_entry(*layer, evicted, -1)?;
-                        self.demote(*layer, evicted, self.vram.slot(*layer, slot.slot))?;
+                        self.evict_vram(*layer, evicted, self.vram.slot(*layer, slot.slot))?;
                     }
                     self.vram.move_slot(*layer, slot.slot, members[to]);
                     self.worth_stale[*layer] = true;

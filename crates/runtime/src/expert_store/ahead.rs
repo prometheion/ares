@@ -299,10 +299,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 }
                 State::Reading(read) => {
                     self.stats.ahead_wasted += 1;
-                    for part in 0..3 {
-                        // What is at the drive comes back; the rest is not started.
-                        let _ = self.reader.cancel(read * 4 + part);
-                    }
+                    self.cancel_read(read);
                 }
                 State::Arrived if picked => self.stats.ahead_used += 1,
                 State::Arrived => self.stats.ahead_wasted += 1,

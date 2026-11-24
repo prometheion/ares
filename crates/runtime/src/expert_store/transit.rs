@@ -50,7 +50,7 @@ use std::time::Instant;
 use ares_io::{Buffer, Class, Read};
 use ares_weights::{Start, Swap, SwapRule, Want};
 
-use super::{ExpertStore, Phase, SlotDevice, StoreError};
+use super::{ExpertStore, Phase, SlotDevice, StoreError, part_key, read_of};
 
 /// The transit and staging slots of a store: what [`super::StorePlan`] works
 /// out.
@@ -328,10 +328,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                         State::Reading { read, .. } => {
                             self.transit.stage_guessed =
                                 self.transit.stage_guessed.saturating_sub(1);
-                            for part in 0..3 {
-                                // A part that has finished is fine as it is.
-                                let _ = self.reader.promote(read * 4 + part);
-                            }
+                            self.promote_read(read);
                         }
                         State::Staged { .. } => {
                             self.transit.stage_guessed =
@@ -552,8 +549,8 @@ impl<D: SlotDevice> ExpertStore<D> {
                 _ => (member, worth, None),
             };
             let stays = worth <= 0.0 || self.ram.sets[layer].contains(member);
-            let needed = if stays { worth } else { rule.margin * worth + rule.bonus };
-            if own <= needed {
+            let beats = if stays { own > worth } else { rule.beats(own, worth) };
+            if !beats {
                 return Ok(false);
             }
             if let Some(coldest) = lent {
@@ -564,9 +561,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let Start::Slot(swap) = started else { return Ok(false) };
         let tier_slot = self.vram.slot(layer, swap.slot);
         if let Some(evicted) = swap.evict {
-            self.stats.evictions += 1;
-            self.devices[g.device].set_entry(layer, evicted, -1)?;
-            self.demote(layer, evicted, tier_slot)?;
+            self.evict_vram(layer, evicted, tier_slot)?;
         }
         let parts = [0, 1, 2].map(|part| (g.offsets[part], g.lens[part]));
         self.devices[g.device].adopt(
@@ -654,10 +649,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     self.transit.entries.remove(&key);
                 }
                 State::Reading { read, .. } => {
-                    for part in 0..3 {
-                        // What is at the drive comes back; the rest is not started.
-                        let _ = self.reader.cancel(read * 4 + part);
-                    }
+                    self.cancel_read(read);
                     if let Some(entry) = self.transit.entries.get_mut(&key) {
                         entry.dropped = true;
                     }
@@ -785,7 +777,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             // is free only when no read and no upload uses it.
             let buffer = unsafe { Buffer::from_raw(self.stage_part(layer, stage, part), span.len) };
             let read = Read {
-                key: id * 4 + part as u64,
+                key: part_key(id, part),
                 file: range.file,
                 offset: range.offset,
                 len: range.len,
@@ -811,7 +803,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// A read of the file has come back. Returns whether it was transit's.
     pub(super) fn transit_read_done(&mut self, read_key: u64, failed: bool) -> bool {
-        let id = read_key / 4;
+        let id = read_of(read_key);
         let Some(key) = self.transit.reads.get(&id).copied() else { return false };
         let Some(entry) = self.transit.entries.get_mut(&key) else {
             self.transit.reads.remove(&id);
