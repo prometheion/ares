@@ -15,8 +15,8 @@
 //!     [--candidates 48] [--rows 16] [--threads 12] [--study 0,16,32,47] [--layers 0..48]
 //! ```
 //!
-//! - `measure` opens the model through `Session`, the hand-driven driver,
-//!   with the server's settings (rows of a step as the server takes them, the tiers filled from the usage profile in `--usage`,
+//! - `measure` opens the model through `Session`, which steps the parts by
+//!   hand through the runtime's own stages and flow, with the server's settings (rows of a step as the server takes them, the tiers filled from the usage profile in `--usage`,
 //!   by default the user's cache directory, as a start of the server fills
 //!   them), and for every text reads its first `--prompt` tokens as a prompt
 //!   and then the next `--tokens` one token a step, as generation does, with
@@ -365,9 +365,9 @@ fn read_reference(path: &Path) -> Result<Vec<Vec<(u32, f32)>>, AnyError> {
     Ok(rows)
 }
 
-/// Opens the model on the devices as the server does (with steps of `rows`
-/// rows, or as many as the server takes), the tiers filled from the usage
-/// profile.
+/// Opens the model on the devices with the server's settings (steps of
+/// `rows` rows, or as many as the server takes), as a session that steps it
+/// by hand, the tiers filled from the usage profile.
 fn open<'g>(
     args: &Args,
     gguf: &'g Gguf,

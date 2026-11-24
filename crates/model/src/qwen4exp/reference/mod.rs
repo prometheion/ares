@@ -300,7 +300,7 @@ pub struct Window {
     /// values, stream `c` of a row at `[c * N, (c + 1) * N)`.
     pub residual: Vec<Vec<f32>>,
     /// The residual after the last layer, `rows * D` values: what the final
-    /// mixer reads and what the MTP MTP block starts from.
+    /// mixer reads and what the MTP block starts from.
     pub trunk_out: Vec<f32>,
     /// The output of the final mixer, `rows * N` values.
     pub final_mix: Vec<f32>,

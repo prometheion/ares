@@ -305,6 +305,18 @@ The blocks so far:
 - **The MTP driver** (`blocks/mtp.rs`): one for every model, described under
   "The MTP driver" in [Speculation](#speculation). A model gives it its MTP
   layer and where its hidden state is tapped.
+- **The step's inputs and drafts** (`blocks/step.rs`): what a part reads from
+  the step record (tokens, segments, replays, rotary positions, the windows
+  whose drafts the MTP block or the DFlash drafter makes, the table updates,
+  the outcome of the windows before) with one set of checks, the bounds of a
+  step's segments and the K/V group's limit of a window, and how the drafters
+  of a part hand out a step's drafts (one list, their probabilities, their
+  device time).
+- **The arena of weights** (`blocks/arena.rs`): a stateless part both models
+  use as it is: every tensor at a multiple of 64 bytes, the stored bytes, rows
+  or columns gathered into a matrix of their own, or values the host made,
+  read from the model file with ordinary reads a piece at a time and uploaded
+  from there. The 27B keeps its layout chooser on top.
 
 What every model reads from its files the same way is in the module `files`:
 the strict reader of an architecture's metadata keys (the architecture check,
@@ -315,6 +327,17 @@ one took refused), the stored `Matrix`, and one `FileError` that names the key
 or tensor and that the errors of `qwen35`, `qwen4exp`, `qwen3vl` and `dflash`
 wrap. Each model keeps its list of keys and tensors and its own checks of how
 the values fit together.
+
+What the CPU references share is the module `reference`: the dot product and
+the matrix product with their fixed orders of summation, the threads over
+ranges of rows, the scalar functions and norms, the delta rule and the
+convolution of a recurrent layer, and what a window takes besides its tokens.
+Each model's reference keeps its own blocks and names in its `pieces` the
+functions its kernels are held to. (The image tower's and the DFlash drafter's
+references sum in other orders, on purpose.) What a model is to the text of a
+request (its name and context, tokenizer, chat options and format, the
+projector images are read through) is `chat::ModelText`, which both models'
+`Model` impls take their text half from.
 
 ## A step
 
@@ -3289,8 +3312,8 @@ made-up model with a row of weights of 61440 and two weights of 7e4: its logits 
 7.1e-3 of the reference, as without such weights (6.0e-3); with the rule taken out the logits
 of a prompt of nine rows are not numbers and the step after it fails.
 The layout probes time such a matrix by its type, on the tile kernels. `qwen4exp` reads the
-range of its float matrices at load as well (`Mat::range` in its `device/load.rs`) and its
-wide steps ask it before every float product; its quantized matrices go through
+range of its float matrices at load as well (`Mat::range`, read once per matrix by
+`blocks/arena.rs` for both models) and its wide steps ask it before every float product; its quantized matrices go through
 `Kernels::product`, which knows no range and needs none.
 
 *Small weights.* What a matrix loses below 6.1e-5 is absolute, at most 2^-25 per weight. The
@@ -4703,9 +4726,28 @@ have.
 `ares --model <first part of the file>` serves Qwen3.8-Flash-Next like the
 27B: the same endpoints, timings and metrics, cancellation, a request that
 gives way and comes back, several sequences in a step. The model is
-`ares_model::qwen4exp::device::Qwen4Exp`, its parts `Qwen4ExpDevice`; `Session`
-stays as the tool's and the tests' way to step it by hand (and for the probes
-that compare layer by layer).
+`ares_model::qwen4exp::device::Qwen4Exp`, its parts `Qwen4ExpDevice`.
+
+There is one opening path and one way to drive the parts. Opening goes through
+the stages of `device/open.rs` (a part with its token rows, the room each device
+has for expert slots, the store's plan with transit, the feed with the pruning
+mask and the owners of the experts, the peers and the owner mask): the runtime's
+device threads each run them for their own part and meet twice in between
+(`runtime/parts.rs`: the plan needs every device's room, the store every
+device's slots), the roles' trial runs the first and the last of them on parts
+without a store. A step is driven through `Flow` (`device/flow.rs`): the store
+behind a lock no thread waits for, the n-gram rows, the lead of at most six
+layers over the route records, the rounds of a wide step's missed experts, the
+waits. `Session` steps the model by hand for the tests and the tools through the
+same stages and the same flow, from one host thread for every part; it stays a
+face of its own, not one over the executor as the 27B's session is, because its
+probe stops both devices at every layer and reads both parts (the runtime's
+threads would need a barrier for that inside the production step) and the tests
+read the logits, which the runtime samples on the device. What only it does: the
+tier in RAM locked whole, the experts of two devices divided by a recorded
+routing (`SessionOptions::routing`, for measurements), sequences that own their
+pages. The model's options are `ModelOptions` (`device/options.rs`), what the
+server builds.
 
 **It drafts with its MTP block, from the model file or a file of the block.**
 The model's draft head is a block of its own (section 4 of the
@@ -5015,7 +5057,7 @@ width (`device/part/wide.rs`, `device/misses.rs`):
 - *No read is started on a guess.* The store reads guesses ahead into half of staging as
   prefetches and promotes them when a record names them (`transit_guess`), and `Feed` can
   guess, for the layers ahead (`ares_weights::Lookahead` gives the distance), what the wide
-  step before missed there and no tier holds. That guess is off (`SessionOptions::
+  step before missed there and no tier holds. That guess is off (`ModelOptions::
   read_ahead`), because it is mostly wrong and costs more than it gives: see "Transit,
   measured". The next layers' routers applied to this layer's input are a better guess;
   the steps of eight rows make it on the device (see "Reading experts ahead of their

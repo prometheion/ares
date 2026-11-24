@@ -10,10 +10,15 @@
 //!   attention layers, the scratch of a step, and [`Part::enqueue`], which
 //!   queues the kernels of a step and does not wait.
 //! - [`Qwen4Exp`] (`runtime.rs`) is the model as the runtime and the server
-//!   drive it: a thread per device steps its part, with the expert store's
-//!   tiers behind it (`feed.rs`, `misses.rs`, `board.rs`, `usage.rs`), the
-//!   n-gram rows (`ngram.rs`), the prefix cache's checkpoints (`resume.rs`)
-//!   and a long prompt run layer by layer (`runtime/pass.rs`).
+//!   drive it ([`ModelOptions`], `options.rs`): a thread per device opens its
+//!   part (`runtime/parts.rs`) and steps it (`runtime/device.rs`), with the
+//!   expert store's tiers behind it (`feed.rs`, `misses.rs`, `board.rs`,
+//!   `usage.rs`), the n-gram rows (`ngram.rs`), the prefix cache's checkpoints
+//!   (`resume.rs`) and a long prompt run layer by layer (`runtime/pass.rs`).
+//! - `open.rs` holds the stages every way of opening the parts goes through,
+//!   and `flow.rs` what the threads that drive a step share: the store behind
+//!   its lock, the n-gram rows, the lead over the route records, the rounds of
+//!   a wide step's missed experts and the waits.
 //! - `mtp.rs` runs the model's MTP block next to the part that holds the
 //!   output head, for a model the runtime drives ([`Qwen4Exp::with_mtp`]).
 //! - `roles.rs` times, when two devices share every layer, the second
@@ -21,10 +26,9 @@
 //!   and keeps the faster ([`RoleTrial`]).
 //! - `prune.rs` lets the routers leave out, or stand an expert of a tier in
 //!   for, a pick that only the file holds ([`PruneSetup`]; off unless asked).
-//! - [`Session`] drives a whole model, on one device or several, from one
-//!   host thread: it fetches the n-gram rows, hands the residual from device
-//!   to device, follows the route records and lets the expert store bring
-//!   what a step misses.
+//! - [`Session`] steps a whole model by hand from one host thread, for the
+//!   tests and the tools: the same stages and flow, with a hook that sees
+//!   every layer ([`Probe`]) and the logits on the host.
 //!
 //! The CPU reference in [`crate::qwen4exp::reference`] is what every path
 //! here is measured against (`tests/qwen4exp_device.rs`).
