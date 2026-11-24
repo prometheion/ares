@@ -3,7 +3,7 @@
 //! kernels (`ExpertKernels`) in launches of up to eight rows.
 //!
 //! For one layer of each type gate and up have in the file, and for 1 to 4096 rows: the
-//! time of one layer's MoE block (plan, gate and up, down, combine), the share of each
+//! time of one layer's MoE block (plan, gate and up, down), the share of each
 //! stage, rows per second, and how close that is to the memory and the tensor-core
 //! limits. Every expert the rows pick is in device memory (in several copies when few
 //! are picked, taken in turn, so that the weights come from memory and not from the L2
@@ -18,8 +18,8 @@
 //! ```
 
 use ares_cuda::{
-    Accumulate, Device, DeviceBuffer, DevicePtr, Event, ExpertKernels, ExpertRowKernels,
-    ExpertShape, Kernels, PrefillPath, ROWS_TILES, Result, Stream, Wait, devices,
+    Device, DeviceBuffer, DevicePtr, Event, ExpertKernels, ExpertRowKernels, ExpertShape, Kernels,
+    PrefillPath, ROWS_TILES, Result, Stream, Wait, devices,
 };
 use ares_gguf::Gguf;
 
@@ -198,7 +198,7 @@ fn main() -> Result<()> {
             let routes = read_routes(trace, *index, shape.top_k as usize);
             println!("  blk.{index} {}/{} (gate and up {ty_name})", gate.ty, down.ty);
             println!(
-                "  {:>5} {:>4} {:>4} {:>7} | {:>8} {:>8} {:>8} {:>8} | {:>9} {:>7} {:>7} {:>7} | {:>9} {:>6}",
+                "  {:>5} {:>4} {:>4} {:>7} | {:>8} {:>8} {:>8} | {:>9} {:>7} {:>7} {:>7} | {:>9} {:>6}",
                 "rows",
                 "exp",
                 "tile",
@@ -206,7 +206,6 @@ fn main() -> Result<()> {
                 "plan us",
                 "g+u us",
                 "down us",
-                "comb us",
                 "block us",
                 "rows/s",
                 "GB/s",
@@ -290,7 +289,6 @@ fn main() -> Result<()> {
                 let record_buf = DeviceBuffer::new(&device, record.len() as u64)?;
                 record_buf.write(0, &record)?;
                 let hidden = DeviceBuffer::new(&device, shape.rows_hidden_bytes(n_rows))?;
-                let scratch = DeviceBuffer::new(&device, shape.rows_scratch_bytes(n_rows))?;
                 let out = DeviceBuffer::new(&device, 4 * u64::from(n_rows) * n as u64)?;
                 // SAFETY: as above.
                 unsafe { stream.fill(out.ptr(), 0, 4 * n_rows as usize * n)? };
@@ -409,25 +407,9 @@ fn main() -> Result<()> {
                                 &shape,
                                 n_rows,
                                 tile,
-                                Accumulate::Ordered,
                                 table_at(i),
                                 plan.ptr(),
                                 hidden.ptr(),
-                                out.ptr(),
-                                scratch.ptr(),
-                            )
-                        }
-                    })?;
-                    let ms_combine = time(&stream, reps, 3, |_| {
-                        // SAFETY: as above.
-                        unsafe {
-                            rows.rows_combine(
-                                &stream,
-                                &shape,
-                                n_rows,
-                                tile,
-                                plan.ptr(),
-                                scratch.ptr(),
                                 out.ptr(),
                             )
                         }
@@ -449,39 +431,10 @@ fn main() -> Result<()> {
                                 &shape,
                                 n_rows,
                                 tile,
-                                Accumulate::Ordered,
                                 table_at(i),
                                 plan.ptr(),
                                 act.ptr(),
                                 hidden.ptr(),
-                                scratch.ptr(),
-                                out.ptr(),
-                            )
-                        }
-                    })?;
-                    let ms_atomic = time(&stream, reps, 3, |i| {
-                        // SAFETY: as above.
-                        unsafe {
-                            rows.plan_rows(
-                                &stream,
-                                &shape,
-                                n_rows,
-                                tile,
-                                record_buf.ptr(),
-                                plan.ptr(),
-                                0,
-                            )?;
-                            rows.rows_experts(
-                                &stream,
-                                &shape,
-                                n_rows,
-                                tile,
-                                Accumulate::Atomic,
-                                table_at(i),
-                                plan.ptr(),
-                                act.ptr(),
-                                hidden.ptr(),
-                                scratch.ptr(),
                                 out.ptr(),
                             )
                         }
@@ -496,31 +449,15 @@ fn main() -> Result<()> {
                         * f64::from(shape.n_ff)
                         * f64::from(shape.n_embd);
                     let bytes = set.len() as f64 * stride as f64;
-                    lines.push((
-                        tile, items, ms_plan, ms_gate_up, ms_down, ms_combine, ms_block, ms_atomic,
-                        flops, bytes,
-                    ));
-                    if best.is_none_or(|(b, _)| ms_block.min(ms_atomic) < b) {
-                        best = Some((ms_block.min(ms_atomic), tile));
+                    lines.push((tile, items, ms_plan, ms_gate_up, ms_down, ms_block, flops, bytes));
+                    if best.is_none_or(|(b, _)| ms_block < b) {
+                        best = Some((ms_block, tile));
                     }
                 }
-                for (
-                    tile,
-                    items,
-                    plan_ms,
-                    gu_ms,
-                    down_ms,
-                    comb_ms,
-                    block_ms,
-                    atomic_ms,
-                    flops,
-                    bytes,
-                ) in lines
-                {
+                for (tile, items, plan_ms, gu_ms, down_ms, block_ms, flops, bytes) in lines {
                     let mark = if best.is_some_and(|(_, t)| t == tile) { "*" } else { " " };
-                    let block = block_ms.min(atomic_ms);
                     println!(
-                        "  {:>5} {:>4} {:>3}{} {:>7} | {:>8.1} {:>8.1} {:>8.1} {:>8.1} | {:>9.1} {:>7.0} {:>7.0} {:>7.1} | {:>9.1} {:>6.2}  (ordered {:.1} us, atomic {:.1} us)",
+                        "  {:>5} {:>4} {:>3}{} {:>7} | {:>8.1} {:>8.1} {:>8.1} | {:>9.1} {:>7.0} {:>7.0} {:>7.1} | {:>9.1} {:>6.2}",
                         n_rows,
                         set.len(),
                         tile,
@@ -529,15 +466,12 @@ fn main() -> Result<()> {
                         plan_ms * 1e3,
                         gu_ms * 1e3,
                         down_ms * 1e3,
-                        comb_ms * 1e3,
-                        block * 1e3,
-                        f64::from(n_rows) / (block / 1e3),
-                        bytes / 1e9 / (block / 1e3),
-                        flops / 1e12 / (block / 1e3),
-                        old_us,
-                        old_us / (block * 1e3),
                         block_ms * 1e3,
-                        atomic_ms * 1e3,
+                        f64::from(n_rows) / (block_ms / 1e3),
+                        bytes / 1e9 / (block_ms / 1e3),
+                        flops / 1e12 / (block_ms / 1e3),
+                        old_us,
+                        old_us / (block_ms * 1e3),
                     );
                 }
             }

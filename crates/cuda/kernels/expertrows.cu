@@ -7,7 +7,6 @@
 #include "common.cuh"
 #include "expertrows_plan.cuh"
 #include "expertrows_down.cuh"
-#include "expertrows_combine.cuh"
 #include "mm_types_more.cuh"
 
 // Gate and up of the types that have a decoder written for these kernels

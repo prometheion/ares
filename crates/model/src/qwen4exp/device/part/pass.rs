@@ -927,12 +927,10 @@ impl Part {
                     &shape,
                     c.rows,
                     tile,
-                    ares_cuda::Accumulate::Atomic,
                     table,
                     c.plan,
                     state.at.hidden,
                     c.out,
-                    DevicePtr::NULL,
                 )?;
             }
         }

@@ -23,14 +23,9 @@
 // ErQ20 below is written for this kernel (the type of the model the kernels were made
 // for); expertrows_mm.cuh makes one of any item decoder of the dense tile kernels.
 //
-// Two ways to add the experts' outputs to the rows (Accumulate in src/experts.rs), chosen
-// by the kernel's last argument:
-//
-// - Atomic: `red.add` of weight * value into the row of `out`. No scratch, but the
-//   order in which a row's experts are added depends on the schedule.
-// - Ordered: the value goes to `scratch[pair][n_embd]`, and ares_er_combine adds a
-//   row's picks in the order of the router, so the row's bits do not depend on the
-//   other rows or on the schedule.
+// The experts' outputs are added to the rows with `red.add` of weight * value into the row
+// of `out`: the order in which a row's experts are added depends on the schedule, so the sum
+// can differ in its last bit from run to run.
 #pragma once
 
 #include "expertrows_gate_up.cuh"
@@ -70,8 +65,8 @@ struct ErQ20 {
 template <class D, int NB, int STAGES>
 static __device__ __forceinline__ void ares_er_down(
     const uint64_t* __restrict__ expert_addr, uint32_t down_offset, uint8_t* plan_bytes, const __half* __restrict__ hidden,
-    const float* __restrict__ hscale, float* __restrict__ out, float* __restrict__ scratch, uint32_t n_ff, uint32_t n_embd,
-    uint32_t n_experts, uint32_t n_pairs, uint32_t atomic) {
+    const float* __restrict__ hscale, float* __restrict__ out, uint32_t n_ff, uint32_t n_embd, uint32_t n_experts,
+    uint32_t n_pairs) {
     constexpr uint32_t NMAX = 8 * NB;
     constexpr uint32_t STAGE_BYTES = NMAX * 128;
     extern __shared__ __align__(16) uint8_t dyn_smem[];
@@ -90,11 +85,6 @@ static __device__ __forceinline__ void ares_er_down(
     const uint32_t count = item.count;
     if (addr == 0) {
         // The sum of the rows that wanted this expert gets nothing from it.
-        if (atomic == 0) {
-            for (uint32_t i = threadIdx.x; i < count * 64; i += ARES_ER_THREADS) {
-                scratch[static_cast<size_t>(item.first + i / 64) * n_embd + tile * 64 + (i & 63)] = 0.0f;
-            }
-        }
         return;
     }
 
@@ -221,15 +211,9 @@ static __device__ __forceinline__ void ares_er_down(
                 if (col < count) {
                     const float w = weight_sm[col];
                     const float va = acc[nb][e] * w, vb = acc[nb][2 + e] * w;
-                    if (atomic != 0) {
-                        float* dst = out + static_cast<size_t>(rows_sm[col]) * n_embd + row0 + g;
-                        atomicAdd(dst, va);
-                        atomicAdd(dst + 8, vb);
-                    } else {
-                        float* dst = scratch + static_cast<size_t>(item.first + col) * n_embd + row0 + g;
-                        dst[0] = va;
-                        dst[8] = vb;
-                    }
+                    float* dst = out + static_cast<size_t>(rows_sm[col]) * n_embd + row0 + g;
+                    atomicAdd(dst, va);
+                    atomicAdd(dst + 8, vb);
                 }
             }
         }
@@ -237,17 +221,16 @@ static __device__ __forceinline__ void ares_er_down(
 }
 
 // Defines the down kernel `NAME` for the type `D`: `NB` blocks of 8 pairs, `STAGES` stages
-// of hidden values. `atomic` is 1 for the atomic sum and 0 for the ordered one.
+// of hidden values.
 //
 // Grid: (items of the plan or more, n_embd / 64); block: ARES_ER_THREADS; dynamic shared
 // memory: D::TABLE_BYTES + STAGES * 8 NB * 128 + 8 NB * 8 bytes.
 #define ARES_ER_DOWN_KERNEL(NAME, D, NB, STAGES)                                                               \
     extern "C" __global__ void __launch_bounds__(ARES_ER_THREADS) NAME(                                        \
         const uint64_t* expert_addr, uint32_t down_offset, uint8_t* plan, const __half* hidden, const float* hscale, \
-        float* out, float* scratch, uint32_t n_ff, uint32_t n_embd, uint32_t n_experts, uint32_t n_pairs,     \
-        uint32_t atomic) {                                                                                     \
-        ares_er_down<D, NB, STAGES>(expert_addr, down_offset, plan, hidden, hscale, out, scratch, n_ff, n_embd, \
-                                    n_experts, n_pairs, atomic);                                               \
+        float* out, uint32_t n_ff, uint32_t n_embd, uint32_t n_experts, uint32_t n_pairs) {                   \
+        ares_er_down<D, NB, STAGES>(expert_addr, down_offset, plan, hidden, hscale, out, n_ff, n_embd, n_experts, \
+                                    n_pairs);                                                                  \
     }
 
 // The down kernels of a type by tile, with 4 stages each.

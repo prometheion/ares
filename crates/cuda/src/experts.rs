@@ -51,7 +51,7 @@ use crate::error::{Error, Result};
 use crate::kernels::MAX_BATCH;
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
-use crate::stream::{Event, Stream};
+use crate::stream::Stream;
 
 /// The kernels of the mixture of experts as a fat binary (`build.rs`).
 static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/experts.fatbin"));
@@ -1241,19 +1241,6 @@ fn rows_table_bytes(ty: GgmlType) -> (u64, u64) {
     (gate_up, tile)
 }
 
-/// How the many-row down kernel adds an expert's output to a row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Accumulate {
-    /// `red.add` of the weighted output into the row of `out`. Needs no scratch. The
-    /// order in which a row's picks are added depends on the schedule, so the sum can
-    /// differ in its last bit from run to run.
-    Atomic,
-    /// The weighted outputs go to a scratch of [`ExpertShape::rows_scratch_bytes`] and
-    /// [`ExpertRowKernels::rows_combine`] adds them to the row in the order of the
-    /// router. The row's bits do not depend on the other rows of the call.
-    Ordered,
-}
-
 /// Where the parts of a plan lie in its buffer (`AresErLayout` in
 /// `kernels/expertrows_layout.cuh`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1459,12 +1446,6 @@ impl ExpertShape {
         (2 * u64::from(self.n_ff) * self.pairs(n_rows)).next_multiple_of(16)
     }
 
-    /// Bytes of the scratch of [`Accumulate::Ordered`]: a row of `n_embd` f32 for each
-    /// pair.
-    pub fn rows_scratch_bytes(&self, n_rows: u32) -> u64 {
-        4 * u64::from(self.n_embd) * self.pairs(n_rows)
-    }
-
     /// Bytes of the activations of `n_rows` rows in the form the many-row kernels read:
     /// that of [`PrefillPath::F16`](crate::PrefillPath::F16), the same number as
     /// [`Kernels::prefill_activation_bytes`](crate::Kernels::prefill_activation_bytes)
@@ -1516,12 +1497,13 @@ fn tile_index(tile: u32) -> Result<usize> {
 /// 2. [`ExpertRowKernels::rows_gate_up`] computes `silu(gate x) * (up x)` of every
 ///    pair and leaves it as f16 in the hidden buffer.
 /// 3. [`ExpertRowKernels::rows_down`] multiplies the hidden values by down, scales by
-///    the router weights and adds to the rows ([`Accumulate`]).
-/// 4. With [`Accumulate::Ordered`], [`ExpertRowKernels::rows_combine`].
+///    the router weights and adds to the rows with `red.add`: the order in which a row's
+///    picks are added depends on the schedule, so the sum can differ in its last bit from
+///    run to run.
 ///
-/// [`ExpertRowKernels::rows_experts`] runs stages 2 to 4. The plan does not depend on
-/// where the experts are, so one plan serves several calls of stages 2 to 4 with
-/// different address tables (the waves of a layer).
+/// [`ExpertRowKernels::rows_experts`] runs stages 2 and 3. The plan does not depend on
+/// where the experts are, so one plan serves several calls of stages 2 and 3 with
+/// different address tables.
 ///
 /// **The address table.** The kernels find an expert through a table of one device
 /// address per expert (`u64`, 0 for none): the expert's *slot*, in which the gate
@@ -1555,7 +1537,6 @@ pub struct ExpertRowKernels {
     plan_count: Function,
     plan_offsets: Function,
     plan_scatter: Function,
-    combine: Function,
     /// Per type of [`EXPERT_TYPES`]: the bytes of shared memory of its tables and the
     /// kernels by tile, for gate and up and for down.
     gate_up: Vec<(u64, [Function; 4])>,
@@ -1625,7 +1606,6 @@ impl ExpertRowKernels {
             plan_count: module.function("ares_er_plan_count")?,
             plan_offsets: module.function("ares_er_plan_offsets")?,
             plan_scatter: module.function("ares_er_plan_scatter")?,
-            combine: module.function("ares_er_combine")?,
             gate_up: all(gate_up)?,
             down: all(down)?,
         })
@@ -1784,18 +1764,14 @@ impl ExpertRowKernels {
 
     /// Multiplies the hidden values of every pair of the plan whose expert has an
     /// address by the expert's down matrix and the pair's router weight, and adds the
-    /// product to the pair's row: into `out` with [`Accumulate::Atomic`], into `scratch`
-    /// with [`Accumulate::Ordered`] (then [`ExpertRowKernels::rows_combine`] adds it to
-    /// `out`; the scratch of a missing expert's pairs is zeroed).
+    /// product to the pair's row of `out` with `red.add`.
     ///
     /// # Safety
     ///
     /// Those of [`ExpertRowKernels::rows_gate_up`], and: `hidden` must hold what that
     /// wrote for this plan and these `addresses` (or for an address table with
-    /// the same experts present); `out` `n_rows * n_embd` f32, 4-byte aligned; `scratch`
-    /// (for `Ordered` only, else it may be [`DevicePtr::NULL`])
-    /// [`ExpertShape::rows_scratch_bytes`] bytes, 4-byte aligned. `out` and `scratch`
-    /// must not overlap anything else named.
+    /// the same experts present); `out` `n_rows * n_embd` f32, 4-byte aligned, overlapping
+    /// nothing else named.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn rows_down(
         &self,
@@ -1803,22 +1779,16 @@ impl ExpertRowKernels {
         shape: &ExpertShape,
         n_rows: u32,
         tile: u32,
-        way: Accumulate,
         addresses: DevicePtr,
         plan: DevicePtr,
         hidden: DevicePtr,
         out: DevicePtr,
-        scratch: DevicePtr,
     ) -> Result<()> {
         let (pairs, index) = Self::check_call(shape, n_rows, tile)?;
         check_align("expert addresses", addresses, 8)?;
         check_align("plan", plan, 16)?;
         check_align("hidden values", hidden, 16)?;
         check_align("expert output", out, 4)?;
-        check_align("scratch", scratch, 4)?;
-        if way == Accumulate::Ordered && scratch == DevicePtr::NULL {
-            return Err(invalid("many-row experts", "the ordered sum needs a scratch".into()));
-        }
         let geometry = || invalid("expert shape", "sizes overflow".into());
         let down_offset =
             u32::try_from(shape.down_offset().ok_or_else(geometry)?).map_err(|_| geometry())?;
@@ -1830,12 +1800,10 @@ impl ExpertRowKernels {
             .ptr(hidden)
             .ptr(hidden.offset(shape.rows_hidden_scales_offset(n_rows)))
             .ptr(out)
-            .ptr(scratch)
             .u32(shape.n_ff)
             .u32(shape.n_embd)
             .u32(shape.n_experts)
-            .u32(pairs)
-            .u32(u32::from(way == Accumulate::Atomic));
+            .u32(pairs);
         let grid = [layout.max_items(), shape.n_embd / ROWS_WEIGHT_ROWS, 1];
         let Some((table, kernels)) = expert_type(shape.down_ty).map(|i| &self.down[i]) else {
             return Err(invalid("expert shape", "no many-row kernel for the types".into()));
@@ -1845,44 +1813,7 @@ impl ExpertRowKernels {
         unsafe { kernels[index].launch(stream, grid, [ROWS_THREADS, 1, 1], shared, args) }
     }
 
-    /// Adds the experts' outputs that [`Accumulate::Ordered`] left in `scratch` to the
-    /// rows of `out`, each row's picks in the order of the router.
-    ///
-    /// # Safety
-    ///
-    /// On the stream's device and alive until the launch has run: `plan` the plan of
-    /// these rows, `scratch` what [`ExpertRowKernels::rows_down`] wrote, `out`
-    /// `n_rows * n_embd` f32.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn rows_combine(
-        &self,
-        stream: &Stream,
-        shape: &ExpertShape,
-        n_rows: u32,
-        tile: u32,
-        plan: DevicePtr,
-        scratch: DevicePtr,
-        out: DevicePtr,
-    ) -> Result<()> {
-        let (pairs, _) = Self::check_call(shape, n_rows, tile)?;
-        check_align("plan", plan, 16)?;
-        check_align("scratch", scratch, 4)?;
-        check_align("expert output", out, 4)?;
-        let args = Args::new()
-            .ptr(plan)
-            .ptr(scratch)
-            .ptr(out)
-            .u32(shape.n_experts)
-            .u32(pairs)
-            .u32(tile)
-            .u32(shape.top_k)
-            .u32(shape.n_embd);
-        // SAFETY: the argument list matches ares_er_combine.
-        unsafe { self.combine.launch(stream, [n_rows, 1, 1], [256, 1, 1], 0, args) }
-    }
-
-    /// Stages 2 to 4: gate and up, down and, for [`Accumulate::Ordered`], the
-    /// combine. `scratch` is used by `Ordered` only.
+    /// Stages 2 and 3: gate and up, then down.
     ///
     /// # Safety
     ///
@@ -1894,25 +1825,17 @@ impl ExpertRowKernels {
         shape: &ExpertShape,
         n_rows: u32,
         tile: u32,
-        way: Accumulate,
         addresses: DevicePtr,
         plan: DevicePtr,
         act: DevicePtr,
         hidden: DevicePtr,
-        scratch: DevicePtr,
         out: DevicePtr,
     ) -> Result<()> {
         // SAFETY: the caller's guarantees are those of the functions called.
         unsafe {
             self.rows_gate_up(stream, shape, n_rows, tile, addresses, plan, act, hidden)?;
-            self.rows_down(
-                stream, shape, n_rows, tile, way, addresses, plan, hidden, out, scratch,
-            )?;
-            if way == Accumulate::Ordered {
-                self.rows_combine(stream, shape, n_rows, tile, plan, scratch, out)?;
-            }
+            self.rows_down(stream, shape, n_rows, tile, addresses, plan, hidden, out)
         }
-        Ok(())
     }
 }
 
@@ -1923,42 +1846,38 @@ impl ExpertShape {
     /// rows that picked it and the slot `slot_of` gives it). `picks` has `top_k` experts for
     /// each row. For measurements, which need picks and no router.
     pub fn host_record(&self, picks: &[Vec<u32>], slot_of: &[i32]) -> Vec<u8> {
-        decode_record(self, picks, slot_of)
-    }
-}
-
-fn decode_record(shape: &ExpertShape, picks: &[Vec<u32>], slot_of: &[i32]) -> Vec<u8> {
-    let k = shape.top_k as usize;
-    let cap = picks.len() * k;
-    let mut bytes = vec![0u8; shape.record_bytes(picks.len() as u32) as usize];
-    let mut put = |at: usize, v: u32| bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
-    let mut groups: std::collections::BTreeMap<u32, (u32, [f32; MAX_BATCH as usize])> =
-        Default::default();
-    for (b, ids) in picks.iter().enumerate() {
-        for (j, id) in ids.iter().enumerate() {
-            let weight = 1.0 / k as f32;
-            put(HEADER_BYTES + 4 * (b * k + j), *id);
-            put(HEADER_BYTES + 4 * cap + 4 * (b * k + j), weight.to_bits());
-            let entry = groups.entry(*id).or_insert((0, [0.0; MAX_BATCH as usize]));
-            entry.0 |= 1 << b;
-            entry.1[b] = weight;
+        let k = self.top_k as usize;
+        let cap = picks.len() * k;
+        let mut bytes = vec![0u8; self.record_bytes(picks.len() as u32) as usize];
+        let mut put = |at: usize, v: u32| bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let mut groups: std::collections::BTreeMap<u32, (u32, [f32; MAX_BATCH as usize])> =
+            Default::default();
+        for (b, ids) in picks.iter().enumerate() {
+            for (j, id) in ids.iter().enumerate() {
+                let weight = 1.0 / k as f32;
+                put(HEADER_BYTES + 4 * (b * k + j), *id);
+                put(HEADER_BYTES + 4 * cap + 4 * (b * k + j), weight.to_bits());
+                let entry = groups.entry(*id).or_insert((0, [0.0; MAX_BATCH as usize]));
+                entry.0 |= 1 << b;
+                entry.1[b] = weight;
+            }
         }
-    }
-    put(4, groups.len() as u32);
-    put(12, cap as u32);
-    let mut first_pair = 0;
-    for (g, (expert, (mask, weight))) in groups.iter().enumerate() {
-        let at = HEADER_BYTES + 8 * cap + GROUP_BYTES * g;
-        put(at, *expert);
-        put(at + 4, slot_of[*expert as usize] as u32);
-        put(at + 8, *mask);
-        put(at + 12, first_pair);
-        for (b, w) in weight.iter().enumerate() {
-            put(at + 16 + 4 * b, w.to_bits());
+        put(4, groups.len() as u32);
+        put(12, cap as u32);
+        let mut first_pair = 0;
+        for (g, (expert, (mask, weight))) in groups.iter().enumerate() {
+            let at = HEADER_BYTES + 8 * cap + GROUP_BYTES * g;
+            put(at, *expert);
+            put(at + 4, slot_of[*expert as usize] as u32);
+            put(at + 8, *mask);
+            put(at + 12, first_pair);
+            for (b, w) in weight.iter().enumerate() {
+                put(at + 16 + 4 * b, w.to_bits());
+            }
+            first_pair += mask.count_ones();
         }
-        first_pair += mask.count_ones();
+        bytes
     }
-    bytes
 }
 
 impl ExpertRowKernels {
@@ -1977,138 +1896,6 @@ impl ExpertRowKernels {
             f64::from(n_rows) * f64::from(shape.top_k) / f64::from(shape.n_experts.max(1));
         let index = [2.5, 10.0, 40.0].iter().filter(|limit| per_expert >= **limit).count();
         ROWS_TILES[index]
-    }
-
-    /// Measures, on this device and for this shape, up to how many rows the decode
-    /// kernels ([`ExpertKernels::experts`]) are faster than these: the largest `n` of
-    /// 1 to [`MAX_BATCH`] such that for every row count up to `n` the decode kernels take
-    /// no longer for the experts of the rows. 0 means the many-row kernels are faster
-    /// from one row on. A caller that wants the best of both families routes the
-    /// windows of up to that many rows through the decode kernels.
-    ///
-    /// The measurement is a few milliseconds of kernels on a temporary layer of up to
-    /// `MAX_BATCH * top_k` experts (random bytes, activations of zeros: the time of the
-    /// kernels does not depend on the values) that picks different experts for every
-    /// row, which is as much weight traffic as the rows can cause. It needs about 12
-    /// MB of device memory per expert of the shape's size and 100 ms; do it once, when
-    /// the model is loaded.
-    pub fn few_rows_break_even(&self, decode: &ExpertKernels, shape: &ExpertShape) -> Result<u32> {
-        shape.check()?;
-        let device = &self.device;
-        let stream = Stream::new(device, 0)?;
-        let max_experts = (MAX_BATCH * shape.top_k).min(shape.n_experts);
-        let stride =
-            shape.slot_bytes().ok_or_else(|| invalid("expert shape", "sizes overflow".into()))?;
-        let pool = crate::memory::DeviceBuffer::new(device, u64::from(max_experts) * stride)?;
-        let buffer = |bytes: u64| crate::memory::DeviceBuffer::new(device, bytes.max(16));
-        let table = buffer(8 * u64::from(shape.n_experts))?;
-        let slot_table = buffer(4 * u64::from(shape.n_experts))?;
-        let mut addresses = vec![0u64; shape.n_experts as usize];
-        let mut slots = vec![-1i32; shape.n_experts as usize];
-        for e in 0..max_experts {
-            addresses[e as usize] = pool.ptr().as_raw() + u64::from(e) * stride;
-            slots[e as usize] = e as i32;
-        }
-        table.write(0, &addresses.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>())?;
-        slot_table.write(0, &slots.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
-        let n = u64::from(shape.n_embd);
-        let decode_act =
-            buffer(crate::Kernels::quantized_activation_bytes(shape.n_embd, MAX_BATCH))?;
-        let decode_hidden = buffer(shape.hidden_bytes(MAX_BATCH))?;
-        let decode_out = buffer(4 * n * u64::from(MAX_BATCH))?;
-        let act = buffer(shape.rows_activation_bytes(MAX_BATCH))?;
-        let hidden = buffer(shape.rows_hidden_bytes(MAX_BATCH))?;
-        let scratch = buffer(shape.rows_scratch_bytes(MAX_BATCH))?;
-        let out = buffer(4 * n * u64::from(MAX_BATCH))?;
-        let tile = ROWS_TILES[0];
-        let plan = buffer(shape.rows_plan_bytes(MAX_BATCH, tile))?;
-        // SAFETY: every buffer is live, and `len` is its size.
-        unsafe {
-            for (buf, len) in [
-                (&pool, u64::from(max_experts) * stride),
-                (&decode_act, decode_act.len()),
-                (&act, act.len()),
-                (&decode_out, decode_out.len()),
-                (&out, out.len()),
-                (&hidden, hidden.len()),
-                (&decode_hidden, decode_hidden.len()),
-                (&scratch, scratch.len()),
-            ] {
-                stream.fill(buf.ptr(), 0, len as usize)?;
-            }
-        }
-        // Scales of the pool's blocks must be finite: zeros are.
-        let (start, end) = (Event::timed(device)?, Event::timed(device)?);
-        let time = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
-            let reps = 20u32;
-            let mut best = f64::INFINITY;
-            for _ in 0..3 {
-                start.record(&stream)?;
-                for _ in 0..reps {
-                    f()?;
-                }
-                end.record(&stream)?;
-                end.synchronize()?;
-                best = best.min(f64::from(end.elapsed_ms_since(&start)?) / f64::from(reps));
-            }
-            Ok(best)
-        };
-        let mut break_even = 0;
-        for n_rows in 1..=MAX_BATCH {
-            // Row r picks the experts r * top_k ...: no expert twice.
-            let picks: Vec<Vec<u32>> = (0..n_rows)
-                .map(|r| (0..shape.top_k).map(|j| (r * shape.top_k + j) % max_experts).collect())
-                .collect();
-            let old_record = decode_record(shape, &picks, &slots);
-            let old_record_buf = buffer(old_record.len() as u64)?;
-            old_record_buf.write(0, &old_record)?;
-            let mut record = vec![0u8; HEADER_BYTES];
-            record.extend(picks.iter().flatten().flat_map(|id| id.to_le_bytes()));
-            record.extend(
-                picks.iter().flatten().flat_map(|_| (1.0 / shape.top_k as f32).to_le_bytes()),
-            );
-            let record_buf = buffer(record.len() as u64)?;
-            record_buf.write(0, &record)?;
-            // SAFETY: the buffers are sized for this shape and number of rows, and every
-            // picked expert has a slot and an address.
-            let old = time(&mut || unsafe {
-                decode.experts(
-                    &stream,
-                    shape,
-                    pool.ptr(),
-                    slot_table.ptr(),
-                    old_record_buf.ptr(),
-                    decode_act.ptr(),
-                    decode_hidden.ptr(),
-                    decode_out.ptr(),
-                    None,
-                    n_rows,
-                    None,
-                )
-            })?;
-            // SAFETY: as above.
-            let new = time(&mut || unsafe {
-                self.plan_rows(&stream, shape, n_rows, tile, record_buf.ptr(), plan.ptr(), 0)?;
-                self.rows_experts(
-                    &stream,
-                    shape,
-                    n_rows,
-                    tile,
-                    Accumulate::Ordered,
-                    table.ptr(),
-                    plan.ptr(),
-                    act.ptr(),
-                    hidden.ptr(),
-                    scratch.ptr(),
-                    out.ptr(),
-                )
-            })?;
-            if old > new {
-                break;
-            }
-            break_even = n_rows;
-        }
-        Ok(break_even)
     }
 }
 
@@ -2224,7 +2011,6 @@ mod tests {
     #[test]
     fn the_sizes_of_the_buffers_of_many_rows_follow_the_shape() {
         assert_eq!(flash_next(GgmlType::IQ2_S).rows_hidden_bytes(2), 2 * 640 * 20 + 10 * 4 * 20);
-        assert_eq!(flash_next(GgmlType::IQ2_S).rows_scratch_bytes(2), 4 * 2560 * 20);
     }
 
     #[test]

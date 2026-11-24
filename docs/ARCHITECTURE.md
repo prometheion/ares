@@ -3382,7 +3382,7 @@ kernels were written for the types of Qwen3.8-Flash-Next, gate and up IQ2_S, IQ2
 IQ1_M and down Q2_0, and what is measured in this section is measured on those). The decode
 kernels above take eight rows; these take
 as many as there is memory for, and are meant for prompts and windows of drafts.
-Four stages, all on the device, none needing the host to read the picks:
+Three stages, all on the device, none needing the host to read the picks:
 
 - **Plan** (`plan_rows`). From a route record of any number of rows (the ids and
   weights the router writes, `n_rows * top_k` of each) a stable counting sort by
@@ -3412,13 +3412,14 @@ Four stages, all on the device, none needing the host to read the picks:
 - **Down** (`rows_down`). The same with the type of down, for Q2_0: a word of 16 codes gives the pairs
   (value j, value j + 8) of the operand with one shift and mask, so the hidden
   values are stored in that order. The product of a block of 64 is multiplied by
-  the pair's scale as it is added to the accumulators.
-- **Sum** (`Accumulate`). `Atomic` adds the weighted output to the row with
-  `red.add` (no scratch; the order in which a row's picks are added depends on the
-  schedule). `Ordered` writes it to a scratch of `top_k * n_embd` f32 per row
-  (102 KB a row for Flash-Next) and `rows_combine` adds a row's picks in the order
-  of the router: a row then has the same bits alone, in a batch and in any other
-  place of a batch (tested), as the decode kernels guarantee.
+  the pair's scale as it is added to the accumulators, and the weighted output is added
+  to the row with `red.add`: the order in which a row's picks are added depends on the
+  schedule, so a row's sum can differ in its last bits from run to run and between a
+  row alone and in a batch; its hidden values do not (tested). An ordered sum (a
+  scratch of `top_k * n_embd` f32 per row and a kernel adding a row's picks in the order
+  of the router) gave the same bits everywhere; nothing used it, and since the owner's
+  rule of 2026-11-23 (greedy output may differ from run to run, as long as it is not
+  wrong) it is gone (2026-11-24).
 
 An expert of the plan without an address is not read: its pairs add nothing, are
 counted in the plan (`missing_pairs`) and the expert is flagged, so the caller
@@ -3427,9 +3428,8 @@ how the waves of a layer run.
 
 These kernels do not wait for an expert on the device and have no host share: they skip
 an expert without an address and report it. The decode kernels therefore stay for the
-steps of a generating sequence, which depend on both, and for the windows below the
-break-even (which is at most eight rows, the decode kernels' own limit, so every step of
-more than eight rows is above it). The slices of a prompt of Qwen3.8-Flash-Next run on the
+steps of a generating sequence, which depend on both, and for windows of up to eight rows
+(the decode kernels' own limit). The slices of a prompt of Qwen3.8-Flash-Next run on the
 new kernels (see "Wide steps" under "Qwen3.8-Flash-Next through the runtime"); the host
 gives each round its address table and brings what a table lacked.
 
@@ -3460,7 +3460,7 @@ Measured 2026-11-11 on the recorded routes of `qwen4exp` (`examples/expert_rows_
 `long`, `mixed`, `german` and `english` of `/var/tmp/ares-qwen4exp-trace`, token after token),
 the real experts of one layer, all that the rows pick in device memory, random activations.
 Microseconds for one layer's block (IQ2_S gate and up, Q2_0 down), "block" being plan, gate
-and up, down and, for the ordered sum, the combine, run one after the other; the tile is
+and up, down and, for the ordered sum (removed since), the combine, run one after the other; the tile is
 the best of 8, 16, 32 and 64. "Decode kernels" are `ExpertKernels::experts` in launches of
 eight rows (the router and the host-built record are not in their time). GB/s are the weights
 read once (every expert the rows pick) over the block time, TFLOPS are the useful products
@@ -3506,8 +3506,8 @@ at 8, 1855 / 4243 at 256, 12998 / 28900 at 4096; IQ1_M (blk.8) 66 / 114, 194 / 4
   16 rows the decode kernels still win for IQ2_S (0.7 to 0.93 times as fast on the RTX 4070, 0.8
   to 0.85 on the RTX 3060 up to 8 rows) and for IQ2_XXS at 1 and 2 rows on the RTX 4070; IQ1_M is
   ahead from 2 rows, and from 1 row on the RTX 3060. So the family cannot be chosen by a constant:
-  `ExpertRowKernels::few_rows_break_even` times both on the device for the shape (about 100 ms, once
-  at load) and says up to how many rows the decode kernels are faster. The test run found 8 rows
+  a probe that timed both on the device for the shape (about 100 ms; no production code called
+  it, and it was removed on 2026-11-24) found that the decode kernels are faster up to 8 rows
   for IQ2_S on both cards, 5 (RTX 4070) and 1 (RTX 3060) for IQ2_XXS and none for IQ1_M. A verify
   window of 2 to 16 rows is therefore not faster than today's kernels for the 34 IQ2_S layers; for
   the 14 others it is up to 1.4 (IQ2_XXS) to 2 (IQ1_M) times as fast at 16 rows.
@@ -3520,9 +3520,10 @@ at 8, 1855 / 4243 at 256, 12998 / 28900 at 4096; IQ1_M (blk.8) 66 / 114, 194 / 4
   pipelines, activations resident in shared memory, L2 prefetch hints, and accumulating in f16
   (14 % faster for 8e-4 more error) were tried and are in the comments of the kernels with
   their numbers; none closed the gap. The layout of the loads is the open lead.
-- **Atomic or ordered.** `red.add` into the output is 3 to 15 % faster than the scratch and the
-  combine (more above 1024 rows, where the scratch is 100 KB a row), and needs no scratch; the
-  ordered sum is what gives a row the same bits alone, in a batch and in any place of a batch.
+- **Atomic or ordered.** `red.add` into the output was 3 to 15 % faster than the scratch and the
+  combine of the ordered sum (more above 1024 rows, where the scratch is 100 KB a row), and needs
+  no scratch; the ordered sum, which gave a row the same bits alone, in a batch and in any place
+  of a batch, is gone (above).
 - **The plan** costs 7 us for one row, 9 us at 64, 16 at 256, 26 at 4096 (RTX 4070; 10, 14, 22, 44
   on the RTX 3060): a few percent of a block at 256 rows and above.
 - **What a prompt pass could reach.** Experts only, all resident, 48 layers (34 of IQ2_S, 11 of
@@ -3535,8 +3536,8 @@ at 8, 1855 / 4243 at 256, 12998 / 28900 at 4096; IQ1_M (blk.8) 66 / 114, 194 / 4
   about twice as long at the dense kernels' rates (an estimate, not a measurement). The experts that
   are not in memory, which the pass has to stream, come on top.
 - **Memory a call needs**, per row for Qwen3.8-Flash-Next (ten picks): 5.2 KB of f16
-  activations, 13.2 KB of hidden values, 102 KB of scratch for the ordered sum (none for the
-  atomic one), 0.12 KB of plan and 10 KB of output; the plan is 0.6 MB for 4096 rows.
+  activations, 13.2 KB of hidden values, 0.12 KB of plan and 10 KB of output; the plan is
+  0.6 MB for 4096 rows.
 
 **Experts in every weight type** (`kernels/experts.cu`, `kernels/expertrows*.cu`,
 `ares_runtime::expert_store::cpu`). The three matrices of an expert may be stored in any of

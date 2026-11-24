@@ -763,12 +763,10 @@ impl Part {
                 &shape,
                 rows,
                 tile,
-                Accumulate::Atomic,
                 device_table,
                 self.at(s.plan_rows),
                 self.at(s.hidden_rows),
                 self.at(s.out),
-                DevicePtr::NULL,
             )?;
             wide.done.record(stream)?;
         }

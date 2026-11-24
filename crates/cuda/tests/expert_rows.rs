@@ -17,15 +17,15 @@
 //!   row a different expert, counts that are not multiples of the tile, ids out of
 //!   range.
 //! - *The products*: the hidden values and the output of every type and tile against
-//!   the exact layer, and the output of the ordered sum bit for bit alone and in a batch.
+//!   the exact layer, and the hidden values of a row bit for bit alone and in a batch.
 //! - *Missing experts* (no address) add nothing, are reported and are not read.
 
 use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Accumulate, Device, DeviceBuffer, ExpertRowKernels, ExpertShape, Kernels, PrefillPath,
-    ROWS_TILES, RowsPlan, Stream, Wait, device_count,
+    Device, DeviceBuffer, ExpertRowKernels, ExpertShape, Kernels, PrefillPath, ROWS_TILES,
+    RowsPlan, Stream, Wait, device_count,
 };
 
 fn gpus() -> Option<&'static [Device]> {
@@ -511,7 +511,6 @@ fn run(
     picks: &Picks,
     n_rows: u32,
     tile: u32,
-    way: Accumulate,
     present: &dyn Fn(u32) -> bool,
 ) -> Run {
     let shape = &layer.shape;
@@ -559,8 +558,6 @@ fn run(
     let plan = DeviceBuffer::new(device, plan_bytes).unwrap();
     let hidden = DeviceBuffer::new(device, shape.rows_hidden_bytes(n_rows)).unwrap();
     hidden.write(0, &vec![0xC3u8; shape.rows_hidden_bytes(n_rows) as usize]).unwrap();
-    let scratch = DeviceBuffer::new(device, shape.rows_scratch_bytes(n_rows).max(16)).unwrap();
-    scratch.write(0, &vec![0xC3u8; shape.rows_scratch_bytes(n_rows).max(16) as usize]).unwrap();
     let out = DeviceBuffer::new(device, 4 * u64::from(n_rows) * n as u64).unwrap();
     out.write(0, &vec![0u8; 4 * n_rows as usize * n]).unwrap();
 
@@ -583,12 +580,10 @@ fn run(
             shape,
             n_rows,
             tile,
-            way,
             table.ptr(),
             plan.ptr(),
             act.ptr(),
             hidden.ptr(),
-            scratch.ptr(),
             out.ptr(),
         )
         .unwrap();
@@ -652,11 +647,10 @@ fn check_layer(
     picks: &Picks,
     n_rows: u32,
     tile: u32,
-    way: Accumulate,
     present: &dyn Fn(u32) -> bool,
 ) -> Deviation {
     let exact = exact(layer, x, picks, n_rows, present);
-    check_layer_against(device, layer, x, picks, n_rows, tile, way, present, &exact)
+    check_layer_against(device, layer, x, picks, n_rows, tile, present, &exact)
 }
 
 /// [`check_layer`] against an exact result the caller has (the same on every device).
@@ -668,12 +662,11 @@ fn check_layer_against(
     picks: &Picks,
     n_rows: u32,
     tile: u32,
-    way: Accumulate,
     present: &dyn Fn(u32) -> bool,
     exact: &Exact,
 ) -> Deviation {
     let shape = &layer.shape;
-    let run = run(device, layer, x, picks, n_rows, tile, way, present);
+    let run = run(device, layer, x, picks, n_rows, tile, present);
     let plan = RowsPlan::parse(&run.plan, shape, n_rows, tile).expect("a plan");
     let out = relative_rms(run.out.iter().zip(&exact.out).map(|(g, e)| (f64::from(*g), *e)));
 
@@ -689,7 +682,7 @@ fn check_layer_against(
     }
     let dev = Deviation { out, hidden: relative_rms(hidden_pairs.into_iter()) };
     eprintln!(
-        "{} on {}: {n_rows} rows, tile {tile}, {way:?}: hidden {:.2e}, output {:.2e} rms",
+        "{} on {}: {n_rows} rows, tile {tile}: hidden {:.2e}, output {:.2e} rms",
         layer.name,
         device.info().name,
         dev.hidden,
@@ -711,18 +704,18 @@ fn experts_match_the_reference_on_generated_blocks() {
         let layer = synthetic_layer(gate_ty, 40, 4, 100 + i as u64);
         let mut rng = Rng(0x9e3779b97f4a7c15 + i as u64);
         let n = layer.shape.n_embd;
-        for (n_rows, tile, way, pattern) in [
-            (1u32, 8u32, Accumulate::Ordered, Pattern::Random),
-            (3, 8, Accumulate::Atomic, Pattern::Random),
-            (9, 16, Accumulate::Ordered, Pattern::OneExpertTakesEveryRow),
-            (30, 32, Accumulate::Atomic, Pattern::EveryRowDifferent),
-            (100, 64, Accumulate::Ordered, Pattern::Skewed),
-            (100, 8, Accumulate::Ordered, Pattern::Random),
+        for (n_rows, tile, pattern) in [
+            (1u32, 8u32, Pattern::Random),
+            (3, 8, Pattern::Random),
+            (9, 16, Pattern::OneExpertTakesEveryRow),
+            (30, 32, Pattern::EveryRowDifferent),
+            (100, 64, Pattern::Skewed),
+            (100, 8, Pattern::Random),
         ] {
             let x = activations(&mut rng, n_rows, n);
             let picks = picks(&pattern, &layer.shape, n_rows, &mut rng);
             for device in gpus {
-                let dev = check_layer(device, &layer, &x, &picks, n_rows, tile, way, &|_| true);
+                let dev = check_layer(device, &layer, &x, &picks, n_rows, tile, &|_| true);
                 assert!(dev.hidden <= 2e-3, "hidden values off by {}", dev.hidden);
                 assert!(dev.out <= 2e-3, "output off by {}", dev.out);
             }
@@ -731,8 +724,8 @@ fn experts_match_the_reference_on_generated_blocks() {
 }
 
 /// Every weight type as the type of gate and up (with down as Q2_0) and as the type of
-/// down (with gate and up as IQ2_S), and a few pairs of other types, on every tile and
-/// both sums: against the exact result, within the bound of the types the kernels were
+/// down (with gate and up as IQ2_S), and a few pairs of other types, on every tile:
+/// against the exact result, within the bound of the types the kernels were
 /// written for.
 #[test]
 fn experts_of_every_weight_type_match_the_reference() {
@@ -749,10 +742,10 @@ fn experts_of_every_weight_type_match_the_reference() {
         (GgmlType::TQ1_0, GgmlType::IQ1_S),
     ]);
     let steps = [
-        (1u32, 8u32, Accumulate::Ordered, Pattern::Random),
-        (9, 16, Accumulate::Atomic, Pattern::OneExpertTakesEveryRow),
-        (30, 32, Accumulate::Atomic, Pattern::EveryRowDifferent),
-        (70, 64, Accumulate::Ordered, Pattern::Skewed),
+        (1u32, 8u32, Pattern::Random),
+        (9, 16, Pattern::OneExpertTakesEveryRow),
+        (30, 32, Pattern::EveryRowDifferent),
+        (70, 64, Pattern::Skewed),
     ];
     for (i, (gate_ty, down_ty)) in pairs.into_iter().enumerate() {
         let layer = synthetic_layer_of(gate_ty, down_ty, 24, 4, 500 + i as u64);
@@ -760,35 +753,26 @@ fn experts_of_every_weight_type_match_the_reference() {
     }
 }
 
-/// Runs `layer` with each of `steps` (rows, tile, sum, picks) on every device and holds the
+/// Runs `layer` with each of `steps` (rows, tile, picks) on every device and holds the
 /// hidden values and the output to the bound of the types the kernels were written for.
 fn check_layer_of_types(
     gpus: &[Device],
     layer: &Layer<'_>,
     seed: u64,
-    steps: &[(u32, u32, Accumulate, Pattern)],
+    steps: &[(u32, u32, Pattern)],
 ) {
     layer.shape.check_rows().expect("a shape the kernels take");
     let mut rng = Rng(seed);
     let n = layer.shape.n_embd;
     let mut worst = (0.0f64, 0.0f64);
-    for (n_rows, tile, way, pattern) in steps {
-        let (n_rows, tile, way) = (*n_rows, *tile, *way);
+    for (n_rows, tile, pattern) in steps {
+        let (n_rows, tile) = (*n_rows, *tile);
         let x = activations(&mut rng, n_rows, n);
         let picks = picks(pattern, &layer.shape, n_rows, &mut rng);
         let exact = exact(layer, &x, &picks, n_rows, &|_| true);
         for device in gpus {
-            let dev = check_layer_against(
-                device,
-                layer,
-                &x,
-                &picks,
-                n_rows,
-                tile,
-                way,
-                &|_| true,
-                &exact,
-            );
+            let dev =
+                check_layer_against(device, layer, &x, &picks, n_rows, tile, &|_| true, &exact);
             // A comparison with what is not a number is false either way: say so first.
             assert!(
                 dev.hidden.is_finite() && dev.out.is_finite(),
@@ -811,14 +795,14 @@ fn wide_shape(gate_ty: GgmlType, down_ty: GgmlType) -> ExpertShape {
     ExpertShape { n_embd: 2560, n_ff, n_experts: 8, top_k: 2, gate_ty, down_ty }
 }
 
-/// The steps of the tests at real widths: every tile, both sums, an expert with more pairs
-/// than the largest tile holds.
-fn wide_steps() -> [(u32, u32, Accumulate, Pattern); 4] {
+/// The steps of the tests at real widths: every tile, an expert with more pairs than the
+/// largest tile holds.
+fn wide_steps() -> [(u32, u32, Pattern); 4] {
     [
-        (1, 8, Accumulate::Ordered, Pattern::Random),
-        (9, 16, Accumulate::Atomic, Pattern::OneExpertTakesEveryRow),
-        (17, 32, Accumulate::Atomic, Pattern::Skewed),
-        (65, 64, Accumulate::Ordered, Pattern::OneExpertTakesEveryRow),
+        (1, 8, Pattern::Random),
+        (9, 16, Pattern::OneExpertTakesEveryRow),
+        (17, 32, Pattern::Skewed),
+        (65, 64, Pattern::OneExpertTakesEveryRow),
     ]
 }
 
@@ -919,24 +903,24 @@ fn missing_experts_are_reported_and_not_read() {
         let missing_pairs = picks.ids.iter().filter(|e| !present(**e)).count() as u32;
         assert!(missing_pairs > 0);
         for device in gpus {
-            for way in [Accumulate::Ordered, Accumulate::Atomic] {
-                let dev = check_layer(device, &layer, &x, &picks, n_rows, tile, way, &present);
-                assert!(dev.out <= 2e-3, "the output of the present experts is off by {}", dev.out);
-                assert!(dev.hidden <= 2e-3);
-                let run = run(device, &layer, &x, &picks, n_rows, tile, way, &present);
-                let plan = RowsPlan::parse(&run.plan, shape, n_rows, tile).unwrap();
-                assert_eq!(plan.missing_pairs(), missing_pairs);
-                for e in 0..shape.n_experts {
-                    let picked = picks.ids.contains(&e);
-                    assert_eq!(plan.was_missing(e), picked && !present(e), "expert {e}");
-                }
+            let dev = check_layer(device, &layer, &x, &picks, n_rows, tile, &present);
+            assert!(dev.out <= 2e-3, "the output of the present experts is off by {}", dev.out);
+            assert!(dev.hidden <= 2e-3);
+            let run = run(device, &layer, &x, &picks, n_rows, tile, &present);
+            let plan = RowsPlan::parse(&run.plan, shape, n_rows, tile).unwrap();
+            assert_eq!(plan.missing_pairs(), missing_pairs);
+            for e in 0..shape.n_experts {
+                let picked = picks.ids.contains(&e);
+                assert_eq!(plan.was_missing(e), picked && !present(e), "expert {e}");
             }
         }
     }
 }
 
+/// The hidden values of a row are the same bits alone, in a batch and in another place of
+/// a batch; its output is the same sum up to the order the atomic adds of its picks took.
 #[test]
-fn a_row_gets_the_same_bits_alone_and_in_a_batch() {
+fn a_row_gets_the_same_hidden_values_alone_and_in_a_batch() {
     let Some(gpus) = gpus() else { return };
     for gate_ty in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
         let layer = synthetic_layer(gate_ty, 40, 4, 21);
@@ -947,26 +931,36 @@ fn a_row_gets_the_same_bits_alone_and_in_a_batch() {
         let x = activations(&mut rng, n_rows, shape.n_embd);
         let all = picks(&Pattern::Skewed, shape, n_rows, &mut rng);
         let k = shape.top_k as usize;
+        // The hidden values of the picks of `row` of a run, and its output.
+        let row_of = |run: &Run, picks: &Picks, rows: u32, tile: u32, row: usize| {
+            let plan = RowsPlan::parse(&run.plan, shape, rows, tile).unwrap();
+            let hidden: Vec<Vec<f64>> = (row * k..(row + 1) * k)
+                .map(|pair| {
+                    let pos = plan.position(pair as u32).unwrap() as usize;
+                    device_hidden(shape, rows, run, pos)
+                })
+                .collect();
+            assert_eq!(picks.ids.len(), rows as usize * k);
+            (hidden, run.out[row * n..(row + 1) * n].to_vec())
+        };
+        let same_sum = |a: &[f32], b: &[f32], what: &str| {
+            let off = relative_rms(a.iter().zip(b).map(|(a, b)| (f64::from(*a), f64::from(*b))));
+            assert!(off <= 1e-5, "{gate_ty}: {what}: the outputs differ by {off}");
+        };
         for device in gpus {
-            let batch = run(device, &layer, &x, &all, n_rows, 64, Accumulate::Ordered, &|_| true);
+            let batch = run(device, &layer, &x, &all, n_rows, 64, &|_| true);
             for row in [0usize, 3, 31, 69] {
                 let one = Picks {
                     ids: all.ids[row * k..(row + 1) * k].to_vec(),
                     weights: all.weights[row * k..(row + 1) * k].to_vec(),
                 };
-                let alone = run(
-                    device,
-                    &layer,
-                    &x[row * n..(row + 1) * n],
-                    &one,
-                    1,
-                    8,
-                    Accumulate::Ordered,
-                    &|_| true,
-                );
-                assert_eq!(alone.out, batch.out[row * n..(row + 1) * n], "{gate_ty}: row {row}");
+                let alone = run(device, &layer, &x[row * n..(row + 1) * n], &one, 1, 8, &|_| true);
+                let (hidden_alone, out_alone) = row_of(&alone, &one, 1, 8, 0);
+                let (hidden_batch, out_batch) = row_of(&batch, &all, n_rows, 64, row);
+                assert_eq!(hidden_alone, hidden_batch, "{gate_ty}: row {row}");
+                same_sum(&out_alone, &out_batch, &format!("row {row}"));
             }
-            // The rows in another order give each row the same bits.
+            // The rows in another order give each row the same hidden values.
             let order: Vec<usize> = (0..n_rows as usize).rev().collect();
             let xr: Vec<f32> = order.iter().flat_map(|r| x[r * n..(r + 1) * n].to_vec()).collect();
             let shuffled = Picks {
@@ -976,14 +970,12 @@ fn a_row_gets_the_same_bits_alone_and_in_a_batch() {
                     .flat_map(|r| all.weights[r * k..(r + 1) * k].to_vec())
                     .collect(),
             };
-            let reversed =
-                run(device, &layer, &xr, &shuffled, n_rows, 32, Accumulate::Ordered, &|_| true);
+            let reversed = run(device, &layer, &xr, &shuffled, n_rows, 32, &|_| true);
             for (i, r) in order.iter().enumerate() {
-                assert_eq!(
-                    reversed.out[i * n..(i + 1) * n],
-                    batch.out[r * n..(r + 1) * n],
-                    "{gate_ty}: row {r} in another place"
-                );
+                let (hidden_moved, out_moved) = row_of(&reversed, &shuffled, n_rows, 32, i);
+                let (hidden_batch, out_batch) = row_of(&batch, &all, n_rows, 64, *r);
+                assert_eq!(hidden_moved, hidden_batch, "{gate_ty}: row {r} in another place");
+                same_sum(&out_moved, &out_batch, &format!("row {r} in another place"));
             }
         }
     }
@@ -1003,7 +995,7 @@ fn rows_of_any_magnitude_keep_their_precision() {
     }
     let picks = picks(&Pattern::Random, shape, n_rows, &mut rng);
     for device in gpus {
-        let run = run(device, &layer, &x, &picks, n_rows, 16, Accumulate::Ordered, &|_| true);
+        let run = run(device, &layer, &x, &picks, n_rows, 16, &|_| true);
         let exact = exact(&layer, &x, &picks, n_rows, &|_| true);
         for row in 0..n_rows as usize {
             let dev = relative_rms(
@@ -1076,45 +1068,16 @@ fn experts_on_real_tensors() {
                 ]
             }),
         };
-        for (n_rows, tile, way) in [
-            (1u32, 8u32, Accumulate::Ordered),
-            (5, 16, Accumulate::Atomic),
-            (12, 8, Accumulate::Ordered),
-        ] {
+        for (n_rows, tile) in [(1u32, 8u32), (5, 16), (12, 8)] {
             let x = activations(&mut rng, n_rows, shape.n_embd);
             let picks = picks(&Pattern::Random, &shape, n_rows, &mut rng);
             // Only the experts the rows pick are put on the device.
             let present = |e: u32| picks.ids.contains(&e);
             for device in gpus {
-                let dev = check_layer(device, &layer, &x, &picks, n_rows, tile, way, &present);
+                let dev = check_layer(device, &layer, &x, &picks, n_rows, tile, &present);
                 assert!(dev.hidden <= 2e-3, "hidden values off by {}", dev.hidden);
                 assert!(dev.out <= 2e-3, "output off by {}", dev.out);
             }
-        }
-    }
-}
-
-#[test]
-fn the_break_even_with_the_decode_kernels_is_measured_on_the_device() {
-    let Some(gpus) = gpus() else { return };
-    for gate_ty in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
-        let shape = ExpertShape {
-            n_embd: 2560,
-            n_ff: 640,
-            n_experts: 512,
-            top_k: 10,
-            gate_ty,
-            down_ty: GgmlType::Q2_0,
-        };
-        for device in gpus {
-            let rows = ExpertRowKernels::load(device).unwrap();
-            let decode = ares_cuda::ExpertKernels::load(device).unwrap();
-            let up_to = rows.few_rows_break_even(&decode, &shape).unwrap();
-            eprintln!(
-                "{gate_ty} on {}: the decode kernels are faster up to {up_to} rows",
-                device.info().name
-            );
-            assert!(up_to <= ares_cuda::MAX_BATCH);
         }
     }
 }

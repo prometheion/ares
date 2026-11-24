@@ -16,8 +16,8 @@
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Accumulate, Device, DeviceBuffer, Event, ExpertKernels, ExpertRowKernels, ExpertShape, Kernels,
-    MAX_BATCH, Result, Stream, Wait,
+    Device, DeviceBuffer, Event, ExpertKernels, ExpertRowKernels, ExpertShape, Kernels, MAX_BATCH,
+    Result, Stream, Wait,
 };
 
 const EXPERTS: u32 = 64;
@@ -142,12 +142,10 @@ fn measure(
                 shape,
                 rows,
                 tile,
-                Accumulate::Atomic,
                 table.ptr(),
                 plan.ptr(),
                 act.ptr(),
                 hidden.ptr(),
-                ares_cuda::DevicePtr::NULL,
                 out.ptr(),
             )
         })?;
