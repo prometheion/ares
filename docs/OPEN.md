@@ -1530,6 +1530,13 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       executor's places on `PlaceChunks` (its oracle plays the strictest device, which the
       chunks are not); the record's windows and the text half of `impl Model` in both models
       (the model's phase 2); the cache's transfer counter kept twice (a metric's name).
+      Checked on the two local cards (2026-11-24, on main 45d2e4d6): every GPU suite of the
+      runtime, `qwen35_device_runtime`, `qwen4exp_device`, `qwen4exp_prefix`, `real_devices`,
+      `real_cache` and `real` pass; `qwen4exp_runtime` 30 of 30 but once
+      `a_request_cuts_in_between_the_pieces_of_a_long_prompt` (the split by layers: the long
+      prompt's first token another), which passed alone three times on this branch and on main
+      and in the whole suite again. Speed, VRAM and the plans as on main (27B at the owner's
+      settings, Flash-Next IQ2_XS at `--ram 8G`, alternating).
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
