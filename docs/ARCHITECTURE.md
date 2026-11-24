@@ -3827,7 +3827,10 @@ recurrent block about 21 µs on the RTX 4070 outside its products, of which
 the delta rule takes 10 to 14: it moves the 3 MiB of state of the block and
 is bound by memory. A prompt of 2048 rows costs the delta rule 1.16 ms per
 block (2.44 ms on the RTX 3060), which is 2.3 times as fast as the thread
-mapping of the llama.cpp fork's kernel in the same harness. The rule is
+mapping of the llama.cpp fork's kernel in the same harness. The shape (two lanes
+a row of the matrix, 64 rows a block, 16 rows of the segment staged at a time) was
+the best of ten measured for prompt rows on both cards; the others and the port of
+the fork's design were removed on 2026-11-24 (`kernels/layers.cu`). The rule is
 sequential in the rows; a chunked form on the tensor cores is not built.
 
 A row of a draft window has the bits of the row alone in these kernels: the

@@ -1258,6 +1258,8 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] A backend-free crate and the `ares-gpu` facade; expert and Flash-Next kernels; both
       models on Vulkan in every placement; attention for wide windows (2 to 6.5 times slower
       than CUDA today); the delta rule's f16 state rounded per row; the sampler's `-0.0`.
+- [ ] Vulkan's draft carry (`SamplerKernels::{shift,keep,commit}_hidden`) has no CUDA twin any
+      more (no caller there, removed on `cleanup/cuda`): drop it or give both a caller at parity.
 
 ## Measurements owed on a quiet machine
 - [ ] On the test machine (RTX 4060 Ti 16 GB with gpu-unlock, 62 GB RAM, a
@@ -1450,7 +1452,9 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
 - [ ] Defects first: the watchdog's blind device waits (in `sched/parallel`); a server test that
       writes the user's `~/.cache/ares`; a type list that must match a kernel by hand; Flash-Next
       tests scheduling with another price estimate than production; two options missing in `--help`.
-      Done on `cleanup/server-model`: the cache, the Flash-Next tests' estimate, `--help`.
+      Done on `cleanup/server-model`: the cache, the Flash-Next tests' estimate, `--help`. Done on
+      `cleanup/cuda`: the type list (the host reads from each decode kernel whether it walks
+      several tiles of rows; a test fails a row a kernel leaves unwritten).
 - [ ] Phase 1 (no conflict with the branches in flight): server test helpers and handler copies,
       `Models::Fixed`, dead code; one table of weight types in `ares-cuda`, dead kernels, test
       helpers; the replaced "pass in waves" design, copied quota code, unused public API in the
@@ -1476,6 +1480,29 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       store's small copies (running means, odds, the step clock, the profile and table files,
       the CPU kernels' test rig, the read submission of `read` and `transit_read`), the expert
       store's test rig and the fake executor of `tests/images.rs`.
+      `ares-cuda` part done on `cleanup/cuda`: one table of weight types (`kernels/types.rs`), the
+      dead kernels (draft carry, nine delta-rule shapes and the fork's design, the Q4_K reference,
+      the ordered sum of the expert rows, the break-even probe), `tests/common`, `ares_quant::act`
+      for the int8 activations, `invalid`/`check_align` once. Left, with the reason:
+  - [ ] After `kv/overflow` merges: the `ATTN_PROBE` clock instrumentation in `attn_kernel.cuh`
+        and `attn_direct.cuh`, and the copies of `gpus`, `Rng` and the byte helpers in
+        `tests/attention.rs` (all in kv's files).
+  - [ ] At Vulkan parity: Vulkan's draft carry (`draft_shift`/`keep`/`commit`, which CUDA no
+        longer has, and its test), its delta-rule shape sweep, and its copies of the activation
+        layout (`vulkan/src/layers.rs`) and of the quantization (`vulkan/tests/mmvq.rs`): use
+        `ares_quant::act` there.
+  - [ ] The owner to decide: whether `examples/launch_cost.rs` and `q4_bench.rs` (results named
+        nowhere in the docs) are retired, and `matvec_bench` folded into `few_rows_bench` and
+        `weight_pass`.
+  - [ ] Small, not done: the examples' own copies of `Rng`, `f32_bytes` and `gpus` (attention,
+        expert layer, expert rows, expert types, sampler steps); the runtime's `store_hidden`
+        quantizes 32 hidden values as `ares_quant::act::Group` does but keeps its own sums per
+        16 (a hot CPU path, left as it is); the kernel side's type lists per module (an X-macro
+        list, optional).
+  - [ ] Moved to phase 2: one `time_best` for the five timing loops at load (they decide
+        measured choices, so a merge is a change of measurements), the names (`Eng*`/`EngMm*`/
+        `Er*`/`AresCodes*` decoders, `q4` for qwen4exp beside the Q4 types, tile names `_n1` for
+        8 rows) and the splits of `experts.rs`, `kernels.rs`, `mm.cuh` and `mmr_codes.cuh`.
 - [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
       one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
       one place, the conductor split, the two model loaders of the server, shared device helpers.
