@@ -23,14 +23,12 @@
 //!   observed deviation is printed (`--nocapture`) so that a change that makes
 //!   it worse can be noticed; the assertion only guards against a gross error.
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
-use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, Stream, Wait, device_count};
+use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, Stream};
+use common::blocks::{TYPES, is_float, random_blocks};
+use common::{Rng, f32_bytes, gpus, read_f32};
 
-mod blocks;
-
-use blocks::{TYPES, is_float};
+mod common;
 
 /// The shapes `(n_in, n_out, n_batch)` a type is tested on: its smallest matrix (one
 /// block), one row, row counts that do not fill a thread block of 8 rows, a row
@@ -61,62 +59,6 @@ fn shapes_for(ty: GgmlType) -> Vec<(usize, usize, usize)> {
         // Many thread blocks.
         (bv * 4, 3000, 3),
     ]
-}
-
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    /// A value of a normal distribution (Box-Muller), occasionally an outlier:
-    /// real activations have a few much larger values per row.
-    fn activation(&mut self) -> f32 {
-        let u1 = (self.unit() + 1.0) * 0.5 + 1e-7;
-        let u2 = self.unit();
-        let normal = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::PI * u2).cos();
-        if self.next().is_multiple_of(400) { normal * 30.0 } else { normal }
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 4];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
-
-/// `n_blocks` blocks of `ty` of random bytes ([`blocks::random_blocks`]).
-fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
-    blocks::random_blocks(&mut || rng.next(), ty, n_blocks)
 }
 
 /// The quantization of activations as `ares_quantize_act` does it, on the CPU:
@@ -316,7 +258,7 @@ fn fast_matvec_computes_the_dequantized_product_on_every_type() {
     let mut rng = Rng(0x2545f4914f6cdd1d);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        for (ty, _) in TYPES {
+        for ty in TYPES {
             let bv = ty.block_values() as usize;
             let shapes = shapes_for(ty);
             for (n_in, n_out, n_batch) in shapes {
@@ -362,7 +304,7 @@ fn every_row_of_a_matrix_taller_than_a_launch_is_written() {
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
         let n_out = 16 * 8 * device.info().multiprocessors as usize + 5;
-        for (ty, _) in TYPES {
+        for ty in TYPES {
             let n_in = ty.block_values().max(32) as usize;
             let w = random_blocks(&mut rng, ty, n_in / ty.block_values() as usize * n_out);
             let x: Vec<f32> = (0..n_in * 2).map(|_| rng.activation()).collect();
@@ -389,7 +331,7 @@ fn fast_matvec_on_real_tensors() {
     let gguf = ares_gguf::Gguf::open(&path).unwrap();
     let mut rng = Rng(0x853c49e6748fea9b);
     let mut checked = Vec::new();
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         let Some(tensor) = gguf
             .tensors()
             .iter()
@@ -451,7 +393,7 @@ fn exact_matvec_multiplies_unquantized_rows_on_every_type() {
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
         let stream = Stream::new(device, 0).unwrap();
-        for (ty, _) in TYPES {
+        for ty in TYPES {
             let bv = ty.block_values() as usize;
             let (mut worst, mut differ, mut outputs) = (0f64, 0usize, 0usize);
             for (n_in, n_out, n_batch) in shapes_for(ty) {
@@ -533,7 +475,7 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
         let stream = Stream::new(device, 0).unwrap();
-        for (ty, _) in TYPES {
+        for ty in TYPES {
             let bv = ty.block_values() as usize;
             for n_out in [19usize, 1500] {
                 let n_in = bv * 8;
@@ -612,7 +554,7 @@ fn bad_arguments_are_refused() {
         assert!(error.contains(ty.name()) && error.contains("no fast weight kernel"), "{error}");
         assert!(error.contains("q4_K") && error.contains("iq4_xs"), "{error}");
     }
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         assert!(Kernels::has_fast_matvec(ty));
     }
 

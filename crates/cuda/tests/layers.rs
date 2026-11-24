@@ -18,44 +18,14 @@
 // the same shapes; a comment on each of the launches would repeat that.
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
 use ares_cuda::{
     AttentionShape, Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels,
-    NormKind, OutputGate, RopeParams, Segment, StepRecord, Stream, Wait, device_count,
-    quantized_activation_bytes,
+    NormKind, OutputGate, RopeParams, Segment, StepRecord, Stream, quantized_activation_bytes,
 };
+use common::{Rng, gpus, rel_max};
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-}
+mod common;
 
 struct Gpu {
     device: Device,
@@ -104,17 +74,6 @@ impl Gpu {
     fn step(&self, record: &StepRecord) -> DeviceBuffer {
         self.bytes(record.as_bytes())
     }
-}
-
-fn random_floats(rng: &mut Rng, n: usize, scale: f32) -> Vec<f32> {
-    (0..n).map(|_| rng.unit() * scale).collect()
-}
-
-/// Largest absolute difference, relative to the largest value of `reference`.
-fn rel_max(got: &[f32], reference: &[f64]) -> f64 {
-    assert_eq!(got.len(), reference.len());
-    let scale = reference.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
-    got.iter().zip(reference).fold(0.0f64, |m, (g, r)| m.max((f64::from(*g) - r).abs())) / scale
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +382,7 @@ fn head_norms_match_the_formulas() {
             for &rows in &[1usize, 7, 37] {
                 for kind in [NormKind::Rms, NormKind::L2] {
                     for with_weight in [false, true] {
-                        let x = random_floats(&mut rng, rows * width, 5.0);
+                        let x = rng.floats(rows * width, 5.0);
                         let weight: Vec<f32> = (0..width).map(|_| 0.5 + rng.unit().abs()).collect();
                         let eps = 1e-6;
                         let want = norm_reference(
@@ -507,7 +466,7 @@ fn the_gather_of_output_rows_copies_and_norms() {
         let gpu = Gpu::new(device);
         let mut rng = Rng(0x5EED_0003);
         let (n_rows, d) = (11usize, 1024usize);
-        let x = random_floats(&mut rng, n_rows * d, 3.0);
+        let x = rng.floats(n_rows * d, 3.0);
         let weight: Vec<f32> = (0..d).map(|_| 0.5 + rng.unit().abs()).collect();
         let out_rows = [10u32, 0, 4, 4, 7];
         let segments = [Segment { row0: 0, n_rows: 11, slot: 0, pos0: 0, direct: false }];
@@ -596,8 +555,8 @@ fn swiglu_with_quantization_is_the_separate_kernels() {
         let gpu = Gpu::new(device);
         let mut rng = Rng(0x5EED_0004);
         for &n_values in &[32usize, 96, 4096, 17408 * 2] {
-            let gate = random_floats(&mut rng, n_values, 6.0);
-            let up = random_floats(&mut rng, n_values, 2.0);
+            let gate = rng.floats(n_values, 6.0);
+            let up = rng.floats(n_values, 2.0);
             let (gb, ub) = (gpu.floats(&gate), gpu.floats(&up));
             let act = gpu.empty(quantized_activation_bytes(n_values as u64));
             unsafe {
@@ -635,8 +594,8 @@ fn the_gated_norm_with_quantization_matches_its_formula_and_the_layout() {
         {
             for gate in [OutputGate::Silu, OutputGate::Sigmoid] {
                 let n = rows * heads * width;
-                let o = random_floats(&mut rng, n, 4.0);
-                let z = random_floats(&mut rng, n, 5.0);
+                let o = rng.floats(n, 4.0);
+                let z = rng.floats(n, 5.0);
                 let weight: Vec<f32> = (0..width).map(|_| 0.3 + rng.unit().abs()).collect();
                 let (ob, zb, wb) = (gpu.floats(&o), gpu.floats(&z), gpu.floats(&weight));
                 let act = gpu.empty(quantized_activation_bytes(n as u64));
@@ -766,8 +725,8 @@ fn the_rope_table_and_the_attention_preparation_match_the_formulas() {
             }
         }
 
-        let qg = random_floats(&mut rng, n * nh * 2 * hd, 3.0);
-        let k = random_floats(&mut rng, n * nkv * hd, 3.0);
+        let qg = rng.floats(n * nh * 2 * hd, 3.0);
+        let k = rng.floats(n * nkv * hd, 3.0);
         let q_norm: Vec<f32> = (0..hd).map(|_| 0.5 + rng.unit().abs()).collect();
         let k_norm: Vec<f32> = (0..hd).map(|_| 0.5 + rng.unit().abs()).collect();
         let (qgb, kb, qnb, knb) =

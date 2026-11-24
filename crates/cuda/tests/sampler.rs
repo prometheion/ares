@@ -16,34 +16,19 @@
 //! slices as several devices hold it (the exchange between the slices is added
 //! on the host here). The time of a pick is printed.
 
-use std::sync::OnceLock;
 use std::time::Instant;
 
-use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, SampleBatch, SamplePlan, SamplerKernels, Stream, Wait,
-    device_count,
-};
+use ares_cuda::{Device, DeviceBuffer, DevicePtr, SampleBatch, SamplePlan, SamplerKernels, Stream};
 use ares_sampler::{
     Entry, LogprobOut, Logprobs, Mirostat, Order, SAMPLE_STATUS_EMPTY, SAMPLE_STATUS_NONFINITE,
     SampleParams, SamplePick, SampleRow, Stage, TokenMask, sample_reference,
 };
+use common::{f32_bytes, gpus};
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
+mod common;
 
-/// A small deterministic generator, so failures reproduce.
+/// A small deterministic generator, so failures reproduce. Not `common::Rng`: its values are
+/// in [0, 1), from which the rows draw their shapes.
 struct Rng(u64);
 
 impl Rng {
@@ -186,10 +171,6 @@ fn settings(vocab: u32) -> Vec<SampleParams> {
         SampleParams { logprobs: lp(3, true), ..SampleParams::GREEDY },
         p(&|s| (s.mirostat, s.mirostat_mu, s.logprobs) = (Some(Mirostat::V2), 5.0, lp(4, true))),
     ]
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 fn u32_bytes(values: &[u32]) -> Vec<u8> {

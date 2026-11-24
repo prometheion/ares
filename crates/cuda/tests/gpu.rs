@@ -9,62 +9,13 @@
 //! ARES_TEST_CUDA=1 cargo test -p ares-cuda --test gpu
 //! ```
 
-use std::sync::OnceLock;
-
 use ares_cuda::{
     Device, DeviceBuffer, DevicePtr, Event, Kernels, PinnedBuffer, Stream, Wait, device_count,
     devices, driver_version, peer_access,
 };
+use common::{Rng, f32_bytes, gpus, read_f32, upload_f32};
 
-/// The opened devices, shared by all tests of this binary so each context is
-/// created once. `None` when the tests are not enabled.
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 4];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
-
-fn upload_f32(device: &Device, values: &[f32]) -> DeviceBuffer {
-    let buffer = DeviceBuffer::new(device, values.len() as u64 * 4).unwrap();
-    buffer.write(0, &f32_bytes(values)).unwrap();
-    buffer
-}
+mod common;
 
 #[test]
 fn describes_devices_without_opening_them() {

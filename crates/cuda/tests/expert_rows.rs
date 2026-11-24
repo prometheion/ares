@@ -20,157 +20,19 @@
 //!   the exact layer, and the hidden values of a row bit for bit alone and in a batch.
 //! - *Missing experts* (no address) add nothing, are reported and are not read.
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
 use ares_cuda::{
     Device, DeviceBuffer, ExpertRowKernels, ExpertShape, Kernels, PrefillPath, ROWS_TILES,
-    RowsPlan, Stream, Wait, device_count,
+    RowsPlan, Stream,
 };
+use common::blocks::{blocks_of, random_blocks_of_one_size, real_blocks};
+use common::{Rng, bytes_f32, f32_bytes, gpus};
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
+mod common;
 
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    /// A value of a normal distribution, occasionally an outlier: real activations have
-    /// a few much larger values per row.
-    fn activation(&mut self) -> f32 {
-        let u1 = (self.unit() + 1.0) * 0.5 + 1e-7;
-        let u2 = self.unit();
-        let normal = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::PI * u2).cos();
-        if self.next().is_multiple_of(400) { normal * 30.0 } else { normal }
-    }
-
-    fn below(&mut self, n: u32) -> u32 {
-        (self.next() >> 33) as u32 % n
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
-}
-
-/// The weight types, each with the byte offsets of the f16 scales of a block; IQ1_M,
-/// MXFP4 and NVFP4 keep theirs in other forms and the float types have none
-/// (`random_blocks`).
-const TYPES: [(GgmlType, &[usize]); 28] = [
-    (GgmlType::Q4_K, &[0, 2]),
-    (GgmlType::Q5_K, &[0, 2]),
-    (GgmlType::Q6_K, &[208]),
-    (GgmlType::Q3_K, &[108]),
-    (GgmlType::Q2_K, &[80, 82]),
-    (GgmlType::IQ4_XS, &[0]),
-    (GgmlType::IQ4_NL, &[0]),
-    (GgmlType::IQ3_S, &[0]),
-    (GgmlType::IQ3_XXS, &[0]),
-    (GgmlType::IQ2_S, &[0]),
-    (GgmlType::IQ2_XS, &[0]),
-    (GgmlType::IQ2_XXS, &[0]),
-    (GgmlType::IQ1_S, &[0]),
-    (GgmlType::IQ1_M, &[]),
-    (GgmlType::Q8_0, &[0]),
-    (GgmlType::Q4_0, &[0]),
-    (GgmlType::Q4_1, &[0, 2]),
-    (GgmlType::Q5_0, &[0]),
-    (GgmlType::Q5_1, &[0, 2]),
-    (GgmlType::TQ1_0, &[52]),
-    (GgmlType::TQ2_0, &[64]),
-    (GgmlType::MXFP4, &[]),
-    (GgmlType::NVFP4, &[]),
-    (GgmlType::Q1_0, &[0]),
-    (GgmlType::Q2_0, &[0]),
-    (GgmlType::F32, &[]),
-    (GgmlType::F16, &[]),
-    (GgmlType::BF16, &[]),
-];
-
-/// The scale of a made-up block: between 0.002 and 0.022 for the types whose codes are
-/// small numbers, as the blocks of real tensors have, and less by the size of the codes
-/// for the types whose codes and inner scales are large (a block of Q6_K decodes to up to
-/// 4096 times its scale), so that the weights of every type are of one size.
-fn block_scale(rng: &mut Rng, ty: GgmlType) -> f32 {
-    let codes = match ty {
-        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_S => 8.0,
-        GgmlType::Q6_K | GgmlType::IQ4_XS => 24.0,
-        GgmlType::IQ3_XXS => 3.0,
-        _ => 1.0,
-    };
-    (0.002 + 0.02 * (rng.unit() * 0.5 + 0.5)) / codes
-}
-
-/// `n_blocks` random blocks of a weight type with finite scales (any other bytes are valid
-/// in every one of these types); for a float type, `n_blocks` values.
-fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
-    let (_, scales) = TYPES.iter().find(|(t, _)| *t == ty).expect("a weight type");
-    let block = ty.block_bytes() as usize;
-    let mut bytes: Vec<u8> = (0..n_blocks * block).map(|_| (rng.next() >> 32) as u8).collect();
-    for blk in bytes.chunks_exact_mut(block) {
-        let scale = block_scale(rng, ty);
-        for &at in *scales {
-            let signed = if rng.next().is_multiple_of(4) { -scale } else { scale };
-            blk[at..at + 2].copy_from_slice(&ares_quant::f32_to_f16(signed).to_le_bytes());
-        }
-        match ty {
-            // The f16 d is spread over the top nibbles of the four u16 of the scales.
-            GgmlType::IQ1_M => {
-                let d = ares_quant::f32_to_f16(scale);
-                for i in 0..4 {
-                    let at = 48 + 2 * i;
-                    let word = u16::from_le_bytes([blk[at], blk[at + 1]]);
-                    let word = (word & 0x0FFF) | (((d >> (4 * i)) & 0xF) << 12);
-                    blk[at..at + 2].copy_from_slice(&word.to_le_bytes());
-                }
-            }
-            // An E8M0 exponent: 2^-7 to 2^-4.
-            GgmlType::MXFP4 => blk[0] = 121 + (rng.next() % 4) as u8,
-            // Four UE4M3 scales of exponent 1 to 4 (2^-7 to 2^-4), never the NaN code.
-            GgmlType::NVFP4 => {
-                for byte in blk.iter_mut().take(4) {
-                    *byte = ((1 + rng.next() % 4) << 3 | (rng.next() % 8)) as u8;
-                }
-            }
-            GgmlType::F32 => blk.copy_from_slice(&(rng.unit() * 0.2).to_le_bytes()),
-            GgmlType::F16 => {
-                blk.copy_from_slice(&ares_quant::f32_to_f16(rng.unit() * 0.2).to_le_bytes());
-            }
-            GgmlType::BF16 => {
-                blk.copy_from_slice(&ares_quant::f32_to_bf16(rng.unit() * 0.2).to_le_bytes());
-            }
-            _ => {}
-        }
-    }
-    bytes
+/// A number below `n`, from the high bits of the generator.
+fn below(rng: &mut Rng, n: u32) -> u32 {
+    (rng.next() >> 33) as u32 % n
 }
 
 /// A layer to test on: its shape and a way to get an expert's matrices.
@@ -196,7 +58,12 @@ fn synthetic_layer_of(
 ) -> Layer<'static> {
     let n_ff = down_ty.block_values().max(128);
     let shape = ExpertShape { n_embd: 512, n_ff, n_experts, top_k, gate_ty, down_ty };
-    layer_of(format!("synthetic {gate_ty} and {down_ty}"), shape, seed, &mut random_blocks)
+    layer_of(
+        format!("synthetic {gate_ty} and {down_ty}"),
+        shape,
+        seed,
+        &mut random_blocks_of_one_size,
+    )
 }
 
 /// A layer of `shape` with experts whose matrices are the blocks that
@@ -270,7 +137,7 @@ fn picks(pattern: &Pattern, shape: &ExpertShape, n_rows: u32, rng: &mut Rng) -> 
             }
         }
         while chosen.len() < k as usize {
-            let e = rng.below(shape.n_experts);
+            let e = below(rng, shape.n_experts);
             if !chosen.contains(&e) {
                 chosen.push(e);
             }
@@ -529,7 +396,7 @@ fn run(
     let mut slots: Vec<u64> = (0..n_slots).collect();
     let mut shuffle = Rng(0x1234_5678_9abc_def1 ^ u64::from(shape.n_experts));
     for i in (1..slots.len()).rev() {
-        slots.swap(i, shuffle.below(i as u32 + 1) as usize);
+        slots.swap(i, below(&mut shuffle, i as u32 + 1) as usize);
     }
     let mut addresses = vec![0u64; shape.n_experts as usize];
     for e in 0..shape.n_experts {
@@ -731,7 +598,7 @@ fn experts_match_the_reference_on_generated_blocks() {
 fn experts_of_every_weight_type_match_the_reference() {
     let Some(gpus) = gpus() else { return };
     let mut pairs: Vec<(GgmlType, GgmlType)> = Vec::new();
-    for (ty, _) in TYPES {
+    for ty in ExpertShape::types() {
         pairs.push((ty, GgmlType::Q2_0));
         pairs.push((GgmlType::IQ2_S, ty));
     }
@@ -812,57 +679,13 @@ fn wide_steps() -> [(u32, u32, Pattern); 4] {
 #[test]
 fn experts_of_every_weight_type_match_the_reference_at_real_widths() {
     let Some(gpus) = gpus() else { return };
-    for (i, (ty, _)) in TYPES.into_iter().enumerate() {
+    for (i, ty) in ExpertShape::types().enumerate() {
         for (gate_ty, down_ty) in [(ty, GgmlType::Q2_0), (GgmlType::IQ2_S, ty)] {
             let shape = wide_shape(gate_ty, down_ty);
             let name = format!("{gate_ty} and {down_ty}, {} x {}", shape.n_embd, shape.n_ff);
-            let layer = layer_of(name, shape, 700 + i as u64, &mut random_blocks);
+            let layer = layer_of(name, shape, 700 + i as u64, &mut random_blocks_of_one_size);
             check_layer_of_types(gpus, &layer, 0x2545f4914f6cdd1d + i as u64, &wide_steps());
         }
-    }
-}
-
-/// The largest tensor of two or more dimensions of every weight type the file has: the
-/// blocks a quantizer wrote, which the tests take as the matrices of experts.
-fn real_blocks(gguf: &ares_gguf::Gguf) -> Vec<(GgmlType, &[u8])> {
-    let mut found: Vec<(GgmlType, &[u8])> = Vec::new();
-    for tensor in gguf.tensors() {
-        if tensor.dims.as_slice().len() < 2 || !TYPES.iter().any(|(ty, _)| *ty == tensor.ty) {
-            continue;
-        }
-        let data = gguf.data(tensor);
-        match found.iter_mut().find(|(ty, _)| *ty == tensor.ty) {
-            Some((_, largest)) if largest.len() < data.len() => *largest = data,
-            Some(_) => {}
-            None => found.push((tensor.ty, data)),
-        }
-    }
-    found
-}
-
-/// A source of blocks for [`layer_of`] that takes the blocks of `ty` from `data`, one
-/// stretch after the other and from the start again at the end, and generates the blocks
-/// of every other type.
-fn blocks_of<'a>(
-    ty: GgmlType,
-    data: &'a [u8],
-) -> impl FnMut(&mut Rng, GgmlType, usize) -> Vec<u8> + 'a {
-    let block = ty.block_bytes() as usize;
-    let mut at = 0;
-    move |rng, wanted, n_blocks| {
-        if wanted != ty {
-            return random_blocks(rng, wanted, n_blocks);
-        }
-        let mut bytes = Vec::with_capacity(n_blocks * block);
-        while bytes.len() < n_blocks * block {
-            if at + block > data.len() {
-                at = 0;
-            }
-            let take = (n_blocks * block - bytes.len()).min((data.len() - at) / block * block);
-            bytes.extend_from_slice(&data[at..at + take]);
-            at += take;
-        }
-        bytes
     }
 }
 

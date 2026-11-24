@@ -21,102 +21,36 @@
 //!   deviations are printed (`--nocapture`); the assertion guards against a gross
 //!   error.
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
 use ares_cuda::{
     ActivationForm, Device, DeviceBuffer, DevicePtr, FEW_ROWS, FewPlan, Kernels, Precision, Stream,
-    Wait, WeightLayout, device_count,
+    WeightLayout,
 };
 use ares_quant::{f16_to_f32, f32_to_f16};
+use common::blocks::random_blocks;
+use common::{Rng, f32_bytes, gpus, read_f32};
 
-/// The types with a device layout, and the byte offsets of the f16 fields of a
-/// block that must be finite for the test data to be meaningful.
-const TYPES: [(GgmlType, &[usize]); 12] = [
-    (GgmlType::Q4_K, &[0, 2]),
-    (GgmlType::Q5_K, &[0, 2]),
-    (GgmlType::Q6_K, &[208]),
-    (GgmlType::Q3_K, &[108]),
-    (GgmlType::Q2_K, &[80, 82]),
-    (GgmlType::Q4_0, &[0]),
-    (GgmlType::Q4_1, &[0, 2]),
-    (GgmlType::Q5_0, &[0]),
-    (GgmlType::Q5_1, &[0, 2]),
-    (GgmlType::Q8_0, &[0]),
-    (GgmlType::IQ4_XS, &[0]),
-    (GgmlType::IQ4_NL, &[0]),
+mod common;
+
+/// The types with a device layout, in the order the tests go through them.
+const TYPES: [GgmlType; 12] = [
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q3_K,
+    GgmlType::Q2_K,
+    GgmlType::Q4_0,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
+    GgmlType::Q8_0,
+    GgmlType::IQ4_XS,
+    GgmlType::IQ4_NL,
 ];
-
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
 
 /// The kernels of the devices.
 fn loaded() -> Vec<(&'static Device, Kernels)> {
     gpus().unwrap_or(&[]).iter().map(|d| (d, Kernels::load(d).unwrap())).collect()
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    /// A value of a normal distribution, occasionally an outlier: real activations
-    /// have a few much larger values per row.
-    fn activation(&mut self) -> f32 {
-        let u1 = (self.unit() + 1.0) * 0.5 + 1e-7;
-        let u2 = self.unit();
-        let normal = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::PI * u2).cos();
-        if self.next().is_multiple_of(400) { normal * 30.0 } else { normal }
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 4];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
-
-/// `n_blocks` blocks of `ty` of random bytes, with finite f16 scales of both signs.
-fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
-    let (_, scales) = TYPES.iter().find(|(t, _)| *t == ty).unwrap();
-    let block = ty.block_bytes() as usize;
-    let mut bytes: Vec<u8> = (0..n_blocks * block).map(|_| (rng.next() >> 32) as u8).collect();
-    for b in 0..n_blocks {
-        for &offset in *scales {
-            let scale = (0.002 + 0.02 * (rng.unit() * 0.5 + 0.5))
-                * if rng.next().is_multiple_of(4) { -1.0 } else { 1.0 };
-            let at = b * block + offset;
-            bytes[at..at + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
-        }
-    }
-    bytes
 }
 
 fn through_f16(v: f32) -> f64 {
@@ -293,7 +227,7 @@ fn a_device_layout_takes_the_bytes_of_the_file() {
         |ty: GgmlType, n_out, n_in| Kernels::layout_bytes(ty, WeightLayout::File, n_out, n_in);
     let device =
         |ty: GgmlType, n_out, n_in| Kernels::layout_bytes(ty, WeightLayout::Device, n_out, n_in);
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         assert!(Kernels::has_device_layout(ty, 5120));
         // Whole tiles of 16 rows: the same bytes.
         assert_eq!(device(ty, 17408, 5120), file(ty, 17408, 5120));
@@ -316,7 +250,7 @@ fn a_device_layout_takes_the_bytes_of_the_file() {
 #[test]
 fn the_rearrangement_is_the_reference_layout() {
     let mut rng = Rng(0x2545f4914f6cdd1d);
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         for (n_out, n_in) in [(1usize, 256usize), (16, 256), (37, 768), (128, 1024)] {
             let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
             let bytes = ares_quant::layout::rearranged_bytes(ty, n_out, n_in).unwrap();
@@ -364,7 +298,7 @@ fn every_kernel_computes_the_product() {
         (200, 1536, &[4, 9]),
     ];
     let mut rng = Rng(0x9e3779b97f4a7c15);
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         for (n_out, n_in, rows) in shapes {
             let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
             for &n_rows in rows {
@@ -411,7 +345,7 @@ fn every_kernel_computes_the_product() {
 fn the_table_serves_every_number_of_rows() {
     let (n_out, n_in) = (144usize, 512usize);
     let mut rng = Rng(0xd1342543de82ef95);
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
         for (device, kernels) in loaded() {
             let kept = kernels.layout_table(ty).unwrap();
@@ -494,7 +428,7 @@ fn a_row_is_the_same_bits_in_any_batch_and_launch() {
     let mut rng = Rng(0x6a09e667f3bcc908);
     // Shapes of 5 super-blocks (parts of one or two), a ragged tile, and 17 super-blocks.
     for (n_out, n_in) in [(70usize, 1280usize), (33, 4352), (16, 256)] {
-        for (ty, _) in TYPES {
+        for ty in TYPES {
             let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
             let x: Vec<f32> = (0..n_in * FEW_ROWS as usize).map(|_| rng.activation()).collect();
             for (device, kernels) in loaded() {
@@ -564,7 +498,7 @@ fn a_row_is_the_same_bits_in_any_batch_and_launch() {
 fn tuning_a_shape_changes_no_bit() {
     let mut rng = Rng(0xbb67ae8584caa73b);
     for (n_out, n_in) in [(144usize, 2048usize), (2000, 1024)] {
-        for (ty, _) in [TYPES[0], TYPES[2], TYPES[9], TYPES[10]] {
+        for ty in [TYPES[0], TYPES[2], TYPES[9], TYPES[10]] {
             let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
             let x: Vec<f32> = (0..n_in * 4).map(|_| rng.activation()).collect();
             for (device, kernels) in loaded() {
@@ -608,7 +542,7 @@ fn the_device_layout_on_real_tensors() {
     let gguf = ares_gguf::Gguf::open(&path).unwrap();
     let mut rng = Rng(0x853c49e6748fea9b);
     let mut checked = Vec::new();
-    for (ty, _) in TYPES {
+    for ty in TYPES {
         let Some(tensor) = gguf
             .tensors()
             .iter()

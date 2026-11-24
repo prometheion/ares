@@ -10,62 +10,13 @@
 //! ARES_TEST_CUDA=1 cargo test -p ares-cuda --test tower -- --test-threads=1 --nocapture
 //! ```
 
-use std::sync::OnceLock;
-
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, HeadShape, Kernels, PositionGrid, PrefillPath, Stream,
-    TowerKernels, Wait, device_count,
+    DeviceBuffer, DevicePtr, HeadShape, Kernels, PositionGrid, PrefillPath, Stream, TowerKernels,
 };
 use ares_quant::{f16_to_f32, f32_to_f16};
+use common::{Rng, gpus, read_f32, upload_f32};
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    fn values(&mut self, n: usize, scale: f32) -> Vec<f32> {
-        (0..n).map(|_| self.unit() * scale).collect()
-    }
-}
-
-fn upload(device: &Device, values: &[f32]) -> DeviceBuffer {
-    let buffer = DeviceBuffer::new(device, (values.len().max(1) * 4) as u64).unwrap();
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    buffer.write(0, &bytes).unwrap();
-    buffer
-}
-
-fn download(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 4];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
+mod common;
 
 fn bytes_of(buffer: &DeviceBuffer, n: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; n];
@@ -101,7 +52,7 @@ fn convert(
     n_rows: usize,
 ) -> Vec<u8> {
     let device = kernels.device();
-    let x = upload(device, values);
+    let x = upload_f32(device, values);
     let bytes = Kernels::prefill_activation_bytes(PrefillPath::F16, n_in as u32, n_rows as u32);
     let out = DeviceBuffer::new(device, bytes).unwrap();
     // SAFETY: the buffers hold the rows and the prepared bytes.
@@ -136,19 +87,20 @@ fn norm_and_gelu_write_the_f16_form_of_the_tile_kernels() {
         for group in [1usize, 4] {
             let rows_in = n_rows * group;
             // Values around an offset, some rows with a large one: the residual's look.
-            let mut x = rng.values(rows_in * n, 3.0);
+            let mut x = rng.floats(rows_in * n, 3.0);
             for (r, row) in x.chunks_mut(n).enumerate() {
                 let offset = if r % 3 == 0 { 400.0 } else { 0.5 };
                 row.iter_mut().for_each(|v| *v += offset);
                 row[r % n] = 6000.0;
             }
-            let weight = rng.values(n, 2.0);
-            let bias = rng.values(n, 0.5);
+            let weight = rng.floats(n, 2.0);
+            let bias = rng.floats(n, 0.5);
             let width = n * group;
             let bytes =
                 Kernels::prefill_activation_bytes(PrefillPath::F16, width as u32, n_rows as u32);
             let out = DeviceBuffer::new(device, bytes).unwrap();
-            let (xb, wb, bb) = (upload(device, &x), upload(device, &weight), upload(device, &bias));
+            let (xb, wb, bb) =
+                (upload_f32(device, &x), upload_f32(device, &weight), upload_f32(device, &bias));
             // SAFETY: the buffers have the sizes the launch reads and writes.
             unsafe {
                 tower
@@ -190,11 +142,11 @@ fn norm_and_gelu_write_the_f16_form_of_the_tile_kernels() {
 
         // GELU: rows of 4304 values padded to 4320.
         let (n, pad) = (4304usize, 4320usize);
-        let y = rng.values(n_rows * n, 30.0);
-        let bias = rng.values(n, 5.0);
+        let y = rng.floats(n_rows * n, 30.0);
+        let bias = rng.floats(n, 5.0);
         let bytes = Kernels::prefill_activation_bytes(PrefillPath::F16, pad as u32, n_rows as u32);
         let out = DeviceBuffer::new(device, bytes).unwrap();
-        let (yb, bb) = (upload(device, &y), upload(device, &bias));
+        let (yb, bb) = (upload_f32(device, &y), upload_f32(device, &bias));
         // SAFETY: as above.
         unsafe {
             tower
@@ -241,26 +193,27 @@ fn residual_place_and_positions_are_exact() {
         let stream = Stream::new(device, 0).unwrap();
         let mut rng = Rng(11);
         let (n, rows) = (1152usize, 37usize);
-        let x = rng.values(rows * n, 5000.0);
-        let y = rng.values(rows * n, 3.0);
-        let bias = rng.values(n, 1.0);
-        let (xb, yb, bb) = (upload(device, &x), upload(device, &y), upload(device, &bias));
+        let x = rng.floats(rows * n, 5000.0);
+        let y = rng.floats(rows * n, 3.0);
+        let bias = rng.floats(n, 1.0);
+        let (xb, yb, bb) =
+            (upload_f32(device, &x), upload_f32(device, &y), upload_f32(device, &bias));
         // SAFETY: the buffers hold the rows.
         unsafe {
             tower.residual(&stream, xb.ptr(), yb.ptr(), bb.ptr(), n as u32, rows as u32).unwrap()
         };
         stream.synchronize().unwrap();
-        let ours = download(&xb, rows * n);
+        let ours = read_f32(&xb, rows * n);
         for (i, v) in ours.iter().enumerate() {
             assert_eq!(v.to_bits(), (x[i] + (y[i] + bias[i % n])).to_bits(), "residual {i}");
         }
 
         let (width, dst_width, at) = (300usize, 1000usize, 640usize);
-        let src = rng.values(rows * width, 2.0);
-        let part_bias = rng.values(width, 1.0);
+        let src = rng.floats(rows * width, 2.0);
+        let part_bias = rng.floats(width, 1.0);
         let dst = DeviceBuffer::new(device, (rows * dst_width * 4) as u64).unwrap();
         dst.write(0, &vec![0u8; rows * dst_width * 4]).unwrap();
-        let (sb, pb) = (upload(device, &src), upload(device, &part_bias));
+        let (sb, pb) = (upload_f32(device, &src), upload_f32(device, &part_bias));
         // SAFETY: as above.
         unsafe {
             tower
@@ -289,7 +242,7 @@ fn residual_place_and_positions_are_exact() {
                 .unwrap();
         }
         stream.synchronize().unwrap();
-        let placed = download(&dst, rows * dst_width);
+        let placed = read_f32(&dst, rows * dst_width);
         for r in 0..rows {
             for i in 0..width {
                 let s = src[r * width + i];
@@ -301,14 +254,14 @@ fn residual_place_and_positions_are_exact() {
 
         // Positions: a table of 6 x 6 cells of 8 values, grids larger, smaller and equal.
         let (side, n) = (6usize, 8usize);
-        let table = rng.values(side * side * n, 4.0);
-        let patch_bias = rng.values(n, 1.0);
-        let (tb, pb) = (upload(device, &table), upload(device, &patch_bias));
+        let table = rng.floats(side * side * n, 4.0);
+        let patch_bias = rng.floats(n, 1.0);
+        let (tb, pb) = (upload_f32(device, &table), upload_f32(device, &patch_bias));
         for (pw, ph) in [(6usize, 6usize), (10, 4), (2, 14), (4, 2)] {
             let factor = |m: usize| (m - 1) as f32 / (side - 1) as f32;
             let patches = pw * ph;
-            let x = rng.values(patches * n, 2.0);
-            let xb = upload(device, &x);
+            let x = rng.floats(patches * n, 2.0);
+            let xb = upload_f32(device, &x);
             let grid = PositionGrid {
                 n: n as u32,
                 side: side as u32,
@@ -320,7 +273,7 @@ fn residual_place_and_positions_are_exact() {
             // SAFETY: as above.
             unsafe { tower.positions(&stream, xb.ptr(), pb.ptr(), tb.ptr(), grid).unwrap() };
             stream.synchronize().unwrap();
-            let ours = download(&xb, patches * n);
+            let ours = read_f32(&xb, patches * n);
             let nx = pw / 2;
             for p in 0..patches {
                 let (py, px) = (2 * (p / 4 / nx) + p % 4 / 2, 2 * (p / 4 % nx) + p % 2);
@@ -372,10 +325,10 @@ fn rotation_and_attention_match_the_host() {
             let patches = 4 * nx * ny;
             let shape =
                 HeadShape { n_head: n_head as u32, head_dim: d as u32, n_patches: patches as u32 };
-            let qkv = rng.values(patches * 3 * width, 4.0);
-            let bias = rng.values(3 * width, 1.0);
+            let qkv = rng.floats(patches * 3 * width, 4.0);
+            let bias = rng.floats(3 * width, 1.0);
             let heads = DeviceBuffer::new(device, shape.bytes()).unwrap();
-            let (qb, bb) = (upload(device, &qkv), upload(device, &bias));
+            let (qb, bb) = (upload_f32(device, &qkv), upload_f32(device, &bias));
             // In two calls, as the groups of a block do.
             let half = (patches / 2) as u32;
             // SAFETY: the buffers hold the rows and the heads of `shape`.
@@ -466,7 +419,7 @@ fn rotation_and_attention_match_the_host() {
                 }
             }
             // The attention over the device's f16 rows, in f64 on the host.
-            let ours = download(&out, patches * width);
+            let ours = read_f32(&out, patches * width);
             let (mut diff, mut norm) = (0f64, 0f64);
             for head in 0..n_head {
                 let (q, k, v) = (&host[0][head], &host[1][head], &host[2][head]);

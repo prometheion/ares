@@ -27,47 +27,48 @@
 //!   printed (`--nocapture`) so that a change that makes them worse can be
 //!   noticed; the assertion only guards against a gross error.
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Kernels, Precision, PrefillPath, Stream, Wait, WeightRange,
-    device_count,
+    Device, DeviceBuffer, DevicePtr, Kernels, Precision, PrefillPath, Stream, WeightRange,
 };
 use ares_quant::{f16_to_f32, f32_to_bf16, f32_to_f16};
+use common::blocks::{put_iq1_m_scale, scale_offsets};
+use common::{Rng, f32_bytes, gpus, read_f32};
 
-/// The types with a prefill kernel, and the byte offsets of the f16 fields of a
-/// block that must be finite for the test data to be meaningful.
-const TYPES: [(GgmlType, &[usize]); 11] = [
-    (GgmlType::Q4_K, &[0, 2]),
-    (GgmlType::Q5_K, &[0, 2]),
-    (GgmlType::Q6_K, &[208]),
-    (GgmlType::Q3_K, &[108]),
-    (GgmlType::IQ4_XS, &[0]),
-    (GgmlType::IQ4_NL, &[0]),
-    (GgmlType::IQ3_S, &[0]),
-    (GgmlType::IQ3_XXS, &[0]),
-    (GgmlType::IQ2_S, &[0]),
-    (GgmlType::IQ2_XS, &[0]),
-    (GgmlType::Q8_0, &[0]),
+mod common;
+
+/// The types of the first prefill module (`kernels/prefill.cu`), with the int8 variant, in
+/// the order the tests go through them.
+const TYPES: [GgmlType; 11] = [
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q3_K,
+    GgmlType::IQ4_XS,
+    GgmlType::IQ4_NL,
+    GgmlType::IQ3_S,
+    GgmlType::IQ3_XXS,
+    GgmlType::IQ2_S,
+    GgmlType::IQ2_XS,
+    GgmlType::Q8_0,
 ];
 
 /// The types of the second module (`kernels/prefill_more.cu`): the f16 variants only.
-const MORE_TYPES: [(GgmlType, &[usize]); 14] = [
-    (GgmlType::IQ2_XXS, &[0]),
-    (GgmlType::IQ1_S, &[0]),
-    (GgmlType::IQ1_M, &[]),
-    (GgmlType::Q2_0, &[0]),
-    (GgmlType::Q2_K, &[80, 82]),
-    (GgmlType::Q4_0, &[0]),
-    (GgmlType::Q4_1, &[0, 2]),
-    (GgmlType::Q5_0, &[0]),
-    (GgmlType::Q5_1, &[0, 2]),
-    (GgmlType::TQ1_0, &[52]),
-    (GgmlType::TQ2_0, &[64]),
-    (GgmlType::MXFP4, &[]),
-    (GgmlType::NVFP4, &[]),
-    (GgmlType::Q1_0, &[0]),
+const MORE_TYPES: [GgmlType; 14] = [
+    GgmlType::IQ2_XXS,
+    GgmlType::IQ1_S,
+    GgmlType::IQ1_M,
+    GgmlType::Q2_0,
+    GgmlType::Q2_K,
+    GgmlType::Q4_0,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
+    GgmlType::TQ1_0,
+    GgmlType::TQ2_0,
+    GgmlType::MXFP4,
+    GgmlType::NVFP4,
+    GgmlType::Q1_0,
 ];
 
 /// The float types, also of the second module: no scales in the data.
@@ -76,8 +77,8 @@ const FLOAT_TYPES: [GgmlType; 3] = [GgmlType::F32, GgmlType::F16, GgmlType::BF16
 const PATHS: [PrefillPath; 3] = [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush];
 
 /// Every type with a tile kernel.
-fn all_types() -> impl Iterator<Item = (GgmlType, &'static [usize])> {
-    TYPES.into_iter().chain(MORE_TYPES).chain(FLOAT_TYPES.map(|ty| (ty, &[][..])))
+fn all_types() -> impl Iterator<Item = GgmlType> {
+    TYPES.into_iter().chain(MORE_TYPES).chain(FLOAT_TYPES)
 }
 
 /// The values of a row the kernels take at once: a block, or 32 for the float types, whose
@@ -89,57 +90,6 @@ fn unit(ty: GgmlType) -> usize {
 /// The paths a type has kernels for.
 fn paths_of(kernels: &Kernels, ty: GgmlType) -> Vec<PrefillPath> {
     PATHS.into_iter().filter(|p| kernels.has_prefill_path(ty, *p)).collect()
-}
-
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    /// A value of a normal distribution (Box-Muller), occasionally an outlier:
-    /// real activations have a few much larger values per row.
-    fn activation(&mut self) -> f32 {
-        let u1 = (self.unit() + 1.0) * 0.5 + 1e-7;
-        let u2 = self.unit();
-        let normal = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::PI * u2).cos();
-        if self.next().is_multiple_of(400) { normal * 30.0 } else { normal }
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 4];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 /// The values as weights of a float type.
@@ -163,41 +113,33 @@ fn random_floats(rng: &mut Rng, ty: GgmlType, n: usize) -> Vec<u8> {
 /// `n_blocks` blocks of `ty` of random bytes, with finite scales (f16 of both signs; a
 /// small power of two for MXFP4's exponent byte and NVFP4's four UE4M3 bytes), where the
 /// bytes of a scale could otherwise be infinite or NaN. Any other bytes are valid in every
-/// one of these types.
+/// one of these types. The scales of MXFP4 and NVFP4 are smaller than those of
+/// `common::blocks::random_blocks`, so that the f16 sums of the tile kernels do not overflow.
 fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
     if FLOAT_TYPES.contains(&ty) {
         return random_floats(rng, ty, n_blocks);
     }
-    let (_, scales) = all_types().find(|(t, _)| *t == ty).unwrap();
     let block = ty.block_bytes() as usize;
     let mut bytes: Vec<u8> = (0..n_blocks * block).map(|_| (rng.next() >> 32) as u8).collect();
-    for b in 0..n_blocks {
-        for &offset in scales {
+    for blk in bytes.chunks_exact_mut(block) {
+        for &offset in scale_offsets(ty) {
             let scale = (0.002 + 0.02 * (rng.unit() * 0.5 + 0.5))
                 * if rng.next().is_multiple_of(4) { -1.0 } else { 1.0 };
-            let at = b * block + offset;
-            bytes[at..at + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+            blk[offset..offset + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
         }
         match ty {
             // The E8M0 exponent byte: 2^-7 to 2^3.
-            GgmlType::MXFP4 => bytes[b * block] = 120 + (rng.next() % 11) as u8,
+            GgmlType::MXFP4 => blk[0] = 120 + (rng.next() % 11) as u8,
             // The four UE4M3 scale bytes: 0.125 to 2.
             GgmlType::NVFP4 => {
-                for i in 0..4 {
-                    bytes[b * block + i] = 0x20 + (rng.next() % 0x21) as u8;
+                for byte in blk.iter_mut().take(4) {
+                    *byte = 0x20 + (rng.next() % 0x21) as u8;
                 }
             }
-            _ => {}
-        }
-        if ty == GgmlType::IQ1_M {
-            // The f16 d is spread over the top nibbles of the four u16 of the scales.
-            let d = f32_to_f16(0.002 + 0.02 * (rng.unit() * 0.5 + 0.5));
-            for i in 0..4 {
-                let at = b * block + 48 + 2 * i;
-                let word = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-                let word = (word & 0x0FFF) | (((d >> (4 * i)) & 0xF) << 12);
-                bytes[at..at + 2].copy_from_slice(&word.to_le_bytes());
+            GgmlType::IQ1_M => {
+                put_iq1_m_scale(blk, f32_to_f16(0.002 + 0.02 * (rng.unit() * 0.5 + 0.5)));
             }
+            _ => {}
         }
     }
     bytes
@@ -451,7 +393,7 @@ fn prefill_matmul_computes_the_emulated_product_on_every_type() {
     let mut rng = Rng(0x2545f4914f6cdd1d);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        for (ty, _) in all_types() {
+        for ty in all_types() {
             let bv = ty.block_values() as usize;
             let step = unit(ty);
             let mut shapes = vec![
@@ -501,7 +443,7 @@ fn prefill_matmul_is_right_around_every_shape_boundary() {
     let mut rng = Rng(0x5851f42d4c957f2d);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        for (ty, _) in all_types() {
+        for ty in all_types() {
             let bv = ty.block_values() as usize;
             let n_in = 512usize;
             let mut cases: Vec<(usize, usize)> = [
@@ -552,7 +494,7 @@ fn prefill_matmul_on_real_tensors() {
     let gguf = ares_gguf::Gguf::open(&path).unwrap();
     let mut rng = Rng(0x853c49e6748fea9b);
     let mut checked = Vec::new();
-    for (ty, _) in all_types() {
+    for ty in all_types() {
         let candidates = gguf.tensors().iter().filter(|t| {
             t.ty == ty
                 && t.dims.as_slice().len() == 2
@@ -634,7 +576,7 @@ fn the_int8_path_agrees_with_the_decode_kernels() {
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
         let stream = Stream::new(device, 0).unwrap();
-        for (ty, _) in TYPES {
+        for ty in TYPES {
             let bv = ty.block_values() as usize;
             let (n_in, n_out, n_rows) = (bv * 12, 150usize, 8usize);
             let w = random_blocks(&mut rng, ty, n_in / bv * n_out);
@@ -706,7 +648,7 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
     let mut rng = Rng(0xda942042e4dd58b5);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        for (ty, _) in all_types() {
+        for ty in all_types() {
             let bv = ty.block_values() as usize;
             let (n_in, n_out, n_rows) = (unit(ty) * 8, 150usize, 130usize);
             let w = random_blocks(&mut rng, ty, n_in / bv * n_out);
@@ -1020,7 +962,7 @@ fn the_shapes_fit_the_device() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        for (ty, _) in all_types() {
+        for ty in all_types() {
             for path in paths_of(&kernels, ty) {
                 let shapes = kernels.prefill_shapes(ty, path).unwrap();
                 assert_eq!(shapes.len(), 3);
@@ -1129,7 +1071,7 @@ fn bad_arguments_are_refused() {
     for ty in ares_core::ggml_type::ALL_TYPES.into_iter().filter(|t| t.is_weight()) {
         // Every weight type has both families, and the rule says where one hands over to the other.
         assert!(Kernels::has_fast_matvec(ty), "{ty}");
-        assert!(all_types().any(|(t, _)| t == ty), "{ty} has no tile kernel");
+        assert!(all_types().any(|t| t == ty), "{ty} has no tile kernel");
         if let Some(rows) = Kernels::decode_kernel_rows(ty) {
             assert!((1..=32).contains(&rows), "{ty}: {rows}");
         }

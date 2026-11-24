@@ -11,6 +11,9 @@ use ares_cuda::{
     Device, DeviceBuffer, Kernels, LayerKernels, MergeNorm, Mesh, Route, Stream, Wait, Wire,
     device_count, partial_wire_bytes, peer_access,
 };
+use common::{f32_bytes, read_f32, upload_f32};
+
+mod common;
 
 const D: u32 = 1024;
 const EPS: f32 = 1e-6;
@@ -53,22 +56,6 @@ impl Rng {
     }
 }
 
-fn bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn upload(device: &Device, values: &[f32]) -> DeviceBuffer {
-    let buffer = DeviceBuffer::new(device, values.len() as u64 * 4).unwrap();
-    buffer.write(0, &bytes(values)).unwrap();
-    buffer
-}
-
-fn download(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut raw = vec![0u8; n * 4];
-    buffer.read(0, &mut raw).unwrap();
-    raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
-
 /// One device's buffers of a merge.
 struct Side {
     stream: Stream,
@@ -96,7 +83,7 @@ impl Side {
             xn: DeviceBuffer::new(device, values).unwrap(),
             act: DeviceBuffer::new(device, act_bytes).unwrap(),
             act_ref: DeviceBuffer::new(device, act_bytes).unwrap(),
-            weight: upload(device, weight),
+            weight: upload_f32(device, weight),
         }
     }
 }
@@ -209,8 +196,8 @@ fn merges_give_every_device_the_same_sum_and_its_norm() {
                 let partials = [rng.rows(n, 1.0), rng.rows(n, 0.5)];
                 let load = || {
                     for (side, partial) in sides.iter().zip(&partials) {
-                        side.x.write(0, &bytes(&x0)).unwrap();
-                        side.p.write(0, &bytes(partial)).unwrap();
+                        side.x.write(0, &f32_bytes(&x0)).unwrap();
+                        side.p.write(0, &f32_bytes(partial)).unwrap();
                     }
                 };
 
@@ -221,7 +208,7 @@ fn merges_give_every_device_the_same_sum_and_its_norm() {
                     out: s.xn.ptr(),
                 });
                 sync();
-                let got: Vec<Vec<f32>> = sides.iter().map(|s| download(&s.x, count)).collect();
+                let got: Vec<Vec<f32>> = sides.iter().map(|s| read_f32(&s.x, count)).collect();
                 let what = format!("{route:?} {wire:?} round {round} ({n} rows, push {push})");
                 assert!(
                     got[0].iter().zip(&got[1]).all(|(a, b)| a.to_bits() == b.to_bits()),
@@ -258,7 +245,7 @@ fn merges_give_every_device_the_same_sum_and_its_norm() {
                         }
                     }
                 }
-                let normed = download(&sides[0].xn, count);
+                let normed = read_f32(&sides[0].xn, count);
                 for row in 0..n as usize {
                     let at = row * D as usize;
                     let xs = &got[0][at..at + D as usize];

@@ -12,53 +12,17 @@
 // the same shapes; a comment on each of the launches would repeat that.
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
 use ares_cuda::{
     AttendBuffers, AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry,
     CommitSet, Device, DeviceBuffer, IndexerShape, Kernels, KeyFormat, LayerKernels, ListHandOver,
     MixerMatrix, NgramShape, Plan, Q4Kernels, RopeParams, Segment, SelectionRule, StepRecord,
-    Stream, Wait, device_count, quantized_activation_bytes,
+    Stream, quantized_activation_bytes,
 };
+use common::blocks::{TYPES, random_blocks};
+use common::{Rng, gpus, rel_max};
 
-mod blocks;
-
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-    fn floats(&mut self, n: usize, scale: f32) -> Vec<f32> {
-        (0..n).map(|_| self.unit() * scale).collect()
-    }
-}
+mod common;
 
 struct Gpu {
     device: Device,
@@ -118,13 +82,6 @@ impl Gpu {
         let bytes = self.read_bytes(buffer, 0, n * 4);
         bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect()
     }
-}
-
-/// Largest absolute difference, relative to the largest value of `reference`.
-fn rel_max(got: &[f32], reference: &[f64]) -> f64 {
-    assert_eq!(got.len(), reference.len());
-    let scale = reference.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
-    got.iter().zip(reference).fold(0.0f64, |m, (g, r)| m.max((f64::from(*g) - r).abs())) / scale
 }
 
 fn report(name: &str, value: f64) {
@@ -383,16 +340,15 @@ fn the_fused_read_takes_every_weight_type() {
         let gpu = Gpu::new(device);
         let mut rng = Rng(0x3a91_c4f7_0b2e_6d15);
         eprintln!("  {}", gpu.name());
-        for (ty, _) in blocks::TYPES {
+        for ty in TYPES {
             let bv = ty.block_values() as usize;
             let (hc, n, rank) = if 320 % bv == 0 { (4, 2560, 320) } else { (4, 512, 256) };
             let d = hc * n;
             let (mut worst, mut differ) = (0f64, 0usize);
             for rows in [1usize, 5] {
-                let mut next = || rng.next();
-                let down = blocks::random_blocks(&mut next, ty, rank * d / bv);
-                let inject = blocks::random_blocks(&mut next, ty, hc * d / bv);
-                let up = blocks::random_blocks(&mut next, ty, d * rank / bv);
+                let down = random_blocks(&mut rng, ty, rank * d / bv);
+                let inject = random_blocks(&mut rng, ty, hc * d / bv);
+                let up = random_blocks(&mut rng, ty, d * rank / bv);
                 let decode = |bytes: &[u8], values: usize| -> Vec<f32> {
                     let mut out = vec![0f32; values];
                     ares_quant::dequantize(ty, bytes, &mut out).unwrap();
@@ -1500,7 +1456,7 @@ fn the_ngram_rows_of_every_weight_type_are_decoded() {
     for device in gpus {
         let gpu = Gpu::new(device);
         let mut rng = Rng(0x51c3_0d2a_77e4_9b01);
-        for (ty, _) in blocks::TYPES {
+        for ty in TYPES {
             let shape = NgramShape {
                 n_stream: 2,
                 n_embd: 512,
@@ -1513,8 +1469,7 @@ fn the_ngram_rows_of_every_weight_type_are_decoded() {
             let rows = 3usize;
             let n = shape.n_embd as usize;
             let values = rows * n;
-            let fetched =
-                blocks::random_blocks(&mut || rng.next(), ty, values / ty.block_values() as usize);
+            let fetched = random_blocks(&mut rng, ty, values / ty.block_values() as usize);
             assert_eq!(fetched.len(), rows * shape.fetched_row_bytes() as usize);
             let mut want = vec![0.0f32; values];
             ares_quant::dequantize(ty, &fetched, &mut want).unwrap();
