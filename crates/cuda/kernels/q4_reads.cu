@@ -5,8 +5,8 @@
 // its decoder inlined. Every other weight type takes the pair in q4.cu that decodes by the
 // type at run time (`ares_q4_read_down_any`), which is slower (a call per four values) and
 // compiles once for all of them: inlined, a pair takes some 12 seconds of nvcc. A module of
-// its own (build.rs) so that it compiles beside q4.cu. The Rust side (src/q4.rs) lists the
-// same names.
+// its own (build.rs) so that it compiles beside q4.cu. The Rust side (src/q4.rs) makes the
+// same names from the types src/kernels/types.rs marks as `inlined_read`.
 
 #include "q4_fused.cuh"
 

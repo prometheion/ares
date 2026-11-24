@@ -14,9 +14,11 @@ use crate::error::{Error, Result};
 use crate::memory::{DeviceBuffer, DevicePtr};
 use crate::module::{Args, Function, Module};
 use crate::stream::{Event, Stream};
+use types::TYPES;
 
 mod layout;
 mod paths;
+pub(crate) mod types;
 
 pub use layout::{
     ActivationForm, FEW_ROWS, FewPlan, LayoutKernel, LayoutRows, LayoutTable, WeightLayout,
@@ -55,120 +57,16 @@ const REDUCE_THREADS: u32 = 256;
 const MMVQ_THREADS: u32 = 128;
 const MMVQ_ROWS_PER_BLOCK: u32 = 8;
 
-/// The weight types that have a decode kernel (`kernels/mmvq_*.cuh`): the type,
-/// the kernel's name in the module, and the alignment in bytes the kernel
-/// needs of the matrix (the widest load it uses).
-const FAST_TYPES: [(GgmlType, &str, u64); 28] = [
-    (GgmlType::Q4_K, "ares_mmvq_q4_K", 16),
-    (GgmlType::Q5_K, "ares_mmvq_q5_K", 16),
-    (GgmlType::Q6_K, "ares_mmvq_q6_K", 2),
-    (GgmlType::Q3_K, "ares_mmvq_q3_K", 2),
-    (GgmlType::IQ4_XS, "ares_mmvq_iq4_xs", 8),
-    (GgmlType::IQ4_NL, "ares_mmvq_iq4_nl", 2),
-    (GgmlType::IQ3_S, "ares_mmvq_iq3_s", 2),
-    (GgmlType::IQ3_XXS, "ares_mmvq_iq3_xxs", 2),
-    (GgmlType::IQ2_S, "ares_mmvq_iq2_s", 2),
-    (GgmlType::IQ2_XS, "ares_mmvq_iq2_xs", 2),
-    (GgmlType::Q8_0, "ares_mmvq_q8_0", 2),
-    (GgmlType::F32, "ares_mmvq_f32", 4),
-    (GgmlType::F16, "ares_mmvq_f16", 2),
-    (GgmlType::BF16, "ares_mmvq_bf16", 2),
-    (GgmlType::Q4_0, "ares_mmvq_q4_0", 2),
-    (GgmlType::Q4_1, "ares_mmvq_q4_1", 4),
-    (GgmlType::Q5_0, "ares_mmvq_q5_0", 2),
-    (GgmlType::Q5_1, "ares_mmvq_q5_1", 4),
-    (GgmlType::Q2_K, "ares_mmvq_q2_K", 4),
-    (GgmlType::IQ1_S, "ares_mmvq_iq1_s", 2),
-    (GgmlType::IQ1_M, "ares_mmvq_iq1_m", 8),
-    (GgmlType::IQ2_XXS, "ares_mmvq_iq2_xxs", 2),
-    (GgmlType::TQ1_0, "ares_mmvq_tq1_0", 2),
-    (GgmlType::TQ2_0, "ares_mmvq_tq2_0", 2),
-    (GgmlType::MXFP4, "ares_mmvq_mxfp4", 1),
-    (GgmlType::NVFP4, "ares_mmvq_nvfp4", 4),
-    (GgmlType::Q1_0, "ares_mmvq_q1_0", 2),
-    (GgmlType::Q2_0, "ares_mmvq_q2_0", 2),
-];
-
-/// The quantized weight types and their kernel of [`Kernels::matvec_exact`]
-/// (`kernels/mmv_exact.cu`), with the alignment in bytes it needs of the matrix (its
-/// decoders read bytes and the f16 scales of the blocks).
-const EXACT_TYPES: [(GgmlType, &str, u64); 25] = [
-    (GgmlType::Q4_0, "ares_mmv_exact_q4_0", 2),
-    (GgmlType::Q4_1, "ares_mmv_exact_q4_1", 2),
-    (GgmlType::Q5_0, "ares_mmv_exact_q5_0", 2),
-    (GgmlType::Q5_1, "ares_mmv_exact_q5_1", 2),
-    (GgmlType::Q8_0, "ares_mmv_exact_q8_0", 2),
-    (GgmlType::Q2_K, "ares_mmv_exact_q2_K", 2),
-    (GgmlType::Q3_K, "ares_mmv_exact_q3_K", 2),
-    (GgmlType::Q4_K, "ares_mmv_exact_q4_K", 2),
-    (GgmlType::Q5_K, "ares_mmv_exact_q5_K", 2),
-    (GgmlType::Q6_K, "ares_mmv_exact_q6_K", 2),
-    (GgmlType::IQ2_XXS, "ares_mmv_exact_iq2_xxs", 2),
-    (GgmlType::IQ2_XS, "ares_mmv_exact_iq2_xs", 2),
-    (GgmlType::IQ3_XXS, "ares_mmv_exact_iq3_xxs", 2),
-    (GgmlType::IQ1_S, "ares_mmv_exact_iq1_s", 2),
-    (GgmlType::IQ4_NL, "ares_mmv_exact_iq4_nl", 2),
-    (GgmlType::IQ3_S, "ares_mmv_exact_iq3_s", 2),
-    (GgmlType::IQ2_S, "ares_mmv_exact_iq2_s", 2),
-    (GgmlType::IQ4_XS, "ares_mmv_exact_iq4_xs", 2),
-    (GgmlType::IQ1_M, "ares_mmv_exact_iq1_m", 2),
-    (GgmlType::TQ1_0, "ares_mmv_exact_tq1_0", 2),
-    (GgmlType::TQ2_0, "ares_mmv_exact_tq2_0", 2),
-    (GgmlType::MXFP4, "ares_mmv_exact_mxfp4", 1),
-    (GgmlType::NVFP4, "ares_mmv_exact_nvfp4", 2),
-    (GgmlType::Q1_0, "ares_mmv_exact_q1_0", 2),
-    (GgmlType::Q2_0, "ares_mmv_exact_q2_0", 2),
-];
-
-/// The decode types whose codebook is large (16 KiB: IQ1_S and IQ1_M). A thread
-/// block copies it once and then walks several tiles of rows, so their launches
-/// have fewer blocks than the matrix has tiles ([`DECODE_TABLE_BLOCKS_PER_SM`] per
-/// multiprocessor). The other codebooks (1 to 8 KiB) are cheap enough to copy
-/// for every tile, and a block per tile keeps more warps resident: persistent
-/// launches of those lost 10% of the speed of IQ2_XS and IQ3_S.
-const DECODE_TABLE_TYPES: [GgmlType; 2] = [GgmlType::IQ1_S, GgmlType::IQ1_M];
-const DECODE_TABLE_BLOCKS_PER_SM: u32 = 12;
-
-/// The weight types that have a prefill kernel (`kernels/mm_types.cuh`): the type,
-/// the kernels' name suffix (`ares_mm_{i8,i8m,i8s,f16,f16m,f16s}_<suffix>`), the
-/// alignment in bytes it needs of the matrix (the same as the decode kernel's) and
-/// the bytes of shared memory its codebook takes (`SMEM_BYTES` of the type).
-const PREFILL_TYPES: [(GgmlType, &str, u64, u32); 11] = [
-    (GgmlType::Q4_K, "q4_K", 16, 0),
-    (GgmlType::Q5_K, "q5_K", 16, 0),
-    (GgmlType::Q6_K, "q6_K", 2, 0),
-    (GgmlType::Q3_K, "q3_K", 2, 0),
-    (GgmlType::IQ4_XS, "iq4_xs", 8, 0),
-    (GgmlType::IQ4_NL, "iq4_nl", 2, 0),
-    (GgmlType::IQ3_S, "iq3_s", 2, 512 * 4),
-    (GgmlType::IQ3_XXS, "iq3_xxs", 2, 256 * 4),
-    (GgmlType::IQ2_S, "iq2_s", 2, 1024 * 8),
-    (GgmlType::IQ2_XS, "iq2_xs", 2, 512 * 8),
-    (GgmlType::Q8_0, "q8_0", 2, 0),
-];
-
-/// The weight types of the second prefill module (`kernels/mm_types_more.cuh`), laid out as
-/// [`PREFILL_TYPES`]. They have the f16 and the f16 flush variants and no int8 one
-/// ([`Kernels::measure_prefill_path`] measures which is as fast).
-const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 17] = [
-    (GgmlType::IQ2_XXS, "iq2_xxs", 2, 2048 + 4096),
-    (GgmlType::IQ1_S, "iq1_s", 2, 16384),
-    (GgmlType::IQ1_M, "iq1_m", 8, 16384),
-    (GgmlType::Q2_0, "q2_0", 2, 0),
-    (GgmlType::Q2_K, "q2_K", 4, 0),
-    (GgmlType::Q4_0, "q4_0", 2, 0),
-    (GgmlType::Q4_1, "q4_1", 4, 0),
-    (GgmlType::Q5_0, "q5_0", 2, 0),
-    (GgmlType::Q5_1, "q5_1", 4, 0),
-    (GgmlType::TQ1_0, "tq1_0", 2, 0),
-    (GgmlType::TQ2_0, "tq2_0", 2, 0),
-    (GgmlType::MXFP4, "mxfp4", 1, 0),
-    (GgmlType::NVFP4, "nvfp4", 4, 0),
-    (GgmlType::Q1_0, "q1_0", 2, 0),
-    (GgmlType::F32, "f32", 16, 0),
-    (GgmlType::F16, "f16", 16, 0),
-    (GgmlType::BF16, "bf16", 16, 0),
-];
+/// A decode kernel whose codebook in shared memory takes at least this many bytes (IQ1_S and
+/// IQ1_M: 16 KiB) copies it once per thread block and then walks several tiles of rows
+/// (`ARES_MMVQ_WALK_TABLE_BYTES` in `kernels/mmvq.cuh`), so its launches have fewer blocks
+/// than the matrix has tiles ([`DECODE_WALK_BLOCKS_PER_SM`] per multiprocessor). The other
+/// codebooks (1 to 8 KiB) are cheap enough to copy for every tile, and a block per tile keeps
+/// more warps resident: persistent launches of those lost 10% of the speed of IQ2_XS and
+/// IQ3_S. Which kernel walks is read from the kernel when it is loaded: its static shared
+/// memory is its codebook, so the launch and the kernel cannot disagree.
+const DECODE_WALK_TABLE_BYTES: u32 = 16384;
+const DECODE_WALK_BLOCKS_PER_SM: u32 = 12;
 
 /// One shape of the prefill kernels (`kernels/prefill.cu`): the weight rows and
 /// activation rows a thread block computes, and its threads.
@@ -224,33 +122,6 @@ const SHAPE_SUFFIX: [&str; 3] = ["", "m", "s"];
 /// What a launch gets without asking for more shared memory.
 const DEFAULT_SHARED: u32 = 48 << 10;
 
-/// For each weight type, up to how many activation rows the decode kernels (in
-/// launches of [`MAX_BATCH`] rows) are the faster family; above it the tensor-core
-/// kernels are. See [`Kernels::decode_kernel_rows`].
-const DECODE_ROWS: [(GgmlType, u32); 16] = [
-    (GgmlType::Q4_K, 16),
-    (GgmlType::Q5_K, 16),
-    (GgmlType::Q6_K, 8),
-    (GgmlType::Q3_K, 8),
-    (GgmlType::IQ4_XS, 12),
-    (GgmlType::IQ4_NL, 12),
-    (GgmlType::IQ3_S, 16),
-    (GgmlType::IQ3_XXS, 16),
-    (GgmlType::IQ2_S, 12),
-    (GgmlType::IQ2_XS, 12),
-    (GgmlType::Q8_0, 8),
-    (GgmlType::IQ2_XXS, 16),
-    (GgmlType::IQ1_S, 12),
-    (GgmlType::IQ1_M, 12),
-    (GgmlType::Q2_0, 16),
-    (GgmlType::Q4_0, 16),
-];
-
-/// The types for which [`PrefillPath::F16Flush`] was as fast as int8 on the two capped cards
-/// the kernels were written on: the path of such a type that was not measured on a capped
-/// card ([`Kernels::prefill_path_for`]).
-const FLUSH_AS_FAST: [GgmlType; 3] = [GgmlType::Q4_K, GgmlType::IQ2_S, GgmlType::IQ2_XS];
-
 /// The smallest L2 cache, in bytes, for which the small and medium shapes ask L2 to
 /// prefetch the next group of four steps of every row they read (see
 /// `kernels/mm.cuh`). On an RTX 4070 (36 MiB) it takes the small shape from 0.34 to
@@ -281,6 +152,25 @@ pub enum PrefillPath {
     /// 1.2e-4 of the row's factor to a multiple of 2^-24 of it, which an output
     /// of very small weights feels (`docs/ARCHITECTURE.md`, "Float matrices").
     F16Flush,
+}
+
+impl PrefillPath {
+    /// The index of the path in the kernels of a type (`[int8, f16, f16 flushed]`).
+    const fn index(self) -> usize {
+        match self {
+            Self::Int8 => 0,
+            Self::F16 => 1,
+            Self::F16Flush => 2,
+        }
+    }
+
+    /// The bytes of a value of a tile of the path: 1 for int8, 2 for f16.
+    const fn value_bytes(self) -> u32 {
+        match self {
+            Self::Int8 => 1,
+            Self::F16 | Self::F16Flush => 2,
+        }
+    }
 }
 
 /// What the size of a float matrix's weights (F32, F16, BF16) leaves of the tile kernels
@@ -406,16 +296,15 @@ pub enum Precision {
     Exact,
 }
 
-/// The kernels of one type: the alignment, the bytes of its table and the kernels indexed
-/// `[path][shape]`; a type has none for a path it has no variant of.
-type PrefillType = (GgmlType, u64, u32, [Option<[Function; 3]>; 3]);
+/// The tile kernels of one type, indexed `[path][shape]`; a type has none for a path it has no
+/// variant of.
+type PrefillKernels = [Option<[Function; 3]>; 3];
 
 /// The kernels of the prefill modules on one device.
 #[derive(Debug, Clone)]
 struct Prefill {
-    /// Per type: the alignment, the bytes of its table and the kernels, indexed
-    /// `[path][shape]`.
-    types: Vec<PrefillType>,
+    /// The kernels of each type of [`TYPES`].
+    types: Vec<PrefillKernels>,
     /// The kernels over the device layouts and their tables.
     layouts: layout::Layouts,
     convert_f16: Function,
@@ -424,6 +313,14 @@ struct Prefill {
     full_rate: bool,
     /// The paths measured per type ([`Kernels::measure_prefill_path`]).
     choices: paths::Choices,
+}
+
+/// The decode kernel of a type on a device.
+#[derive(Debug, Clone)]
+struct Decode {
+    function: Function,
+    /// Whether a thread block walks several tiles of rows ([`DECODE_WALK_TABLE_BYTES`]).
+    walks: bool,
 }
 
 /// The kernels of the engine on one device.
@@ -435,9 +332,10 @@ pub struct Kernels {
     sum_peer_f32: Function,
     rms_norm_f32: Function,
     quantize_act: Function,
-    fast: Vec<(GgmlType, u64, Function)>,
-    /// The kernels of [`Kernels::matvec_exact`] for the quantized types.
-    exact: Vec<(GgmlType, u64, Function)>,
+    /// The decode kernel of each type of [`TYPES`].
+    decode: Vec<Decode>,
+    /// The kernel of [`Kernels::matvec_exact`] of each type of [`TYPES`] that has one.
+    exact: Vec<Option<Function>>,
     /// The tensor-core weight kernels.
     prefill: Prefill,
 }
@@ -447,8 +345,10 @@ impl Prefill {
         let module = Module::load(device, PREFILL_IMAGE)?;
         let more = Module::load(device, PREFILL_MORE_IMAGE)?;
         let limit = device.info().max_shared_per_block_optin;
-        let mut types = Self::load_types(&module, &PREFILL_TYPES, true, limit)?;
-        types.extend(Self::load_types(&more, &PREFILL_MORE_TYPES, false, limit)?);
+        let types = TYPES
+            .iter()
+            .map(|t| Self::load_type(if t.tile.int8 { &module } else { &more }, t, limit))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             types,
             layouts: layout::Layouts::load(&module, limit)?,
@@ -458,48 +358,38 @@ impl Prefill {
         })
     }
 
-    /// The kernels of `list` in `module`, with the int8 variant or without it.
-    fn load_types(
-        module: &Module,
-        list: &[(GgmlType, &str, u64, u32)],
-        int8: bool,
-        limit: u32,
-    ) -> Result<Vec<PrefillType>> {
-        list.iter()
-            .map(|(ty, suffix, align, table)| {
-                let mut paths = Vec::new();
-                for (path, (variant, elem)) in
-                    [("i8", 1u32), ("f16", 2u32), ("h", 2u32)].into_iter().enumerate()
-                {
-                    if path == 0 && !int8 {
-                        paths.push(None);
-                        continue;
-                    }
-                    let mut shapes = Vec::new();
-                    for (shape, part) in SHAPES[path].iter().zip(SHAPE_SUFFIX) {
-                        let function =
-                            module.function(&format!("ares_mm_{variant}{part}_{suffix}"))?;
-                        let bytes = shape.shared_bytes(elem, *table);
-                        if bytes > limit {
-                            return Err(Error::Invalid {
-                                what: "prefill kernel",
-                                detail: format!(
-                                    "{ty} needs {bytes} bytes of shared memory per block, the device allows {limit}"
-                                ),
-                            });
-                        }
-                        if bytes > DEFAULT_SHARED {
-                            function.allow_dynamic_shared(bytes)?;
-                        }
-                        shapes.push(function);
-                    }
-                    paths.push(Some(<[Function; 3]>::try_from(shapes).expect("three shapes")));
+    /// The tile kernels of the type `t` in `module`: the int8 variant where it has one, and
+    /// the two f16 ones.
+    fn load_type(module: &Module, t: &types::TypeInfo, limit: u32) -> Result<PrefillKernels> {
+        let mut paths = Vec::new();
+        for (path, (variant, elem)) in
+            [("i8", 1u32), ("f16", 2u32), ("h", 2u32)].into_iter().enumerate()
+        {
+            if path == 0 && !t.tile.int8 {
+                paths.push(None);
+                continue;
+            }
+            let mut shapes = Vec::new();
+            for (shape, part) in SHAPES[path].iter().zip(SHAPE_SUFFIX) {
+                let function = module.function(&format!("ares_mm_{variant}{part}_{}", t.ty))?;
+                let bytes = shape.shared_bytes(elem, t.tile.table);
+                if bytes > limit {
+                    return Err(Error::Invalid {
+                        what: "prefill kernel",
+                        detail: format!(
+                            "{} needs {bytes} bytes of shared memory per block, the device allows {limit}",
+                            t.ty
+                        ),
+                    });
                 }
-                let kernels =
-                    <[Option<[Function; 3]>; 3]>::try_from(paths).expect("three paths");
-                Ok((*ty, *align, *table, kernels))
-            })
-            .collect()
+                if bytes > DEFAULT_SHARED {
+                    function.allow_dynamic_shared(bytes)?;
+                }
+                shapes.push(function);
+            }
+            paths.push(Some(<[Function; 3]>::try_from(shapes).expect("three shapes")));
+        }
+        Ok(<PrefillKernels>::try_from(paths).expect("three paths"))
     }
 }
 
@@ -552,14 +442,22 @@ impl Kernels {
     pub fn load(device: &Device) -> Result<Self> {
         let module = Module::load(device, IMAGE)?;
         let prefill = Prefill::load(device)?;
-        let fast = FAST_TYPES
+        let decode = TYPES
             .iter()
-            .map(|(ty, name, align)| Ok((*ty, *align, module.function(name)?)))
+            .map(|t| {
+                let function = module.function(&format!("ares_mmvq_{}", t.ty))?;
+                let (_, table) = function.resources()?;
+                Ok(Decode { function, walks: table >= DECODE_WALK_TABLE_BYTES })
+            })
             .collect::<Result<Vec<_>>>()?;
         let exact_module = Module::load(device, EXACT_IMAGE)?;
-        let exact = EXACT_TYPES
+        let exact = TYPES
             .iter()
-            .map(|(ty, name, align)| Ok((*ty, *align, exact_module.function(name)?)))
+            .map(|t| {
+                t.exact_align
+                    .map(|_| exact_module.function(&format!("ares_mmv_exact_{}", t.ty)))
+                    .transpose()
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             device: device.clone(),
@@ -568,7 +466,7 @@ impl Kernels {
             sum_peer_f32: module.function("ares_sum_peer_f32")?,
             rms_norm_f32: module.function("ares_rms_norm_f32")?,
             quantize_act: module.function("ares_quantize_act")?,
-            fast,
+            decode,
             exact,
             prefill,
         })
@@ -703,7 +601,7 @@ impl Kernels {
 
     /// Whether [`Kernels::matvec`] has a kernel for weights of type `ty`.
     pub fn has_fast_matvec(ty: GgmlType) -> bool {
-        FAST_TYPES.iter().any(|(t, _, _)| *t == ty)
+        types::index(ty).is_some()
     }
 
     /// Quantizes `n_batch` rows of `n_in` f32 activations to the int8 format
@@ -800,15 +698,16 @@ impl Kernels {
         n_out: u32,
         n_batch: u32,
     ) -> Result<()> {
-        let Some((_, align, function)) = self.fast.iter().find(|(t, _, _)| *t == ty) else {
+        let Some(index) = types::index(ty) else {
             return Err(Error::Invalid {
                 what: "weight kernel type",
                 detail: format!(
                     "{ty} has no fast weight kernel (it has one for {})",
-                    FAST_TYPES.map(|(t, _, _)| t.name()).join(", ")
+                    types::names(|_| true)
                 ),
             });
         };
+        let (align, decode) = (TYPES[index].decode_align, &self.decode[index]);
         let block_values = ty.block_values();
         if n_in == 0 || !n_in.is_multiple_of(block_values) {
             return Err(Error::Invalid {
@@ -822,18 +721,18 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", w, *align)?;
+        check_alignment("weight matrix", w, align)?;
         check_alignment("quantized activations", q, 16)?;
         let tiles = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
-        let blocks = if DECODE_TABLE_TYPES.contains(&ty) {
-            tiles.min(DECODE_TABLE_BLOCKS_PER_SM * self.device.info().multiprocessors)
+        let blocks = if decode.walks {
+            tiles.min(DECODE_WALK_BLOCKS_PER_SM * self.device.info().multiprocessors)
         } else {
             tiles
         };
         let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
         // SAFETY: the argument list matches the ares_mmvq_* kernels; the ranges are the
         // caller's guarantee.
-        unsafe { function.launch(stream, [blocks, 1, 1], [MMVQ_THREADS, 1, 1], 0, args) }
+        unsafe { decode.function.launch(stream, [blocks, 1, 1], [MMVQ_THREADS, 1, 1], 0, args) }
     }
 
     /// `y[b] = W x[b]` as [`Kernels::matvec`], with the activations as they are: the f32
@@ -863,7 +762,9 @@ impl Kernels {
         n_out: u32,
         n_batch: u32,
     ) -> Result<()> {
-        let Some((_, align, function)) = self.exact.iter().find(|(t, _, _)| *t == ty) else {
+        let exact =
+            types::index(ty).and_then(|i| Some((TYPES[i].exact_align?, self.exact[i].as_ref()?)));
+        let Some((align, function)) = exact else {
             // SAFETY: the caller's guarantee covers the float kernels, which read the f32
             // section only.
             return unsafe { self.matvec(stream, ty, w, q, y, n_in, n_out, n_batch) };
@@ -881,7 +782,7 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", w, *align)?;
+        check_alignment("weight matrix", w, align)?;
         check_alignment("activations", q, 16)?;
         let blocks = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
         let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
@@ -927,7 +828,7 @@ impl Kernels {
     /// kernel loses from 9 rows on, and the types not measured have no entry: above
     /// eight rows they take the tile kernels.
     pub fn decode_kernel_rows(ty: GgmlType) -> Option<u32> {
-        DECODE_ROWS.iter().find(|(t, _)| *t == ty).map(|(_, rows)| *rows)
+        types::info(ty)?.decode_rows
     }
 
     /// The bytes of shared memory the tile kernels' decoder of `ty` keeps its tables in
@@ -935,23 +836,14 @@ impl Kernels {
     /// tile kernel. The many-row expert kernels, which decode with the same decoders, lay
     /// out their shared memory with it.
     pub fn tile_table_bytes(ty: GgmlType) -> Option<u32> {
-        PREFILL_TYPES
-            .iter()
-            .chain(PREFILL_MORE_TYPES.iter())
-            .find(|(t, _, _, _)| *t == ty)
-            .map(|(_, _, _, table)| *table)
+        Some(types::info(ty)?.tile.table)
     }
 
     /// Whether [`Kernels::matmul`] has a kernel of `path` for weights of type `ty` on this
     /// device: every type of [`Kernels::has_fast_matvec`] has the two f16 variants, those
     /// that are not in the first module (the float types among them) have no int8 one.
     pub fn has_prefill_path(&self, ty: GgmlType, path: PrefillPath) -> bool {
-        let index = match path {
-            PrefillPath::Int8 => 0,
-            PrefillPath::F16 => 1,
-            PrefillPath::F16Flush => 2,
-        };
-        self.prefill.types.iter().any(|(t, .., paths)| *t == ty && paths[index].is_some())
+        types::index(ty).is_some_and(|i| self.prefill.types[i][path.index()].is_some())
     }
 
     /// The path the prefill family takes on this device for the requested
@@ -995,25 +887,21 @@ impl Kernels {
     /// each needs and how it sits on this device, and up to how many activation rows
     /// [`Kernels::matmul`] uses it.
     pub fn prefill_shapes(&self, ty: GgmlType, path: PrefillPath) -> Result<Vec<PrefillShape>> {
-        let prefill = &self.prefill;
-        let Some((_, _, table, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
+        let Some(index) = types::index(ty) else {
             return Err(Error::Invalid {
                 what: "prefill kernel type",
                 detail: format!("{ty} has no prefill kernel"),
             });
         };
-        let (path_index, elem) = match path {
-            PrefillPath::Int8 => (0, 1),
-            PrefillPath::F16 => (1, 2),
-            PrefillPath::F16Flush => (2, 2),
-        };
+        let (table, kernels) = (TYPES[index].tile.table, &self.prefill.types[index]);
+        let (path_index, elem) = (path.index(), path.value_bytes());
         let up_to = [u32::MAX, MM_MEDIUM_ROWS, MM_SMALL_ROWS];
         (0..3)
             .map(|shape| {
                 let info = SHAPES[path_index][shape];
                 let function =
                     &kernels[path_index].as_ref().ok_or_else(|| no_variant(ty, path))?[shape];
-                let shared_bytes = info.shared_bytes(elem, *table);
+                let shared_bytes = info.shared_bytes(elem, table);
                 let (registers, _) = function.resources()?;
                 Ok(PrefillShape {
                     weight_rows: info.weight_rows,
@@ -1153,21 +1041,16 @@ impl Kernels {
         n_out: u32,
         n_rows: u32,
     ) -> Result<()> {
-        let prefill = &self.prefill;
-        let Some((_, align, table, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
+        let Some(index) = types::index(ty) else {
             return Err(Error::Invalid {
                 what: "prefill kernel type",
                 detail: format!(
                     "{ty} has no prefill kernel (it has one for {})",
-                    PREFILL_TYPES
-                        .iter()
-                        .chain(&PREFILL_MORE_TYPES)
-                        .map(|(t, ..)| t.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    types::names(|_| true)
                 ),
             });
         };
+        let (tile, kernels) = (TYPES[index].tile, &self.prefill.types[index]);
         // The kernels take the weights in items of 32 values; a float type has blocks of one.
         let block_values = ty.block_values().max(32);
         if n_in == 0 || !n_in.is_multiple_of(block_values) {
@@ -1187,18 +1070,20 @@ impl Kernels {
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("weight matrix", w, *align)?;
+        check_alignment("weight matrix", w, tile.align)?;
         check_alignment("prepared activations", act, 16)?;
-        let (path_index, elem, act_row_bytes) = match path {
-            PrefillPath::Int8 => (0, 1, u64::from(n_in) * 9 / 8),
-            PrefillPath::F16 => (1, 2, u64::from(n_in) * 2),
-            PrefillPath::F16Flush => (2, 2, u64::from(n_in) * 2),
+        let (path_index, elem) = (path.index(), path.value_bytes());
+        // The bytes of a row of activations: the int8 codes with their pairs (8 bytes per
+        // 32 values), or f16 values.
+        let act_row_bytes = match path {
+            PrefillPath::Int8 => u64::from(n_in) * 9 / 8,
+            PrefillPath::F16 | PrefillPath::F16Flush => u64::from(n_in) * 2,
         };
         let shape = shape_index(n_rows);
         let function = &kernels[path_index].as_ref().ok_or_else(|| no_variant(ty, path))?[shape];
         let shape_info = SHAPES[path_index][shape];
         let Shape { weight_rows, batch_rows, threads } = shape_info;
-        let shared = shape_info.shared_bytes(elem, *table);
+        let shared = shape_info.shared_bytes(elem, tile.table);
         let n_weight_tiles = n_out.div_ceil(weight_rows);
         let n_batch_tiles = n_rows.div_ceil(batch_rows);
         // The grid is ordered in groups of activation tiles that take every weight tile

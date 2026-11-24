@@ -123,14 +123,20 @@ struct AresUnroll<T, std::void_t<decltype(T::UNROLL)>> {
     static constexpr int value = T::UNROLL;
 };
 
+// A type whose codebook in shared memory takes at least this many bytes (IQ1_S and IQ1_M:
+// 16 KiB) copies it once per thread block and walks several tiles of rows; its launches have
+// fewer blocks than the matrix has tiles. The host tells such a kernel by its static shared
+// memory, which is the codebook (DECODE_WALK_TABLE_BYTES in src/kernels.rs, the same number).
+#define ARES_MMVQ_WALK_TABLE_BYTES 16384
+
 // y[b][r] = sum over c of W[r][c] * x[b][c], for b < n_batch, r < n_out.
 //
 //   w   n_out rows of n_in / BLOCK_VALUES blocks, 16-byte aligned
 //   aq  the int8 values of the quantized activations (n_batch rows of n_in)
 //   y   n_batch rows of n_out f32 values
 //
-// Grid: up to ceil(n_out / (WARPS * ROWS)) blocks of WARPS * 32 threads; with
-// fewer, each block takes several tiles of rows.
+// Grid: ceil(n_out / (WARPS * ROWS)) blocks of WARPS * 32 threads; for a type that walks
+// (ARES_MMVQ_WALK_TABLE_BYTES) up to that many, each block taking several tiles of rows.
 template <class T, int WARPS, int ROWS>
 static __device__ __forceinline__ void ares_mmvq(
     const uint8_t* __restrict__ w, const int8_t* __restrict__ aq, float* __restrict__ y,
@@ -249,7 +255,7 @@ static __device__ __forceinline__ void ares_mmvq(
     };
     // Only the types with a large codebook walk several tiles per block (the launch of
     // the others has a block for every tile, and the loop would cost them registers).
-    if constexpr (T::SMEM_BYTES >= 16384) {
+    if constexpr (T::SMEM_BYTES >= ARES_MMVQ_WALK_TABLE_BYTES) {
         for (uint32_t tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
             rows_of_tile(tile);
         }

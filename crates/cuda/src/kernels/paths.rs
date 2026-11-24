@@ -251,11 +251,7 @@ impl Kernels {
                 end.record(&stream)?;
                 end.synchronize()?;
                 if round > 0 {
-                    let slot = match path {
-                        PrefillPath::Int8 => 0,
-                        PrefillPath::F16 => 1,
-                        PrefillPath::F16Flush => 2,
-                    };
+                    let slot = path.index();
                     best[slot] = best[slot].min(end.elapsed_ms_since(&start)? / BURST as f32);
                 }
             }
@@ -269,16 +265,12 @@ impl Kernels {
     /// have no int8 kernel, int8 for the others. A model's loader measures every type it
     /// multiplies in the file's layout, so this serves tests and benches.
     fn kept_path(&self, ty: GgmlType) -> Result<PrefillPath> {
-        let prefill = &self.prefill;
-        if prefill.full_rate {
+        if self.prefill.full_rate {
             return Ok(PrefillPath::F16);
         }
-        let has_int8 = prefill
-            .types
-            .iter()
-            .find(|(t, ..)| *t == ty)
-            .is_none_or(|(.., paths)| paths[0].is_some());
-        Ok(if super::FLUSH_AS_FAST.contains(&ty) || !has_int8 {
+        let info = super::types::info(ty);
+        let has_int8 = info.is_none_or(|t| t.tile.int8);
+        Ok(if info.is_some_and(|t| t.flush_as_fast) || !has_int8 {
             PrefillPath::F16Flush
         } else {
             PrefillPath::Int8

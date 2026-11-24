@@ -2,7 +2,7 @@
 // (mmv_exact.cuh): one per quantized weight type, named after the type as ggml spells it.
 // The float types have theirs in module.cu (`ares_mmvq_f32` and so on), which read the same
 // activations. A module of its own (build.rs), so that it compiles beside module.cu. The
-// Rust side (src/kernels.rs) lists the same names.
+// Rust side makes the same names from the types of src/kernels/types.rs.
 
 #include "mmv_exact.cuh"
 

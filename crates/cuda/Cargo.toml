@@ -10,13 +10,13 @@ build = "build.rs"
 
 [dependencies]
 ares-core.workspace = true
+ares-quant = { path = "../quant" }
 ares-sampler.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 ares-gguf.workspace = true
-ares-quant = { path = "../quant" }
 
 [lints]
 workspace = true

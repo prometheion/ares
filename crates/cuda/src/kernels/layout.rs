@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 
-use super::{DEFAULT_SHARED, Kernels, MAX_BATCH, Precision, PrefillPath, check_alignment};
+use super::{DEFAULT_SHARED, Kernels, MAX_BATCH, Precision, PrefillPath, check_alignment, types};
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::memory::{DeviceBuffer, DevicePtr};
@@ -106,23 +106,12 @@ const GROUP_L2_SHARE: u64 = 4;
 const GROUP_MIN: u64 = 2;
 const GROUP_MAX: u64 = 16;
 
-/// The types with a device layout and their kernels' name part (`ARES_MMR_CODES` in
-/// `kernels/prefill.cu`). All of them step through a row in super-blocks of 256
-/// values, so a row must be a whole number of those.
-const TYPES: [(GgmlType, &str); 12] = [
-    (GgmlType::Q4_K, "q4_K"),
-    (GgmlType::Q5_K, "q5_K"),
-    (GgmlType::Q6_K, "q6_K"),
-    (GgmlType::Q3_K, "q3_K"),
-    (GgmlType::Q2_K, "q2_K"),
-    (GgmlType::Q4_0, "q4_0"),
-    (GgmlType::Q4_1, "q4_1"),
-    (GgmlType::Q5_0, "q5_0"),
-    (GgmlType::Q5_1, "q5_1"),
-    (GgmlType::Q8_0, "q8_0"),
-    (GgmlType::IQ4_XS, "iq4_xs"),
-    (GgmlType::IQ4_NL, "iq4_nl"),
-];
+/// The types with a device layout: those `ares_quant::layout` lays out (`ARES_MMR_CODES` in
+/// `kernels/prefill.cu` instantiates their kernels). All of them step through a row in
+/// super-blocks of 256 values, so a row must be a whole number of those.
+fn layout_types() -> impl Iterator<Item = GgmlType> {
+    types::TYPES.iter().map(|t| t.ty).filter(|ty| ares_quant::layout::spec(*ty).is_some())
+}
 const COLUMNS_MULTIPLE: u32 = 256;
 
 /// One kernel of a table.
@@ -284,13 +273,12 @@ pub(super) struct Layouts {
 
 impl Layouts {
     pub(super) fn load(module: &Module, shared_limit: u32) -> Result<Self> {
-        let types = TYPES
-            .iter()
-            .map(|(ty, suffix)| {
+        let types = layout_types()
+            .map(|ty| {
                 let mut shapes = Vec::with_capacity(SHAPES.len());
                 for shape in SHAPES {
                     let function =
-                        module.function(&format!("ares_mmr_{}_{suffix}", shape.name))?;
+                        module.function(&format!("ares_mmr_{}_{ty}", shape.name))?;
                     let bytes = shape.shared_bytes();
                     if bytes > shared_limit {
                         return Err(Error::Invalid {
@@ -306,11 +294,11 @@ impl Layouts {
                     }
                     shapes.push(function);
                 }
-                let few = |rows: u32, warps: u32| module.function(&format!("ares_mmf_{rows}_w{warps}_{suffix}"));
+                let few = |rows: u32, warps: u32| module.function(&format!("ares_mmf_{rows}_w{warps}_{ty}"));
                 let few = [[few(8, 4)?, few(8, 8)?], [few(16, 4)?, few(16, 8)?]];
                 Ok(TypeKernels {
-                    ty: *ty,
-                    repack: module.function(&format!("ares_repack_{suffix}"))?,
+                    ty,
+                    repack: module.function(&format!("ares_repack_{ty}"))?,
                     shapes: <[Function; 4]>::try_from(shapes).expect("four shapes"),
                     warps_per_multiprocessor: few[0][0].blocks_per_multiprocessor(128, 0)? * 4,
                     few,
@@ -330,7 +318,7 @@ fn no_layout(ty: GgmlType) -> Error {
         what: "device layout",
         detail: format!(
             "{ty} has none (the types that have one: {})",
-            TYPES.map(|(t, _)| t.name()).join(", ")
+            layout_types().map(|t| t.name()).collect::<Vec<_>>().join(", ")
         ),
     }
 }
@@ -356,7 +344,7 @@ impl Kernels {
     /// Whether a matrix of `ty` with rows of `n_in` values has a device layout
     /// ([`WeightLayout::Device`]): the type has one and the rows are whole steps of it.
     pub fn has_device_layout(ty: GgmlType, n_in: u32) -> bool {
-        TYPES.iter().any(|(t, _)| *t == ty) && n_in != 0 && n_in.is_multiple_of(COLUMNS_MULTIPLE)
+        ares_quant::layout::has_layout(ty, n_in as usize)
     }
 
     /// The layout a loader should give a matrix of `ty` with rows of `n_in` values
@@ -386,9 +374,7 @@ impl Kernels {
     pub fn layout_alignment(ty: GgmlType, layout: WeightLayout) -> u64 {
         match layout {
             WeightLayout::Device => 16,
-            WeightLayout::File => {
-                super::FAST_TYPES.iter().find(|(t, ..)| *t == ty).map_or(16, |(_, _, align)| *align)
-            }
+            WeightLayout::File => types::info(ty).map_or(16, |t| t.decode_align),
         }
     }
 

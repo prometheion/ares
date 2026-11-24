@@ -12,7 +12,7 @@
 #include "sum_peer.cuh"
 
 // One weight kernel per type, named after the type as ggml spells it. The
-// Rust side (src/kernels.rs) lists the same names.
+// Rust side makes the same names from the types of src/kernels/types.rs.
 ARES_MMVQ_KERNEL(ares_mmvq_q4_K, EngQ4K)
 ARES_MMVQ_KERNEL(ares_mmvq_q5_K, EngQ5K)
 ARES_MMVQ_KERNEL(ares_mmvq_q6_K, EngQ6K)

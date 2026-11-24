@@ -10,7 +10,8 @@
 #include "mm_shapes.cuh"
 
 // One kernel per type, variant and shape, named after the type as ggml spells it:
-// ares_mm_<i8|f16><|m|s>_<type>. The Rust side lists the same names.
+// ares_mm_<i8|f16><|m|s>_<type>. The Rust side makes the same names from the types of
+// src/kernels/types.rs, where the types of this module are those with the int8 variant.
 ARES_MM_I8_LARGE(ares_mm_i8_q4_K, EngMmQ4K)
 ARES_MM_I8_LARGE(ares_mm_i8_q5_K, EngMmQ5K)
 ARES_MM_I8_LARGE(ares_mm_i8_q6_K, EngMmQ6K)
@@ -121,8 +122,8 @@ ARES_MM_H_SMALL(ares_mm_hs_iq2_xs, EngMmIQ2XS)
 ARES_MM_H_SMALL(ares_mm_hs_q8_0, EngMmQ80)
 
 // The kernels over the device layouts (mmr.cuh, mmr_codes.cuh): ares_mmr_<shape>_<type>
-// and the rearrangement ares_repack_<type>. The Rust side (src/kernels/layout.rs)
-// lists the same types.
+// and the rearrangement ares_repack_<type>, for the types ares_quant::layout lays out
+// (src/kernels/layout.rs).
 ARES_MMR_CODES(q4_K, AresCodesQ4K)
 ARES_MMR_CODES(q5_K, AresCodesQ5K)
 ARES_MMR_CODES(q6_K, AresCodesQ6K)

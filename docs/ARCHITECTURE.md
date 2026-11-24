@@ -2889,6 +2889,21 @@ image tower); there is no path for a device without them.
 - `Stream` and `Event` order work on and between devices.
 - `Kernels` gives one typed launch per kernel.
 
+**One table of weight types** (`src/kernels/types.rs`). What the kernels of each of the 28
+weight types are and need is one row of `TYPES`, which every list of types in the crate is
+read from: the alignment of its decode kernel and of its exact kernel, whether its tile
+kernels have the int8 variant (those that do are in `prefill.cu`, the others in
+`prefill_more.cu`), their alignment and table bytes, up to how many rows the decode kernels
+are the faster family, whether the f16 path with f16 accumulation was as fast as int8 on the
+capped cards, the table bytes of a gate and up decoder written for the many-row expert
+kernels, and whether qwen4exp's fused read has its decoder inlined. A kernel's name is the
+type's as ggml spells it (`ares_mmvq_q4_K`, `ares_er_down_q2_0_n1`), the types with a device
+layout are those `ares_quant::layout` lays out, and two facts are read from the kernels when
+they are loaded, so that the host and a kernel cannot disagree: whether a decode kernel walks
+several tiles of rows per thread block (its static shared memory, the codebook, is at least
+16 KiB: IQ1_S and IQ1_M; its launch then has fewer blocks than the matrix has tiles), and
+which module of the many-row expert kernels holds a type's kernels.
+
 **Decode weight kernels.** A matrix times 1 to 8 rows of activations, which
 is what decides decode speed, for all 28 weight types (`kernels/mmvq.cuh`,
 `mmvq_more.cuh`, `mmvq_float.cuh`). For the quantized types the activations
@@ -3196,7 +3211,7 @@ decode kernels in launches of eight rows for IQ2_XXS, 6.5 for IQ1_S), and no dev
 layout was tried for them: the rearranged form of Q4_K above was not faster than the
 tile kernel at prompt sizes and these kernels are within 8 % of Q4_K's rate, so there is
 no gap for a layout to close, and Vulkan has nothing to mirror (the layouts stay those
-of the file). Their rows of `DECODE_ROWS` (the decode kernels win up to 16 rows for IQ2_XXS, Q2_0 and Q4_0,
+of the file). Their decode rows (`decode_rows` in `kernels/types.rs`: the decode kernels win up to 16 rows for IQ2_XXS, Q2_0 and Q4_0,
 up to 12 for IQ1_S and IQ1_M; Q2_K and Q5_1 have none, since theirs win only up to about 10
 rows, nor have the types not measured, so above eight rows those take the tile kernels) are
 from the same bench at 8 to 32 rows.
@@ -3326,7 +3341,7 @@ capped tensor cores run. Up to 8 rows the decode kernels are as fast or faster (
 for bf16 at 8 rows against 0.42 / 0.76; 0.056 against 0.107 ms for 320 x 10240) and compute
 the exact product; from 9 rows on the tile
 kernels are faster for all three types (0.40 against 0.77 for two launches), so the float
-types have no row of `DECODE_ROWS`. Flash-Next's mixers (bf16, 512 rows):
+types have no decode rows. Flash-Next's mixers (bf16, 512 rows):
 `hc_{attn,ffn}_down` 320 x 10240 3.10 / 4.02 ms in launches of eight rows, 0.31 / 0.44 ms on
 the tile kernels' f16 path and 0.21 / 0.30 with f16 accumulation; `hc_{attn,ffn}_up` 10240 x
 320 1.21 / 2.55 ms, 0.097 / 0.22 and 0.081 / 0.18 ms.

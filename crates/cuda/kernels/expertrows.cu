@@ -2,7 +2,8 @@
 // compute the experts' products for any number of rows on the tensor cores. A module
 // of its own (see build.rs); it uses `mma.m16n8k16` with f16 inputs and `cp.async`, as
 // the prefill module does.
-// Loaded by `ExpertRowKernels` (src/experts.rs); the Rust side lists the same names.
+// Loaded by `ExpertRowKernels` (src/experts.rs), which makes the same names from the types
+// of src/kernels/types.rs and finds the module of each by asking for it.
 
 #include "common.cuh"
 #include "expertrows_plan.cuh"

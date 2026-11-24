@@ -87,6 +87,7 @@ use ares_core::ggml_type::ALL_TYPES;
 use crate::attention::{AttnItem, AttnRow, ENTRY_CELLS};
 use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::kernels::types;
 use crate::layers::{CommitSet, StepDims};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
@@ -425,8 +426,9 @@ impl Q4Kernels {
     }
 
     /// The pairs of the fused read for every weight type: those of the float types and the
-    /// one that decodes by the type at run time from `module`, those of [`INLINED_READS`]
-    /// from `typed`, by the names `kernels/q4_reads.cu` gives them.
+    /// one that decodes by the type at run time from `module`, those of the types whose read
+    /// has its decoder inlined (`TypeInfo::inlined_read`) from `typed`, by the names
+    /// `kernels/q4_reads.cu` gives them.
     fn load_reads(module: &Module, typed: &Module) -> Result<Vec<Read>> {
         let float = Read::load(module, "")?;
         let any = Read::load(module, "_any")?;
@@ -436,7 +438,7 @@ impl Q4Kernels {
             .map(|ty| {
                 let read = if is_float(ty) {
                     float.clone()
-                } else if INLINED_READS.contains(&ty) {
+                } else if types::info(ty).is_some_and(|t| t.inlined_read) {
                     Read::load(typed, &format!("_{}", ty.name()))?
                 } else {
                     any.clone()
@@ -1244,21 +1246,6 @@ pub struct Departure {
     /// The number of the exchange.
     pub token: u32,
 }
-
-/// The quantized types whose fused read has its decoder inlined (`kernels/q4_reads.cu`):
-/// those files use for the stream mixers. Every other type is read by the kernels that
-/// decode by the type at run time.
-const INLINED_READS: [GgmlType; 9] = [
-    GgmlType::Q8_0,
-    GgmlType::Q4_0,
-    GgmlType::Q4_1,
-    GgmlType::Q5_0,
-    GgmlType::Q5_1,
-    GgmlType::IQ4_NL,
-    GgmlType::Q4_K,
-    GgmlType::Q5_K,
-    GgmlType::Q6_K,
-];
 
 /// The most rows of `down` one block of the read's first launch computes
 /// (`ARES_Q4_TILE`).
