@@ -1,7 +1,7 @@
 //! Test support: a scripted engine and helpers to drive the router, the
 //! `ares` binary (`process`) and requests on a socket (`socket`). A test of a
-//! real model names its file by the variable README.md's "Tests" lists for it
-//! ([`model_file`]).
+//! real model names its file by the variable `docs/dev/README.md`, "Tests" lists
+//! for it ([`model_file`]).
 #![allow(dead_code)]
 
 use std::path::PathBuf;

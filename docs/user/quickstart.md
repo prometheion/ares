@@ -22,6 +22,14 @@ cargo build --release
 The binary is `target/release/ares`. The release build uses fat link-time
 optimization and takes a while.
 
+The build environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `ARES_CUDA_ARCHS` | Compute capabilities to build machine code for, such as `89` for one RTX 40 card. Default: the tested classes, `86,89`. A class that is not tested can be named on purpose; the build warns. Classes below Ampere are an error. |
+| `NVCC` | The CUDA compiler. Default: `$CUDA_PATH/bin/nvcc`, `$CUDA_HOME/bin/nvcc`, `nvcc` on `PATH`, `/opt/cuda/bin/nvcc`, `/usr/local/cuda/bin/nvcc`. |
+| `GLSLC` | The shader compiler. Default: `glslc` on `PATH`, `$VULKAN_SDK/bin/glslc`, `/usr/bin/glslc`, `/usr/local/bin/glslc`. |
+
 ## Run a model
 
 Qwen3.8 27B, with everything left to the server:

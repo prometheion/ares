@@ -9,7 +9,8 @@ It checks, in every tracked text file:
 - each relative Markdown link of a document points to a file that exists, and its
   `#anchor`, if any, to a heading of that file;
 - each mention of a document of this repository (`docs/...`, `README.md`, or a path that
-  starts with a directory of docs/) names a file that exists;
+  starts with a directory of docs/) names a file that exists, unless it is called the
+  former one ("the former `docs/X.md`");
 - each citation of a paragraph, written `<file>.md, "<name>"` or `"<name>" in <file>.md`
   (backticks and comment markers between the lines do not matter), names a heading or the
   bold or italic lead of a paragraph of that file.
@@ -184,6 +185,9 @@ def main():
         for m in MENTION.finditer(flat):
             path = m.group('path')
             if not ours(path):
+                continue
+            # "the former `docs/X.md`" names a file that is gone on purpose.
+            if flat[max(0, m.start() - 9):m.start()].rstrip('` ').endswith('former'):
                 continue
             if resolve(path, src) is None:
                 problems.append('%s:%d: names a missing document: %s'

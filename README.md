@@ -31,66 +31,30 @@ The first statement of the goals is
 it has been decided differently since, for example the GPUs CUDA runs on;
 [`docs/OPEN.md`](docs/OPEN.md) holds the current decisions.
 
-## What it runs
+## Status
 
-**Models.** Two architectures, as GGUF files in any of the 28 GGUF weight types:
+There is no release. What runs on `main`:
 
-| Model | Architecture | Kind |
-| --- | --- | --- |
-| Qwen3.8 27B | `qwen35` | dense, with its MTP block |
-| Qwen3.8 Flash-Next | `qwen4exp` | mixture of experts; the experts live in VRAM, in RAM and on the SSD |
+| | |
+| --- | --- |
+| Models | Qwen3.8 27B (`qwen35`, dense) and Qwen3.8 Flash-Next (`qwen4exp`, a mixture of experts whose experts live in VRAM, RAM and on the SSD), as GGUF files in any of the 28 GGUF weight types; images through the model's projector ([models](docs/user/models.md)) |
+| GPUs | CUDA on NVIDIA Ampere (8.6, RTX 30) and Ada (8.9, RTX 40), one card or two; other GPUs are refused and are meant to run through the Vulkan backend later ([hardware](docs/user/hardware.md)) |
+| System | Linux only |
+| APIs | OpenAI chat, completions and Responses; Anthropic Messages, so Claude Code works against Ares; Prometheus metrics ([API](docs/user/api.md)) |
 
-Images go through the model's projector (`--mmproj`, the `mmproj` GGUF beside
-the model). Other architectures are refused. The small Qwen3.5 0.8B has the
-27B's architecture and is used by the tests.
+[`docs/user/features.md`](docs/user/features.md) lists what Ares does, one line
+each; [`docs/OPEN.md`](docs/OPEN.md) what is open and in work.
 
-**GPUs.** CUDA on NVIDIA Ampere (compute capability 8.6, RTX 30) and Ada (8.9,
-RTX 40), the two classes the engine was tested on. A GPU of another class is
-refused when the device is opened, and the server skips it. Blackwell (12.0,
-RTX 50) follows once it has been tested. Every other GPU is meant to run
-through the Vulkan backend later: its kernels exist, but no model runs on it
-yet. Ares was tested with one card and with two. Between cards, data goes
-directly from device to device when the driver allows peer access, and through
-host memory otherwise.
+## Getting started
 
-**System.** Linux only. The engine reads weights with io_uring and direct I/O,
-keeps the prompt cache on disk with direct I/O, and loads the driver's
-`libcuda.so.1` at run time.
+```sh
+cargo build --release
+target/release/ares --model ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf
+```
 
-## What it does
-
-A short list. [`docs/user/features.md`](docs/user/features.md) has one line for every
-feature.
-
-- **API routes:** `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
-  and the Anthropic Messages API (`/v1/messages` and its token count), so Claude
-  Code works against Ares; `/v1/models`, `/health`, `/metrics` (Prometheus),
-  and llama.cpp's `/tokenize`, `/detokenize` and `/props`.
-- **Tools and structured output:** tool calls held to the tools' schemas by a
-  grammar, streamed; `response_format` with a JSON schema; GBNF grammars;
-  thinking with a budget of tokens.
-- **Images** in all three API styles.
-- **Prompt cache,** automatic and shared by all requests: checkpoints at the
-  end of the system prompt and tools and at every message boundary, kept in
-  RAM inside `--ram` and on the SSD with `--cache`. A conversation resumes after
-  a restart.
-- **Parallel requests and priorities:** `--parallel` sequences at once, a
-  `priority` per request (or the header `x-ares-priority`), a bounded line
-  with `--queue`.
-- **Drafts:** the model's MTP block, an n-gram drafter and DFlash2 drafters.
-  How many drafts a step verifies is chosen from the measured price of a step
-  and the acceptance. On the 27B the text with drafts is token for token the
-  text without.
-- **Experts across VRAM, RAM and SSD** (Flash-Next): slots in VRAM, a tier in
-  RAM, the rest read from the model file on the SSD. The CPU computes experts
-  that are missing on the card. A prompt read alone passes through the model
-  layer by layer, so that each expert crosses the link once.
-- **One limit for host memory:** `--ram` covers all page-locked memory, and
-  the engine gives memory back when other programs need it.
-- **Several models** from one preset file, loaded when a request names them.
-
-In work: K and V of a running sequence beyond VRAM, in RAM (Flash-Next), and
-Flash-Next models larger than RAM streamed from the SSD.
+[`docs/user/quickstart.md`](docs/user/quickstart.md) has what the build needs,
+both models, a first request and Claude Code; [`docs/README.md`](docs/README.md)
+lists every document, for running Ares and for developing it.
 
 ## Measured
 
@@ -146,188 +110,6 @@ in a long context more slowly. The work on this is listed in
 
 Comparisons of Flash-Next with Strata, the engine it is measured against, are
 not listed until they have been run in the same session.
-
-## Build
-
-You need:
-
-- Linux, with an NVIDIA driver for the GPU.
-- Rust 1.95 or newer (`rust-toolchain.toml` picks the stable channel).
-- The CUDA toolkit 13.0 or newer, for `nvcc`. It is needed to build, not to run.
-- `glslc`, the shader compiler of the Vulkan SDK or the shaderc package, for
-  the Vulkan shaders.
-
-```sh
-cargo build --release
-```
-
-The binary is `target/release/ares`. The release build uses fat link-time
-optimization and takes a while.
-
-The build environment:
-
-| Variable | Meaning |
-| --- | --- |
-| `ARES_CUDA_ARCHS` | Compute capabilities to build machine code for, such as `89` for one RTX 40 card. Default: the tested classes, `86,89`. A class that is not tested can be named on purpose; the build warns. Classes below Ampere are an error. |
-| `NVCC` | The CUDA compiler. Default: `$CUDA_PATH/bin/nvcc`, `$CUDA_HOME/bin/nvcc`, `nvcc` on `PATH`, `/opt/cuda/bin/nvcc`, `/usr/local/cuda/bin/nvcc`. |
-| `GLSLC` | The shader compiler. Default: `glslc` on `PATH`, `$VULKAN_SDK/bin/glslc`, `/usr/bin/glslc`, `/usr/local/bin/glslc`. |
-
-## Run
-
-```sh
-target/release/ares --model ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf
-```
-
-Without more options the server chooses the devices, the split and the context
-from what the GPUs report, and the log says what it chose. It listens on
-`127.0.0.1:8000`. The model's id is the file name without `.gguf` (here
-`Qwen3.8-27B-UD-Q4_K_S`); `/v1/models` lists it.
-
-```sh
-curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "Qwen3.8-27B-UD-Q4_K_S",
-  "messages": [{"role": "user", "content": "Hello"}]
-}'
-```
-
-The command line of the measurements above, for two 12 GiB cards:
-
-```sh
-ares --model Qwen3.8-27B-UD-Q4_K_S.gguf --devices 0,1 \
-  --split tensor --shares 0.625,0.375 \
-  --context 262144 --parallel 2 --kv q5 \
-  --drafters mtp --draft-vocab draft-vocab.txt \
-  --ram 16G --cache ~/.cache/ares-prompts --cache-size 48G \
-  --reasoning-effort medium
-```
-
-Flash-Next with its MTP block from a file of its own, and 40 GiB of RAM for the
-experts and the prompt cache:
-
-```sh
-ares --model Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf \
-  --drafters mtp-q2_0.gguf --ram 40G --cache ~/.cache/ares-prompts
-```
-
-The main options (`ares --help` lists them all):
-
-| Option | Meaning |
-| --- | --- |
-| `--model <FILE>` | The GGUF file (any part of a split model). |
-| `--models-preset <FILE>` | Several models from an INI file, one section each (below). |
-| `--host`, `--port` | Where to listen. Default: `127.0.0.1`, `8000`. |
-| `--devices <LIST>` | CUDA devices by the driver's index, such as `0,1`. Default: all. |
-| `--split single\|tensor\|layer`, `--shares <LIST>` | How the model is spread over the devices, and each device's share. |
-| `--context <TOKENS>` | K/V cells for all sequences together. Default: what the free VRAM holds. |
-| `--parallel <N>` | Sequences that run at once. Default: 4. |
-| `--kv <FORMAT>` | K and V in `f16`, `q8`, `q7`, `q6`, `q5` or `q4`, or two of them (K,V). Default: `q8`. |
-| `--ram <SIZE>` | The most host RAM the engine may use. Default: all the machine has. |
-| `--cache <DIR>`, `--cache-size <SIZE>` | The prompt cache on the SSD. Default: none; 32G. |
-| `--drafters <LIST>` | `mtp`, `none`, or the file of an MTP block or a DFlash2 drafter. The n-gram drafter takes part with them. |
-| `--draft-vocab <FILE>` | Token ids the model drafters may propose, one per line. |
-| `--mmproj <FILE>` | The image projector. Without it, images are refused. |
-| `--api-key <KEYS>`, `--api-key-file <FILE>` | Keys a request must carry. Default: none. |
-
-Every option is also an environment variable, `ARES_` and its name in capitals
-(`ARES_CONTEXT=32768`), and a line of the file of `--config`. The command line
-holds over the environment, and the environment over the file. `RUST_LOG` sets
-the log level. `ARES_LIBCUDA` names a driver library to load in place of the
-system's `libcuda.so.1`, for example a build of the driver with peer access on
-consumer cards.
-
-**Several models.** `--models-preset` serves the models of an INI file. A
-model is loaded when a request names it, the one used least recently makes
-room, and an idle model can be unloaded:
-
-```ini
-[*]
-ram = 24G
-idle-unload = 30m
-
-[qwen-27b]
-model = /models/Qwen3.8-27B-UD-Q4_K_S.gguf
-aliases = default
-load-on-startup = true
-
-[flash-next]
-model = /models/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf
-drafters = /models/mtp-q2_0.gguf
-```
-
-**Claude Code.** Point it at the Messages API, and give every model name it
-uses the id of a model, here `qwen-27b` of the preset above:
-
-```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8000 ANTHROPIC_API_KEY=unused
-export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen-27b ANTHROPIC_DEFAULT_SONNET_MODEL=qwen-27b \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen-27b
-export API_TIMEOUT_MS=1800000  # a first prompt of 16k tokens can take minutes on Flash-Next
-claude --model qwen-27b
-```
-
-## Tests
-
-```sh
-cargo test --workspace
-```
-
-Tests that open GPUs are off by default, because opening a device takes VRAM
-that a running model may need. Enable them per backend:
-
-```sh
-ARES_TEST_CUDA=1 cargo test -p ares-cuda --test gpu -- --test-threads=1
-ARES_TEST_VULKAN=1 cargo test -p ares-vulkan --test gpu -- --test-threads=1
-```
-
-Tests against real models skip with a message unless their model files are
-named, one variable for each file, the same in every crate:
-
-| Variable | Model file |
-| --- | --- |
-| `ARES_TEST_QWEN35_0_8B` | Qwen3.5-0.8B (`Qwen3.5-0.8B-Q4_K_M.gguf`) |
-| `ARES_TEST_QWEN38_27B` | Qwen3.8-27B in Q4_K_S (`Qwen3.8-27B-UD-Q4_K_S.gguf`), on two cards |
-| `ARES_TEST_QWEN38_27B_IQ2` | Qwen3.8-27B in IQ2_XXS (`Qwen3.8-27B-UD-IQ2_XXS.gguf`), on one card |
-| `ARES_TEST_DRAFT_MODEL` | that IQ2_XXS file with its MTP block (`...-with-draft-block.gguf`) |
-| `ARES_TEST_DFLASH_27B` | the 27B's DFlash2 drafter |
-| `ARES_TEST_FLASH_NEXT` | Qwen3.8-Flash-Next, the first part of its split file |
-| `ARES_TEST_FLASH_NEXT_MTP` | Flash-Next's MTP block (`mtp-q2_0.gguf`) |
-| `ARES_TEST_GGUF` | any model file whose tensors the kernel tests of `ares-cuda` and `ares-vulkan` check |
-
-`git grep ARES_TEST_` lists the others (directories of captures, devices,
-ports, limits).
-
-## Layout
-
-| Path | Contents |
-| --- | --- |
-| `crates/core` | Tensor element types, byte units, memory ledgers, the host memory limit |
-| `crates/gguf` | GGUF reader |
-| `crates/quant` | CPU reference for every quantization type; the K/V formats |
-| `crates/cuda` | CUDA device layer and kernels |
-| `crates/vulkan` | Vulkan device layer and shaders |
-| `crates/state` | Sequence state: pages, prefix sharing, checkpoints |
-| `crates/store` | Sequence state on disk (the prompt cache that survives restarts) |
-| `crates/io` | Reads of weights straight from the model file (io_uring, direct I/O) |
-| `crates/sched` | Step planning, admission, draft policy, the n-gram drafter |
-| `crates/weights` | Expert tiers and pruning policy |
-| `crates/runtime` | Conductor and device threads: the step loop |
-| `crates/model` | Model architectures: CPU reference and device implementation |
-| `crates/sampler` | Sampler settings, the arithmetic every backend repeats, the CPU reference of a pick |
-| `crates/grammar` | GBNF grammars, JSON schemas and regular expressions turned into the tokens that may come next |
-| `crates/tokenizer` | Tokenizer and chat templates |
-| `crates/api` | Types between the HTTP server and the runtime |
-| `crates/server` | The `ares` binary |
-
-## Documentation
-
-[`docs/README.md`](docs/README.md) says what each document is for:
-
-- [`docs/user/features.md`](docs/user/features.md): what Ares can do today, one line each.
-- [`docs/dev/architecture/`](docs/dev/architecture/overview.md): how the engine works.
-- [`docs/OPEN.md`](docs/OPEN.md): the working list of what is open, measured
-  and decided.
-- [`docs/dev/studies/`](docs/dev/studies/): studies of the model architectures and
-  of other engines.
 
 ## Thanks
 
