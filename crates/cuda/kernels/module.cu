@@ -3,7 +3,6 @@
 
 #include "common.cuh"
 #include "basic.cuh"
-#include "matvec_q4_K.cuh"
 #include "quantize_act.cuh"
 #include "mmvq_q4_K.cuh"
 #include "mmvq_kquants.cuh"

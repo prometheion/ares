@@ -1,8 +1,8 @@
 // Q4_K for the integer weight kernels (mmvq.cuh).
 //
-// Layout of a block (see matvec_q4_K.cuh): 256 values in 144 bytes, 16-byte
-// aligned: a 16-byte header (d and dmin as f16, 12 bytes of packed 6-bit
-// scales and minimums of the 8 sub-blocks of 32), then 128 bytes of nibbles.
+// Layout of a block: 256 values in 144 bytes, 16-byte aligned: a 16-byte
+// header (d and dmin as f16, 12 bytes of packed 6-bit scales and minimums of
+// the 8 sub-blocks of 32), then 128 bytes of nibbles.
 // Of each 32 bytes the low nibbles are the 32 values of sub-block 2j and the
 // high nibbles those of sub-block 2j+1 (j = 0..3, 64 values each).
 //

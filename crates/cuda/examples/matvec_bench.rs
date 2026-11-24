@@ -5,8 +5,7 @@
 //! 500 GB/s on an RTX 4070 and 360 on an RTX 3060 by the data sheet, 479 and
 //! 341 measured with a plain streaming read).
 //!
-//! First the exact f32 Q4_K kernel, the reference, one launch at a time. Then
-//! the fast integer kernels of every type, `quantize_activations` once and
+//! The fast integer kernels of every type, `quantize_activations` once and
 //! `matvec` after it, the way a step uses them: 40 launches in a row between
 //! two events, over several copies of the matrix that together are larger than
 //! any L2 cache, so that every launch reads its weights from memory. For a type
@@ -31,8 +30,7 @@ const N_IN: u32 = 5120;
 const N_OUT: u32 = 17408;
 
 fn main() -> Result<()> {
-    // Optional arguments: a device ordinal, and a list of type names ("q4_K,f16"); with
-    // the list the f32 baseline is skipped.
+    // Optional arguments: a device ordinal, and a list of type names ("q4_K,f16").
     let args: Vec<String> = std::env::args().skip(1).collect();
     let only_device: Option<u32> = args.first().and_then(|a| a.parse().ok());
     let only_types: Option<Vec<&str>> = args.get(1).map(|a| a.split(',').collect());
@@ -43,60 +41,6 @@ fn main() -> Result<()> {
         let device = Device::open(info.ordinal, Wait::Spin)?;
         let kernels = Kernels::load(&device)?;
         let stream = Stream::new(&device, 0)?;
-        'baseline: {
-            if only_types.is_some() {
-                break 'baseline;
-            }
-            let w_bytes = u64::from(N_OUT) * u64::from(N_IN / 256) * 144;
-            let w = DeviceBuffer::new(&device, w_bytes)?;
-            let x = DeviceBuffer::new(&device, 8 * u64::from(N_IN) * 4)?;
-            let scratch = DeviceBuffer::new(&device, 8 * u64::from(N_IN / 32) * 4)?;
-            let y = DeviceBuffer::new(&device, 8 * u64::from(N_OUT) * 4)?;
-            // Any bytes are a valid Q4_K matrix for timing; the scales stay finite.
-            // SAFETY: whole buffers on this device.
-            unsafe {
-                stream.fill(w.ptr(), 0x11, w_bytes as usize)?;
-                stream.fill(x.ptr(), 0, 8 * N_IN as usize * 4)?;
-            }
-            stream.synchronize()?;
-
-            println!(
-                "CUDA{} {}: {N_OUT} x {N_IN} Q4_K, {:.1} MiB",
-                info.ordinal,
-                info.name,
-                w_bytes as f64 / (1 << 20) as f64
-            );
-            for n_batch in [1u32, 2, 4, 8] {
-                let mut times = Vec::new();
-                for _ in 0..60 {
-                    let start = Instant::now();
-                    // SAFETY: the buffers were sized for 8 activation rows above.
-                    unsafe {
-                        kernels.matvec_q4_k(
-                            &stream,
-                            w.ptr(),
-                            x.ptr(),
-                            scratch.ptr(),
-                            y.ptr(),
-                            N_IN,
-                            N_OUT,
-                            n_batch,
-                        )?;
-                    }
-                    stream.synchronize()?;
-                    times.push(start.elapsed().as_secs_f64());
-                }
-                let mut times = times.split_off(10);
-                times.sort_by(f64::total_cmp);
-                let median = times[times.len() / 2];
-                println!(
-                    "  {n_batch} row(s): {:>7.3} ms  {:>6.1} GB/s of weights",
-                    median * 1e3,
-                    w_bytes as f64 / median / 1e9
-                );
-            }
-        }
-
         println!("fast kernels, {N_OUT} x {N_IN} (median of 5 runs of {RUN} launches):");
         for ty in FAST_TYPES {
             if only_types.as_ref().is_some_and(|names| !names.contains(&ty.name())) {

@@ -77,18 +77,3 @@ ARES_KERNEL ares_rms_norm_f32(const float* x, const float* weight, float* y, uin
         yr[i] = xr[i] * scale * (weight != nullptr ? weight[i] : 1.0f);
     }
 }
-
-// out[g] = the sum of x[32 g .. 32 g + 31] for g < n_groups. One thread per
-// group. Quantized types with an offset per sub-block need these sums once
-// per activation row, not once per weight row.
-ARES_KERNEL ares_sum32_f32(const float* x, float* out, uint32_t n_groups) {
-    const uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
-    if (g < n_groups) {
-        const float* xg = x + static_cast<size_t>(g) * 32;
-        float sum = 0.0f;
-        for (int l = 0; l < 32; l++) {
-            sum += xg[l];
-        }
-        out[g] = sum;
-    }
-}

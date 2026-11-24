@@ -434,8 +434,6 @@ pub struct Kernels {
     add_to_f32: Function,
     sum_peer_f32: Function,
     rms_norm_f32: Function,
-    sum32_f32: Function,
-    matvec_q4_k: Function,
     quantize_act: Function,
     fast: Vec<(GgmlType, u64, Function)>,
     /// The kernels of [`Kernels::matvec_exact`] for the quantized types.
@@ -569,8 +567,6 @@ impl Kernels {
             add_to_f32: module.function("ares_add_to_f32")?,
             sum_peer_f32: module.function("ares_sum_peer_f32")?,
             rms_norm_f32: module.function("ares_rms_norm_f32")?,
-            sum32_f32: module.function("ares_sum32_f32")?,
-            matvec_q4_k: module.function("ares_matvec_q4_K")?,
             quantize_act: module.function("ares_quantize_act")?,
             fast,
             exact,
@@ -693,59 +689,6 @@ impl Kernels {
         unsafe { self.rms_norm_f32.launch(stream, [rows, 1, 1], [REDUCE_THREADS, 1, 1], 0, args) }
     }
 
-    /// `y[b] = W x[b]` for a Q4_K matrix `w` of `n_out` rows and `n_in`
-    /// columns and `n_batch` activation rows.
-    ///
-    /// `scratch` receives `n_batch * n_in / 32` f32 values (the sums of the
-    /// activations per 32 values, which the type's offsets need).
-    ///
-    /// # Safety
-    ///
-    /// On the stream's device and alive until both launches have run: `w`
-    /// must address the matrix as GGUF stores it, 16-byte aligned; `x`
-    /// `n_batch * n_in` f32 values; `scratch` `n_batch * n_in / 32` f32
-    /// values; `y` `n_batch * n_out` f32 values. `y` and `scratch` must not
-    /// overlap the inputs.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn matvec_q4_k(
-        &self,
-        stream: &Stream,
-        w: DevicePtr,
-        x: DevicePtr,
-        scratch: DevicePtr,
-        y: DevicePtr,
-        n_in: u32,
-        n_out: u32,
-        n_batch: u32,
-    ) -> Result<()> {
-        if !n_in.is_multiple_of(256) || n_in == 0 {
-            return Err(Error::Invalid {
-                what: "Q4_K matrix",
-                detail: format!("{n_in} columns are not a whole number of 256-value blocks"),
-            });
-        }
-        if n_batch == 0 || n_batch > MAX_BATCH {
-            return Err(Error::Invalid {
-                what: "weight kernel batch",
-                detail: format!("{n_batch} activation rows; one launch takes 1 to {MAX_BATCH}"),
-            });
-        }
-        if n_out == 0 {
-            return Ok(());
-        }
-        let n_groups = n_batch * (n_in / 32);
-        let args = Args::new().ptr(x).ptr(scratch).u32(n_groups);
-        // SAFETY: the argument list matches ares_sum32_f32.
-        unsafe {
-            self.sum32_f32.launch(stream, [n_groups.div_ceil(256), 1, 1], [256, 1, 1], 0, args)?;
-        }
-        // One thread per unit of 64 values, in whole warps, up to the reduce width.
-        let threads = (n_in / 64).next_multiple_of(32).min(REDUCE_THREADS);
-        let args = Args::new().ptr(w).ptr(x).ptr(scratch).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
-        // SAFETY: the argument list matches ares_matvec_q4_K.
-        unsafe { self.matvec_q4_k.launch(stream, [n_out, 1, 1], [threads, 1, 1], 0, args) }
-    }
-
     /// The bytes that [`Kernels::quantize_activations`] writes for `n_batch`
     /// rows of `n_in` activations: the int8 values, then (from the next
     /// multiple of 16 bytes) one `(scale, sum)` pair of f32 per group of 32
@@ -831,10 +774,8 @@ impl Kernels {
     /// quantized activations, so their results differ from the exact product by
     /// about 1% rms (the rounding of the activations; the weights are exact);
     /// the float types (F32, F16, BF16) multiply the activations as they are, and
-    /// differ from it by f32 rounding only. The exact f32 kernel
-    /// ([`Kernels::matvec_q4_k`] for Q4_K) stays the reference for Q4_K. A type
-    /// without a fast kernel (see [`Kernels::has_fast_matvec`]) is refused with
-    /// an error.
+    /// differ from it by f32 rounding only. A type without a fast kernel (see
+    /// [`Kernels::has_fast_matvec`]) is refused with an error.
     ///
     /// # Safety
     ///

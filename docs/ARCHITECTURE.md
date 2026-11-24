@@ -3994,8 +3994,9 @@ on the RTX 3060, with f16 accumulation at 117.0 and 51.2, and int8 at 234 and
 (2790 MHz; under the tile kernels the card sits at its power limit at 2655 MHz),
 and the probe reports full rate.
 
-`ares_matvec_q4_K` stays as the exact f32 reference. It is slow because each
-lane reads activations 256 bytes apart, not because of its arithmetic.
+The first weight kernel, an f32 Q4_K kernel kept as a reference (`ares_matvec_q4_K`), was
+removed on 2026-11-24: every decode kernel is held to a CPU emulation of its arithmetic and to
+`ares_quant::dequantize` (`tests/mmvq.rs`).
 
 One thing the device tests caught is worth knowing: a "synchronous" upload
 from ordinary memory returns when the data is in the driver's staging buffer,

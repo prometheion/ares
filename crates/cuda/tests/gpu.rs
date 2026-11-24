@@ -8,16 +8,12 @@
 //! ```sh
 //! ARES_TEST_CUDA=1 cargo test -p ares-cuda --test gpu
 //! ```
-//!
-//! `ARES_TEST_GGUF=<model.gguf>` adds a check of the weight kernel against a
-//! real Q4_K matrix of that model.
 
 use std::sync::OnceLock;
 
-use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, Kernels, MAX_BATCH, PinnedBuffer, Stream, Wait,
-    device_count, devices, driver_version, peer_access,
+    Device, DeviceBuffer, DevicePtr, Event, Kernels, PinnedBuffer, Stream, Wait, device_count,
+    devices, driver_version, peer_access,
 };
 
 /// The opened devices, shared by all tests of this binary so each context is
@@ -221,134 +217,6 @@ fn add_and_rms_norm_match_the_cpu() {
                 }
             }
         }
-    }
-}
-
-/// A Q4_K matrix of random blocks with finite scales.
-fn random_q4k(rng: &mut Rng, n_in: usize, n_out: usize) -> Vec<u8> {
-    // f16 bit patterns of small finite values, both signs.
-    const SCALES: [u16; 6] = [0x2e66, 0x3266, 0xae66, 0x1c00, 0x3800, 0xb000];
-    let blocks = n_in / 256 * n_out;
-    let mut bytes = Vec::with_capacity(blocks * 144);
-    for _ in 0..blocks {
-        bytes.extend_from_slice(&SCALES[(rng.next() % 6) as usize].to_le_bytes());
-        bytes.extend_from_slice(&SCALES[(rng.next() % 6) as usize].to_le_bytes());
-        for _ in 0..140 {
-            bytes.push((rng.next() >> 32) as u8);
-        }
-    }
-    bytes
-}
-
-/// Runs the kernel on `w` and checks it against decoding the matrix on the
-/// CPU and multiplying in f64.
-fn check_matvec_q4k(
-    device: &Device,
-    kernels: &Kernels,
-    rng: &mut Rng,
-    w: &[u8],
-    n_in: usize,
-    n_out: usize,
-    n_batch: usize,
-) {
-    let stream = Stream::new(device, 0).unwrap();
-    let x: Vec<f32> = (0..n_in * n_batch).map(|_| rng.unit()).collect();
-    let dw = DeviceBuffer::new(device, w.len() as u64).unwrap();
-    dw.write(0, w).unwrap();
-    let dx = upload_f32(device, &x);
-    let scratch = DeviceBuffer::new(device, (n_batch * n_in / 32 * 4) as u64).unwrap();
-    let dy = DeviceBuffer::new(device, (n_batch * n_out * 4) as u64).unwrap();
-    // SAFETY: the buffers were sized for these shapes just above.
-    unsafe {
-        kernels
-            .matvec_q4_k(
-                &stream,
-                dw.ptr(),
-                dx.ptr(),
-                scratch.ptr(),
-                dy.ptr(),
-                n_in as u32,
-                n_out as u32,
-                n_batch as u32,
-            )
-            .unwrap();
-    }
-    stream.synchronize().unwrap();
-    let got = read_f32(&dy, n_batch * n_out);
-
-    let mut weights = vec![0f32; n_in * n_out];
-    ares_quant::dequantize(GgmlType::Q4_K, w, &mut weights).unwrap();
-    for b in 0..n_batch {
-        let xb = &x[b * n_in..][..n_in];
-        for r in 0..n_out {
-            let row = &weights[r * n_in..][..n_in];
-            let (mut want, mut magnitude) = (0f64, 0f64);
-            for (weight, value) in row.iter().zip(xb) {
-                let product = f64::from(*weight) * f64::from(*value);
-                want += product;
-                magnitude += product.abs();
-            }
-            let have = f64::from(got[b * n_out + r]);
-            // The kernel sums f32 products in another order than this loop.
-            assert!(
-                (have - want).abs() <= 2e-5 * magnitude + 1e-6,
-                "matvec {n_out}x{n_in}, batch row {b}, output {r}: {have} != {want} \
-                 (sum of magnitudes {magnitude})"
-            );
-        }
-    }
-}
-
-#[test]
-fn matvec_q4k_matches_the_cpu_decoder() {
-    let Some(gpus) = gpus() else { return };
-    let mut rng = Rng(0x2545f4914f6cdd1d);
-    for device in gpus {
-        let kernels = Kernels::load(device).unwrap();
-        // One block per row; fewer units than a warp; more units than the
-        // widest thread block (17408 columns are 272 units); every batch size.
-        for (n_in, n_out, n_batch) in
-            [(256, 3, 1), (2560, 67, 1), (2560, 5, 3), (5120, 33, 8), (17408, 9, 2)]
-        {
-            let w = random_q4k(&mut rng, n_in, n_out);
-            check_matvec_q4k(device, &kernels, &mut rng, &w, n_in, n_out, n_batch);
-        }
-
-        let stream = Stream::new(device, 0).unwrap();
-        let null = DevicePtr::NULL;
-        // SAFETY: both calls are refused before anything is launched.
-        unsafe {
-            assert!(kernels.matvec_q4_k(&stream, null, null, null, null, 300, 1, 1).is_err());
-            let too_many = MAX_BATCH + 1;
-            assert!(
-                kernels.matvec_q4_k(&stream, null, null, null, null, 256, 1, too_many).is_err()
-            );
-        }
-    }
-}
-
-#[test]
-fn matvec_q4k_matches_the_cpu_decoder_on_a_real_model() {
-    let Some(gpus) = gpus() else { return };
-    let Some(path) = std::env::var_os("ARES_TEST_GGUF") else {
-        eprintln!("skipped: set ARES_TEST_GGUF=<model.gguf> to check a real Q4_K matrix");
-        return;
-    };
-    let gguf = ares_gguf::Gguf::open(&path).unwrap();
-    let tensor = gguf
-        .tensors()
-        .iter()
-        .filter(|t| t.ty == GgmlType::Q4_K && t.dims.as_slice().len() == 2)
-        .min_by_key(|t| t.size)
-        .expect("the model has no 2-D Q4_K tensor");
-    let (n_in, n_out) = (tensor.dims.get(0) as usize, tensor.dims.get(1) as usize);
-    eprintln!("checking {} ({n_out} x {n_in})", tensor.name);
-    let rows = n_out.min(512);
-    let w = &gguf.data(tensor)[..rows * (n_in / 256) * 144];
-    let mut rng = Rng(0x853c49e6748fea9b);
-    for device in gpus {
-        let kernels = Kernels::load(device).unwrap();
-        check_matvec_q4k(device, &kernels, &mut rng, w, n_in, rows, 2);
     }
 }
 
