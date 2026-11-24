@@ -294,10 +294,9 @@ pub const OPTIONS: &[Opt] = &[
     Opt::model(
         "--kv",
         "<FORMAT>",
-        "Storage format of K and V: f16, q8, q7, q6, q5 or q4, or two names (K,V). The \
-         formats from q7 on store a tile of 128 cells relative to its mean and keep the \
-         first tile and the newest cells exact; Qwen3.8-Flash-Next takes f16 and q8 only \
-         [default: q8]",
+        "Storage format of K and V: f16, q8, q7, q6, q5 or q4, or two names (K,V); both \
+         models take every format. The formats from q7 on store a tile of 128 cells relative \
+         to its mean and keep the first tile and the newest cells exact [default: q8]",
     ),
     Opt::model(
         "--ram",
