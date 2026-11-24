@@ -1116,16 +1116,29 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
   - [x] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's):
         `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` passes on the RTX 4070 + RTX 3060
         (2026-11-22). Not run with the real file on two cards.
-  - [ ] **Defect since the prompt kernel (`attn/long-context`) is on main**, seen in the merge
-        check (2026-11-23, `integrate2`): `qwen4exp_runtime k_and_v_beyond_vram_change_no_token`
-        fails in its case of lent wide steps (steps of 32 rows on a loan, K and V beyond the first
-        page in RAM): 0 of 16 tokens as the reference's, where every page in VRAM gives 16 and the
-        same branch on the base before that merge gave 16 and 16. Decode steps, wide steps of the
-        own scratch, passes (`a_prompt_read_layer_by_layer_reads_k_and_v_beyond_vram_from_a_copy`)
-        and a sequence that starts on a far page pass. The prompt kernel takes the far pool
-        (`conv_entry`) as the other kernels do; what else of that merge meets the lent step's copy
-        of the far slots is not found. Lent steps serve a prompt only where passes do not (DFlash,
-        formats with exact tiles).
+  - [x] **Lent wide steps with K and V beyond VRAM "fail since the prompt kernel"** (merge check
+        2026-11-23, `integrate2`): neither the far pages' nor the prompt kernel's (`kvfix`,
+        2026-11-24). The failing case compared the first token of a prompt read in lent steps (32
+        rows on a loan) with the CPU reference, which ranks it 0.43 logits above the next (58 over
+        22). Lent steps answer 22 in about half the runs on a quiet machine, with every page in VRAM
+        as often as with K and V beyond the first page, and on main without this branch: see "Lent
+        steps with the CPU's share" below. The far test's lent case now uploads every miss and
+        asserts that the far pages change no token (`k_and_v_beyond_vram_change_no_token`, 5 of 5
+        runs in all three placements; the old case failed in 3 of 4 runs of the branch on ae836d2).
+  - [ ] **Lent steps with the CPU's share** (found by `kvfix`, 2026-11-24; main's, not the far
+        pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
+        loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
+        -2.20..-2.25 in most runs and 58 -2.14, 22 -2.10 in the others, the same values every time
+        (the token after it follows: 39 at -1.89 or -1.74): two states, not a spread. Main 852cc02
+        8 of 12 runs (7 answered 22), main ae836d2 One 6 of 8 and by layers 1 of 8, this branch
+        alike with and without far pages; with every miss uploaded (`Serve::Stream`) 0 of 16, in wide steps of the
+        own scratch (about 32 experts on the CPU a step, against 370 on a loan) 0 of 24, with every
+        miss the CPU can take on it (`Serve::Cpu`) 5 of 16. The rows' int8 input of the CPU against
+        the GPU's f16 moves the first token by a few hundredths, not by 0.3: something of the CPU's
+        share on lent VRAM is computed differently in some runs. The reading of `misses.rs`,
+        `hybrid/wide.rs`, `cpu/mod.rs` and `transit.rs` found no cause; a diagnostic that prints the
+        first tokens' log-probabilities per run (`zz_dbg_lent_gaps`, with the serve mode and a log
+        line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`).
   - [ ] **Defect, seen in the merge check (2026-11-23, `integrate2`)**: on the two local cards with
         IQ2_XS, `--ram 8G`, no `--context`, a prompt of 80 507 tokens (483 far pages) and then an
         unrelated short request: the short request hung in its first step until the watchdog took
