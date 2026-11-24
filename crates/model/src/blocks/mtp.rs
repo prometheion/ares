@@ -98,15 +98,6 @@ pub struct MtpStep {
     pub chances: Option<DraftChances>,
 }
 
-/// Where a step left the tokens its drafters drafted: `tokens` u32 on the
-/// device, at the places of their windows. `u32::MAX` is a draft that could
-/// not be picked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Drafted {
-    pub ptr: DevicePtr,
-    pub tokens: u32,
-}
-
 /// Device time of the block, what it wrote and how its drafts fared, added
 /// up over steps.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

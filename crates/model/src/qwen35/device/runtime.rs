@@ -2,12 +2,11 @@
 //! what it is and builds a [`Part`] on each device's thread, and the
 //! [`DeviceModel`] that turns the runtime's step into the part's.
 
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
-use ares_cuda::{DevicePtr, ENTRY_CELLS, Segment, Stream};
+use ares_cuda::{DevicePtr, ENTRY_CELLS, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
@@ -20,14 +19,14 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 use super::choose::{Balance, LayoutReport};
 use super::load::{read_matrix, table_shape};
 use super::part::{
-    Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
+    Exchange, MTP_KV, MtpBytes, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
     TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
 use crate::blocks::rows::{self, EmbeddingReport, HostTable, Stage};
 use crate::blocks::slots::{self, Declared};
+use crate::blocks::step::{self, DrafterIds, StepInputs};
 use crate::chat;
-use crate::dflash::PassSeq;
 use crate::qwen3vl::{Projector, TowerAt};
 use crate::qwen35::{Config, Weights};
 
@@ -605,18 +604,13 @@ impl Model for Qwen35 {
             ledger: cx.ledger.entries().map(|(name, bytes)| (name.to_owned(), bytes)).collect(),
         });
         // The ids of the drafters in the record, in the order of `drafters`.
-        let block_id = self.placement.mtp().map(|_| 1);
-        let dflash_id = self.dflash_drafts().map(|_| 1 + u32::from(block_id.is_some()));
+        let ids = DrafterIds::new(self.placement.mtp().is_some(), self.dflash_drafts().is_some());
         Ok(Box::new(Qwen35Device {
             part,
             tower,
-            tokens: Vec::new(),
-            segments: Vec::new(),
-            replay: Vec::new(),
-            chains: Vec::new(),
-            passes: Vec::new(),
-            block_id,
-            dflash_id,
+            inputs: StepInputs::default(),
+            ids,
+            n_vocab: self.config.n_vocab as u32,
         }))
     }
 }
@@ -627,19 +621,11 @@ struct Qwen35Device {
     part: Part,
     /// The image tower, on the part that runs it.
     tower: Option<TowerAt>,
-    /// The tokens of the step's rows, read from the record.
-    tokens: Vec<u32>,
-    /// The segments of the step, read from the record once.
-    segments: Vec<Segment>,
-    /// The rows of the step that are replays.
-    replay: Vec<Range<u32>>,
-    /// The windows of the step whose drafts the model's MTP block makes,
-    /// and those the DFlash drafter makes.
-    chains: Vec<MtpChain>,
-    passes: Vec<PassSeq>,
-    /// The ids the record names the two drafters by, when the model has them.
-    block_id: Option<u32>,
-    dflash_id: Option<u32>,
+    /// The step being enqueued as the record says it, kept to reuse the
+    /// memory, and the ids the record names the model's drafters by.
+    inputs: StepInputs,
+    ids: DrafterIds,
+    n_vocab: u32,
 }
 
 impl DeviceModel for Qwen35Device {
@@ -661,12 +647,8 @@ impl DeviceModel for Qwen35Device {
             return Ok(None);
         }
         // The page tables as the device copy will be when the step runs.
-        let mut taken = 0;
-        for i in 0..record.updates() {
-            let update = record.update(i);
-            let entries = (taken..taken + update.count).map(|k| record.entry(k));
-            self.part.update_table(update.slot, update.first, entries)?;
-            taken += update.count;
+        for (slot, first, entries) in step::table_updates(record) {
+            self.part.update_table(slot, first, entries.map(|k| record.entry(k)))?;
         }
         // Those windows are committed to recurrent state, and the copies of the
         // prefix cache follow (saves, page copies, restores: the record's
@@ -678,84 +660,18 @@ impl DeviceModel for Qwen35Device {
         // the copies take its cells.
         self.part.mtp_follow(step.stream, step.tables, step.pages)?;
         self.part.enqueue_copies(step.stream, step.pages, record)?;
-        self.tokens.clear();
-        self.tokens.extend((0..record.rows()).map(|i| record.row(i).token));
-        self.segments.clear();
-        self.segments.extend((0..record.segments()).map(|i| record.segment(i)));
-        self.replay.clear();
-        for (i, segment) in self.segments.iter().enumerate() {
-            if record.replay(i as u32) {
-                self.replay.push(segment.row0..segment.row0 + segment.n_rows);
-            }
-        }
-        // The windows whose drafts a drafter of the part makes, each at its
-        // place in the step's list of drafts: the MTP block's chains, with
-        // their newest token and the settings of the rows that verify the
-        // drafts (all rows of a window are wanted, so the sampler rows of a
-        // window are consecutive; `wanted` counts the wanted rows before it),
-        // and the DFlash drafter's passes.
-        self.chains.clear();
-        self.passes.clear();
-        let (mut bar, mut place) = (0, 0);
-        for (i, segment) in self.segments.iter().enumerate() {
-            let Some(drafter) = record.drafter(i as u32) else { continue };
-            if segment.n_rows < 2 {
-                continue;
-            }
-            let links = segment.n_rows - 1;
-            // The bars of the window's links, when the record has them.
-            let needs = if record.draft_bars() >= bar + links {
-                (bar..bar + links).map(|k| record.draft_need(k)).collect()
-            } else {
-                Vec::new()
-            };
-            bar += links;
-            if Some(drafter) == self.block_id {
-                let wanted: u32 = (0..record.runs())
-                    .map(|r| record.run(r))
-                    .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
-                    .sum();
-                self.chains.push(MtpChain {
-                    segment: i as u32,
-                    token: record.row(segment.row0).token,
-                    rows: (0..links).map(|j| record.sampler(wanted + j).for_draft()).collect(),
-                    needs,
-                    place,
-                });
-            } else if Some(drafter) == self.dflash_id {
-                self.passes.push(PassSeq {
-                    slot: segment.slot,
-                    position: segment.pos0 as u32,
-                    newest: record.row(segment.row0).token,
-                    record_row: segment.row0 + 1,
-                    wanted: links,
-                    place,
-                });
-            } else {
-                return Err(ModelError::Invalid(format!("the part has no drafter {drafter}")));
-            }
-            place += links;
-        }
-        // The rows' rotary positions where they are not their cells (a
-        // sequence with images): the records of the part's groups and the MTP
+        self.inputs.read(record, self.ids, self.n_vocab)?;
+        // The rotary positions: the records of the part's groups and the MTP
         // block's take them.
-        let at_cells = (0..record.rows()).all(|i| {
-            let p = record.row(i).position;
-            record.rotary(i) == [p, p, p, 0]
-        });
-        self.part.set_rotary(if at_cells {
-            Vec::new()
-        } else {
-            (0..record.rows()).map(|i| record.rotary(i).map(|p| p as i32)).collect()
-        });
+        self.part.set_rotary(self.inputs.rotary.clone());
         if self.part.has_mtp() {
             self.part.mtp_step(MtpStep {
                 tokens: step.record_on_device.offset(record.tokens_offset()),
-                chains: std::mem::take(&mut self.chains),
+                chains: std::mem::take(&mut self.inputs.chains),
                 chances: record.draft_chances(),
             })?;
         }
-        if self.part.has_dflash() && self.passes.is_empty() {
+        if self.part.has_dflash() && self.inputs.passes.is_empty() {
             self.part.dflash_no_pass();
         }
         let exchange = Exchange { links: step.links, index: step.index, stream: step.stream };
@@ -768,19 +684,19 @@ impl DeviceModel for Qwen35Device {
                     stream: step.stream,
                     step: step.record_on_device,
                     dims: record.dims(),
-                    tokens: &self.tokens,
-                    segments: &self.segments,
+                    tokens: &self.inputs.tokens,
+                    segments: &self.inputs.segments,
                     tables: step.tables,
                     pages: step.pages,
                     exchange: None,
-                    replay: &self.replay,
+                    replay: &self.inputs.replay,
                 })?;
             }
             // The drafter is on one device; the others have nothing to do.
-            if !self.passes.is_empty() && self.part.has_dflash() {
+            if !self.inputs.passes.is_empty() && self.part.has_dflash() {
                 let list = self.part.draft_list();
                 let tokens = step.record_on_device.offset(record.tokens_offset());
-                self.part.dflash_pass(step.stream, tokens, &self.passes, list)?;
+                self.part.dflash_pass(step.stream, tokens, &self.inputs.passes, list)?;
             }
             return Ok(None);
         }
@@ -791,12 +707,12 @@ impl DeviceModel for Qwen35Device {
             stream: step.stream,
             step: step.record_on_device,
             dims: record.dims(),
-            tokens: &self.tokens,
-            segments: &self.segments,
+            tokens: &self.inputs.tokens,
+            segments: &self.inputs.segments,
             tables: step.tables,
             pages: step.pages,
             exchange: (step.devices > 1).then_some(&exchange),
-            replay: &self.replay,
+            replay: &self.inputs.replay,
         })
     }
 
@@ -820,16 +736,14 @@ impl DeviceModel for Qwen35Device {
     }
 
     fn model_drafts(&self) -> Option<ModelDrafts> {
-        self.part.drafted().map(|d| ModelDrafts { ptr: d.ptr, tokens: d.tokens })
+        self.part.drafters().drafted()
     }
 
     fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
-        self.part.draft_probs(out);
+        self.part.drafters().probs(out);
     }
 
     fn model_draft_ms(&mut self) -> f64 {
-        // A failed read of the events is not worth failing the step for:
-        // the cost then stays what it was measured as before.
-        self.part.draft_ms().unwrap_or(0.0)
+        self.part.draft_ms()
     }
 }

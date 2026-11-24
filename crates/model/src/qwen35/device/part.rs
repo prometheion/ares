@@ -46,7 +46,7 @@ use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::slots::{Arena, Checkpoint, Extent, Places, SlotLayout};
 
 pub use crate::blocks::slots::CopyTimes;
-pub use mtp::{Drafted, MtpBytes, MtpChain, MtpStep, MtpTimes};
+pub use mtp::{MtpBytes, MtpChain, MtpStep, MtpTimes};
 pub(crate) use resume::declared;
 pub use resume::{checkpoint_bytes, state_slot_bytes};
 

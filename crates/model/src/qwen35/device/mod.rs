@@ -29,10 +29,9 @@ pub use crate::blocks::rows::EmbeddingReport;
 pub use choose::{Balance, LayoutProbe, LayoutReport, Layouts};
 pub use harness::Harness;
 pub use part::{
-    CopyTimes, Drafted, Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, MtpTimes, Options,
-    PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, TAILS_PER_SLOT,
-    attention_state_bytes, checkpoint_bytes, exact_bytes, page_bytes, partial_state_bytes,
-    state_slot_bytes,
+    CopyTimes, Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, MtpTimes, Options, PAGE_ENTRY,
+    PHASES, Part, PartSetup, Phase, Profile, StepEnv, TAILS_PER_SLOT, attention_state_bytes,
+    checkpoint_bytes, exact_bytes, page_bytes, partial_state_bytes, state_slot_bytes,
 };
 pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};

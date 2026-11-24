@@ -41,6 +41,26 @@ impl File {
     pub fn bytes(&self) -> u64 {
         self.weights().map_or(0, |w| w.bytes())
     }
+
+    /// Opens the drafter on `device` for a model of `n_embd` values a row,
+    /// `n_layer` layers and `n_vocab` tokens, whose embedding of the mask token
+    /// is `mask_row`: refused when the drafter does not fit the model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_drafter(
+        &self,
+        n_embd: usize,
+        n_layer: usize,
+        n_vocab: usize,
+        device: &ares_cuda::Device,
+        ledger: &mut ares_core::Ledger,
+        setup: DrafterSetup,
+        mask_row: Vec<f32>,
+    ) -> Result<Drafter, ares_runtime::ModelError> {
+        let invalid = |e: String| ares_runtime::ModelError::Invalid(e);
+        self.config.fits(n_embd, n_layer, n_vocab).map_err(|e| invalid(e.to_string()))?;
+        let w = self.weights().map_err(|e| invalid(e.to_string()))?;
+        Drafter::open(&self.config, &w, device, ledger, setup, mask_row)
+    }
 }
 
 impl std::fmt::Debug for File {

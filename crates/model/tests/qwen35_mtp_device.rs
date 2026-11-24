@@ -438,13 +438,13 @@ fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
             // links it did not make are not the next chain's (the next chain
             // read past its tables with them, 2026-11-17). The same chain again
             // is then the chain it was, bit for bit.
-            rig.part.draft_ms().unwrap();
+            rig.part.draft_ms();
             let links = rig.part.mtp_times().links;
             let even: DraftChances = std::array::from_fn(|_| 0.5);
             let (pos0, token) = ((n + WINDOW) as u32, generated[WINDOW]);
             let bars = vec![0.0, 1.0, 1.0, 1.0];
             let cut = rig.chain_with(pos0, token, &greedy, bars, Some(even));
-            rig.part.draft_ms().unwrap();
+            rig.part.draft_ms();
             assert_eq!(rig.part.mtp_times().links, links + 1, "the bar ended the chain");
             assert_eq!(cut.drafts[0], second.drafts[0]);
             let again = rig.chain(pos0, token, &greedy);

@@ -38,16 +38,17 @@ use ares_cuda::{
     AttendBuffers, AttentionShape, AttnRow, DeviceBuffer, DevicePtr, ENTRY_CELLS, KeptRows,
     Kernels, LayerKernels, Plan, Planner, PrefillPath, Segment, Stream,
 };
-use ares_runtime::ModelError;
+use ares_runtime::{ModelDrafts, ModelError};
 
 use super::super::load::{DeviceWeights, Mat, MixerW, MtpW};
 use super::kv;
 use super::{
     AttentionAt, MTP_KV, Options, Part, Phase, Prepared, StepEnv, TAILS_PER_SLOT, geometry, invalid,
 };
-pub use crate::blocks::mtp::{Drafted, MtpChain, MtpStep, MtpTimes};
 use crate::blocks::mtp::{Driver, DriverSetup, LinkLogits, MtpLayer, Rows};
+pub use crate::blocks::mtp::{MtpChain, MtpStep, MtpTimes};
 use crate::blocks::rows::HostTable;
+use crate::blocks::step::{self, Drafters};
 use crate::qwen35::Config;
 
 /// What the MTP block takes on its device, in bytes.
@@ -613,16 +614,8 @@ impl Part {
     /// Device milliseconds of the drafters of the step that ran last: the
     /// MTP block's chains and the DFlash drafter's pass (0 when it drafted
     /// nothing). The step must have ended.
-    pub fn draft_ms(&mut self) -> Result<f64, ModelError> {
-        let pass = match &mut self.dflash {
-            Some(d) => d.pass_ms()?,
-            None => 0.0,
-        };
-        let chain = match &mut self.mtp {
-            Some(m) => m.driver.chain_ms()?,
-            None => 0.0,
-        };
-        Ok(chain + pass)
+    pub fn draft_ms(&mut self) -> f64 {
+        step::draft_ms(self.mtp.as_mut().map(|m| &mut m.driver), self.dflash.as_mut())
     }
 
     /// Tells the part what its MTP block drafts in the step that is enqueued
@@ -632,42 +625,23 @@ impl Part {
         m.driver.draft_step(step)
     }
 
+    /// The drafters of the part, which hand out the step's drafts: the MTP
+    /// block's and the DFlash drafter's in one list, the MTP block's when the
+    /// part has one.
+    pub(crate) fn drafters(&self) -> Drafters<'_> {
+        Drafters { mtp: self.mtp.as_ref().map(|m| &m.driver), dflash: self.dflash.as_ref() }
+    }
+
     /// Where the step enqueued last left its drafts, the MTP block's and
     /// the DFlash drafter's in one list; `None` when it drafted nothing.
-    pub fn drafted(&self) -> Option<Drafted> {
-        let mtp = self.mtp.as_ref().map_or(0, |m| m.driver.drafted());
-        let dflash = self.dflash.as_ref().map_or(0, |d| d.drafted());
-        let tokens = mtp.max(dflash);
-        (tokens > 0).then(|| Drafted { ptr: self.draft_list(), tokens })
+    pub fn drafted(&self) -> Option<ModelDrafts> {
+        self.drafters().drafted()
     }
 
     /// The step's list of drafts, which every drafter of the part writes at
     /// the places of its windows: the MTP block's when the part has one.
     pub fn draft_list(&self) -> DevicePtr {
-        match (&self.mtp, &self.dflash) {
-            (Some(m), _) => m.driver.list(),
-            (None, Some(d)) => d.own_list(),
-            (None, None) => DevicePtr::NULL,
-        }
-    }
-
-    /// The probability the drafter gave each draft of the step that ran last,
-    /// in the order of [`Part::drafted`], appended to `out`; NaN for a link
-    /// that was not made. The step has ended.
-    pub fn draft_probs(&self, out: &mut Vec<f32>) {
-        let Some(drafted) = self.drafted() else { return };
-        let from = out.len();
-        out.resize(from + drafted.tokens as usize, f32::NAN);
-        if let Some(m) = &self.mtp {
-            m.driver.probs(&mut out[from..]);
-        }
-        if let Some(d) = self.dflash.as_ref().filter(|d| d.drafted() > 0) {
-            for s in d.last_pass() {
-                for j in s.place..s.place + s.wanted {
-                    out[from + j as usize] = d.prob(j);
-                }
-            }
-        }
+        self.drafters().list()
     }
 
     /// The block's exact K/V entries (its cells are in them while their tile is

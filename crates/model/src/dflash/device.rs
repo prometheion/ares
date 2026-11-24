@@ -573,6 +573,21 @@ impl Drafter {
         self.product_at(kernels, stream, ty, w, d, self.setup.head_rows, h, rows, self.logits())
     }
 
+    /// The start of a step of the model of `segments`: its rows, whose taps
+    /// the model gives the drafter and which it injects at the end
+    /// ([`Drafter::begin_step`]).
+    pub fn begin_segments(
+        &mut self,
+        stream: &Stream,
+        segments: &[ares_cuda::Segment],
+    ) -> Result<(), ModelError> {
+        let rows: Vec<(u32, u32)> = segments
+            .iter()
+            .flat_map(|s| (0..s.n_rows).map(move |k| (s.slot, s.pos0 as u32 + k)))
+            .collect();
+        self.begin_step(stream, &rows)
+    }
+
     /// The start of a step of the model: its rows, as `(slot, position)` in
     /// the order of the step, whose taps follow. Every row is injected; of a
     /// sequence with more rows in the step than its ring holds cells, only the

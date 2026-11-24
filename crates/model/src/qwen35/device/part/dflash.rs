@@ -41,8 +41,6 @@ pub(super) fn open(
     let Some(plan) = placement.draft.as_ref().filter(|d| d.device == index) else {
         return Ok(None);
     };
-    file.config.fits(c.n_embd, c.n_layer, c.n_vocab).map_err(|e| invalid(e.to_string()))?;
-    let w = file.weights().map_err(|e| invalid(e.to_string()))?;
     let mask_row = embedding_row(weights, file.config.mask_token)?;
     let setup = DrafterSetup {
         max_slots,
@@ -50,7 +48,8 @@ pub(super) fn open(
         window_rows: opts.window_rows,
         head_rows: plan.head_rows,
     };
-    Ok(Some(Drafter::open(&file.config, &w, device, ledger, setup, mask_row)?))
+    let (n_embd, n_layer, n_vocab) = (c.n_embd, c.n_layer, c.n_vocab);
+    Ok(Some(file.open_drafter(n_embd, n_layer, n_vocab, device, ledger, setup, mask_row)?))
 }
 
 /// The row of `token` of the model's embedding table as f32, from the file.
@@ -86,12 +85,7 @@ impl Part {
     /// blocks give it and which it injects at the end.
     pub(super) fn dflash_begin(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         let Some(d) = &mut self.dflash else { return Ok(()) };
-        let rows: Vec<(u32, u32)> = env
-            .segments
-            .iter()
-            .flat_map(|s| (0..s.n_rows).map(move |k| (s.slot, s.pos0 as u32 + k)))
-            .collect();
-        d.begin_step(env.stream, &rows)
+        d.begin_segments(env.stream, env.segments)
     }
 
     /// Before block `i` (of the model, this part holds every block on the

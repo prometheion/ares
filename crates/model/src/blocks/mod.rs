@@ -28,6 +28,9 @@
 //!   every drafter that projects to the vocabulary reads.
 //! - [`mtp`]: the driver of an MTP block, for every model that drafts with
 //!   one.
+//! - [`step`]: what a part reads from the step record (tokens, segments,
+//!   replays, rotary positions, the drafters' windows, table updates,
+//!   commits) and how the drafters of a part hand out their drafts.
 
 pub mod far;
 pub(crate) mod forms;
@@ -37,6 +40,7 @@ pub(crate) mod mtp;
 pub(crate) mod recurrent;
 pub(crate) mod rows;
 pub(crate) mod slots;
+pub(crate) mod step;
 
 use ares_runtime::ModelError;
 

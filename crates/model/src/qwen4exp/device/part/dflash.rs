@@ -52,15 +52,15 @@ impl Part {
                  is not built for a split by layers"
             )));
         }
-        file.config.fits(self.n as usize, n_layer, n_vocab).map_err(|e| invalid(e.to_string()))?;
-        let w = file.weights().map_err(|e| invalid(e.to_string()))?;
         let setup = DrafterSetup {
             max_slots,
             max_rows: self.opts.max_rows,
             window_rows: self.opts.window_rows,
             head_rows,
         };
-        self.dflash = Some(Drafter::open(&file.config, &w, device, ledger, setup, mask_row)?);
+        let n = self.n as usize;
+        self.dflash =
+            Some(file.open_drafter(n, n_layer, n_vocab, device, ledger, setup, mask_row)?);
         Ok(())
     }
 
@@ -69,9 +69,8 @@ impl Part {
         self.dflash.as_ref()
     }
 
-    /// Device milliseconds of the drafter's last pass (0 without one).
-    pub fn dflash_pass_ms(&mut self) -> f64 {
-        self.dflash.as_mut().and_then(|d| d.pass_ms().ok()).unwrap_or(0.0)
+    pub(crate) fn dflash_mut(&mut self) -> Option<&mut Drafter> {
+        self.dflash.as_mut()
     }
 
     /// Tells the drafter that the step enqueued next has no pass.
@@ -84,12 +83,7 @@ impl Part {
     /// The start of a step: the drafter is told its rows.
     pub fn dflash_begin(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         let Some(d) = &mut self.dflash else { return Ok(()) };
-        let rows: Vec<(u32, u32)> = env
-            .segments
-            .iter()
-            .flat_map(|s| (0..s.n_rows).map(move |k| (s.slot, s.pos0 as u32 + k)))
-            .collect();
-        d.begin_step(env.stream, &rows)
+        d.begin_segments(env.stream, env.segments)
     }
 
     /// After the read of the first mixer of model layer `layer`: its tap, when

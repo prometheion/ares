@@ -638,7 +638,7 @@ impl Qwen4ExpDevice {
                 inbound: None,
                 xbase: 0,
                 pools: step.pages,
-                replay: &self.replay,
+                replay: &self.inputs.replay,
             };
             pass_experts(
                 &mut self.part,
@@ -744,25 +744,32 @@ impl Qwen4ExpDevice {
     ) -> Result<PassRun, ModelError> {
         let stream = step.stream;
         let micro = micro_batches_at(key.rows, self.flow.own_rows, &key.cuts);
-        self.part.pass_open(stream, &self.segments, &self.replay, step.pages, at, &micro)?;
-        let replay = !self.replay.is_empty();
-        let segment = self.segments[0];
+        self.part.pass_open(
+            stream,
+            &self.inputs.segments,
+            &self.inputs.replay,
+            step.pages,
+            at,
+            &micro,
+        )?;
+        let replay = !self.inputs.replay.is_empty();
+        let segment = self.inputs.segments[0];
         // The rows of the step's image cells, which the micro-batch of each row embeds.
         let splices = rows::image_splices(&step.record, step.image_stage, self.part.n_embd());
         let mut steps = Vec::with_capacity(micro.len());
         for &(first, rows) in &micro {
             let segments =
                 [Segment { row0: 0, n_rows: rows, pos0: segment.pos0 + first as i32, ..segment }];
-            let tokens = self.tokens[first as usize..(first + rows) as usize].to_vec();
+            let tokens = self.inputs.tokens[first as usize..(first + rows) as usize].to_vec();
             let wanted: Vec<u32> = self
                 .out_rows
                 .iter()
                 .filter(|r| (first..first + rows).contains(r))
                 .map(|r| r - first)
                 .collect();
-            let rotary = match self.rotary.is_empty() {
+            let rotary = match self.inputs.rotary.is_empty() {
                 true => Vec::new(),
-                false => self.rotary[first as usize..(first + rows) as usize].to_vec(),
+                false => self.inputs.rotary[first as usize..(first + rows) as usize].to_vec(),
             };
             let at = (!rotary.is_empty()).then_some(rotary.as_slice());
             let mut record = StepRecord::new(&segments, &tokens, at, &wanted)?;
@@ -801,8 +808,9 @@ impl Qwen4ExpDevice {
         if wanted_elsewhere {
             return Err(invalid("a prompt read layer by layer wants logits only of its last rows"));
         }
-        let rotary = (!self.rotary.is_empty()).then_some(self.rotary.as_slice());
-        let mut span = StepRecord::new(&self.segments, &self.tokens, rotary, &self.out_rows)?;
+        let rotary = (!self.inputs.rotary.is_empty()).then_some(self.inputs.rotary.as_slice());
+        let mut span =
+            StepRecord::new(&self.inputs.segments, &self.inputs.tokens, rotary, &self.out_rows)?;
         if replay {
             span.mark_replay(0)?;
         }
@@ -839,7 +847,8 @@ impl Qwen4ExpDevice {
         if self.drives_ngram {
             for &(row, place) in &saves {
                 let position = key.pos0 as u32 + row;
-                let bytes = self.flow.lock_ngram().saved_at(position, &self.tokens[..row as usize]);
+                let bytes =
+                    self.flow.lock_ngram().saved_at(position, &self.inputs.tokens[..row as usize]);
                 self.resume.save_host(place, &bytes)?;
             }
         }
@@ -849,8 +858,8 @@ impl Qwen4ExpDevice {
             saves,
             micro: steps,
             span,
-            segments: self.segments.clone(),
-            tokens: self.tokens.clone(),
+            segments: self.inputs.segments.clone(),
+            tokens: self.inputs.tokens.clone(),
             picks,
             fetched,
             layer: 0,

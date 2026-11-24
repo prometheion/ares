@@ -492,20 +492,14 @@ impl MtpBlock {
         self.driver.list()
     }
 
-    /// The drafts the step enqueued last made, at most: 0 for none.
-    pub(super) fn drafted(&self) -> u32 {
-        self.driver.drafted()
+    /// The shared driver, whose drafts of a step the part hands out
+    /// (`blocks/step.rs`).
+    pub(super) fn driver(&self) -> &Driver {
+        &self.driver
     }
 
-    /// The probability the block gave each of its drafts of the step that ran
-    /// last, written into `out` at the drafts' places. The step has ended.
-    pub(super) fn probs(&self, out: &mut [f32]) {
-        self.driver.probs(out);
-    }
-
-    /// Device milliseconds of the chains of the step that ran last.
-    pub(super) fn chain_ms(&mut self) -> f64 {
-        self.driver.chain_ms().unwrap_or(0.0)
+    pub(super) fn driver_mut(&mut self) -> &mut Driver {
+        &mut self.driver
     }
 
     /// The chains of the step that ran last, with their drafts as the host

@@ -2,10 +2,9 @@
 //! the runtime's step into the part's, its layers enqueued through the
 //! [`Flow`] the device threads share.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use ares_cuda::{DevicePtr, Event, MAX_BATCH, Segment, StepRecord, Stream};
+use ares_cuda::{DevicePtr, Event, MAX_BATCH, StepRecord, Stream};
 use ares_runtime::{
     DeviceModel, DeviceTransfer, Logits, ModelDrafts, ModelError, Pick, StepContext, TowerJob,
     TransferContext,
@@ -19,16 +18,15 @@ use super::super::part::{PAGE_ENTRY, Part, StepEnv};
 use super::super::resume::Resume;
 use super::Qwen4Exp;
 use super::pass::PassRun;
-use crate::blocks::mtp::{MtpChain, MtpStep};
+use crate::blocks::mtp::MtpStep;
 use crate::blocks::rows::{self, HostTable};
+use crate::blocks::step::{self, DrafterIds, Drafters, StepInputs};
 use crate::qwen3vl::TowerAt;
 
 /// A part behind the runtime's interface.
 pub(super) struct Qwen4ExpDevice {
     /// The image tower, on the part that runs it.
     pub(super) tower: Option<TowerAt>,
-    /// The rotary positions of the step's rows, where they are not their cells.
-    pub(super) rotary: Vec<[i32; 4]>,
     pub(super) index: usize,
     pub(super) devices: usize,
     /// Whether the devices hold a range of layers each (and hand the residual
@@ -44,9 +42,10 @@ pub(super) struct Qwen4ExpDevice {
     pub(super) routing: Routing,
     pub(super) part: Part,
     pub(super) flow: Arc<Flow>,
-    // The step being enqueued, kept to reuse the memory.
-    pub(super) segments: Vec<Segment>,
-    pub(super) tokens: Vec<u32>,
+    /// The step being enqueued as the record says it, kept to reuse the
+    /// memory, and the ids the record names the model's drafters by.
+    pub(super) inputs: StepInputs,
+    pub(super) ids: DrafterIds,
     pub(super) out_rows: Vec<u32>,
     pub(super) accepted: Vec<u32>,
     /// The draft windows of the step before, as (slot, first row), which the
@@ -57,16 +56,9 @@ pub(super) struct Qwen4ExpDevice {
     pub(super) shape: Vec<(u32, bool, u32, u32)>,
     /// The model's MTP block, on the part that holds the output head.
     pub(super) mtp: Option<MtpBlock>,
-    /// Whether the model drafts (on this part or another).
-    pub(super) drafts: bool,
-    /// The ids the record names the MTP block and the DFlash drafter by.
-    pub(super) mtp_id: Option<u32>,
-    pub(super) dflash_id: Option<u32>,
     /// The embedding rows, for the DFlash drafter's newest tokens, on the part
     /// that holds it.
     pub(super) dflash_embedding: Option<Arc<HostTable>>,
-    /// The windows of the step whose drafts the DFlash drafter makes.
-    pub(super) passes: Vec<crate::dflash::PassSeq>,
     /// Where the part left the residual of the rows of its last step.
     pub(super) residual: Option<DevicePtr>,
     /// The host's copy of the picks of a pass's layer, kept for the next pass.
@@ -74,12 +66,8 @@ pub(super) struct Qwen4ExpDevice {
     /// The pass this part paused, and whether the step that ended last was paused.
     pub(super) pass_run: Option<PassRun>,
     pub(super) paused: bool,
-    /// The windows of the step whose drafts the MTP block makes.
-    pub(super) chains: Vec<MtpChain>,
     /// The step being run only drafts.
     pub(super) only_drafts: bool,
-    /// The rows of the step that are a replay.
-    pub(super) replay: Vec<Range<u32>>,
     /// The checkpoints of the prefix cache on this device.
     pub(super) resume: Resume,
     /// The first page whose K and V are in host memory, when some are, and
@@ -110,7 +98,6 @@ impl Qwen4ExpDevice {
         let near = o.near_pages();
         Self {
             tower,
-            rotary: Vec::new(),
             index,
             devices: model.placement.n_devices(),
             by_layers: model.placement.tensor.is_none(),
@@ -122,32 +109,33 @@ impl Qwen4ExpDevice {
                 * (c.n_layer as u32 + 1)
                 * (flow.pass_rows.div_ceil(o.own_rows().max(1)) + 2),
             mtp,
-            drafts: model.mtp.is_some() || model.dflash.is_some(),
-            mtp_id: model.mtp.as_ref().map(|_| 1),
-            dflash_id: model.dflash.as_ref().map(|_| 1 + u32::from(model.mtp.is_some())),
+            inputs: StepInputs::default(),
+            ids: DrafterIds::new(model.mtp.is_some(), model.dflash.is_some()),
             dflash_embedding,
-            passes: Vec::new(),
             residual: None,
             picks: None,
             pass_run: None,
             paused: false,
-            chains: Vec::new(),
             only_drafts: false,
             drives_ngram: part.ngram_layer().is_some(),
             routing,
             part,
             flow,
-            segments: Vec::new(),
-            tokens: Vec::new(),
             out_rows: Vec::new(),
             accepted: Vec::new(),
             windows: Vec::new(),
             shape: Vec::new(),
-            replay: Vec::new(),
             resume,
             near: (near < o.pages()).then_some(near),
             live: Vec::new(),
         }
+    }
+
+    /// The drafters of this part: the step's one list is the MTP block's when
+    /// the device has it (the DFlash drafter writes its drafts into it), else
+    /// the DFlash drafter's.
+    fn drafters(&self) -> Drafters<'_> {
+        Drafters { mtp: self.mtp.as_ref().map(MtpBlock::driver), dflash: self.part.dflash() }
     }
 
     /// Page `page` is in use until the pool frees it.
@@ -198,91 +186,12 @@ impl Qwen4ExpDevice {
         if rows == 0 {
             return Err(invalid("a step without rows"));
         }
-        self.segments.clear();
-        self.chains.clear();
-        self.passes.clear();
-        self.replay.clear();
+        self.inputs.read(record, self.ids, self.n_vocab)?;
         // The rows' rotary positions where they are not their cells (a
         // sequence with images): the step's record and the MTP block's take
         // them.
-        self.rotary.clear();
-        let at_cells = (0..rows).all(|i| {
-            let p = record.row(i).position;
-            record.rotary(i) == [p, p, p, 0]
-        });
-        if !at_cells {
-            self.rotary.extend((0..rows).map(|i| record.rotary(i).map(|p| p as i32)));
-        }
         if let Some(block) = &mut self.mtp {
-            block.set_rotary(self.rotary.clone());
-        }
-        let (mut bar, mut place) = (0, 0);
-        for i in 0..record.segments() {
-            let segment = record.segment(i);
-            if record.replay(i) {
-                self.replay.push(segment.row0..segment.row0 + segment.n_rows);
-            }
-            if let Some(drafter) = record.drafter(i) {
-                if !self.drafts {
-                    return Err(invalid("the model drafts nothing itself"));
-                }
-                // The DFlash drafter's windows: one pass each, its drafts at
-                // the window's place in the step's list.
-                if segment.n_rows >= 2 && Some(drafter) == self.dflash_id {
-                    let links = segment.n_rows - 1;
-                    bar += links;
-                    self.passes.push(crate::dflash::PassSeq {
-                        slot: segment.slot,
-                        position: segment.pos0 as u32,
-                        newest: record.row(segment.row0).token,
-                        record_row: segment.row0 + 1,
-                        wanted: links,
-                        place,
-                    });
-                    place += links;
-                } else if segment.n_rows >= 2 && Some(drafter) != self.mtp_id {
-                    return Err(invalid(format!("the model has no drafter {drafter}")));
-                } else if segment.n_rows >= 2 {
-                    let at = place;
-                    place += segment.n_rows - 1;
-                    // All rows of a window are wanted, so its sampler rows are
-                    // consecutive; `wanted` counts the wanted rows before it.
-                    let wanted: u32 = (0..record.runs())
-                        .map(|r| record.run(r))
-                        .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
-                        .sum();
-                    // The bars of the window's links, when the record has them.
-                    let links = segment.n_rows - 1;
-                    let needs = if record.draft_bars() >= bar + links {
-                        (bar..bar + links).map(|k| record.draft_need(k)).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    bar += links;
-                    self.chains.push(MtpChain {
-                        segment: i,
-                        token: record.row(segment.row0).token,
-                        rows: (0..links).map(|j| record.sampler(wanted + j).for_draft()).collect(),
-                        needs,
-                        place: at,
-                    });
-                }
-            }
-            self.segments.push(segment);
-        }
-        // The rows that take the block's drafts have no token yet.
-        let mut drafted = vec![false; rows as usize];
-        for chain in &self.chains {
-            let s = &self.segments[chain.segment as usize];
-            drafted[(s.row0 + 1) as usize..(s.row0 + s.n_rows) as usize].fill(true);
-        }
-        self.tokens.clear();
-        for row in 0..rows {
-            let token = if drafted[row as usize] { 0 } else { record.row(row).token };
-            if token >= self.n_vocab {
-                return Err(invalid(format!("token {token} of a vocabulary of {}", self.n_vocab)));
-            }
-            self.tokens.push(token);
+            block.set_rotary(self.inputs.rotary.clone());
         }
         self.out_rows.clear();
         for run in 0..record.runs() {
@@ -299,7 +208,7 @@ impl Qwen4ExpDevice {
         // only drafts runs none of the model's rows and is no step of the
         // store.
         let windows: Vec<(u32, u32)> =
-            self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect();
+            self.inputs.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect();
         let worth: Option<Vec<f32>> = record
             .row_worth(0)
             .map(|_| (0..rows).map(|row| record.row_worth(row).unwrap_or(0.0)).collect());
@@ -326,11 +235,9 @@ impl Qwen4ExpDevice {
         if self.part.has_deferred() {
             self.accepted.clear();
             for &(slot, row0) in &self.windows {
-                let outcome = (0..record.commits())
-                    .map(|i| record.commit(i))
-                    .find(|c| c.slot == slot && c.row0 == row0)
+                let accepted = step::accepted(record, slot, row0)
                     .ok_or_else(|| invalid(format!("no outcome for the window of slot {slot}")))?;
-                self.accepted.push(outcome.accepted);
+                self.accepted.push(accepted);
             }
             self.part.enqueue_commit(stream, &self.accepted)?;
             if self.drives_ngram {
@@ -341,12 +248,7 @@ impl Qwen4ExpDevice {
         // The MTP block follows the rows of the last step that count, in
         // the tables of that step.
         if let (Some(block), Some(residual)) = (&mut self.mtp, self.residual.take()) {
-            let outcome = |slot: u32, row0: u32| {
-                (0..record.commits())
-                    .map(|i| record.commit(i))
-                    .find(|c| c.slot == slot && c.row0 == row0)
-                    .map(|c| c.accepted)
-            };
+            let outcome = |slot: u32, row0: u32| step::accepted(record, slot, row0);
             block.follow(stream, &outcome, residual)?;
         }
 
@@ -358,18 +260,14 @@ impl Qwen4ExpDevice {
         }
 
         // The page tables as the conductor made them.
-        let mut taken = 0;
-        for i in 0..record.updates() {
-            let update = record.update(i);
+        for (slot, first, entries) in step::table_updates(record) {
             if self.part.has_attention() {
-                let entries = (taken..taken + update.count).map(|k| record.entry(k));
-                self.part.update_table(stream, update.slot, update.first, entries)?;
+                let entries = entries.clone().map(|k| record.entry(k));
+                self.part.update_table(stream, slot, first, entries)?;
             }
             if let Some(block) = &mut self.mtp {
-                let entries = (taken..taken + update.count).map(|k| record.entry(k));
-                block.update_table(stream, update.slot, update.first, entries)?;
+                block.update_table(stream, slot, first, entries.map(|k| record.entry(k)))?;
             }
-            taken += update.count;
         }
 
         // The copies of the prefix cache, behind the commit of the step before
@@ -394,13 +292,20 @@ impl Qwen4ExpDevice {
         if record.drafts_only() {
             let tokens = step.record_on_device.offset(record.tokens_offset());
             if let Some(block) = &mut self.mtp {
-                let chains = std::mem::take(&mut self.chains);
+                let chains = std::mem::take(&mut self.inputs.chains);
                 let step = MtpStep { tokens, chains, chances: record.draft_chances() };
-                block.step(stream, &self.segments, &self.tokens, &self.replay, Some(step), true)?;
+                block.step(
+                    stream,
+                    &self.inputs.segments,
+                    &self.inputs.tokens,
+                    &self.inputs.replay,
+                    Some(step),
+                    true,
+                )?;
             }
             // The DFlash drafter's passes, into the step's one list: the MTP
             // block's when it is on this device too.
-            if !self.passes.is_empty() && self.part.dflash().is_some() {
+            if !self.inputs.passes.is_empty() && self.part.dflash().is_some() {
                 let table = self
                     .dflash_embedding
                     .as_ref()
@@ -413,7 +318,7 @@ impl Qwen4ExpDevice {
                     out
                 };
                 let list = self.mtp.as_ref().map(MtpBlock::list);
-                self.part.dflash_pass(stream, tokens, &self.passes, &embed, list)?;
+                self.part.dflash_pass(stream, tokens, &self.inputs.passes, &embed, list)?;
             } else {
                 self.part.dflash_no_pass();
             }
@@ -425,28 +330,35 @@ impl Qwen4ExpDevice {
         // The newest cell of every sequence in the MTP block. Its chains run
         // in a step that only drafts: the rows that verify them have their
         // tokens, which every device thread needs.
-        if !self.chains.is_empty() {
+        if !self.inputs.chains.is_empty() {
             return Err(invalid("the MTP block's chains run in a step that only drafts"));
         }
         // (A pass's rows are followed by the block after the pass, micro-batch by
         // micro-batch.)
         if let Some(block) = self.mtp.as_mut().filter(|_| pass.is_none()) {
-            block.step(stream, &self.segments, &self.tokens, &self.replay, None, false)?;
+            block.step(
+                stream,
+                &self.inputs.segments,
+                &self.inputs.tokens,
+                &self.inputs.replay,
+                None,
+                false,
+            )?;
         }
 
         // The rows of the n-gram table, and where the sequences are now (a pass that goes on
         // read its rows when it started).
         if self.drives_ngram && !resumes {
             let mut ngram = self.flow.lock_ngram();
-            let mut parts = Vec::with_capacity(self.segments.len());
-            for s in &self.segments {
+            let mut parts = Vec::with_capacity(self.inputs.segments.len());
+            for s in &self.inputs.segments {
                 ngram.begin_sequence(s.slot, s.pos0 as u32)?;
                 let rows = s.row0 as usize..(s.row0 + s.n_rows) as usize;
-                parts.push((s.slot, &self.tokens[rows]));
+                parts.push((s.slot, &self.inputs.tokens[rows]));
             }
             ngram.ask(&parts)?;
             for (slot, tokens) in parts {
-                let direct = self.segments.iter().any(|s| s.slot == slot && s.direct);
+                let direct = self.inputs.segments.iter().any(|s| s.slot == slot && s.direct);
                 if direct {
                     ngram.advance(slot, tokens);
                 } else {
@@ -455,9 +367,11 @@ impl Qwen4ExpDevice {
             }
         }
         self.windows.clear();
-        self.windows.extend(self.segments.iter().filter(|s| !s.direct).map(|s| (s.slot, s.row0)));
+        self.windows
+            .extend(self.inputs.segments.iter().filter(|s| !s.direct).map(|s| (s.slot, s.row0)));
         self.shape.clear();
-        self.shape.extend(self.segments.iter().map(|s| (s.slot, s.direct, s.n_rows, s.row0)));
+        self.shape
+            .extend(self.inputs.segments.iter().map(|s| (s.slot, s.direct, s.n_rows, s.row0)));
         if let Some(key) = pass {
             return self.enqueue_pass(step, key, number as u32);
         }
@@ -467,14 +381,16 @@ impl Qwen4ExpDevice {
         // The rows of the step's image cells, copied over the gathered ones by
         // the part that embeds.
         self.part.splice_rows(rows::image_splices(record, step.image_stage, self.part.n_embd()));
-        let rotary = (!self.rotary.is_empty()).then_some(self.rotary.as_slice());
-        let mut host = StepRecord::new(&self.segments, &self.tokens, rotary, &self.out_rows)?;
-        for (i, s) in self.segments.iter().enumerate() {
-            if self.replay.iter().any(|r| r.contains(&s.row0)) {
+        let rotary = (!self.inputs.rotary.is_empty()).then_some(self.inputs.rotary.as_slice());
+        let mut host =
+            StepRecord::new(&self.inputs.segments, &self.inputs.tokens, rotary, &self.out_rows)?;
+        for (i, s) in self.inputs.segments.iter().enumerate() {
+            if self.inputs.replay.iter().any(|r| r.contains(&s.row0)) {
                 host.mark_replay(i)?;
             }
         }
-        let (segments, tokens, replay) = (&self.segments, &self.tokens, &self.replay);
+        let (segments, tokens, replay) =
+            (&self.inputs.segments, &self.inputs.tokens, &self.inputs.replay);
 
         // The step: every layer, with the host serving the store behind it.
         let (token, xbase) =
@@ -612,18 +528,7 @@ impl DeviceModel for Qwen4ExpDevice {
     }
 
     fn model_drafts(&self) -> Option<ModelDrafts> {
-        // The step's one list: the MTP block's when the device has it (the
-        // DFlash drafter writes its drafts into it), else the DFlash
-        // drafter's.
-        let mtp = self.mtp.as_ref().map_or(0, MtpBlock::drafted);
-        let dflash = self.part.dflash().map_or(0, |d| d.drafted());
-        let tokens = mtp.max(dflash);
-        let ptr = match (&self.mtp, self.part.dflash()) {
-            (Some(block), _) => block.list(),
-            (None, Some(d)) => d.own_list(),
-            (None, None) => return None,
-        };
-        (tokens > 0).then_some(ModelDrafts { ptr, tokens })
+        self.drafters().drafted()
     }
 
     fn transfer(
@@ -640,24 +545,11 @@ impl DeviceModel for Qwen4ExpDevice {
     }
 
     fn model_draft_ms(&mut self) -> f64 {
-        let pass = self.part.dflash_pass_ms();
-        self.mtp.as_mut().map_or(0.0, MtpBlock::chain_ms) + pass
+        step::draft_ms(self.mtp.as_mut().map(MtpBlock::driver_mut), self.part.dflash_mut())
     }
 
     fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
-        let Some(drafts) = self.model_drafts() else { return };
-        let from = out.len();
-        out.resize(from + drafts.tokens as usize, f32::NAN);
-        if let Some(block) = &self.mtp {
-            block.probs(&mut out[from..]);
-        }
-        if let Some(d) = self.part.dflash().filter(|d| d.drafted() > 0) {
-            for s in d.last_pass() {
-                for j in s.place..s.place + s.wanted {
-                    out[from + j as usize] = d.prob(j);
-                }
-            }
-        }
+        self.drafters().probs(out);
     }
 
     fn paused(&self) -> bool {
