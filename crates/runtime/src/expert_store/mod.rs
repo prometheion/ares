@@ -93,7 +93,7 @@ use ares_core::LedgerError;
 use ares_io::{Buffer, Class, Completion, ExpertMap, Read, Reader};
 use ares_weights::{ExpertHeat, GuessQueue, LayerNeed, SplitRule, Start, Swap, Want, split_slots};
 
-pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
+pub use device::{CudaSlots, SlotDevice};
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
 pub use hybrid::{CostModel, ExpertTypes, Miss, PromoteRule, Serve, WideCpu, WidePick};
@@ -415,10 +415,8 @@ pub struct StoreStats {
     pub cpu_start_ms: Vec<f32>,
     /// Experts that took a VRAM slot between steps, by heat.
     pub promotions: u64,
-    /// Experts a step missed that were uploaded on loan, and members on loan
-    /// that became members like any other by their heat, without a copy.
+    /// Experts a step missed that were uploaded on loan.
     pub loans: u64,
-    pub loans_kept: u64,
     /// Milliseconds the reads of experts a step waited for took, from their
     /// start to the bytes being in RAM, summed over the experts.
     pub demand_read_ms: f64,
@@ -467,12 +465,6 @@ pub struct StoreStats {
     pub pieces_released: u64,
     pub pieces_locked: u64,
     pub piece_evictions: u64,
-    /// Experts that only the file held and that only rows verifying drafts
-    /// or rows left already picked, which were not read for them; and the
-    /// experts in a tier that only rows left already picked, which were not
-    /// computed.
-    pub left_reads: u64,
-    pub left_experts: u64,
     /// The read-ahead of predicted picks ([`ExpertStore::ahead`]): experts a prediction
     /// named for a layer before its router ran (each once per step), and of them those the
     /// router then picked.
@@ -858,7 +850,6 @@ impl<D: SlotDevice> ExpertStore<D> {
         reader: Reader,
         devices: Vec<D>,
         region: HostRegion,
-        profile: Option<&ExpertHeat>,
     ) -> Result<Self, StoreError> {
         let StorePlan { config, n_experts, block, layers, vram, ram, transit, layout } = plan;
         let mut region = region;
@@ -876,12 +867,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         {
             return Err(StoreError::Plan(format!("no device {missing} was given")));
         }
-        let mut heat = ExpertHeat::new(layers.len(), n_experts, config.heat_decay);
-        if let Some(profile) = profile {
-            for layer in 0..layers.len() {
-                heat.layer_mut(layer).copy_from_slice(profile.layer(layer));
-            }
-        }
+        let heat = ExpertHeat::new(layers.len(), n_experts, config.heat_decay);
         let ram_skip = ram.pools.iter().map(|p| vec![[0; 3]; p.slots as usize]).collect();
         region.cut(&layout.spans);
         let pieces = Pieces::new(layout, &ram);

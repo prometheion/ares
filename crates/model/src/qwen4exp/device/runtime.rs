@@ -780,7 +780,7 @@ pub fn widest_rows<E>(
 /// about 50 KiB a row on Flash-Next against 0.5 to 0.7 MiB of scratch) for
 /// good, which the slots lose, as do the parcels a split by layers hands the
 /// residual over in (80 KiB a row on the receiving device); what is estimated
-/// here leaves a tenth of the lendable_scratch room spare for what the plan of the
+/// here leaves a tenth of the lendable room spare for what the plan of the
 /// store takes besides (transit). `drafter` is what the drafters take of the bytes for
 /// slots on the device with the head (the MTP block's experts stay resident there), which
 /// the slots of that device do not have.

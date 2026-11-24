@@ -1128,7 +1128,12 @@ fn main() -> Result<(), AnyError> {
         plan.slots(0),
         LAYERS * EXPERTS,
     );
-    let mut store = ExpertStore::new(plan, map, reader, slots, region, profile.as_ref())?;
+    let mut store = ExpertStore::new(plan, map, reader, slots, region)?;
+    if let Some(heat) = &profile {
+        for layer in 0..store.n_layers() {
+            store.set_heat(layer, heat.layer(layer));
+        }
+    }
     let mut workers = 0;
     let _idle_pool = if options.idle_pool && options.serve == Serve::Stream {
         let placement = Placement::for_machine(&Topology::read(), 1);

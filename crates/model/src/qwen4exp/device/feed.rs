@@ -921,7 +921,7 @@ pub(super) fn build_store(
     region: HostRegion,
     cpu: Option<(CpuPool, Serve)>,
 ) -> Result<ExpertStore<CudaSlots>, Error> {
-    let mut store = ExpertStore::new(plan, map, reader, slots, region, None)?;
+    let mut store = ExpertStore::new(plan, map, reader, slots, region)?;
     if let Some((pool, serve)) = cpu {
         store.enable_cpu(pool, layout.shapes.clone(), serve)?;
     }

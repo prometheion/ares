@@ -1,5 +1,6 @@
 //! Executors without a GPU, for testing the conductor and for measuring it
-//! alone.
+//! alone, and expert slots without a device for the tests of the expert store
+//! ([`HostSlots`]).
 //!
 //! [`HostExecutor`] runs no model. It reads the rows of the step record and
 //! answers each with [`SyntheticModel::host_pick`], a fixed function of the
@@ -70,6 +71,7 @@
 //! host needs for a step.
 
 mod faulty;
+mod slots;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -84,6 +86,7 @@ use crate::synthetic::SyntheticModel;
 use crate::timing::DeviceTimes;
 
 pub use faulty::{Failure, Fault, Faulty};
+pub use slots::{HostShareState, HostSlots};
 
 /// A latch a test closes to hold steps back and opens to let them finish.
 #[derive(Clone, Debug)]

@@ -11,9 +11,10 @@ use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_io::{Config, ExpertMap, Reader};
 use ares_runtime::expert_store::{
-    ExpertStore, FillOrder, FillPace, FillTier, HostRegion, HostSlots, LayerSpec, StoreConfig,
-    StorePlan, TierFill,
+    ExpertStore, FillOrder, FillPace, FillTier, HostRegion, LayerSpec, StoreConfig, StorePlan,
+    TierFill,
 };
+use ares_runtime::testing::HostSlots;
 
 const LAYERS: usize = 3;
 const EXPERTS: u32 = 16;
@@ -116,7 +117,7 @@ fn rig(vram_slots: u64, ram_slots: u64, pieces: Option<(usize, usize)>) -> Rig {
     if let Some((per_piece, start)) = pieces {
         region = region.starting_with(start * (per_piece * ram_slot).next_multiple_of(4096));
     }
-    let store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+    let store = ExpertStore::new(plan, map, reader, vec![device], region).unwrap();
     Rig { store, _dir: dir }
 }
 

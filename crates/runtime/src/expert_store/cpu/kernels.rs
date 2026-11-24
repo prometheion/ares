@@ -956,8 +956,9 @@ impl DownKind {
         }
     }
 
-    /// The type of the matrix.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The type of the matrix, for the tests that decode it with the
+    /// reference.
+    #[cfg(test)]
     pub(super) fn ty(self) -> GgmlType {
         match self {
             Self::Q2_0 => GgmlType::Q2_0,

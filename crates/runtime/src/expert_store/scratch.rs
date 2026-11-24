@@ -18,7 +18,7 @@
 //! change hands (as the RAM tier does when it gives pieces back, `elastic.rs`).
 //!
 //! **When.** Between steps, once no upload, copy or read touches the device's
-//! slots ([`ExpertStore::lend_scratch`] says `None` until then), and the memory
+//! slots ([`ExpertStore::lend_pieces`] says `None` until then), and the memory
 //! is the borrower's when [`ExpertStore::scratch_ready`] says so: the moves and
 //! the copies down have run. Given back between steps as well, when nothing
 //! the borrower enqueued still uses it ([`ExpertStore::return_scratch`]): the
@@ -119,12 +119,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             .collect()
     }
 
-    /// The most bytes `device` can lend in one piece: what its largest pool
-    /// can ([`ExpertStore::lendable_pieces`]).
-    pub fn lendable_scratch(&self, device: usize) -> u64 {
-        self.lendable_pieces(device).first().copied().unwrap_or(0)
-    }
-
     /// Where a loan of `pieces` of `device` lies (bytes of each pool, in the
     /// order of [`ExpertStore::lendable_pieces`]), made or not: always the
     /// same slots for the same bytes, a loan per piece that is not empty.
@@ -153,21 +147,9 @@ impl<D: SlotDevice> ExpertStore<D> {
         (!loans.is_empty()).then_some(loans)
     }
 
-    /// Where a loan of `bytes` of `device` in one piece lies, made or not:
-    /// always the same slots of its largest pool for the same bytes. `None`
-    /// when the layers cannot give that much.
-    pub fn scratch_at(&self, device: usize, bytes: u64) -> Option<ScratchLoan> {
-        self.scratch_pieces_at(device, &[bytes]).and_then(|loans| loans.first().copied())
-    }
-
     /// Whether `device` has lent VRAM, ready or not.
     pub fn has_scratch(&self, device: usize) -> bool {
         self.scratch.get(device).is_some_and(Option::is_some)
-    }
-
-    /// The first piece of the loan of `device`, once it is ready.
-    pub fn loan(&self, device: usize) -> Option<ScratchLoan> {
-        self.scratch_loans(device).and_then(|loans| loans.first().copied())
     }
 
     /// The pieces of the loan of `device`, once it is ready.
@@ -183,16 +165,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             && self.reads.is_empty()
             && self.device_ops[device].iter().all(|ops| ops.is_empty())
             && !self.transit.is_busy()
-    }
-
-    /// Lends `bytes` of VRAM of `device` in one piece, between steps: the slots
-    /// at the end of its largest pool ([`ExpertStore::lend_pieces`]).
-    pub fn lend_scratch(
-        &mut self,
-        device: usize,
-        bytes: u64,
-    ) -> Result<Option<ScratchLoan>, StoreError> {
-        Ok(self.lend_pieces(device, &[bytes])?.and_then(|loans| loans.first().copied()))
     }
 
     /// Lends VRAM of `device`, between steps: `pieces` bytes of its pools, in

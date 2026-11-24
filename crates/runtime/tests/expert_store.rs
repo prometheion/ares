@@ -13,8 +13,9 @@ use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_io::{Config, ExpertMap, Reader};
 use ares_runtime::expert_store::{
-    ExpertStore, HostRegion, HostSlots, LayerSpec, Locker, StoreConfig, StoreError, StorePlan,
+    ExpertStore, HostRegion, LayerSpec, Locker, ScratchLoan, StoreConfig, StoreError, StorePlan,
 };
+use ares_runtime::testing::HostSlots;
 
 const LAYERS: usize = 3;
 const EXPERTS: u32 = 16;
@@ -161,10 +162,7 @@ fn rig_reading(
         // A piece is whole pages.
         region = region.starting_with(start * (per_piece * ram_slot).next_multiple_of(4096));
     }
-    Rig {
-        store: ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap(),
-        _dir: dir,
-    }
+    Rig { store: ExpertStore::new(plan, map, reader, vec![device], region).unwrap(), _dir: dir }
 }
 
 impl Rig {
@@ -272,7 +270,7 @@ fn a_resident_layer_holds_all_its_experts_outside_the_tiers_and_never_misses() {
     let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
     let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
     let mut rig = Rig {
-        store: ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap(),
+        store: ExpertStore::new(plan, map, reader, vec![device], region).unwrap(),
         _dir: dir,
     };
     assert!(rig.store.is_resident(0) && !rig.store.is_resident(1));
@@ -768,7 +766,7 @@ mod hybrid {
         assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
         let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
         let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
-        let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+        let mut store = ExpertStore::new(plan, map, reader, vec![device], region).unwrap();
         let pool = CpuPool::new(&Placement::unpinned(2), Duration::from_millis(1)).unwrap();
         store.enable_cpu(pool, vec![SHAPE; LAYERS], serve).unwrap();
         let x: Vec<f32> = (0..256).map(|i| ((i * 37 % 255) as f32 - 127.0) / 64.0).collect();
@@ -884,8 +882,8 @@ mod hybrid {
             rig.store.end_step().unwrap();
             rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
         }
-        let lendable = rig.store.lendable_scratch(0);
-        let loan = rig.store.lend_scratch(0, lendable / 2).unwrap().expect("a loan");
+        let lendable = rig.store.lendable_pieces(0)[0];
+        let loan = lend_one(&mut rig.store, lendable / 2).unwrap().expect("a loan");
         rig.until("lent", |store| store.is_settled());
         assert!(rig.store.scratch_ready(0).unwrap());
         rig.store.take_stats();
@@ -1485,7 +1483,7 @@ mod device {
                 .unwrap();
         slots.add_host_shares(&mut vram, &mut pinned, SHAPE.host_share_bytes(MAX_ROWS)).unwrap();
         let region = HostRegion::pinned(device, &mut pinned, plan.ram_bytes()).unwrap();
-        let mut store = ExpertStore::new(plan, map, reader, vec![slots], region, None).unwrap();
+        let mut store = ExpertStore::new(plan, map, reader, vec![slots], region).unwrap();
         let pool = CpuPool::new(&Placement::unpinned(2), Duration::from_millis(1)).unwrap();
         store.enable_cpu(pool, vec![SHAPE; LAYERS], serve).unwrap();
 
@@ -2485,7 +2483,7 @@ fn give_up_pieces_of_two_pools(
     assert_eq!((plan.slots(0).1, plan.slots(4).1), (6, 6));
     let device = HostSlots::new(&plan.device_pools(0), 5, EXPERTS);
     let region = region(&plan);
-    let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+    let mut store = ExpertStore::new(plan, map, reader, vec![device], region).unwrap();
     let whole = store.ram_bytes().0;
     let agree = |store: &ExpertStore<HostSlots>, more: usize, what: &str| {
         if let Some(bytes) = locked() {
@@ -2542,18 +2540,18 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     let (_, pool) = rig.store.place(0);
     let slots_before: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
     assert_eq!(slots_before, [8, 8, 8]);
-    assert_eq!(rig.store.lendable_scratch(0), (3 * (8 - 2)) as u64 * SLOT_BYTES);
+    assert_eq!(rig.store.lendable_pieces(0), [(3 * (8 - 2)) as u64 * SLOT_BYTES]);
     assert_eq!(
-        rig.store.lend_scratch(0, 19 * SLOT_BYTES).unwrap(),
+        lend_one(&mut rig.store, 19 * SLOT_BYTES).unwrap(),
         None,
         "more than the layers have"
     );
     // Ten slots: the last ten of the pool of 24.
-    let loan = rig.store.lend_scratch(0, 10 * SLOT_BYTES - 5).unwrap().expect("a loan");
+    let loan = lend_one(&mut rig.store, 10 * SLOT_BYTES - 5).unwrap().expect("a loan");
     assert_eq!((loan.pool, loan.first, loan.slots, loan.stride), (pool, 14, 10, SLOT_BYTES));
     rig.settle();
     assert!(rig.store.scratch_ready(0).unwrap());
-    assert_eq!(rig.store.loan(0), Some(loan));
+    assert_eq!(rig.store.scratch_loans(0), Some(vec![loan]));
     // No table entry names a lent slot, and every expert VRAM holds is usable
     // where its entry says.
     let mut held = 0;
@@ -2580,7 +2578,7 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     }
     // Given back: the slots are the layers' again and fill.
     rig.store.return_scratch(0).unwrap();
-    assert_eq!(rig.store.loan(0), None);
+    assert_eq!(rig.store.scratch_loans(0), None);
     let slots_after: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
     assert_eq!(slots_after, slots_before);
     let picks: Vec<Vec<u32>> = (0..LAYERS).map(|_| (8..16).collect()).collect();
@@ -2589,6 +2587,14 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     let stats = rig.store.take_stats();
     assert_eq!(stats.scratch_loans, 1);
     assert!(stats.scratch_moves > 0, "what stayed in the lent slots moved");
+}
+
+/// Lends `bytes` of device 0 in one piece, of its largest pool.
+fn lend_one(
+    store: &mut ExpertStore<HostSlots>,
+    bytes: u64,
+) -> Result<Option<ScratchLoan>, StoreError> {
+    Ok(store.lend_pieces(0, &[bytes])?.and_then(|loans| loans.first().copied()))
 }
 
 /// Loans one after the other, with steps between them that move experts around: every loan
@@ -2610,7 +2616,7 @@ fn loans_one_after_the_other_find_a_home_for_what_stays_in_their_slots() {
             rig.step(&picks);
         }
         let slots = 4 + (round % 3) as u64 * 3;
-        let loan = rig.store.lend_scratch(0, slots * SLOT_BYTES).unwrap().expect("a loan");
+        let loan = lend_one(&mut rig.store, slots * SLOT_BYTES).unwrap().expect("a loan");
         rig.settle();
         assert!(rig.store.scratch_ready(0).unwrap());
         // A step on the loan: its misses go into slots outside it.
@@ -2657,7 +2663,7 @@ fn a_loan_takes_the_last_slots_of_every_pool_it_asks_and_gives_them_back() {
     let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
     let device = HostSlots::new(&plan.device_pools(0), 5, EXPERTS);
     let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
-    let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+    let mut store = ExpertStore::new(plan, map, reader, vec![device], region).unwrap();
     for picks in [[0, 1], [2, 3], [4, 5], [6, 7]] {
         mixed_step(&mut store, &picks).unwrap();
     }

@@ -544,15 +544,10 @@ impl<D: SlotDevice> ExpertStore<D> {
                 }
             }
             if leave {
-                if from_file {
-                    self.stats.left_reads += 1;
-                    // The token of a left row is likely the next step's
-                    // first, which will route here again.
-                    if self.config.read_left {
-                        self.guesses.guess(&mut self.ram.sets, layer, &[expert], self.step + 1);
-                    }
-                } else {
-                    self.stats.left_experts += 1;
+                // The token of a left row is likely the next step's first,
+                // which will route here again.
+                if from_file && self.config.read_left {
+                    self.guesses.guess(&mut self.ram.sets, layer, &[expert], self.step + 1);
                 }
                 self.windows.leave(group.rows);
                 left.push(g);
@@ -923,7 +918,6 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         for (layer, expert, member) in keeps {
             self.vram.sets[layer].keep_loan(expert, member);
-            self.stats.loans_kept += 1;
             self.worth_stale[layer] = true;
         }
         wanted.sort_by(|a, b| b.0.total_cmp(&a.0));
