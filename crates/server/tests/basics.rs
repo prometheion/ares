@@ -37,6 +37,7 @@ fn synthetic(close: Option<&str>, queue: Option<u32>) -> Arc<Runtime> {
             refused_efforts: Vec::new(),
         }),
         tools: None,
+        system_first: true,
     });
     let model = Arc::new(SyntheticModel::new(config).unwrap());
     let config = RuntimeConfig {

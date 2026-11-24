@@ -20,7 +20,7 @@ async fn serve(
     options: ModelOptions,
 ) -> (Arc<MockEngine>, axum::Router) {
     let engine = MockEngine::script(steps);
-    engine.set_chat_format(ChatFormat { thinking, tools: None });
+    engine.set_chat_format(ChatFormat { thinking, tools: None, system_first: true });
     let app = router_of(engine.clone(), options, Config::default()).await;
     (engine, app)
 }

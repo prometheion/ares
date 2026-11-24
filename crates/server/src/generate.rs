@@ -5,8 +5,9 @@
 //!    (`openai::request::from_json` for a body in the chat format; a route of
 //!    another API writes its body over into that format first, as the
 //!    `anthropic` module does).
-//! 2. [`prepare`] applies what the request says about thinking and tools to
-//!    it, and returns the [`Sorter`] of its reply.
+//! 2. [`prepare`] places its system messages as the model's template takes
+//!    them, applies what the request says about thinking and tools to it, and
+//!    returns the [`Sorter`] of its reply.
 //! 3. [`Generation::start`] hands the request to the engine, and
 //!    [`Generation::next`] gives the reply as it comes: [`Piece`]s
 //!    (reasoning, content, the start of a call, fragments of its arguments)
@@ -21,7 +22,7 @@
 
 use std::time::Duration;
 
-use ares_api::{GenerateRequest, TokenProbs, Usage};
+use ares_api::{ChatFormat, GenerateRequest, Message, Prompt, Role, TokenProbs, Usage};
 
 use crate::ReasoningFormat;
 use crate::bridge::{Item, Run, Timings};
@@ -34,7 +35,9 @@ use crate::sorter::{Piece, Sorter};
 use crate::tools;
 
 /// Takes the model a chat request names ([`model_of`]: the request waits
-/// for its load), gives the request the model's defaults for what it leaves
+/// for its load), places its system messages as the model's chat template
+/// takes them ([`place_system_messages`] where the template declares
+/// [`ChatFormat::system_first`]), gives the request the model's defaults for what it leaves
 /// out and holds the length of its reply to the model's limit (the
 /// `defaults` module), applies what the request says about thinking and
 /// about tools to the request for the engine (the variables of the chat
@@ -49,12 +52,53 @@ pub(crate) async fn prepare(
     api: &'static str,
 ) -> Result<(Sorter, Lease), ApiError> {
     let lease = model_of(app, &mut parsed.request.model).await?;
+    let chat = lease.engine().chat_format(&parsed.request.model);
+    if let (Some(ChatFormat { system_first: true, .. }), Prompt::Chat { messages, .. }) =
+        (chat, &mut parsed.request.prompt)
+    {
+        place_system_messages(messages);
+    }
     lease.defaults().apply(parsed);
     let format = format.unwrap_or(lease.reasoning_format());
     let thinking = reasoning::apply(parsed, &**lease.engine(), format)?;
     let calls = tools::apply(parsed, &**lease.engine(), &thinking)?;
     log_request(app, parsed, api);
     Ok((Sorter::new(thinking.splitter, calls), lease))
+}
+
+/// What the system messages of a conversation join: an empty line, as the
+/// Responses route joins `instructions` with them.
+const BETWEEN_SYSTEM_MESSAGES: &str = "\n\n";
+
+/// The messages of the system (and of the developer, which is the system
+/// here) as a chat template takes them that refuses a system message anywhere
+/// but first ([`ChatFormat::system_first`], as Qwen's): the ones that stand
+/// before every other message are one system message, their texts joined by
+/// an empty line; one after another message becomes a message of the user
+/// with its text, which is where a model reads what came in between (Claude
+/// Code sends its environment and the tokens left that way, Codex its
+/// instructions of a turn).
+///
+/// Every route that generates comes through [`prepare`]: the Messages and the
+/// Responses routes write their bodies over into a chat body, with a system
+/// turn where it stood.
+pub(crate) fn place_system_messages(messages: &mut Vec<Message>) {
+    let leading = messages.iter().take_while(|m| m.role == Role::System).count();
+    if leading > 1 {
+        let texts: Vec<String> =
+            messages.drain(1..leading).map(|m| m.content).filter(|text| !text.is_empty()).collect();
+        let first = &mut messages[0];
+        for text in texts {
+            if !first.content.is_empty() {
+                first.content.push_str(BETWEEN_SYSTEM_MESSAGES);
+            }
+            first.content.push_str(&text);
+        }
+    }
+    let from = usize::from(leading > 0);
+    for message in messages.iter_mut().skip(from).filter(|m| m.role == Role::System) {
+        message.role = Role::User;
+    }
 }
 
 /// The line of the log for a request that is taken: its API, its parameters

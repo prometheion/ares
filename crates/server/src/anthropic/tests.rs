@@ -242,16 +242,17 @@ fn a_turn_of_the_system_joins_the_system_prompt_or_is_read_as_a_turn_of_the_user
             {"role": "system", "content": "<total_tokens>999</total_tokens>"},
         ])
     );
-    // The reader of the chat body, the rule of every route, makes the later
-    // ones turns of the user.
+    // For a template that takes a system message only first (Qwen's), every
+    // route makes the later ones turns of the user.
     let json: Json = serde_json::from_value(got.clone()).unwrap();
-    let parsed = crate::openai::request::from_json(
+    let mut parsed = crate::openai::request::from_json(
         crate::openai::request::Endpoint::Chat,
         &json,
         ares_api::RequestId(1),
     )
     .unwrap();
-    let ares_api::Prompt::Chat { messages, .. } = &parsed.request.prompt else { panic!() };
+    let ares_api::Prompt::Chat { messages, .. } = &mut parsed.request.prompt else { panic!() };
+    crate::generate::place_system_messages(messages);
     let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
     assert_eq!(roles, ["system", "user", "user", "assistant", "tool", "user"]);
     // The reply is a new turn, not a continuation of the last one.

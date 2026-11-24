@@ -319,13 +319,14 @@ impl Server {
                 let template = ChatTemplate::new(source, "", "").unwrap();
                 let thinking = ReasoningFormat::detect(&template)
                     .map(|format| chat::thinking_format(format, &chat));
+                let system_first = template.system_first();
                 Arc::new(Templated {
                     trace: trace.clone(),
                     tokenizer: Tokenizer::from_gguf(&Gguf::open(path).unwrap()).unwrap(),
                     template,
                     inner: qwen,
                     chat,
-                    format: ChatFormat { thinking, tools: None },
+                    format: ChatFormat { thinking, tools: None, system_first },
                 })
             }
         };

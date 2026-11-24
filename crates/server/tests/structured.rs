@@ -25,7 +25,7 @@ async fn structure_of(
     thinking: Option<ThinkingFormat>,
 ) -> Option<Structure> {
     let engine = instant();
-    engine.set_chat_format(ChatFormat { thinking, tools: None });
+    engine.set_chat_format(ChatFormat { thinking, tools: None, system_first: true });
     submitted(&engine, &app(&engine).await, path, body).await.structure
 }
 

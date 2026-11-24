@@ -399,7 +399,7 @@ impl Engine for MockEngine {
 
 /// What the template of Qwen3.8 declares.
 pub fn qwen() -> ChatFormat {
-    ChatFormat { thinking: Some(qwen_thinking()), tools: Some(qwen_tools()) }
+    ChatFormat { thinking: Some(qwen_thinking()), tools: Some(qwen_tools()), system_first: true }
 }
 
 /// How the template of Qwen3.8 thinks.

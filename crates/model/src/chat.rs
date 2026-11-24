@@ -134,13 +134,16 @@ impl ModelText {
 /// template's default with `chat` applied.
 pub fn chat_format(tokenizer: &Tokenizer, chat: &ChatOptions) -> ChatFormat {
     // A template the server was started with takes the place of the file's.
-    let (reasoning, tools) = match &chat.template {
-        Some(template) => {
-            (ReasoningFormat::detect(template), ares_tokenizer::ToolFormat::detect(template))
-        }
-        None => (tokenizer.reasoning_format(), tokenizer.tool_format()),
+    let (reasoning, tools, system_first) = match &chat.template {
+        Some(template) => (
+            ReasoningFormat::detect(template),
+            ares_tokenizer::ToolFormat::detect(template),
+            template.system_first(),
+        ),
+        None => (tokenizer.reasoning_format(), tokenizer.tool_format(), tokenizer.system_first()),
     };
     ChatFormat {
+        system_first,
         thinking: reasoning.map(|format| thinking_format(format, chat)),
         tools: tools.map(|format| ToolFormat {
             call_open: format.call_open,

@@ -38,9 +38,9 @@
 //! joined by an empty line: Codex puts its instructions at the head of
 //! `input`, and the chat template of Qwen3.5-0.8B refuses a system message
 //! that is not the first one. Such a message inside a conversation is a
-//! message of the user with its text, as on every route
-//! (`openai::request::place_system_messages`). The items one reply returned for a turn (reasoning,
-//! message, calls) are one message of the assistant again.
+//! message of the user with its text for such a template, as on every route
+//! (`generate::place_system_messages`). The items one reply returned for a
+//! turn (reasoning, message, calls) are one message of the assistant again.
 //!
 //! Anything else is refused with a 400 that names it: `input_image`,
 //! `input_file` and `input_audio` parts (input other than text is not

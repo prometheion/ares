@@ -320,9 +320,9 @@ fn steady_billing_header(text: &str) -> String {
 /// A turn of the system before any other turn joins `system`, the system
 /// prompt, as its blocks are joined. One between other turns (Claude Code
 /// sends its environment and the tokens left that way) stays a system message
-/// where it stands, which the reader of the chat body gives to the template
-/// as a turn of the user (`openai::request::place_system_messages`, the rule of every
-/// route).
+/// where it stands, which every route gives to a template that takes a
+/// system message only first as a turn of the user
+/// (`generate::place_system_messages`).
 ///
 fn conversation(
     fields: &Fields<'_>,

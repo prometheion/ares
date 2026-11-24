@@ -70,6 +70,7 @@ async fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> R
             before_calls: "  ".into(),
             between_calls: " ".into(),
         }),
+        system_first: true,
     });
     let model = Arc::new(SyntheticModel::new(config).unwrap());
     let config = RuntimeConfig {

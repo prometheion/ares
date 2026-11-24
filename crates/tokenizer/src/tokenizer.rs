@@ -426,6 +426,14 @@ impl Tokenizer {
         ChatTemplate::new(source, &text_of(special.bos), &text_of(special.eos))
     }
 
+    /// Whether the model's chat template takes a system message only before
+    /// every other message ([`ChatTemplate::system_first`]); false without a
+    /// template.
+    pub fn system_first(&self) -> bool {
+        let template = self.chat.as_ref().or(self.chat_tool_use.as_ref());
+        template.and_then(|t| t.as_ref().ok()).is_some_and(|t| t.system_first())
+    }
+
     /// How the model's chat template handles thinking, or `None` if it has
     /// none (or no chat template, or one that cannot be used).
     pub fn reasoning_format(&self) -> Option<ReasoningFormat> {

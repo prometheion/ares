@@ -1,6 +1,6 @@
-//! What the chat templates say about thinking: templates written for the tests,
-//! with the structure of the templates of the Qwen3.5 family, and the real
-//! templates of three model files.
+//! What the chat templates say about thinking (and where they take a system
+//! message): templates written for the tests, with the structure of the
+//! templates of the Qwen3.5 family, and the real templates of three model files.
 //!
 //! The real templates are read from the model files named by
 //! `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` (Qwen3.8-27B) and
@@ -174,6 +174,25 @@ fn a_template_that_fails_on_a_probe_has_no_thinking_instead_of_an_error() {
 
 // The real templates.
 
+/// A template that raises an exception for a system message after another
+/// message, as Qwen's do, takes one only first; one that writes it anywhere
+/// (or drops it, as `QWEN_LIKE`) does not say so.
+#[test]
+fn a_template_that_refuses_a_later_system_message_takes_one_only_first() {
+    assert!(!template(QWEN_LIKE).system_first());
+    let refusing = QWEN_LIKE.replace(
+        r#"    {%- if message.role == "user" %}
+        {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}"#,
+        r#"    {%- if message.role == "system" %}
+        {%- if not loop.first %}{{- raise_exception('System message must be at the beginning.') }}{%- endif %}
+        {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
+    {%- elif message.role == "user" %}
+        {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}"#,
+    );
+    assert_ne!(refusing, QWEN_LIKE);
+    assert!(template(&refusing).system_first());
+}
+
 fn tokenizer_of(variable: &str, what: &str) -> Option<Tokenizer> {
     let Some(path) = std::env::var_os(variable) else {
         eprintln!("skipped: set {variable} to the model file of {what}");
@@ -204,6 +223,7 @@ fn the_template_of_qwen35_0_8b_has_the_same_tags_but_drops_the_thinking_of_earli
     // template does not read an effort.
     let format = ReasoningFormat { keeps_history: false, effort: false, ..qwen_format() };
     assert_eq!(tokenizer.reasoning_format(), Some(format));
+    assert!(tokenizer.system_first());
 }
 
 #[test]
@@ -212,6 +232,7 @@ fn the_template_of_qwen38_27b_declares_the_qwen_format() {
     // It takes low, medium, high and xhigh.
     let format = ReasoningFormat { refused_efforts: vec!["minimal".into()], ..qwen_format() };
     assert_eq!(tokenizer.reasoning_format(), Some(format));
+    assert!(tokenizer.system_first());
 }
 
 #[test]
@@ -223,4 +244,5 @@ fn the_template_of_qwen38_flash_next_declares_the_qwen_format() {
     let refused_efforts = vec!["minimal".into(), "high".into()];
     let format = ReasoningFormat { refused_efforts, ..qwen_format() };
     assert_eq!(tokenizer.reasoning_format(), Some(format));
+    assert!(tokenizer.system_first());
 }

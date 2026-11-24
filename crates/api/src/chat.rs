@@ -14,6 +14,12 @@ pub struct ChatFormat {
     /// How the model writes a call of a tool, or `None` if its template
     /// writes calls in no way the engine knows (or has no tools at all).
     pub tools: Option<ToolFormat>,
+    /// Whether the template takes a system message only before every other
+    /// message, as Qwen's do: the front end then joins the system messages
+    /// before the conversation into one and gives one inside it to the
+    /// template as a message of the user.
+    #[serde(default)]
+    pub system_first: bool,
 }
 
 /// How a model writes the calls of tools into its reply: every call between

@@ -211,6 +211,20 @@ impl ChatTemplate {
         &self.source
     }
 
+    /// Whether the template takes a system message only before every other
+    /// message, as Qwen's do (they raise an exception for a later one): it
+    /// renders a system message and a user's, and refuses a system message
+    /// after a user's.
+    pub fn system_first(&self) -> bool {
+        let options = ChatOptions::default();
+        let renders = |roles: &[&str]| {
+            let messages: Vec<Message> =
+                roles.iter().map(|role| Message::new(*role, "Hi")).collect();
+            self.render(&messages, &[], &options).is_ok()
+        };
+        renders(&["system", "user"]) && !renders(&["user", "system", "user"])
+    }
+
     /// Renders the conversation.
     ///
     /// # Errors
