@@ -1565,6 +1565,28 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         `ARES_TEST_QWEN38_27B_IQ2`, `ARES_TEST_FLASH_NEXT`, `ARES_TEST_FLASH_NEXT_MTP`; the
         kernels' `ARES_TEST_GGUF` is any file). `Question::option_texts` is used by its tests
         only (System One's groundwork, kept).
+      Model part done on `cleanup2/model` (2026-11-24): one opening path and one flow for
+      Flash-Next (`device/open.rs`, `device/flow.rs`: the runtime's device threads, the session and
+      the roles' trial open through the same stages, the threads and the session step through the
+      same `Flow`; `runtime.rs` split into `runtime/{parts,meeting,device,plan}.rs` and
+      `part/frame.rs` out of `part.rs`; `ModelOptions` for what the server builds), the step record
+      read and the drafts handed out once for both models (`blocks/step.rs`), their text half
+      (`chat::ModelText`), one arena of weights (`blocks/arena.rs`: Flash-Next now uploads through
+      the 27B's file reads), the references' operations (`crate::reference`), the made-up
+      Flash-Next on the GGUF builder, small copies (`MTP_KV`, `invalid`, the draft vocabulary
+      reader, the segment checks). `Session` stays a face of its own, not one over the executor as
+      the 27B's: its per-layer probe stops both devices at every layer and reads both parts, which
+      the runtime's device threads could only do with a barrier inside the production step, and
+      the tests read the logits on the host, which the runtime samples on the device. Left for the
+      model: the tools (`qwen4exp_run`, `qwen4exp_prune`) measure the session, not the runtime
+      (moving them drops `--owners routing` and the host time of a step: the owner's call);
+      `roles::Runner` stays the trial's own timing loop (no store, every expert in zeros);
+      Flash-Next's embedding staging written twice (`part.rs`, `part/pass.rs`), the profile marks
+      of both parts, `Balance` beside `Meeting`, the record's token offset read by hand (an
+      `ares-cuda` accessor), the server's draft vocabulary reader (server phase), `Qwen35::new`
+      reading its tokenizer while `Qwen4Exp::new` is given one, the large functions left
+      (`Frame::widest`, `enqueue_pass`, `Part::assemble`, `open_balanced`) and the names of the
+      audit's finding 13.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
