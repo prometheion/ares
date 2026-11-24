@@ -820,12 +820,17 @@ impl Qwen4ExpDevice {
             // makes room for when it opens the pass.
             Some(_) => self.flow.await_picks(self.flow.pass_generation())?,
             None => {
-                let picks = match self.picks.take() {
-                    Some(picks) if picks.holds(key.rows, top_k) => picks,
-                    _ => Arc::new(SpanPicks::new(self.part.device(), key.rows, top_k)?),
+                // Taken when the part was opened, for the widest pass.
+                let picks = match &self.picks {
+                    Some(picks) if picks.holds(key.rows, top_k) => picks.clone(),
+                    _ => {
+                        return Err(invalid(format!(
+                            "a pass of {} rows; the part was opened for {}",
+                            key.rows, self.flow.pass_rows
+                        )));
+                    }
                 };
-                self.picks = Some(picks.clone());
-                picks.reset();
+                picks.reset(key.rows, top_k);
                 *self.flow.pass_picks.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some((self.flow.pass_generation(), picks.clone()));
                 picks

@@ -2261,11 +2261,15 @@ fn give_up_pieces_of_two_pools(
     let (after, _) = store.ram_bytes();
     assert_eq!(after, whole - (large_piece + small_piece) as u64, "nothing was locked again");
     agree(&store, large_piece + small_piece, "the releases hold their locks");
+    // The owner locks what the tier may hold between steps: not the large
+    // piece while its release holds its lock.
+    assert_eq!(store.grow_ram(1).unwrap(), 0, "a piece on its way back is not locked");
     drop(released);
     agree(&store, 0, "until they are dropped");
 
-    // Once the releases are dropped, the next step's end takes the large
+    // Once the releases are dropped, the lock between steps takes the large
     // piece again, and the tier serves from it.
+    assert_eq!(store.grow_ram(1).unwrap(), 1);
     mixed_step(&mut store, &[8, 9]).unwrap();
     assert_eq!(store.ram_bytes().0, after + large_piece as u64);
     agree(&store, 0, "the books and the locks agree");

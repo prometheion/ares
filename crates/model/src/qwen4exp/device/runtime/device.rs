@@ -14,7 +14,7 @@ use super::super::flow::{Flow, Routing, Turn, wide_layer};
 use super::super::invalid;
 use super::super::misses::SpanPicks;
 use super::super::mtp::MtpBlock;
-use super::super::part::{PAGE_ENTRY, Part, StepEnv};
+use super::super::part::{Part, StepEnv};
 use super::super::resume::Resume;
 use super::Qwen4Exp;
 use super::pass::PassRun;
@@ -61,7 +61,8 @@ pub(super) struct Qwen4ExpDevice {
     pub(super) dflash_embedding: Option<Arc<HostTable>>,
     /// Where the part left the residual of the rows of its last step.
     pub(super) residual: Option<DevicePtr>,
-    /// The host's copy of the picks of a pass's layer, kept for the next pass.
+    /// The host's copy of the picks of a pass's layer, for the part that routes: taken
+    /// when the part is opened, for the widest pass.
     pub(super) picks: Option<Arc<SpanPicks>>,
     /// The pass this part paused, and whether the step that ended last was paused.
     pub(super) pass_run: Option<PassRun>,
@@ -70,12 +71,6 @@ pub(super) struct Qwen4ExpDevice {
     pub(super) only_drafts: bool,
     /// The checkpoints of the prefix cache on this device.
     pub(super) resume: Resume,
-    /// The first page whose K and V are in host memory, when some are, and
-    /// which pages the tables name and the pool has not freed: the far pools
-    /// keep the pieces of those locked (every device keeps the same books,
-    /// any of them may begin a step for the store).
-    pub(super) near: Option<u32>,
-    pub(super) live: Vec<bool>,
 }
 
 impl Qwen4ExpDevice {
@@ -95,7 +90,6 @@ impl Qwen4ExpDevice {
         dflash_embedding: Option<Arc<HostTable>>,
     ) -> Self {
         let (c, o) = (&model.config, &model.opts.part);
-        let near = o.near_pages();
         Self {
             tower,
             index,
@@ -126,8 +120,6 @@ impl Qwen4ExpDevice {
             windows: Vec::new(),
             shape: Vec::new(),
             resume,
-            near: (near < o.pages()).then_some(near),
-            live: Vec::new(),
         }
     }
 
@@ -136,33 +128,6 @@ impl Qwen4ExpDevice {
     /// the DFlash drafter's.
     fn drafters(&self) -> Drafters<'_> {
         Drafters { mtp: self.mtp.as_ref().map(MtpBlock::driver), dflash: self.part.dflash() }
-    }
-
-    /// Page `page` is in use until the pool frees it.
-    fn mark_live(&mut self, page: u32) {
-        if self.near.is_none() {
-            return;
-        }
-        if self.live.len() <= page as usize {
-            self.live.resize(page as usize + 1, false);
-        }
-        self.live[page as usize] = true;
-    }
-
-    /// The pages the tables name after the step's updates, less those the
-    /// pool freed: the far pools keep the pieces of the far ones locked.
-    fn update_live(&mut self, record: &ares_runtime::RecordView<'_>) {
-        if self.near.is_none() {
-            return;
-        }
-        for i in 0..record.freed() {
-            if let Some(live) = self.live.get_mut(record.freed_page(i) as usize) {
-                *live = false;
-            }
-        }
-        for k in 0..record.entries() {
-            self.mark_live(record.entry(k) & !PAGE_ENTRY);
-        }
     }
 }
 
@@ -221,10 +186,7 @@ impl Qwen4ExpDevice {
             self.give_up_pass();
         }
         let pass = self.pass_of(step)?;
-        self.update_live(record);
-        let far_live =
-            self.near.map_or(&[][..], |near| self.live.get(near as usize..).unwrap_or(&[]));
-        self.flow.begin(number, rows, windows, far_live, self.index, stream, pass.as_ref())?;
+        self.flow.begin(number, rows, windows, self.index, stream, pass.as_ref())?;
         // What this part keeps of a pass that has ended, or that another pass of the same
         // rows has taken the loan of, goes; a paused pass goes on.
         self.forget_ended_pass();
@@ -539,7 +501,7 @@ impl DeviceModel for Qwen4ExpDevice {
         // A page that comes in is in use from now on, before a step's tables
         // name it: the piece of the far pool it lies in is not given back.
         if item.kind == ares_runtime::TransferKind::PageIn {
-            self.mark_live(item.object);
+            self.flow.page_came_in(item.object);
         }
         self.resume.transfer(cx.stream, cx.pages, item, &mut self.part, self.mtp.as_mut())
     }

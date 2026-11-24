@@ -1194,11 +1194,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.ahead_end_step(step_ms);
         self.step += 1;
         self.stats.steps += 1;
-        // Memory the machine wants back goes before anything new is started,
-        // and memory the tier may take again comes a piece a step: a lock
-        // takes tens of milliseconds, and the next step waits for it.
+        // Memory the machine wants back goes before anything new is started
+        // (unlocked once the step has ended on every device). What the tier
+        // may take again its owner locks between steps ([`ExpertStore::grow_ram`]):
+        // a lock waits for no step to run.
         self.shrink_ram(elastic::STEP_WAIT)?;
-        self.grow_ram(1)?;
         if self.config.decay_every > 0 && self.step.is_multiple_of(self.config.decay_every) {
             self.heat.decay();
             self.worth_stale.fill(true);

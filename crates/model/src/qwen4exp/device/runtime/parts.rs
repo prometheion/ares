@@ -19,6 +19,7 @@ use super::super::board::Board;
 use super::super::feed::{MtpExperts, build_store, cpu_pool, device_slots, expert_map, places};
 use super::super::flow::{Flow, Routing};
 use super::super::invalid;
+use super::super::misses::SpanPicks;
 use super::super::mtp::MtpBlock;
 use super::super::ngram::{self, NgramFeed};
 use super::super::open::{self, PartReport, Peer};
@@ -210,8 +211,11 @@ impl Qwen4Exp {
             )
         };
         part.set_experts(places)?;
-        if flow.pass_rows > 0 && !part.takes_passes() {
-            return Err(invalid("a part cannot read prompts layer by layer"));
+        if flow.pass_rows > 0 {
+            if !part.takes_passes() {
+                return Err(invalid("a part cannot read prompts layer by layer"));
+            }
+            part.prepare_passes()?;
         }
         let PartPlan { role, first, shares, head } = self.placement.part(c, index);
         part.lend_rows(c, &PartShape { role, first, shares, head }, self.max_rows(), &lendable)?;
@@ -235,7 +239,12 @@ impl Qwen4Exp {
             )));
         }
         let routing = Routing::of(&self.placement, c, index);
-        Ok(Box::new(Qwen4ExpDevice::new(
+        // The host's copy of a pass's picks, for the part that routes: taken here, for the
+        // widest pass, since a pass runs inside a step.
+        let picks = (flow.pass_rows > 0 && routing.mixer.is_none())
+            .then(|| SpanPicks::new(cx.device, flow.pass_rows, flow.top_k).map(Arc::new))
+            .transpose()?;
+        let mut device = Qwen4ExpDevice::new(
             self,
             index,
             part,
@@ -245,7 +254,9 @@ impl Qwen4Exp {
             tower,
             block,
             dflash_embedding,
-        )))
+        );
+        device.picks = picks;
+        Ok(Box::new(device))
     }
 
     /// An error when the runtime was set up for other slots, pages or rows

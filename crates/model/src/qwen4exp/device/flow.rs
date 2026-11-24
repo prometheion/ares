@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use ares_api::ExpertStats;
 use ares_core::units::Bytes;
 use ares_cuda::{Event, Stream};
-use ares_runtime::{ModelError, PinnedRam};
+use ares_runtime::{ModelError, PinnedRam, RecordView};
 
 use super::feed::Feed;
 use super::invalid;
@@ -26,6 +26,7 @@ use super::ngram::NgramFeed;
 use super::part::{Part, PassSizes, Pieces, StepEnv};
 use super::placement::Placement;
 use super::runtime::{PassKey, PassLoan};
+use crate::blocks::PAGE_ENTRY;
 use crate::blocks::far::FarPool;
 use crate::qwen4exp::Config;
 
@@ -52,9 +53,10 @@ const DRAIN: Duration = Duration::from_secs(5);
 /// it, it must look again soon, and a step that begins waits for it.
 const GROW_SLICE: Duration = Duration::from_millis(40);
 
-/// How long the start of a step tries to make room in the RAM limit for the
-/// K and V beyond VRAM that it names, and how long each try waits for what
-/// is on its way into the tier of experts before the tier gives pieces up.
+/// How long the conductor tries before a step to make room in the RAM limit
+/// for the K and V beyond VRAM that the step names, and how long each try
+/// waits for what is on its way into the tier of experts before the tier
+/// gives pieces up.
 const FAR_WAIT: Duration = Duration::from_secs(10);
 const FAR_SHRINK_WAIT: Duration = Duration::from_millis(200);
 
@@ -109,6 +111,12 @@ pub(super) struct Flow {
     /// pieces cover now, and the engine's RAM, which books them.
     pub(super) far: Vec<Arc<Mutex<FarPool>>>,
     pub(super) far_live: Mutex<Vec<bool>>,
+    /// Per pool page: the tables name it or a transfer brought it in, and the
+    /// pool has not freed it since (kept for the far pools only).
+    pub(super) pages_live: Mutex<Vec<bool>>,
+    /// The number of the last step [`Flow::before_step`] prepared: a step that
+    /// begins without it would read far pages whose pieces nobody locked.
+    pub(super) prepared: AtomicU64,
     pub(super) ram: PinnedRam,
 }
 
@@ -156,6 +164,8 @@ impl Flow {
             pass_count: AtomicU64::new(0),
             far: Vec::new(),
             far_live: Mutex::new(Vec::new()),
+            pages_live: Mutex::new(Vec::new()),
+            prepared: AtomicU64::new(0),
             ram,
         }
     }
@@ -189,10 +199,13 @@ impl Flow {
 
     /// The tier of experts in RAM follows `allowance`, the bytes it may hold.
     /// Called by the thread that watches the machine's memory. A running
-    /// step gives pieces up, and takes one, when it ends
-    /// ([`Flow::finish`]); when no step runs, this gives them up and locks
-    /// pieces for a while, and no step begins meanwhile: the driver's unlock
-    /// waits for the device, and a step's kernels can wait for the store.
+    /// step gives pieces up when it ends ([`Flow::finish`]), and the conductor
+    /// takes one before each step ([`Flow::before_step`]); when no step runs,
+    /// this gives them up and locks pieces for a while, and no step begins
+    /// meanwhile: the driver's unlock waits for the device, and a step's
+    /// kernels can wait for the store, which this thread holds. What it gives
+    /// up while a step runs is unlocked when the step ends
+    /// ([`ares_cuda::gate::retire`]).
     pub(super) fn follow_ram(&self, ram: &PinnedRam, allowance: u64) {
         let mut feed = self.lock_feed();
         feed.store.set_ram_target(allowance);
@@ -208,9 +221,54 @@ impl Flow {
         }
         let begun = Instant::now();
         while begun.elapsed() < GROW_SLICE && !feed.store.in_step() {
-            if !matches!(feed.store.grow_ram(1), Ok(1)) {
+            // Only while no step runs, without waiting for one: a step that
+            // begins would wait for the store, which this thread holds.
+            if !matches!(ares_cuda::gate::try_change(|| feed.store.grow_ram(1)), Some(Ok(1))) {
                 break;
             }
+        }
+    }
+
+    /// The step of `record` is about to be handed to the devices (on the
+    /// conductor's thread, while no step runs): the far pools lock the
+    /// pieces of the far pages the step's tables name and give back the
+    /// others, and the tier of experts takes a piece more when it may hold
+    /// more (a lock takes tens of milliseconds, so a piece a step, and none
+    /// before a step that only drafts). Page-locked memory changes here and
+    /// not inside the step (see "Host memory" in `docs/dev/architecture/host-memory.md`).
+    pub(super) fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
+        let mut feed = self.lock_feed();
+        if let Some(near) =
+            self.far.first().map(|pool| pool.lock().unwrap_or_else(|e| e.into_inner()).near())
+        {
+            let live = {
+                let mut pages = self.pages_live.lock().unwrap_or_else(|e| e.into_inner());
+                for i in 0..record.freed() {
+                    if let Some(live) = pages.get_mut(record.freed_page(i) as usize) {
+                        *live = false;
+                    }
+                }
+                for k in 0..record.entries() {
+                    mark_live(&mut pages, record.entry(k) & !PAGE_ENTRY);
+                }
+                pages.get(near as usize..).unwrap_or(&[]).to_vec()
+            };
+            self.lock_far(&mut feed, &live)?;
+        }
+        // The number `begin` knows the step by (see `Qwen4ExpDevice::enqueue_step`).
+        self.prepared.store(u64::from(record.step()) + 1, Ordering::Release);
+        if !record.drafts_only() {
+            feed.store.grow_ram(1).map_err(|e| invalid(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Pool page `page` came in by a transfer: it is in use from now on,
+    /// before a step's tables name it, and the piece of the far pool it lies
+    /// in is not given back.
+    pub(super) fn page_came_in(&self, page: u32) {
+        if !self.far.is_empty() {
+            mark_live(&mut self.pages_live.lock().unwrap_or_else(|e| e.into_inner()), page);
         }
     }
 
@@ -230,23 +288,27 @@ impl Flow {
     /// is the MTP block's, whose experts are resident, and the work between
     /// two steps of the store (the heat's decay, the slots that move, the RAM
     /// tier that grows) is counted in the model's steps.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn begin(
         &self,
         step: u64,
         rows: u32,
         windows: Option<StepWindows<'_>>,
-        far_live: &[bool],
         index: usize,
         stream: &Stream,
         pass: Option<&PassKey>,
     ) -> Result<(), ModelError> {
         let mut feed = self.lock_feed();
         if self.begun.load(Ordering::Acquire) != step {
-            // The K and V beyond VRAM that the step names are locked before
-            // the store begins it: the tier of experts gives up what they take
-            // while no step runs.
-            self.lock_far(&mut feed, far_live)?;
+            // The K and V beyond VRAM that the step names were locked before
+            // the step was handed over ([`Flow::before_step`]); without that
+            // the devices would reach pages that nobody locked.
+            if !self.far.is_empty() && self.prepared.load(Ordering::Acquire) != step {
+                return Err(invalid(format!(
+                    "step {step} begins with K and V beyond VRAM that were not locked for it: \
+                     `Model::before_step` was not called (a wrapper of the model that does not \
+                     pass it on?)"
+                )));
+            }
             for counter in self.enqueued.iter().chain(&self.followed) {
                 counter.store(0, Ordering::Release);
             }
@@ -254,7 +316,9 @@ impl Flow {
             // A prompt read layer by layer keeps its rows on a loan of its own; the loan of
             // one before goes back first, or serves it.
             if windows.is_some() {
+                let far_live = self.far_live.lock().unwrap_or_else(|e| e.into_inner());
                 let far_reach = far_live.iter().rposition(|l| *l).map_or(0, |s| s as u32 + 1);
+                drop(far_live);
                 self.lend_pass(&mut feed, pass, far_reach)?;
             }
             self.pass_completed.store(false, Ordering::Release);
@@ -274,10 +338,11 @@ impl Flow {
     }
 
     /// Locks the pieces of every far pool that hold far pages in use (`live`,
-    /// a flag per far slot) and gives back the others, between steps, with
-    /// the store not in a step. The tier of experts gives up what the RAM
-    /// limit has no room for: a running sequence's K and V rank above it
-    /// (see "Host memory" in `docs/dev/architecture/host-memory.md`).
+    /// a flag per far slot) and gives back the others, between steps (from
+    /// [`Flow::before_step`]), with the store not in a step. The tier of
+    /// experts gives up what the RAM limit has no room for: a running
+    /// sequence's K and V rank above it (see "Host memory" in
+    /// `docs/dev/architecture/host-memory.md`).
     fn lock_far(&self, feed: &mut Feed, live: &[bool]) -> Result<(), ModelError> {
         if self.far.is_empty() {
             return Ok(());
@@ -593,6 +658,14 @@ impl Flow {
             std::hint::spin_loop();
         }
     }
+}
+
+/// Marks pool page `page` in use in `pages`, a flag per page.
+fn mark_live(pages: &mut Vec<bool>, page: u32) {
+    if pages.len() <= page as usize {
+        pages.resize(page as usize + 1, false);
+    }
+    pages[page as usize] = true;
 }
 
 /// The windows of a step that verify drafts, as (first row, rows), and what

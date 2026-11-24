@@ -370,6 +370,24 @@ impl Part {
         self.wide_state.is_some() && self.opts.own_rows() >= MIN_MICRO
     }
 
+    /// Takes the page-locked buffers a pass sends its inbox from, when the part is opened:
+    /// a pass runs inside a step, where page-locked memory does not change
+    /// (`ares_cuda::gate`).
+    pub fn prepare_passes(&mut self) -> Result<(), ModelError> {
+        if self.pass.is_some() || !self.pass_ring.is_empty() {
+            return Ok(());
+        }
+        self.pass_ring = (0..RING)
+            .map(|_| {
+                Ok((
+                    PinnedBuffer::new(&self.device, self.f.inbox.host_len as usize)?,
+                    Event::new(&self.device)?,
+                ))
+            })
+            .collect::<Result<_, ModelError>>()?;
+        Ok(())
+    }
+
     /// The attention plan of a micro-batch of a pass (`env` is the micro-batch as a step of
     /// its own), on a part with attention layers.
     pub fn pass_plan(&self, env: &StepEnv<'_>) -> Result<MicroPlan, ModelError> {
@@ -423,14 +441,8 @@ impl Part {
         }
         let ring = match self.pass.take() {
             Some(old) => old.ring,
-            None => (0..RING)
-                .map(|_| {
-                    Ok((
-                        PinnedBuffer::new(&self.device, self.f.inbox.host_len as usize)?,
-                        Event::new(&self.device)?,
-                    ))
-                })
-                .collect::<Result<_, ModelError>>()?,
+            None if !self.pass_ring.is_empty() => std::mem::take(&mut self.pass_ring),
+            None => return Err(invalid("a pass on a part that was not prepared for passes")),
         };
         let tiles = vec![0; at.chunks.len()];
         self.pass = Some(State {

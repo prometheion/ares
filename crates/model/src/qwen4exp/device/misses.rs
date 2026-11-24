@@ -116,7 +116,8 @@ enum Stage {
 /// that does not route takes for its own rounds.
 pub(super) struct SpanPicks {
     host: PinnedBuffer,
-    len: usize,
+    /// The bytes the picks of the running pass take, at most those of the buffer.
+    len: std::sync::atomic::AtomicUsize,
     copied: Event,
     /// The layer whose copies `copied` was last recorded behind, plus one (0: none yet): a
     /// worker's thread reads the picks the mixer's thread copies, and must not take the
@@ -125,17 +126,28 @@ pub(super) struct SpanPicks {
 }
 
 impl SpanPicks {
-    /// Room for the picks of `rows` rows of `top_k` picks each.
+    /// The bytes of the picks of `rows` rows of `top_k` picks each.
+    fn bytes(rows: u32, top_k: u32) -> usize {
+        16 + 8 * rows as usize * top_k as usize
+    }
+
+    /// Room for the picks of up to `rows` rows of `top_k` picks each. Taken when the part
+    /// is opened: a pass runs inside a step, where page-locked memory does not change.
     pub(super) fn new(device: &Device, rows: u32, top_k: u32) -> Result<Self, Error> {
-        let len = 16 + 8 * rows as usize * top_k as usize;
+        let len = Self::bytes(rows, top_k);
         let host = PinnedBuffer::new(device, len)?;
         let copied = Event::new(device)?;
-        Ok(Self { host, len, copied, layer: std::sync::atomic::AtomicUsize::new(0) })
+        Ok(Self {
+            host,
+            len: std::sync::atomic::AtomicUsize::new(len),
+            copied,
+            layer: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     /// Whether `rows` rows of `top_k` picks fit.
     pub(super) fn holds(&self, rows: u32, top_k: u32) -> bool {
-        16 + 8 * rows as usize * top_k as usize == self.len
+        Self::bytes(rows, top_k) <= self.host.len()
     }
 
     /// Where the copies write, and the event recorded behind them.
@@ -149,8 +161,11 @@ impl SpanPicks {
         self.layer.store(layer + 1, std::sync::atomic::Ordering::Release);
     }
 
-    /// A new pass begins: no layer's copies are enqueued yet.
-    pub(super) fn reset(&self) {
+    /// A new pass of `rows` rows of `top_k` picks begins (they fit: [`SpanPicks::holds`]):
+    /// no layer's copies are enqueued yet.
+    pub(super) fn reset(&self, rows: u32, top_k: u32) {
+        let len = Self::bytes(rows, top_k).min(self.host.len());
+        self.len.store(len, std::sync::atomic::Ordering::Release);
         self.layer.store(0, std::sync::atomic::Ordering::Release);
     }
 
@@ -162,7 +177,12 @@ impl SpanPicks {
     fn record(&self) -> &[u8] {
         // SAFETY: the copies behind `copied` have run, and nothing writes the buffer before
         // the next layer's copies are enqueued, after this layer is done.
-        unsafe { std::slice::from_raw_parts(self.host.as_ptr(), self.len) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.host.as_ptr(),
+                self.len.load(std::sync::atomic::Ordering::Acquire),
+            )
+        }
     }
 }
 

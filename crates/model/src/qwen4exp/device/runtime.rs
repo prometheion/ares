@@ -31,7 +31,7 @@ use ares_gguf::Gguf;
 use ares_runtime::expert_store::{ExpertTypes, FillStats, Serve, StoreStats};
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, Drafter, Durable, FarPages, LinkSpec, Model,
-    ModelError, PrefixCache, Split, Vision,
+    ModelError, PrefixCache, RecordView, Split, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -810,6 +810,13 @@ impl Model for Qwen4Exp {
 
     fn far_pages(&self) -> Option<FarPages> {
         self.far
+    }
+
+    fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
+        match self.flow.get() {
+            Some(flow) => flow.before_step(record),
+            None => Ok(()),
+        }
     }
 
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {

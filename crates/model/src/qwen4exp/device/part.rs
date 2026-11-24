@@ -563,6 +563,9 @@ pub struct Part {
     wide_state: Option<wide::State>,
     /// A prompt read layer by layer (`pass.rs`), while one is open.
     pass: Option<pass::State>,
+    /// The page-locked buffers a pass sends its inbox from, taken when the part
+    /// is opened ([`Part::prepare_passes`]) and kept by the first pass.
+    pass_ring: Vec<(PinnedBuffer, Event)>,
     /// What a part that runs the model's MTP block needs besides a layer.
     mtp: Option<mtp::State>,
     /// The pruning of the routers of a part that routes.
@@ -882,6 +885,7 @@ impl Part {
             marks,
             wide_state,
             pass: None,
+            pass_ring: Vec::new(),
             mtp: None,
             prune: None,
             predict,

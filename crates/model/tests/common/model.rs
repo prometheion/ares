@@ -12,7 +12,7 @@ use ares_api::{ChatFormat, EngineError, ExpertStats, ModelCard, Prompt};
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, Drafter, Durable, EncodedPrompt, LinkSpec, Model,
-    ModelError, PrefixCache, Split, Vision,
+    ModelError, PrefixCache, RecordView, Split, Vision,
 };
 use ares_sampler::SampleParams;
 use ares_state::PageLayout;
@@ -196,6 +196,9 @@ impl Model for Wrapped {
     }
     fn abandon(&self, part: usize) {
         self.inner.abandon(part);
+    }
+    fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
+        self.inner.before_step(record)
     }
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
         match &self.open {

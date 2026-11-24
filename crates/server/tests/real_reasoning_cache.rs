@@ -34,7 +34,7 @@ use ares_model::chat;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, GpuConfig, GpuExecutor, LinkSpec, Model, ModelError,
-    PrefixCache, RequestReport, Runtime, RuntimeConfig, Split,
+    PrefixCache, RecordView, RequestReport, Runtime, RuntimeConfig, Split,
 };
 use ares_sampler::SampleParams;
 use ares_state::PageLayout;
@@ -236,6 +236,9 @@ impl Model for Templated {
     }
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {
         self.inner.page_layout(cells_per_page)
+    }
+    fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
+        self.inner.before_step(record)
     }
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
         self.inner.open(cx)

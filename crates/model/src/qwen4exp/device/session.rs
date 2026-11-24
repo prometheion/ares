@@ -625,6 +625,13 @@ impl<'g> Session<'g> {
         let prepared = Instant::now();
         let mut waited_rows = Duration::ZERO;
 
+        // The tier of experts takes a piece more when it may hold more, before
+        // the step, as the runtime's conductor does: page-locked memory does
+        // not change inside a step, which runs from here to the end of this
+        // call (`ares_cuda::gate`).
+        self.flow.lock_feed().store.grow_ram(1).map_err(|e| Error::invalid(e.to_string()))?;
+        let _steps = ares_cuda::gate::Steps::begin();
+
         // The step begins for the store, as the runtime's does: its windows
         // verify drafts (no row is worth less than its expert here).
         self.step += 1;
@@ -632,15 +639,7 @@ impl<'g> Session<'g> {
             segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect();
         for (index, stream) in self.streams.iter().enumerate() {
             let windows = Some((windows.as_slice(), None));
-            self.flow.begin(
-                u64::from(self.step),
-                dims.n_rows,
-                windows,
-                &[],
-                index,
-                stream,
-                None,
-            )?;
+            self.flow.begin(u64::from(self.step), dims.n_rows, windows, index, stream, None)?;
         }
         // The exchanges between a mixer and its worker are numbered through
         // the steps: eight per layer.

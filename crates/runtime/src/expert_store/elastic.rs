@@ -14,10 +14,11 @@
 //! locked again and their slots come back empty
 //! ([`ExpertStore::grow_ram`]). Both happen between steps only: the driver's
 //! unlock waits for the device, and a device that computes a step may wait
-//! for the store. A piece that was given up keeps its lock until the owner
-//! drops its release ([`ExpertStore::take_released`]), and it is not locked
-//! again before: the end of a step that gave up pieces of two pools may
-//! find room for one of them right away.
+//! for the store (see [`ares_cuda::gate`]). A piece that was given up keeps
+//! its lock until the owner drops its release ([`ExpertStore::take_released`])
+//! and the unlock is done, and it is not locked again before: the end of a
+//! step that gave up pieces of two pools may find room for one of them right
+//! away.
 //!
 //! **Which experts go.** The slots of a piece belong to a few layers and hold
 //! whatever was read into them. Giving the piece up as it lies would take
@@ -317,8 +318,9 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// Locks up to `most` pieces, as far as the tier may hold more than it
     /// does: their slots go back to the layers that gave them, empty.
     /// Returns the pieces locked. Locking takes time (tens of milliseconds a
-    /// piece) and is done here, by the caller's thread: call it where no
-    /// step waits, like [`ExpertStore::shrink_ram`].
+    /// piece) and is done here, by the caller's thread: call it between
+    /// steps, where no step waits for the store (a lock waits for no step to
+    /// run, and inside one it fails: [`ares_cuda::gate`]).
     pub fn grow_ram(&mut self, most: usize) -> Result<usize, StoreError> {
         let mut locked = 0;
         while locked < most {
