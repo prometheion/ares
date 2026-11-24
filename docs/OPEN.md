@@ -378,6 +378,9 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
 
 ### Parity with the 27B (the owner's rule: what one model can, the other must)
 Everything `user/features.md` lists for the 27B and not for Flash-Next is owed:
+- [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
+      it; the 27B uses its block by default (found 2026-11-24 by `fix/help-docs`). By the
+      owner's rules (parity, and a pure improvement on by default) Flash-Next should too.
 - [ ] Left of K and V in `q7` to `q4` (done 2026-11-16): the share of drafts accepted with the
       MTP block's `q4` K and V was not measured on this model.
 - [ ] Left of the prefix cache with its RAM and SSD levels (done 2026-11-16): the MTP block's
@@ -528,6 +531,13 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       `real_responses` and `real_messages`; the 0.8B was not run again.)
 
 ## Server and API
+- [ ] Found 2026-11-24 by `fix/help-docs` (documented as they are, not changed): chat and
+      completion bodies pass over unknown members nested in a message, a tool or
+      `stream_options`, where Messages and Responses refuse them (the rule: nothing dropped
+      silently); two names of one limit or count with different values let one win silently
+      (`typical` and `repetition_penalty` against their twins are a 400); a negative
+      `min_keep` is accepted; with API keys the Origin check never runs, even with
+      `--allowed-hosts`. Dev-only strings with runs of spaces in five benches and tests.
 - [ ] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
       TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`.
 - [ ] Left of the thinking budget and the loop guard (K03, K05, done 2026-11-22): the
