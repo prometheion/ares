@@ -3143,8 +3143,9 @@ instructions (Marlin's `prmt`/`hsub2`/`hfma2`) took Q4_K from 49 to 55 TFLOPS
 with f32 accumulation and to 78 with f16 accumulation. Now the activations
 bound them: without their `cp.async` the kernel reaches 98 TFLOPS (RTX 4070).
 
-**Rearranged Q4_K** (`Kernels::rearrange`, `matmul_rearranged`,
-`kernels/mmr.cuh`). A Q4_K matrix can be rearranged once at upload into the
+**Rearranged Q4_K** (`Kernels::rearrange`, `kernels/mmr.cuh`; today the device layout of twelve
+types, multiplied through `Kernels::product`, see "Few rows on the device layout"). The first
+measurements of it, with Q4_K alone: a Q4_K matrix can be rearranged once at upload into the
 order the tensor cores read it (codes in `mma` fragment order, 16 bytes per
 lane and 64 values; the 16-byte block headers of 16 rows together): the same
 number of bytes (rows rounded up to 16), 0.3 ms for a 17408 x 5120 matrix on
