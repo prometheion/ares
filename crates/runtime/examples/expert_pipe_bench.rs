@@ -53,7 +53,7 @@ use ares_runtime::expert_store::cpu::{
     CpuExpert, CpuPool, Decode, Features, LayerJob, Placement, Topology, quantize_activations,
 };
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertStore, HostRegion, LayerSpec, Miss, Serve, StoreConfig, StorePlan, StoreStats,
+    CudaSlots, ExpertStore, HostRegion, LayerSpec, Serve, StoreConfig, StorePlan, StoreStats,
 };
 use ares_weights::{ExpertHeat, SlotSet, Start, TableBuilder, TableConfig, Want};
 
@@ -454,8 +454,6 @@ struct Options {
     read_ranks: usize,
     name_ranks: usize,
     sweep: Vec<(usize, usize)>,
-    prompt: usize,
-    wave_room: f64,
     share: f64,
     group: usize,
     skew: f64,
@@ -511,8 +509,6 @@ impl Options {
             read_ranks: 2,
             name_ranks: 10,
             sweep: Vec::new(),
-            prompt: 0,
-            wave_room: 0.5,
             share: 0.55,
             group: 24,
             skew: 0.9,
@@ -564,8 +560,6 @@ impl Options {
                         options.sweep.push((ahead.parse()?, table.parse()?));
                     }
                 }
-                "prompt" => options.prompt = value.parse()?,
-                "wave-room" => options.wave_room = value.parse()?,
                 "share" => options.share = value.parse()?,
                 "group" => options.group = value.parse()?,
                 "skew" => options.skew = value.parse()?,
@@ -601,209 +595,6 @@ impl Options {
         }
         Ok(options)
     }
-}
-
-/// A prompt, layer by layer, with the CPU's part: of the experts a layer's
-/// rows use and VRAM does not hold, the cost model gives the CPU those with
-/// the fewest rows, as many as it computes in the time the link needs for
-/// the others. The link's part goes through waves as in [`prompt_pass`]
-/// (fetched, not computed: there are no expert kernels for prompt rows yet);
-/// the CPU's part is computed for real, for as many (expert, row) pairs as
-/// the routing has, from the bytes in the RAM tier, read from the file where
-/// they are not there. The rows' activations come down and the CPU's sums
-/// go up once per layer, in their real sizes.
-fn prompt_pass_hybrid(
-    store: &mut ExpertStore<CudaSlots>,
-    lanes: &[Lane],
-    devices: &[Device],
-    shapes: &[ExpertShape],
-    trace: &Trace,
-    first: usize,
-    options: &Options,
-) -> Result<(), AnyError> {
-    let experts = shapes[0].n_experts as usize;
-    let k = shapes[0].top_k as usize;
-    let n = shapes[0].n_embd as usize;
-    let features = store.cpu_pool().ok_or("no CPU half")?.features();
-    // Eight rows of activations stand for the rows of every piece.
-    let mut rng = Rng::new(options.seed ^ 0x51ed);
-    let x = bench_activations(&mut rng, 8 * n);
-    let act8 = quantize_activations(&x, n);
-    // What crosses the link per layer for the CPU's part.
-    let down_bytes = options.prompt * act_bytes(n, 1);
-    let up_bytes = options.prompt * n * 4;
-    let mut transfer = Vec::new();
-    for device in devices {
-        transfer.push((
-            DeviceBuffer::new(device, up_bytes as u64)?,
-            PinnedBuffer::new(device, up_bytes)?,
-            Event::new(device)?,
-        ));
-    }
-
-    store.take_stats();
-    let io_before = store.reader().stats();
-    let started = Instant::now();
-    let (mut n_waves, mut in_place) = (0usize, 0usize);
-    let (mut cpu_experts, mut cpu_pairs, mut link_experts) = (0u64, 0u64, 0u64);
-    let mut cpu_busy = Duration::ZERO;
-    /// How many experts the CPU has in work at once: their RAM slots are held.
-    const WINDOW: usize = 24;
-    for (index, lane) in lanes.iter().enumerate() {
-        for layer in &lane.layers {
-            let shape = &shapes[*layer];
-            let mut counts = vec![0u32; experts];
-            for token in first..first + options.prompt {
-                trace.picks(token, *layer).iter().for_each(|e| counts[*e as usize] += 1);
-            }
-            // The split of what VRAM does not hold.
-            let outside: Vec<u32> = (0..experts as u32)
-                .filter(|e| counts[*e as usize] > 0 && !store.in_vram(*layer, *e))
-                .collect();
-            let misses: Vec<Miss> = outside
-                .iter()
-                .map(|e| Miss { pairs: counts[*e as usize], heat: 0.0, cpu_only: false })
-                .collect();
-            let on_cpu = match options.serve {
-                Serve::Cpu => vec![true; misses.len()],
-                _ => store.cost_model().ok_or("no cost model")?.split(
-                    (shape.gate_ty, shape.down_ty),
-                    index,
-                    &misses,
-                    0,
-                ),
-            };
-            let mut link_counts = counts.clone();
-            let mut todo: Vec<u32> = Vec::new();
-            for (expert, cpu) in outside.iter().zip(&on_cpu) {
-                if *cpu {
-                    link_counts[*expert as usize] = 0;
-                    todo.push(*expert);
-                }
-            }
-            // The CPU's experts: those RAM has first, then by rows.
-            todo.sort_by_key(|e| (!store.in_ram(*layer, *e), counts[*e as usize]));
-            cpu_experts += todo.len() as u64;
-            link_experts += (outside.len() - todo.len()) as u64;
-
-            // The rows' activations come down for the CPU.
-            let (device_buffer, host_buffer, sent) = &transfer[index];
-            if !todo.is_empty() {
-                // SAFETY: both buffers hold `up_bytes`, which is more.
-                unsafe {
-                    lane.side.copy_to_host(
-                        host_buffer.as_ptr().cast_mut(),
-                        device_buffer.ptr(),
-                        down_bytes,
-                    )?;
-                }
-            }
-
-            let room = ((store.slots(*layer).0 as f64 * options.wave_room) as usize).max(k);
-            let plan = store.plan_waves(*layer, &link_counts, room).ok_or("no room for a wave")?;
-            in_place += plan.in_place.len();
-            let waves: Vec<&[u32]> = plan.waves.iter().map(|w| &w.experts[..]).collect();
-            let mut wave = 0;
-            let mut wave_running = false;
-            let mut next_cpu = 0;
-            let mut running: Vec<(u32, std::sync::Arc<LayerJob>)> = Vec::new();
-            loop {
-                store.poll()?;
-                // The link's side: the next wave when the one before is in its slots.
-                if wave_running && waves[wave - 1].iter().all(|e| store.in_vram(*layer, *e)) {
-                    wave_running = false;
-                }
-                if !wave_running && wave < waves.len() {
-                    let next = waves.get(wave + 1).copied().unwrap_or(&[]);
-                    store.wave(*layer, waves[wave], next)?;
-                    wave += 1;
-                    n_waves += 1;
-                    wave_running = true;
-                }
-                // The CPU's side: jobs that ended give their experts back.
-                let mut at = 0;
-                while at < running.len() {
-                    if running[at].1.is_done() {
-                        let (expert, job) = running.swap_remove(at);
-                        cpu_busy += job.busy();
-                        store.release_from_cpu(*layer, expert);
-                    } else {
-                        at += 1;
-                    }
-                }
-                // And experts enter the window: computed if RAM has them,
-                // asked for if not.
-                let window = &todo
-                    [next_cpu..(next_cpu + WINDOW - running.len().min(WINDOW)).min(todo.len())];
-                store.read_for_cpu(*layer, window);
-                while next_cpu < todo.len() && running.len() < WINDOW {
-                    let expert = todo[next_cpu];
-                    let rows = counts[expert as usize] as usize;
-                    let Some(found) = store.hold_for_cpu(*layer, expert, 0xff, [0.1; 8])? else {
-                        break;
-                    };
-                    // One entry per eight rows of the expert, the last with the rest.
-                    let pieces: Vec<CpuExpert> = (0..rows.div_ceil(8))
-                        .map(|p| CpuExpert { rows: (1u32 << (rows - 8 * p).min(8)) - 1, ..found })
-                        .collect();
-                    // SAFETY: the matrices are a whole expert of the layer's
-                    // shape in the RAM tier, held there until the job has
-                    // ended and the hold is released above.
-                    let job = std::sync::Arc::new(unsafe {
-                        LayerJob::new(features, shape, 8, &act8, &pieces)?
-                    });
-                    store.cpu_pool().ok_or("no CPU half")?.submit(std::sync::Arc::clone(&job));
-                    running.push((expert, job));
-                    cpu_pairs += rows as u64;
-                    next_cpu += 1;
-                }
-                if !wave_running
-                    && wave == waves.len()
-                    && next_cpu == todo.len()
-                    && running.is_empty()
-                {
-                    break;
-                }
-            }
-            if !todo.is_empty() {
-                // The CPU's sums for the layer's rows go up.
-                // SAFETY: both buffers hold `up_bytes`.
-                unsafe {
-                    lane.stream.copy_from_host(
-                        device_buffer.ptr(),
-                        host_buffer.as_ptr(),
-                        up_bytes,
-                    )?;
-                }
-                sent.record(&lane.stream)?;
-                while !sent.is_done()? {
-                    store.poll()?;
-                }
-            }
-            store.record_counts(*layer, &counts, 1.0);
-        }
-    }
-    let seconds = started.elapsed().as_secs_f64();
-    let stats = store.take_stats();
-    let io = store.reader().stats();
-    let read = io.demand.device_bytes + io.prefetch.device_bytes
-        - io_before.demand.device_bytes
-        - io_before.prefetch.device_bytes;
-    println!(
-        "prompt of {} tokens, layer by layer, with the CPU: {seconds:.2} s, {:.0} tokens/s; {n_waves} waves, {in_place} experts in place, \
-         {link_experts} for the link ({} uploaded, {:.2} GiB; {} copied down), {cpu_experts} for the CPU ({cpu_pairs} pairs, workers busy {:.2} s); \
-         {} read from the file, {:.2} GiB; load {}",
-        options.prompt,
-        options.prompt as f64 / seconds,
-        stats.uploads,
-        gib(stats.upload_bytes),
-        stats.demotions,
-        cpu_busy.as_secs_f64(),
-        stats.demand_reads + stats.guess_reads,
-        gib(read),
-        load_average(),
-    );
-    Ok(())
 }
 
 /// The three matrices of an expert, read from the file.
@@ -1160,7 +951,6 @@ fn main() -> Result<(), AnyError> {
     const K: usize = 10;
     let rows = options.rows as usize;
     let needed = options.profile
-        + options.prompt
         + (options.cold + options.warm + options.steps * (1 + options.sweep.len()) + 1) * rows;
     let trace = match &options.trace {
         Some(paths) => Trace::load(paths, LAYERS, K)?,
@@ -1842,11 +1632,6 @@ fn main() -> Result<(), AnyError> {
             );
         }
     }
-    if options.prompt > 0 && options.serve != Serve::Stream {
-        prompt_pass_hybrid(&mut store, &lanes, &devices, &shapes, &trace, token, &options)?;
-    } else if options.prompt > 0 {
-        prompt_pass(&mut store, &lanes, &shapes, &trace, token, &options)?;
-    }
     Ok(())
 }
 
@@ -1950,137 +1735,6 @@ fn enqueue_layer(
             rows,
             None,
         )?;
-    }
-    Ok(())
-}
-
-/// A prompt of `options.prompt` tokens, layer by layer: every layer's
-/// experts for all rows of the prompt, in waves through the store. The
-/// experts of a wave are computed with the decode kernels, eight rows of ten
-/// experts per launch, which is what exists for their types today; the
-/// launches wait on the device for the wave's experts like a decode step.
-fn prompt_pass(
-    store: &mut ExpertStore<CudaSlots>,
-    lanes: &[Lane],
-    shapes: &[ExpertShape],
-    trace: &Trace,
-    first: usize,
-    options: &Options,
-) -> Result<(), AnyError> {
-    let experts = shapes[0].n_experts as usize;
-    let k = shapes[0].top_k as usize;
-    let rows = options.rows.max(1) as usize;
-    store.take_stats();
-    let io_before = store.reader().stats();
-    let started = Instant::now();
-    let (mut n_waves, mut in_place, mut launches) = (0usize, 0usize, 0u64);
-    let mut compute = Duration::ZERO;
-    for (index, lane) in lanes.iter().enumerate() {
-        for (i, layer) in lane.layers.iter().enumerate() {
-            let mut counts = vec![0u32; experts];
-            for token in first..first + options.prompt {
-                trace.picks(token, *layer).iter().for_each(|e| counts[*e as usize] += 1);
-            }
-            let room = ((store.slots(*layer).0 as f64 * options.wave_room) as usize).max(k);
-            let plan = store.plan_waves(*layer, &counts, room).ok_or("no room for a wave")?;
-            in_place += plan.in_place.len();
-            // What is in place first, then the waves.
-            let mut sets: Vec<&[u32]> = vec![&plan.in_place];
-            sets.extend(plan.waves.iter().map(|w| &w.experts[..]));
-            for (w, set) in sets.iter().enumerate() {
-                if w > 0 {
-                    let next = sets.get(w + 1).copied().unwrap_or(&[]);
-                    store.wave(*layer, set, next)?;
-                    n_waves += 1;
-                }
-                if rows == 8 {
-                    // Ten experts at a time, for eight of their rows per launch.
-                    let enqueued = Instant::now();
-                    for chunk in set.chunks(k) {
-                        if chunk.len() < k {
-                            continue;
-                        }
-                        let most = chunk.iter().map(|e| counts[*e as usize]).max().unwrap_or(0);
-                        // SAFETY: the pinned buffer holds a row of logits per layer and row.
-                        let forced = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                lane.forced_host
-                                    .as_ptr()
-                                    .cast::<f32>()
-                                    .cast_mut()
-                                    .add(i * rows * experts),
-                                rows * experts,
-                            )
-                        };
-                        forced.fill(-30.0);
-                        for row in 0..rows {
-                            for (rank, e) in chunk.iter().enumerate() {
-                                forced[row * experts + *e as usize] = 8.0 - 0.5 * rank as f32;
-                            }
-                        }
-                        let bytes = rows * experts * 4;
-                        for _ in 0..most.div_ceil(8) {
-                            // SAFETY: as in a decode step; the logits are
-                            // copied again for every launch because the
-                            // selection overwrites them.
-                            unsafe {
-                                lane.stream.copy_from_host(
-                                    lane.forced.ptr().offset((i * bytes) as u64),
-                                    lane.forced_host.as_ptr().add(i * bytes),
-                                    bytes,
-                                )?;
-                            }
-                            enqueue_layer(
-                                store,
-                                lane,
-                                index,
-                                i,
-                                *layer,
-                                shapes,
-                                options.rows,
-                                0,
-                                0,
-                                false,
-                            )?;
-                            launches += 1;
-                        }
-                    }
-                    lane.done.record(&lane.stream)?;
-                    while !lane.done.is_done()? {
-                        store.poll()?;
-                    }
-                    compute += enqueued.elapsed();
-                } else {
-                    while store.waiting() > 0 {
-                        store.poll()?;
-                    }
-                }
-            }
-            store.record_counts(*layer, &counts, 1.0);
-        }
-    }
-    let seconds = started.elapsed().as_secs_f64();
-    let stats = store.take_stats();
-    let io = store.reader().stats();
-    let read = io.demand.device_bytes + io.prefetch.device_bytes
-        - io_before.demand.device_bytes
-        - io_before.prefetch.device_bytes;
-    println!(
-        "prompt of {} tokens, layer by layer: {seconds:.2} s, {:.0} tokens/s; {n_waves} waves, {in_place} experts in place, \
-         {} brought in ({} read from the file, {:.2} GiB; {:.2} GiB uploaded; {} copied down)",
-        options.prompt,
-        options.prompt as f64 / seconds,
-        stats.uploads,
-        stats.demand_reads + stats.guess_reads,
-        gib(read),
-        gib(stats.upload_bytes),
-        stats.demotions,
-    );
-    if launches > 0 {
-        println!(
-            "          computed with the decode kernels: {launches} launches of 8 rows x 10 experts, {:.2} s of the total with their waits",
-            compute.as_secs_f64()
-        );
     }
     Ok(())
 }

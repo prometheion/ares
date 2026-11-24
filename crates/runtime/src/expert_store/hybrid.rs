@@ -960,61 +960,6 @@ impl<D: SlotDevice> ExpertStore<D> {
         Ok(())
     }
 
-    /// The workers, for work the store does not schedule itself: the CPU's
-    /// part of a prompt pass.
-    pub fn cpu_pool(&self) -> Option<&CpuPool> {
-        self.hybrid.as_ref().map(|h| &h.pool)
-    }
-
-    /// Asks for `experts` of `layer` in the RAM tier, read from the file if
-    /// they are in no tier: for experts the CPU will compute outside a step
-    /// (a prompt pass). Follow them with [`ExpertStore::in_ram`].
-    pub fn read_for_cpu(&mut self, layer: usize, experts: &[u32]) {
-        let now = Instant::now();
-        for expert in experts {
-            if self.ram.sets[layer].contains(*expert)
-                || self.wants.iter().any(|w| w.layer == layer && w.expert == *expert && w.cpu)
-            {
-                continue;
-            }
-            self.wants.push(Wanted {
-                layer,
-                expert: *expert,
-                demand: true,
-                since: now,
-                source: Source::Disk,
-                cpu: true,
-                loan: false,
-            });
-        }
-    }
-
-    /// Keeps `expert` of `layer` in its RAM slot and says where its
-    /// matrices are, for a job the caller runs; `None` when RAM does not
-    /// hold it. Every hold needs its [`ExpertStore::release_from_cpu`], after
-    /// the job has ended.
-    pub fn hold_for_cpu(
-        &mut self,
-        layer: usize,
-        expert: u32,
-        rows: u32,
-        weight: [f32; MAX_ROWS],
-    ) -> Result<Option<CpuExpert>, StoreError> {
-        if !self.ram.sets[layer].contains(expert) {
-            return Ok(None);
-        }
-        let found = self.cpu_expert(layer, expert, rows, weight)?;
-        self.ram.sets[layer].hold(expert);
-        Ok(Some(found))
-    }
-
-    /// Ends a [`ExpertStore::hold_for_cpu`]: the expert may give way again.
-    pub fn release_from_cpu(&mut self, layer: usize, expert: u32) {
-        self.ram.sets[layer].release(expert);
-        self.ram.sets[layer].unprotect(expert);
-        self.worth_stale[layer] = true;
-    }
-
     /// A step begins: nothing is claimed.
     pub(super) fn cpu_begin_step(&mut self) {
         if let Some(hybrid) = self.hybrid.as_mut() {

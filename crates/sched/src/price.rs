@@ -55,7 +55,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::timing::{Load, StepTimeModel};
+use crate::timing::{ContextFit, Load};
 
 /// How many measurements of a count are kept.
 const KEPT: usize = 8;
@@ -266,7 +266,7 @@ impl Curve {
 pub struct PriceTable {
     rows: Curve,
     /// The context term: the fit of cost per cell over the steps that ran.
-    context: StepTimeModel,
+    context: ContextFit,
 }
 
 impl Default for PriceTable {
@@ -283,7 +283,7 @@ impl PriceTable {
     /// A table whose rows are priced as `estimate` says ([`Estimate::Mean`]
     /// for a model whose steps wait for what they fetch).
     pub fn with_estimate(estimate: Estimate) -> Self {
-        Self { rows: Curve::with_estimate(estimate), context: StepTimeModel::new(0.98) }
+        Self { rows: Curve::with_estimate(estimate), context: ContextFit::new(0.98) }
     }
 
     /// The price of a step of `rows` rows measured at load, with next to no
@@ -295,7 +295,7 @@ impl PriceTable {
     /// Milliseconds a cell that a row reads adds: what attention costs per
     /// cell, from the steps that ran (0 until they tell).
     pub fn per_cell_ms(&self) -> f64 {
-        self.context.cost().map_or(0.0, |cost| cost.per_cell_ms)
+        self.context.fit().map_or(0.0, |(_, _, per_cell)| per_cell)
     }
 
     /// Whether the table holds a measurement.
@@ -325,7 +325,7 @@ impl PriceTable {
         // the cost of its cells. The rows' own price forgets a late step by
         // its rule; the fit never sees one.
         if expected.is_none_or(|expected| ms <= LATE * expected) {
-            self.context.observe_load(load, ms);
+            self.context.observe(load, ms);
         }
     }
 

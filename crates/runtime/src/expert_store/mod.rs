@@ -91,10 +91,7 @@ use std::time::Instant;
 
 use ares_core::LedgerError;
 use ares_io::{Buffer, Class, Completion, ExpertMap, Read, Reader};
-use ares_weights::{
-    ExpertHeat, ExpertWaves, GuessQueue, LayerNeed, Place, SplitRule, Start, Swap, Want,
-    split_slots,
-};
+use ares_weights::{ExpertHeat, GuessQueue, LayerNeed, SplitRule, Start, Swap, Want, split_slots};
 
 pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 use elastic::{Layout, Pieces};
@@ -1129,66 +1126,8 @@ impl<D: SlotDevice> ExpertStore<D> {
         Ok(missing)
     }
 
-    /// Divides the experts a prompt pass needs in `layer` into waves:
-    /// `counts[e]` rows were routed to expert `e`, and `room` experts are
-    /// brought in at a time. What is in a slot needs no wave.
-    pub fn plan_waves(&self, layer: usize, counts: &[u32], room: usize) -> Option<ExpertWaves> {
-        ExpertWaves::plan(
-            counts,
-            |expert| {
-                if self.vram.sets[layer].contains(expert) {
-                    Place::InPlace
-                } else if self.ram.sets[layer].contains(expert) {
-                    Place::Ram
-                } else {
-                    Place::Disk
-                }
-            },
-            room,
-        )
-    }
-
-    /// A wave of a prompt pass: `experts` of `layer` are what the kernels
-    /// enqueued next compute, and the experts of earlier waves and steps are
-    /// no longer needed. Returns how many of them are not in a slot; the
-    /// kernels wait for those on the device, as in a decode step. `next` are
-    /// the experts of the wave after this one: those that are only in the
-    /// file are read into RAM meanwhile.
-    ///
-    /// Between steps only, and only when the device has finished the kernels
-    /// of the layer's wave before: their experts may give way to this one.
-    /// A decode step must not begin while a wave still waits
-    /// ([`ExpertStore::waiting`]), because nothing of a layer is evicted
-    /// while a step is on its way to it.
-    pub fn wave(
-        &mut self,
-        layer: usize,
-        experts: &[u32],
-        next: &[u32],
-    ) -> Result<usize, StoreError> {
-        debug_assert!(!self.in_step, "a wave runs between steps");
-        self.step += 1;
-        self.wants.retain(|w| w.layer != layer || w.demand);
-        let ahead: Vec<u32> = next
-            .iter()
-            .copied()
-            .filter(|e| {
-                !self.vram.sets[layer].contains(*e)
-                    && !self.ram.sets[layer].contains(*e)
-                    && !self.ram.sets[layer].is_loading(*e)
-            })
-            .collect();
-        // The guesses are for the wave after this one, which is the next
-        // step in the tiers' count.
-        self.guesses.guess(&mut self.ram.sets, layer, &ahead, self.step + 1);
-        let missing = self.demand(layer, experts)?;
-        self.poll()?;
-        Ok(missing)
-    }
-
-    /// Adds the routing of a prompt to the heat: `counts[e]` rows of `layer`
-    /// went to expert `e`, each weighing `weight`
-    /// ([`ares_weights::recency_weight`] makes the end of a prompt count most).
+    /// Adds routing to the heat: `counts[e]` rows of `layer` went to expert
+    /// `e`, each weighing `weight`.
     pub fn record_counts(&mut self, layer: usize, counts: &[u32], weight: f32) {
         self.heat.record_counts(layer, counts, weight);
         self.worth_stale[layer] = true;

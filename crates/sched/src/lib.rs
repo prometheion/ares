@@ -17,14 +17,11 @@
 //!   piece of prompt, so that generation keeps a chosen rate while a long
 //!   prompt is read and the prompt gets the rest of the time, and a short one
 //!   is read at once.
-//! - [`Pass`] is the other order for long prompts of a model whose experts
-//!   are fetched: all rows up to a layer's router, then that layer's experts
-//!   for all rows, then on, so that a prompt fetches each expert once.
 //! - [`PriceTable`] is what a step costs by its rows, as a table (the weight
 //!   kernels take their rows in launches, so the price has edges), measured on
 //!   the devices at load and kept true by the steps that run (a late step
 //!   moves nothing, and a size that has not run for long is tried again), with
-//!   a term for the cells the rows read ([`StepTimeModel`] fits that term).
+//!   a term for the cells the rows read, fitted to the steps that ran.
 //! - [`Acceptance`] is how often a drafter's drafts are accepted, per
 //!   position, for a sequence, starting from what the engine has seen.
 //!   [`choose`] picks, for the whole step, whose drafts go into each
@@ -47,7 +44,6 @@ mod admission;
 mod confidence;
 mod draft;
 mod ngram;
-mod pass;
 mod plan;
 mod price;
 mod share;
@@ -58,9 +54,8 @@ pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Ou
 pub use confidence::{BINS as CONFIDENCE_BINS, Confidence, links_made, need};
 pub use draft::{Acceptance, BELIEF};
 pub use ngram::{NgramConfig, NgramCorpus, NgramDrafter, NgramMatch};
-pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
 pub use price::{Curve, Estimate, OLD as PRICE_OLD, PriceTable};
 pub use share::{Pending, Share, Turn};
-pub use timing::{Load, StepCost, StepTimeModel};
+pub use timing::Load;
 pub use window::{Choice, Offer, Prices, Wish, choose, rate};

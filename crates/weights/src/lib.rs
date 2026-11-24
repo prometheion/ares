@@ -26,9 +26,6 @@
 //!   stored with the model.
 //! - [`Lookahead`] chooses how many layers ahead to read, from how long reads
 //!   and layers take and how often the prediction was right.
-//! - [`ExpertWaves`] divides the experts a layer needs for a whole prompt into
-//!   waves that fit the space for them, so that a prompt fetches each expert
-//!   once.
 //! - [`SlotSet::mark_present`] says which experts a tier holds or has on
 //!   their way, which the router's pruning reads (dynamic expert pruning,
 //!   `ares_cuda::Prune`): a pick that only the file holds may be left out or
@@ -125,11 +122,9 @@ mod guess;
 mod lookahead;
 mod split;
 mod table;
-mod waves;
 
 pub use expert::{ExpertHeat, Given, SPARE_WORTH, SlotSet, Start, Swap, SwapRule, Want};
 pub use guess::{GuessQueue, Started};
 pub use lookahead::{Lookahead, LookaheadRule};
 pub use split::{LayerNeed, SplitRule, split_slots};
 pub use table::{Entry, TableBuilder, TableConfig, TableError, TokenTable};
-pub use waves::{ExpertWaves, Place, Wave, recency_weight};

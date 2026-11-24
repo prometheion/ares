@@ -660,35 +660,6 @@ fn slots_follow_the_heat_between_layers() {
     rig.step(&[&[14, 15][..], &[3, 2][..], &[5, 6][..]]);
 }
 
-#[test]
-fn a_prompt_takes_a_layers_experts_in_waves_and_fetches_each_once() {
-    // 4 slots per layer in VRAM, 8 in RAM (a wave, the next one, and what
-    // comes down from VRAM); the prompt routes to all 16.
-    let mut rig = rig(4, 8, recent_first);
-    rig.step(&[&[][..], &[3, 9][..]]);
-    rig.store.take_stats();
-    let counts: Vec<u32> = (0..EXPERTS).map(|e| 1 + e % 5).collect();
-    let plan = rig.store.plan_waves(1, &counts, 3).expect("room for a wave");
-    assert_eq!(plan.in_place, [3, 9]);
-    assert_eq!(plan.waves.len(), 5, "14 experts, 3 at a time");
-    for (i, wave) in plan.waves.iter().enumerate() {
-        let next = plan.waves.get(i + 1).map_or(&[][..], |w| &w.experts[..]);
-        rig.store.wave(1, &wave.experts, next).unwrap();
-        rig.settle();
-        // Now the wave's kernels would run: every expert of it is usable.
-        for expert in &wave.experts {
-            rig.assert_usable(1, *expert);
-        }
-    }
-    rig.store.record_counts(1, &counts, 1.0);
-    let stats = rig.store.take_stats();
-    assert_eq!(stats.uploads, 14, "each expert once");
-    assert_eq!(stats.demand_reads + stats.guess_reads, 14, "each read once: {stats:?}");
-    assert!(stats.guess_reads >= 8, "the next wave is read while one is computed: {stats:?}");
-    // A decode step afterwards works as before.
-    rig.step(&[&[1, 2][..], &[3, 9][..]]);
-}
-
 impl Rig {
     /// Lets guesses be read and uploaded until `there` says that what the
     /// test expects has arrived, however long the reader's thread takes for

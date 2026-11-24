@@ -178,8 +178,8 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit, read and written with direct I/O outside of its index | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; the prefix cache of `qwen35` keeps its level on SSD in it (`--cache`) |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
-| `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the n-gram drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the n-gram drafter and the step cost |
-| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table and the waves are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
+| `ares-sched` | Step planner (generation, decision rows and prompts in one step), the share of time between generation and prompts, admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the price of a step by its rows with a term for the context, draft length choice and the acceptance of drafts, the n-gram drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses all of it (admission without spill to RAM) |
+| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule, the split of slots and the guess queue (its reads ahead of a router); the token table is not used by a running model yet, and elections only by the simulations of `tests/premises` (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking and tool calls, `count_tokens`, `tokenize`, `pieces`, `failure`; the `Structure` of a reply and the `Json` value of requests) | Done, unit tested |
 | `ares-tokenizer` | Text to token ids and back for the byte-level BPE vocabularies of GGUF models, as llama.cpp does; the chat templates (the Jinja dialect of the supported models) and what a template declares about thinking and tool calls | Done; tests against `llama-tokenize` and `llama-server --jinja` |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); unit tests in `src` and route suites against a scripted engine without a GPU, suites that start the real binary (some need the 27B or the files of Flash-Next) and suites that run the engine in the test's process (the suites of the routes on the 0.8B, or on any file the server loads with `ARES_TEST_API_MODEL`: they pass on Flash-Next); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader, and `tests/real_router.rs` on real devices); images through a projector (`--mmproj`, see [Images in a prompt](#images-in-a-prompt)), `/v1/systemone` answers 501 |
@@ -2797,39 +2797,20 @@ pages) and comes with the runtime.
   and 8.3 ms; a lone read takes 1.4 ms, the time of the faster drive. The
   copies must be identical: sizes are compared and contents sampled at open.
   The price is the disk space of the copy.
-- **Prefill of a MoE model, layer by layer** (the order and the waves are
-  built, running them is not). A long prompt uses
-  most experts of every layer. Run in chunks of rows through the whole
-  model, it fetches them again for every chunk, from the SSD or over PCIe
-  from RAM. The other order fetches each expert about once per prompt: a
-  group of layers is computed for all rows of the prompt before the next
-  group starts, and within a layer the routed experts are taken in waves
-  that fit the space for them, most used first. Every engine that streams
-  experts found this to be the largest effect on long prompts (Run My AI:
-  954 GiB read for a 4k prompt in batches of 16 tokens without it, about one
-  read per expert with it; TheCodacus: 16 to about 300 tokens/s on a 16.7k
-  prompt; none of these numbers was reproduced here).
-
-  `ares_sched::Pass` is that order: all rows of the prompt, in chunks that
-  fit a step, up to the router of the first layer with experts; then that
-  layer's experts for all rows; then all rows on to the next router. A
-  prompt runs as a pass when the model's experts are fetched and the prompt
-  does not fit into one step (`runs_as_pass`); `pass_rows_between` sizes the
-  pieces so that generating sequences, which get their ordinary steps
-  between the pieces, are slowed by the chosen factor and no more.
-  `ares_weights::ExpertWaves` divides the experts a layer needs into waves
-  that fit the room for them: what is in host memory before what is on disk,
-  the most used first, each expert in one wave. At the end of a prompt the
-  tiers are elected from the prompt's own routing, its end weighing most
-  (`ExpertHeat::record_counts` with `recency_weight`). On a synthetic prompt
-  of 4096 tokens over 256 experts with room for 32 at a time, a layer
-  fetches 224 experts once when it sees the whole prompt, and 5243 times one
-  (23 times each) when the prompt comes in chunks of 64 rows.
-
-  What is missing is the conductor that runs the pieces and keeps the hidden
-  states of all prompt rows between them, and a model with experts. The
-  kernels that compute a wave for the rows routed to it are built (see
-  "Many-row expert kernels" under "Devices").
+- **Prefill of a MoE model, layer by layer.** A long prompt uses most experts
+  of every layer. Run in chunks of rows through the whole model, it fetches
+  them again for every chunk, from the SSD or over PCIe from RAM. The other
+  order fetches each expert about once per prompt: a layer is computed for
+  all rows of the prompt before the next layer starts. Every engine that
+  streams experts found this to be the largest effect on long prompts (Run
+  My AI: 954 GiB read for a 4k prompt in batches of 16 tokens without it,
+  about one read per expert with it; TheCodacus: 16 to about 300 tokens/s on
+  a 16.7k prompt; none of these numbers was reproduced here). Flash-Next
+  reads its long prompts in that order, as a pass of the model that can
+  pause between micro-batches; a layer's misses come through transit there
+  (see "Long prompts layer by layer" under Flash-Next). It replaced a first
+  design of pieces planned in `ares-sched` and waves of a layer's experts
+  through the tiers, which is gone.
 - **More from the engines that stream experts** (details and the sources'
   numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)).
   Built as bookkeeping in `ares-weights`, with no runtime using it yet; the
@@ -6302,25 +6283,15 @@ What bounds the prompt now:
   product and a second record per layer on the part that routes, and the record's way to the
   host; with it the reads of layer L+1 run while layer L computes.
 - *The pass* (built 2026-11-23: "Long prompts layer by layer" below). A step of more rows
-  brings each expert of a layer once for more rows, and a pass (`ares_sched::Pass`: all rows
-  up to a layer's router in chunks that fit the scratch, then the layer's experts for all rows)
-  takes the scratch out of that. A pass inside one
-  step was designed and written but never compiled (the residual, the pending output and
-  the experts' input of every row kept on the device, 56 KiB a row; rounds over the chunks;
-  only for both cards on every layer), and is not in the tree: a step is what a request
-  that arrives waits for, and a step of 512 rows already takes more than a second on this
-  machine (see "Transit, measured"), so a pass of more rows inside one step keeps every
-  other request waiting for seconds. What an interruptible pass needs instead: the
-  conductor runs the pieces of `Pass` between ordinary steps (`pass_rows_between` sizes
-  them), so a pass is a state of the model that outlives a step: the kept rows on every
-  part and what `Misses` knows of the layer (plan made or not, which experts were computed)
-  must survive ordinary steps that run between two pieces, which need the scratch and the
-  transit slots meanwhile; the executor and `DeviceModel` need a piece as a unit of work
-  that ends without its rows having reached the end of the model; a sequence in a pass has
-  rows at a point inside the model, which the page tables, the recurrent state (its windows
-  advance chunk by chunk and layer by layer, not row by row through all layers) and
-  cancellation must know; and a split by layers must hand the kept rows of all chunks over
-  between the devices at the boundary layer, in pieces the link buffers hold.
+  brings each expert of a layer once for more rows, and a pass (all rows up to a layer's router
+  in micro-batches that fit the scratch, then the layer's experts for all rows) takes the
+  scratch out of that. A pass inside one step that cannot stop was designed and written but
+  never compiled (the residual, the pending output and the experts' input of every row kept on
+  the device, 56 KiB a row; rounds over the chunks; only for both cards on every layer), and is
+  not in the tree: a step is what a request that arrives waits for, and a step of 512 rows
+  already takes more than a second on this machine (see "Transit, measured"), so a pass of more
+  rows inside one step keeps every other request waiting for seconds. The pass that was built
+  pauses between micro-batches instead and goes on in the conductor's next record.
 
 
 **Large prompt steps on lent VRAM** (`expert_store/scratch.rs`, `Part::lay_out`, `Flow::lend`;

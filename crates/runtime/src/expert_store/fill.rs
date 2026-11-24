@@ -155,8 +155,8 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.worth_stale[layer] = true;
     }
 
-    /// The store's count of steps: it moves at the end of every step (and
-    /// every wave of a prompt pass) and at nothing else.
+    /// The store's count of steps: it moves at the end of every step and at
+    /// nothing else.
     pub fn clock(&self) -> u64 {
         self.step
     }
