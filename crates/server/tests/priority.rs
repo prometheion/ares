@@ -22,7 +22,7 @@ async fn priority_of(path: &str, body: Value, header: Option<&str>) -> (StatusCo
         request = request.header(HEADER, value);
     }
     let request = request.body(Body::from(body.to_string())).unwrap();
-    let response = app(&engine).oneshot(request).await.unwrap();
+    let response = app(&engine).await.oneshot(request).await.unwrap();
     let (status, value) = json(response).await;
     let priority = engine.submitted().first().map_or(i32::MAX, |r| r.priority);
     (status, value, priority)

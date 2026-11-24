@@ -4,8 +4,9 @@
 //! running engine on the devices, and says in the log what it decided and
 //! what it took.
 //!
-//! [`router`] turns any [`Engine`] into an OpenAI-compatible server:
-//! `/v1/chat/completions`, `/v1/completions` (plain and streamed), `/v1/models`,
+//! [`router_over`] turns the models of a server ([`models::Models`]: the
+//! presets of a preset file, or the one model of `--model`, each loaded by
+//! its engine) into an OpenAI-compatible server: `/v1/chat/completions`, `/v1/completions` (plain and streamed), `/v1/models`,
 //! `/health` and `/metrics`, llama-server's `/props`, `/tokenize` and
 //! `/detokenize`, and the routes of router mode (`/models/load`,
 //! `/models/unload`, `/models/sse`), into a server of Anthropic's Messages API on
@@ -81,7 +82,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ares_api::Engine;
 use axum::Router;
 use axum::routing::{any, get, post};
 use tokio::net::TcpListener;
@@ -89,7 +89,6 @@ use tokio::sync::{Notify, watch};
 
 pub use crate::access::Access;
 use crate::bridge::Stop;
-use crate::defaults::Defaults;
 use crate::models::Models;
 pub use crate::reasoning::ReasoningFormat;
 
@@ -106,12 +105,6 @@ pub struct Config {
     /// After a shutdown signal the server stops accepting connections and lets
     /// running requests finish for this long, then ends them.
     pub shutdown_grace: Duration,
-    /// How the reasoning of a reply is returned when a request does not say
-    /// (`--reasoning-format`).
-    pub reasoning_format: ReasoningFormat,
-    /// What a request gets for the fields it leaves out, and the most tokens
-    /// of a reply (`--temperature` and the others of the `defaults` module).
-    pub defaults: Defaults,
     /// Who may use the server: keys, names, origins (the `access` module).
     pub access: Access,
     /// How long a client may take to send a request (its head and its
@@ -132,8 +125,6 @@ impl Default for Config {
             event_buffer: 1024,
             max_body_bytes: 64 << 20,
             shutdown_grace: Duration::from_secs(30),
-            reasoning_format: ReasoningFormat::default(),
-            defaults: Defaults::default(),
             access: Access::default(),
             timeout: Duration::from_secs(600),
             log_text: false,
@@ -146,23 +137,9 @@ impl Default for Config {
 /// their clients before the server returns without them.
 const LAST_WORDS: Duration = Duration::from_secs(2);
 
-/// The server's routes over `engine`, with the default [`Config`].
-pub fn router(engine: Arc<dyn Engine>) -> Router {
-    router_with(engine, Config::default())
-}
-
-/// The server's routes over `engine`.
-///
-/// Reads the engine's statistics once ([`Engine::stats`]), which may wait
-/// for the engine's step.
-pub fn router_with(engine: Arc<dyn Engine>, config: Config) -> Router {
-    let models = Models::fixed(engine, config.reasoning_format, config.defaults.clone());
-    router_over(Arc::new(models), config)
-}
-
 /// The server's routes over `models`: a request's `model` names one of them,
-/// which is loaded if it is not. `config.reasoning_format` and
-/// `config.defaults` are not read: each model has its own.
+/// which is loaded if it is not. Each model has its own options (how its
+/// reasoning is returned, the defaults of its requests).
 pub fn router_over(models: Arc<Models>, config: Config) -> Router {
     // Nobody raises this signal: a router that is served by someone else is
     // stopped by them.
@@ -201,37 +178,13 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
         .layer(axum::middleware::from_fn_with_state(access, access::guard))
 }
 
-/// Serves `engine` on `listener` until `shutdown` completes.
+/// Serves `models` on `listener` until `shutdown` completes.
 ///
 /// Shutdown is graceful: the listener closes at once and running requests get
-/// [`Config::shutdown_grace`] to finish. Those that still run then are
-/// cancelled in the engine and their clients told, and the function returns
-/// when they are gone.
-pub async fn serve(
-    listener: TcpListener,
-    engine: Arc<dyn Engine>,
-    config: Config,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> io::Result<()> {
-    serve_until(listener, engine, config, shutdown, std::future::pending()).await
-}
-
-/// Like [`serve`], with a second signal: when `now` completes during the
-/// grace period, the wait for running requests ends at once.
-pub async fn serve_until(
-    listener: TcpListener,
-    engine: Arc<dyn Engine>,
-    config: Config,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-    now: impl Future<Output = ()> + Send,
-) -> io::Result<()> {
-    let models = Models::fixed(engine, config.reasoning_format, config.defaults.clone());
-    serve_models(listener, Arc::new(models), config, shutdown, now).await
-}
-
-/// Serves `models` on `listener` until `shutdown` completes, as [`serve`]
-/// does for one engine; when `now` completes during the grace period, the
-/// wait for running requests ends at once.
+/// [`Config::shutdown_grace`] to finish; when `now` completes during that
+/// time, the wait ends at once. Those that still run then are cancelled in
+/// their engine and their clients told, and the function returns when they
+/// are gone.
 ///
 /// However it stops, no request is left in an engine when this returns,
 /// unless a client did not take its last words within two seconds. The caller

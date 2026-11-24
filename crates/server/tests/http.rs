@@ -3,7 +3,9 @@
 
 mod common;
 
-use ares_api::{EngineError, EngineStats, Event, ExpertStats, FinishReason, Prompt, Role, Usage};
+use ares_api::{
+    EngineError, EngineStats, Event, ExpertStats, FinishReason, ModelCard, Prompt, Role, Usage,
+};
 use ares_server::Config;
 use axum::http::{StatusCode, header};
 use common::*;
@@ -18,29 +20,39 @@ const COMPLETIONS: &str = "/v1/completions";
 #[tokio::test]
 async fn health_answers_ok() {
     let engine = instant();
-    let (status, body) = json(get(&app(&engine), "/health").await).await;
+    let (status, body) = json(get(&app(&engine).await, "/health").await).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({"status": "ok"}));
 }
 
 #[tokio::test]
 async fn models_come_from_the_engine_in_the_openai_list_format() {
-    let engine = instant();
-    let (status, body) = json(get(&app(&engine), "/v1/models").await).await;
+    let models = vec![
+        ModelCard { id: "mock".into(), context_length: 4096, created: 1_700_000_000 },
+        ModelCard { id: "mock-2".into(), context_length: 8192, created: 1_700_000_001 },
+    ];
+    let engine =
+        MockEngine::with_models(models, Plan::Script(Vec::new()), DecisionPlan::Script(Vec::new()));
+    let (status, body) = json(get(&app(&engine).await, "/v1/models").await).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "list");
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(
         body["data"][0],
-        json!({"id": "mock", "object": "model", "created": 1_700_000_000u64, "owned_by": "ares", "context_length": 4096, "defaults": {}})
+        json!({
+            "id": "mock", "object": "model", "created": 1_700_000_000u64, "owned_by": "ares",
+            "context_length": 4096, "aliases": [], "status": {"value": "loaded"}, "defaults": {}
+        })
     );
+    // Each model has its own card.
     assert_eq!(body["data"][1]["id"], "mock-2");
+    assert_eq!(body["data"][1]["context_length"], 8192);
 }
 
 #[tokio::test]
 async fn unknown_paths_and_wrong_methods_answer_in_the_error_format() {
     let engine = instant();
-    let app = app(&engine);
+    let app = app(&engine).await;
     let (status, body) = json(get(&app, "/v2/nothing").await).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "not_found");
@@ -70,7 +82,7 @@ async fn chat_completion_returns_one_json_object() {
             },
         }),
     ]);
-    let (status, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
+    let (status, body) = json(post(&app(&engine).await, CHAT, &chat_body(json!({}))).await).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "chat.completion");
@@ -97,9 +109,10 @@ async fn chat_completion_returns_one_json_object() {
 #[tokio::test]
 async fn completion_returns_text_and_the_length_finish_reason() {
     let engine = MockEngine::script(vec![text(" a time"), done(FinishReason::Length, 3, 5)]);
-    let (status, body) =
-        json(post(&app(&engine), COMPLETIONS, &completion_body(json!({"max_tokens": 5}))).await)
-            .await;
+    let (status, body) = json(
+        post(&app(&engine).await, COMPLETIONS, &completion_body(json!({"max_tokens": 5}))).await,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "text_completion");
@@ -114,7 +127,7 @@ async fn completion_returns_text_and_the_length_finish_reason() {
 #[tokio::test]
 async fn every_request_gets_its_own_id_even_when_they_run_together() {
     let engine = instant();
-    let app = app(&engine);
+    let app = app(&engine).await;
     let calls: Vec<_> = (0..16)
         .map(|_| {
             let app = app.clone();
@@ -234,7 +247,7 @@ async fn conventions_of_other_servers_are_understood() {
 async fn chat_stream_starts_with_the_role_and_ends_with_the_finish_reason() {
     let engine =
         MockEngine::script(vec![text("Hel"), text(""), text("lo"), done(FinishReason::Stop, 3, 2)]);
-    let response = post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await;
+    let response = post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await;
     assert_eq!(response.status(), StatusCode::OK);
     let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap().to_owned();
     assert!(content_type.starts_with("text/event-stream"), "{content_type}");
@@ -276,7 +289,7 @@ async fn usage_chunk_follows_the_last_chunk_when_asked_for() {
         }),
     ]);
     let body = chat_body(json!({"stream": true, "stream_options": {"include_usage": true}}));
-    let body = body_text(post(&app(&engine), CHAT, &body).await).await;
+    let body = body_text(post(&app(&engine).await, CHAT, &body).await).await;
 
     let payloads = sse_payloads(&body);
     assert_eq!(payloads.last().unwrap(), "[DONE]");
@@ -299,7 +312,7 @@ async fn usage_chunk_follows_the_last_chunk_when_asked_for() {
 async fn include_usage_false_adds_nothing() {
     let engine = MockEngine::script(vec![text("x"), done(FinishReason::Stop, 1, 1)]);
     let body = chat_body(json!({"stream": true, "stream_options": {"include_usage": false}}));
-    let stream = parse_sse(&body_text(post(&app(&engine), CHAT, &body).await).await);
+    let stream = parse_sse(&body_text(post(&app(&engine).await, CHAT, &body).await).await);
     assert_eq!(stream.chunks.len(), 3);
     assert!(stream.chunks.iter().all(|c| c.get("usage").is_none()));
 }
@@ -309,7 +322,7 @@ async fn completion_stream_carries_text_without_a_role_chunk() {
     let engine =
         MockEngine::script(vec![text(" a"), text(" time"), done(FinishReason::Stop, 2, 2)]);
     let body = completion_body(json!({"stream": true, "stream_options": {"include_usage": true}}));
-    let stream = parse_sse(&body_text(post(&app(&engine), COMPLETIONS, &body).await).await);
+    let stream = parse_sse(&body_text(post(&app(&engine).await, COMPLETIONS, &body).await).await);
 
     assert!(stream.done);
     let chunks = &stream.chunks;
@@ -326,7 +339,8 @@ async fn completion_stream_carries_text_without_a_role_chunk() {
 async fn a_stream_without_text_still_has_role_finish_and_marker() {
     let engine = instant();
     let stream = parse_sse(
-        &body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await).await,
+        &body_text(post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await)
+            .await,
     );
     assert!(stream.done);
     assert_eq!(stream.chunks.len(), 2);
@@ -344,7 +358,7 @@ async fn multibyte_text_passes_through_a_stream_intact() {
     steps.push(done(FinishReason::Stop, 1, 6));
     let engine = MockEngine::script(steps);
     let body =
-        body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await).await;
+        body_text(post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await).await;
 
     assert!(body.contains("🦀") && body.contains("日本語"), "sent as UTF-8, not escaped: {body}");
     let stream = parse_sse(&body);
@@ -364,7 +378,7 @@ async fn multibyte_text_passes_through_a_plain_response_intact() {
     let mut steps: Vec<_> = PIECES.iter().map(|p| text(p)).collect();
     steps.push(done(FinishReason::Stop, 1, 6));
     let engine = MockEngine::script(steps);
-    let (_, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
+    let (_, body) = json(post(&app(&engine).await, CHAT, &chat_body(json!({}))).await).await;
     assert_eq!(body["choices"][0]["message"]["content"], PIECES.concat());
 }
 
@@ -377,7 +391,8 @@ async fn an_error_returned_by_submit_maps_to_its_status() {
             [(CHAT, chat_body(json!({}))), (COMPLETIONS, completion_body(json!({})))]
         {
             let engine = MockEngine::reject(case.error.clone());
-            assert_error(&case, post(&app(&engine), path, &body).await, "rejected at submit").await;
+            assert_error(&case, post(&app(&engine).await, path, &body).await, "rejected at submit")
+                .await;
         }
     }
 }
@@ -386,7 +401,7 @@ async fn an_error_returned_by_submit_maps_to_its_status() {
 async fn an_error_event_before_any_text_maps_to_its_status() {
     for case in error_cases("max_tokens is silly") {
         let engine = MockEngine::script(vec![fail(case.error.clone())]);
-        let response = post(&app(&engine), CHAT, &chat_body(json!({}))).await;
+        let response = post(&app(&engine).await, CHAT, &chat_body(json!({}))).await;
         assert_error(&case, response, "error event").await;
     }
 }
@@ -398,7 +413,8 @@ async fn a_streaming_request_that_fails_first_gets_the_status_and_not_a_200() {
     for case in error_cases("max_tokens is silly") {
         let engine = MockEngine::script(vec![fail(case.error.clone())]);
         let body = chat_body(json!({"stream": true}));
-        assert_error(&case, post(&app(&engine), CHAT, &body).await, "streaming, error first").await;
+        assert_error(&case, post(&app(&engine).await, CHAT, &body).await, "streaming, error first")
+            .await;
     }
 }
 
@@ -406,7 +422,7 @@ async fn a_streaming_request_that_fails_first_gets_the_status_and_not_a_200() {
 async fn an_error_after_text_ends_the_plain_response_with_the_error() {
     let engine =
         MockEngine::script(vec![text("partial"), fail(EngineError::Internal("boom".into()))]);
-    let (status, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
+    let (status, body) = json(post(&app(&engine).await, CHAT, &chat_body(json!({}))).await).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["error"]["code"], "internal_error");
     assert!(!body.to_string().contains("partial"), "half an answer must not look like an answer");
@@ -416,7 +432,7 @@ async fn an_error_after_text_ends_the_plain_response_with_the_error() {
 async fn an_error_after_text_ends_the_stream_with_an_error_object_and_no_done_marker() {
     let engine =
         MockEngine::script(vec![text("partial"), fail(EngineError::Internal("boom".into()))]);
-    let response = post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await;
+    let response = post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await;
     assert_eq!(response.status(), StatusCode::OK, "the status was sent before the failure");
     let body = body_text(response).await;
 
@@ -431,13 +447,13 @@ async fn an_error_after_text_ends_the_stream_with_an_error_object_and_no_done_ma
 #[tokio::test]
 async fn a_request_the_engine_cancelled_under_a_waiting_client_is_an_error() {
     let engine = MockEngine::script(vec![text("cut"), done(FinishReason::Cancelled, 1, 1)]);
-    let (status, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
+    let (status, body) = json(post(&app(&engine).await, CHAT, &chat_body(json!({}))).await).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["code"], "cancelled");
 
     let engine = MockEngine::script(vec![text("cut"), done(FinishReason::Cancelled, 1, 1)]);
     let body =
-        body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await).await;
+        body_text(post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await).await;
     let stream = parse_sse(&body);
     assert!(!stream.done);
     assert_eq!(stream.chunks.last().unwrap()["error"]["code"], "cancelled");
@@ -448,7 +464,7 @@ async fn a_request_the_engine_cancelled_under_a_waiting_client_is_an_error() {
 async fn an_engine_that_drops_the_sink_without_finishing_is_reported_not_waited_for() {
     // Nothing at all.
     let engine = MockEngine::script(vec![Step::Abandon]);
-    let (status, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
+    let (status, body) = json(post(&app(&engine).await, CHAT, &chat_body(json!({}))).await).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body["error"]["message"].as_str().unwrap().contains("without finishing"));
     assert_eq!(engine.cancelled(), [engine.submitted()[0].id], "the request is released");
@@ -456,7 +472,7 @@ async fn an_engine_that_drops_the_sink_without_finishing_is_reported_not_waited_
     // After some text, while streaming.
     let engine = MockEngine::script(vec![text("a"), Step::Abandon]);
     let body =
-        body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await).await;
+        body_text(post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await).await;
     let stream = parse_sse(&body);
     assert!(!stream.done);
     assert_eq!(stream.chunks.last().unwrap()["error"]["code"], "internal_error");
@@ -533,7 +549,7 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
     ];
 
     let engine = instant();
-    let app = app(&engine);
+    let app = app(&engine).await;
     for (path, body, param, words) in cases {
         let (status, value) = json(post(&app, path, &body).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {value}");
@@ -594,7 +610,7 @@ impl IntoCase for (&'static str, String) {
 async fn an_oversized_body_is_refused_with_413() {
     let engine = instant();
     let config = Config { max_body_bytes: 64, ..Config::default() };
-    let app = app_with(&engine, config);
+    let app = app_with(&engine, config).await;
     let big = chat_body(json!({"padding": "x".repeat(200)}));
 
     // Without a declared length the body is counted as it arrives.
@@ -637,7 +653,7 @@ async fn a_finished_request_reports_where_its_time_went() {
             },
         }),
     ]);
-    let app = app(&engine);
+    let app = app(&engine).await;
     let request = tokio::spawn({
         let app = app.clone();
         async move { json(post(&app, CHAT, &chat_body(json!({}))).await).await }
@@ -671,7 +687,8 @@ async fn a_finished_request_reports_where_its_time_went() {
 #[tokio::test]
 async fn a_stream_carries_the_timings_in_its_finish_chunk() {
     let engine = MockEngine::script(vec![text("Hi"), done(FinishReason::Length, 7, 1)]);
-    let body = body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await);
+    let body =
+        body_text(post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await);
     let stream = parse_sse(&body.await);
     let finish = stream.chunks.last().unwrap();
     assert_eq!(finish["choices"][0]["finish_reason"], "length");
@@ -700,7 +717,7 @@ async fn a_request_that_ran_alone_gets_the_drafts_the_engine_counted_meanwhile()
         done(FinishReason::Stop, 3, 9),
     ]);
     engine.set_stats(drafted(100, 60));
-    let app = app(&engine);
+    let app = app(&engine).await;
 
     let ask = |app: axum::Router| {
         tokio::spawn(async move { json(post(&app, CHAT, &chat_body(json!({}))).await).await.1 })
@@ -730,7 +747,7 @@ async fn requests_that_ran_together_get_no_draft_counts() {
         done(FinishReason::Stop, 3, 9),
     ]);
     engine.set_stats(drafted(0, 0));
-    let app = app(&engine);
+    let app = app(&engine).await;
     let ask = |app: axum::Router| {
         tokio::spawn(async move { json(post(&app, CHAT, &chat_body(json!({}))).await).await.1 })
     };
@@ -760,7 +777,7 @@ async fn requests_that_ran_together_get_no_draft_counts() {
 #[tokio::test]
 async fn metrics_are_the_engines_statistics_as_text() {
     let engine = instant();
-    let (status, body) = json(get(&app(&engine), "/metrics").await).await;
+    let (status, body) = json(get(&app(&engine).await, "/metrics").await).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "an engine without statistics: {body}");
 
     engine.set_stats(EngineStats {
@@ -814,7 +831,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
             ..ares_api::SsdStats::default()
         },
     });
-    let response = get(&app(&engine), "/metrics").await;
+    let response = get(&app(&engine).await, "/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/plain"));
     let text = body_text(response).await;
@@ -875,7 +892,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
 #[tokio::test]
 async fn a_client_that_leaves_a_plain_request_cancels_it_in_the_engine() {
     let engine = MockEngine::script(vec![Step::UntilCancelled]);
-    let app = app(&engine);
+    let app = app(&engine).await;
     let call = tokio::spawn({
         let app = app.clone();
         async move { tower::ServiceExt::oneshot(app, post_request(CHAT, &chat_body(json!({})))).await }
@@ -893,7 +910,7 @@ async fn a_client_that_leaves_a_plain_request_cancels_it_in_the_engine() {
 #[tokio::test]
 async fn a_client_that_leaves_a_stream_cancels_it_in_the_engine() {
     let engine = MockEngine::script(vec![text("a"), Step::UntilCancelled]);
-    let response = post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await;
+    let response = post(&app(&engine).await, CHAT, &chat_body(json!({"stream": true}))).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut body = response.into_body().into_data_stream();
@@ -922,7 +939,7 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
     ]);
     let config = Config { stream_wait: std::time::Duration::from_millis(50), ..Config::default() };
     let response =
-        post(&app_with(&engine, config), CHAT, &chat_body(json!({"stream": true}))).await;
+        post(&app_with(&engine, config).await, CHAT, &chat_body(json!({"stream": true}))).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
     let role = body.next().await.unwrap().unwrap();
@@ -942,7 +959,7 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
     ]);
     let config = Config { stream_wait: std::time::Duration::from_millis(50), ..Config::default() };
     let response =
-        post(&app_with(&engine, config), CHAT, &chat_body(json!({"stream": true}))).await;
+        post(&app_with(&engine, config).await, CHAT, &chat_body(json!({"stream": true}))).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
     body.next().await.unwrap().unwrap();
@@ -957,7 +974,7 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
 #[tokio::test]
 async fn a_client_that_leaves_before_the_first_event_of_a_stream_cancels_too() {
     let engine = MockEngine::script(vec![Step::UntilCancelled]);
-    let app = app(&engine);
+    let app = app(&engine).await;
     let call = tokio::spawn({
         let app = app.clone();
         async move {
@@ -974,14 +991,14 @@ async fn a_client_that_leaves_before_the_first_event_of_a_stream_cancels_too() {
 async fn finished_requests_are_never_cancelled() {
     let script = vec![text("done"), done(FinishReason::Stop, 1, 1)];
     let engine = MockEngine::script(script.clone());
-    let app = app(&engine);
+    let app = app(&engine).await;
     assert_eq!(post(&app, CHAT, &chat_body(json!({}))).await.status(), StatusCode::OK);
     let _ = body_text(post(&app, CHAT, &chat_body(json!({"stream": true}))).await).await;
     let _ =
         body_text(post(&app, COMPLETIONS, &completion_body(json!({"stream": true}))).await).await;
     // A failed request is over as well.
     let failing = MockEngine::script(vec![fail(EngineError::Overloaded)]);
-    let _ = post(&common::app(&failing), CHAT, &chat_body(json!({}))).await;
+    let _ = post(&common::app(&failing).await, CHAT, &chat_body(json!({}))).await;
 
     assert_eq!(engine.submitted().len(), 3);
     assert!(engine.cancelled().is_empty(), "{:?}", engine.cancelled());
@@ -991,7 +1008,7 @@ async fn finished_requests_are_never_cancelled() {
 #[tokio::test]
 async fn an_invalid_request_is_not_cancelled_because_it_was_never_started() {
     let engine = instant();
-    let _ = post(&app(&engine), CHAT, "{").await;
+    let _ = post(&app(&engine).await, CHAT, "{").await;
     assert!(engine.submitted().is_empty() && engine.cancelled().is_empty());
 }
 
@@ -1025,7 +1042,8 @@ async fn a_client_that_does_not_read_is_cut_off_with_an_error_and_loses_no_text_
     steps.push(done(FinishReason::Stop, 1, 41));
     let engine = MockEngine::script(steps);
     let response =
-        post(&app_with(&engine, tiny_buffer()), CHAT, &chat_body(json!({"stream": true}))).await;
+        post(&app_with(&engine, tiny_buffer()).await, CHAT, &chat_body(json!({"stream": true})))
+            .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     // The client holds the response and reads nothing while the engine writes.
@@ -1064,7 +1082,8 @@ async fn the_terminal_event_always_finds_room_so_a_finished_answer_is_never_a_sl
     steps.push(done(FinishReason::Stop, 1, 5));
     let engine = MockEngine::script(steps);
     let response =
-        post(&app_with(&engine, tiny_buffer()), CHAT, &chat_body(json!({"stream": true}))).await;
+        post(&app_with(&engine, tiny_buffer()).await, CHAT, &chat_body(json!({"stream": true})))
+            .await;
 
     gate.open();
     eventually("all events to be sent", || engine.sends().len() == 6).await;
@@ -1084,7 +1103,7 @@ async fn the_default_buffer_takes_a_long_burst_without_cutting_anyone_off() {
     let mut steps: Vec<_> = (0..1000).map(|i| text(&format!("{i},"))).collect();
     steps.push(done(FinishReason::Stop, 1, 1000));
     let engine = MockEngine::script(steps);
-    let (status, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
+    let (status, body) = json(post(&app(&engine).await, CHAT, &chat_body(json!({}))).await).await;
     assert_eq!(status, StatusCode::OK);
     let expected: String = (0..1000).map(|i| format!("{i},")).collect();
     assert_eq!(body["choices"][0]["message"]["content"], expected);
@@ -1093,7 +1112,7 @@ async fn the_default_buffer_takes_a_long_burst_without_cutting_anyone_off() {
 #[tokio::test]
 async fn an_unknown_model_is_not_found_whatever_the_request_asks_of_its_template() {
     let engine = instant();
-    let app = app(&engine);
+    let app = app(&engine).await;
     let tools =
         json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
     for extra in [json!({"tools": tools}), json!({"reasoning_effort": "high"}), json!({})] {

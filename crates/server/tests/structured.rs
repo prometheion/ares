@@ -26,12 +26,12 @@ async fn structure_of(
 ) -> Option<Structure> {
     let engine = instant();
     engine.set_chat_format(ChatFormat { thinking, tools: None });
-    submitted(&engine, &app(&engine), path, body).await.structure
+    submitted(&engine, &app(&engine).await, path, body).await.structure
 }
 
 async fn refused(path: &str, body: &str) -> Value {
     let engine = instant();
-    let (status, value) = json(post(&app(&engine), path, body).await).await;
+    let (status, value) = json(post(&app(&engine).await, path, body).await).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
     assert!(engine.submitted().is_empty(), "the engine was not to see the request");
     value["error"].clone()
@@ -166,7 +166,8 @@ async fn what_the_engine_says_about_a_grammar_is_a_400_that_names_it() {
         "grammar: grammar, line 1, column 10: the rule 'a' is used and never defined".into(),
     ));
     let (status, body) =
-        json(post(&app(&engine), CHAT, &chat_body(json!({"grammar": "root ::= a"}))).await).await;
+        json(post(&app(&engine).await, CHAT, &chat_body(json!({"grammar": "root ::= a"}))).await)
+            .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["error"]["message"].as_str().unwrap().contains("never defined"), "{body}");
 }

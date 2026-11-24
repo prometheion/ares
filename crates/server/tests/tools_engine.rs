@@ -19,6 +19,7 @@ use std::time::Duration;
 use ares_api::{ChatFormat, Engine, ThinkingFormat, ToolFormat};
 use ares_runtime::testing::HostExecutor;
 use ares_runtime::{Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_server::options::ModelOptions;
 use axum::Router;
 use axum::http::StatusCode;
 use common::*;
@@ -27,18 +28,18 @@ use serde_json::{Value, json};
 const CHAT: &str = "/v1/chat/completions";
 
 /// The server over a runtime whose model writes calls after `trigger`.
-fn served(trigger: Option<&str>) -> Router {
-    served_thinking(trigger, None)
+async fn served(trigger: Option<&str>) -> Router {
+    served_thinking(trigger, None).await
 }
 
 /// The same, with a model that thinks until it writes `close`: the prompt
 /// has opened the block.
-fn served_thinking(trigger: Option<&str>, close: Option<&str>) -> Router {
-    served_ending(trigger, close, b'~')
+async fn served_thinking(trigger: Option<&str>, close: Option<&str>) -> Router {
+    served_ending(trigger, close, b'~').await
 }
 
 /// The same, with a model whose replies end at the character `end`.
-fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> Router {
+async fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> Router {
     let mut config = SyntheticConfig::small(Split::Single, 1);
     config.context_length = 2048;
     config.eos = Some(u32::from(end));
@@ -82,7 +83,7 @@ fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> Router 
     let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
         .with_row_cost(Duration::from_micros(3000), Duration::from_micros(30));
     let engine: Arc<dyn Engine> = Arc::new(Runtime::start(model, Box::new(host), config).unwrap());
-    ares_server::router_with(engine, ares_server::Config::default())
+    router_of(engine, ModelOptions::default(), ares_server::Config::default()).await
 }
 
 fn tools() -> Value {
@@ -220,7 +221,7 @@ async fn reply(app: &Router, extra: Value) -> Reply {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_required_call_is_a_call_of_the_tools_with_arguments_of_their_schema() {
-    let app = served(Some("<tool_call>"));
+    let app = served(Some("<tool_call>")).await;
     let one = json!({"tools": tools(), "tool_choice": "required", "parallel_tool_calls": false});
     let got = reply(&app, one).await;
     assert_eq!((got.content.as_str(), got.finish.as_str()), ("", "tool_calls"), "{got:?}");
@@ -250,7 +251,7 @@ async fn a_required_call_is_a_call_of_the_tools_with_arguments_of_their_schema()
 async fn with_auto_the_text_is_free_and_a_call_follows_the_trigger() {
     // What the model writes when nothing binds it, and a character of it to
     // be the trigger: one that the text has not had before.
-    let free = whole(&served(None), json!({"max_tokens": 60})).await;
+    let free = whole(&served(None).await, json!({"max_tokens": 60})).await;
     assert!(free.calls.is_empty());
     let text = &free.content;
     let (at, trigger) = text
@@ -259,7 +260,7 @@ async fn with_auto_the_text_is_free_and_a_call_follows_the_trigger() {
         .find(|&(at, c)| c.is_ascii_graphic() && c != '<' && !text[..at].contains(c))
         .unwrap_or_else(|| panic!("no character to be the trigger in {text:?}"));
 
-    let app = served(Some(&trigger.to_string()));
+    let app = served(Some(&trigger.to_string())).await;
     let auto = json!({"tools": tools(), "parallel_tool_calls": false});
     let got = reply(&app, auto).await;
     // The same text up to the trigger, then one call and the end.
@@ -275,7 +276,7 @@ async fn with_auto_the_text_is_free_and_a_call_follows_the_trigger() {
 /// What the model writes when nothing binds it, and two characters of it:
 /// each is new to the text where it first stands, the second after the first.
 async fn free_text() -> (String, (usize, char), (usize, char)) {
-    let free = whole(&served(None), json!({"max_tokens": 60})).await;
+    let free = whole(&served(None).await, json!({"max_tokens": 60})).await;
     let text = free.content;
     let new = |from: usize| {
         text.char_indices()
@@ -293,7 +294,7 @@ async fn a_call_the_model_opens_while_it_thinks_is_a_call_under_the_rule() {
     let (text, _, (at, marker)) = free_text().await;
     // The model thinks and never writes the closing tag: it writes the
     // marker of a call in the middle of its thinking.
-    let app = served_thinking(Some(&marker.to_string()), Some("</think>"));
+    let app = served_thinking(Some(&marker.to_string()), Some("</think>")).await;
 
     // auto: the text up to the marker is the reasoning, then one call under
     // the rule and the end; whole, streamed and without drafts.
@@ -345,7 +346,7 @@ async fn a_call_the_model_opens_while_it_thinks_is_a_call_under_the_rule() {
 async fn a_call_after_the_closing_tag_is_a_call_as_before() {
     let (text, (closed, close), (at, marker)) = free_text().await;
     // The model closes its thinking, writes on and then opens a call.
-    let app = served_thinking(Some(&marker.to_string()), Some(&close.to_string()));
+    let app = served_thinking(Some(&marker.to_string()), Some(&close.to_string())).await;
     let auto = json!({"tools": tools(), "parallel_tool_calls": false});
     let got = reply(&app, auto).await;
     assert_eq!(got.reasoning, text[..closed], "{got:?}");
@@ -379,7 +380,7 @@ async fn a_reply_that_must_call_does_not_end_in_its_thinking() {
         })
         .unwrap_or_else(|| panic!("no character to be the end in {text:?}"));
     let marker = char::from(end as u8 + 1).to_string();
-    let app = served_ending(Some(&marker), Some("</think>"), end as u8);
+    let app = served_ending(Some(&marker), Some("</think>"), end as u8).await;
 
     // Left alone the model ends its reply there, in its thinking.
     let auto = json!({"tools": tools(), "parallel_tool_calls": false});
@@ -400,7 +401,7 @@ async fn a_reply_that_must_call_does_not_end_in_its_thinking() {
 
     // With a marker the model never writes, it thinks on to the limit of
     // tokens: the reply has no call, and has not ended by itself.
-    let app = served_ending(Some("<tool_call>"), Some("</think>"), end as u8);
+    let app = served_ending(Some("<tool_call>"), Some("</think>"), end as u8).await;
     let must = json!({"tools": tools(), "tool_choice": "required", "max_tokens": at + 20});
     let got = reply(&app, must).await;
     assert_eq!((got.finish.as_str(), got.calls.len()), ("length", 0), "{got:?}");
@@ -410,7 +411,7 @@ async fn a_reply_that_must_call_does_not_end_in_its_thinking() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_runtime_counts_the_prompt_a_run_of_the_same_request_reports() {
-    let app = served(Some("@"));
+    let app = served(Some("@")).await;
     let body = json!({
         "model": "synthetic",
         "system": "be brief",
@@ -439,7 +440,7 @@ async fn the_runtime_counts_the_prompt_a_run_of_the_same_request_reports() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_counts_of_the_openai_routes_are_the_prompts_their_requests_report() {
-    let app = served(Some("@"));
+    let app = served(Some("@")).await;
 
     // A Responses request: the count is the input of its run, what the
     // prefix cache gave included.

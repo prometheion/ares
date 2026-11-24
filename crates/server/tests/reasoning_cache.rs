@@ -42,10 +42,10 @@ use ares_tokenizer::{
     ChatOptions, ChatTemplate, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer,
 };
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, header};
 use serde_json::{Value, json};
-use tower::ServiceExt;
+
+mod common;
+mod gpu;
 
 const PAGE: u32 = 128;
 
@@ -81,20 +81,6 @@ const QWEN_LIKE: &str = r#"
     {%- endif %}
 {%- endif %}
 "#;
-
-fn model_path() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
-            None
-        }
-    }
-}
 
 /// The template to serve the model with: read from the 27B's file if there is
 /// one, the shortened one otherwise.
@@ -296,7 +282,7 @@ impl Answer {
 impl Server {
     /// Starts the engine on the 0.8B. `template` is the chat template to serve
     /// it with, or `None` for the model's own.
-    fn start(path: &PathBuf, template: Option<&str>) -> Self {
+    async fn start(path: &PathBuf, template: Option<&str>) -> Self {
         let options = Options {
             precision: Precision::Exact,
             max_rows: 128,
@@ -344,25 +330,16 @@ impl Server {
             }
         };
         let gpu = GpuConfig::new(&config, &*model);
-        let ordinal =
-            std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
-        let device = Device::open(ordinal, Wait::Block).unwrap();
+        let device = Device::open(common::test_device(), Wait::Block).unwrap();
         let executor = GpuExecutor::start(model.clone(), vec![device], gpu).unwrap();
         let runtime = Arc::new(Runtime::start(model, Box::new(executor), config).unwrap());
-        let app = ares_server::router(runtime.clone());
+        let app = gpu::router(runtime.clone()).await;
         let reported = runtime.snapshot().expect("the engine runs").requests.len();
         Self { runtime, app, trace, path: path.clone(), reported }
     }
 
     async fn post(&self, body: &Value) -> (u16, String) {
-        let request = Request::post("/v1/chat/completions")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status().as_u16();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, String::from_utf8(bytes.to_vec()).unwrap())
+        gpu::ask(&self.app, "/v1/chat/completions", body).await
     }
 
     /// Where the prompt after the request `turn` parts from what came before it.
@@ -373,15 +350,8 @@ impl Server {
 
     /// One metric of `/metrics`.
     async fn metric(&self, name: &str) -> u64 {
-        let response = self
-            .app
-            .clone()
-            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        common::body_text(common::get(&self.app, "/metrics").await)
             .await
-            .unwrap();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        String::from_utf8(bytes.to_vec())
-            .unwrap()
             .lines()
             .find_map(|line| line.strip_prefix(&format!("ares_{name} ")))
             .unwrap_or_else(|| panic!("no metric {name}"))
@@ -538,10 +508,10 @@ async fn conversation(server: &mut Server, kind: Kind, with_reasoning: bool) -> 
 
 #[tokio::test]
 async fn a_conversation_whose_client_sends_the_reasoning_back_computes_only_the_new_message() {
-    let Some(path) = model_path() else { return };
+    let Some(path) = gpu::small() else { return };
     let (template, which) = preserving_template();
     eprintln!("RES served with {which}");
-    let mut server = Server::start(&path, Some(&template));
+    let mut server = Server::start(&path, Some(&template)).await;
     let mut stopped = 0;
     let mut turns = 0;
     for kind in [Kind::Short, Kind::Long] {
@@ -594,10 +564,10 @@ async fn a_conversation_whose_client_sends_the_reasoning_back_computes_only_the_
 
 #[tokio::test]
 async fn a_client_that_drops_the_reasoning_pays_for_it_in_every_turn() {
-    let Some(path) = model_path() else { return };
+    let Some(path) = gpu::small() else { return };
     let (template, which) = preserving_template();
     eprintln!("RES served with {which}");
-    let mut server = Server::start(&path, Some(&template));
+    let mut server = Server::start(&path, Some(&template)).await;
     // The same conversation, the client sending back only what `content` said.
     let answers = conversation(&mut server, Kind::Long, false).await;
 
@@ -619,8 +589,8 @@ async fn a_client_that_drops_the_reasoning_pays_for_it_in_every_turn() {
 
 #[tokio::test]
 async fn with_its_own_template_the_0_8b_cannot_continue_from_its_replies_whatever_is_sent_back() {
-    let Some(path) = model_path() else { return };
-    let mut server = Server::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let mut server = Server::start(&path, None).await;
     // The template writes the thinking of a turn into the prompt only after the
     // last user message: in the next request the reply is an earlier turn.
     let answers = conversation(&mut server, Kind::Long, true).await;

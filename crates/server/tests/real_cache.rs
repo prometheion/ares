@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use common::fresh;
 use common::process::{Client, Server, ares};
+use common::{model_file, test_device};
 use serde_json::json;
 
 mod common;
@@ -39,24 +40,8 @@ mod common;
 /// How long anything may take before a test fails instead of hanging.
 const LIMIT: Duration = Duration::from_secs(300);
 
-fn file(variable: &str, what: &str) -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    let path = std::env::var_os(variable).map(PathBuf::from);
-    if path.is_none() {
-        eprintln!("skipped: set {variable} to {what}");
-    }
-    path
-}
-
 fn port(offset: u16) -> u16 {
     common::process::port(18970, offset)
-}
-
-fn test_device() -> u32 {
-    std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0)
 }
 
 /// A fresh directory for a test's store and files.
@@ -230,7 +215,9 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
 
 #[test]
 fn a_conversation_resumes_from_ssd_after_a_restart_and_after_eviction() {
-    let Some(small) = file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else { return };
+    let Some(small) = model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else {
+        return;
+    };
     let device = test_device().to_string();
     // A context that holds two of the conversations and not five.
     let flags = ["--devices", &device, "--context", "10240", "--parallel", "2"];
@@ -239,7 +226,8 @@ fn a_conversation_resumes_from_ssd_after_a_restart_and_after_eviction() {
 
 #[test]
 fn pages_in_two_forms_on_two_devices_resume_from_ssd() {
-    let Some(model) = file("ARES_TEST_QWEN35_27B_SMALL", "a qwen35 file two devices split") else {
+    let Some(model) = model_file("ARES_TEST_QWEN35_27B_SMALL", "a qwen35 file two devices split")
+    else {
         return;
     };
     let flags = [
@@ -259,7 +247,9 @@ fn pages_in_two_forms_on_two_devices_resume_from_ssd() {
 
 #[test]
 fn a_model_that_was_unloaded_resumes_from_ssd_when_it_is_loaded_again() {
-    let Some(small) = file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else { return };
+    let Some(small) = model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else {
+        return;
+    };
     let dir = scratch("cache-router");
     let ini = dir.join("models.ini");
     let text = format!(
@@ -297,7 +287,8 @@ fn a_model_that_was_unloaded_resumes_from_ssd_when_it_is_loaded_again() {
 /// first token of each is reported.
 #[test]
 fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
-    let Some(model) = file("ARES_TEST_QWEN4EXP_MODEL", "the first file of Qwen3.8-Flash-Next")
+    let Some(model) =
+        model_file("ARES_TEST_QWEN4EXP_MODEL", "the first file of Qwen3.8-Flash-Next")
     else {
         return;
     };

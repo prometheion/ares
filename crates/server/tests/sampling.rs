@@ -18,7 +18,7 @@ const COMPLETIONS: &str = "/v1/completions";
 /// The refusal of a request: its status and the field it names.
 async fn refused(path: &str, body: &str) -> (StatusCode, Option<String>, String) {
     let engine = instant();
-    let (status, value) = json(post(&app(&engine), path, body).await).await;
+    let (status, value) = json(post(&app(&engine).await, path, body).await).await;
     assert!(engine.submitted().is_empty(), "a refused request reaches the engine: {value}");
     let error = &value["error"];
     (
@@ -254,7 +254,7 @@ fn with_probs() -> std::sync::Arc<MockEngine> {
 async fn chat_probabilities_are_asked_for_with_logprobs_and_come_back_per_token() {
     let engine = with_probs();
     let body = chat_body(json!({"logprobs": true, "top_logprobs": 2}));
-    let (status, value) = json(post(&app(&engine), CHAT, &body).await).await;
+    let (status, value) = json(post(&app(&engine).await, CHAT, &body).await).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(
         engine.submitted()[0].sampling.logprobs,
@@ -298,7 +298,7 @@ async fn top_logprobs_needs_logprobs_and_has_a_limit() {
 async fn completions_probabilities_come_in_the_legacy_form() {
     let engine = with_probs();
     let body = completion_body(json!({"logprobs": 2}));
-    let (status, value) = json(post(&app(&engine), COMPLETIONS, &body).await).await;
+    let (status, value) = json(post(&app(&engine).await, COMPLETIONS, &body).await).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(
         engine.submitted()[0].sampling.logprobs,
@@ -315,7 +315,7 @@ async fn completions_probabilities_come_in_the_legacy_form() {
 async fn llama_cpp_asks_for_probabilities_with_n_probs() {
     let engine = with_probs();
     let body = completion_body(json!({"n_probs": 2}));
-    let (_, value) = json(post(&app(&engine), COMPLETIONS, &body).await).await;
+    let (_, value) = json(post(&app(&engine).await, COMPLETIONS, &body).await).await;
     assert_eq!(
         engine.submitted()[0].sampling.logprobs,
         Some(LogprobRequest { top: 2, after_chain: false })
@@ -326,7 +326,7 @@ async fn llama_cpp_asks_for_probabilities_with_n_probs() {
     // After the chain: probabilities, under the names llama.cpp gives them.
     let engine = with_probs();
     let body = completion_body(json!({"n_probs": 2, "post_sampling_probs": true}));
-    let (_, value) = json(post(&app(&engine), COMPLETIONS, &body).await).await;
+    let (_, value) = json(post(&app(&engine).await, COMPLETIONS, &body).await).await;
     assert_eq!(
         engine.submitted()[0].sampling.logprobs,
         Some(LogprobRequest { top: 2, after_chain: true })
@@ -348,7 +348,7 @@ async fn llama_cpp_asks_for_probabilities_with_n_probs() {
 async fn a_stream_carries_the_probabilities_in_chunks_of_their_own() {
     let engine = with_probs();
     let body = chat_body(json!({"logprobs": true, "top_logprobs": 1, "stream": true}));
-    let response = post(&app(&engine), CHAT, &body).await;
+    let response = post(&app(&engine).await, CHAT, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut stream = response.into_body().into_data_stream();
     let mut raw = String::new();
@@ -372,7 +372,7 @@ async fn a_stream_carries_the_probabilities_in_chunks_of_their_own() {
 async fn n_completions_are_n_requests_with_their_own_seeds() {
     let engine = MockEngine::script(vec![text("ab"), done(FinishReason::Stop, 5, 2)]);
     let body = chat_body(json!({"n": 3, "seed": 100}));
-    let (status, value) = json(post(&app(&engine), CHAT, &body).await).await;
+    let (status, value) = json(post(&app(&engine).await, CHAT, &body).await).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     let choices = value["choices"].as_array().unwrap();
     assert_eq!(choices.len(), 3);
@@ -393,7 +393,8 @@ async fn n_completions_are_n_requests_with_their_own_seeds() {
     // llama.cpp's name for the same.
     let engine = MockEngine::script(vec![text("x"), done(FinishReason::Stop, 1, 1)]);
     let (_, value) =
-        json(post(&app(&engine), COMPLETIONS, &completion_body(json!({"n_cmpl": 2}))).await).await;
+        json(post(&app(&engine).await, COMPLETIONS, &completion_body(json!({"n_cmpl": 2}))).await)
+            .await;
     assert_eq!(value["choices"].as_array().unwrap().len(), 2);
     for bad in [json!({"n": 0}), json!({"n": 17}), json!({"n": -1})] {
         let (status, param, _) = refused(CHAT, &chat_body(bad.clone())).await;
@@ -409,7 +410,7 @@ async fn a_request_that_allows_no_drafts_says_so_with_every_sampler_field_and_fo
         "draft": false, "n": 2, "seed": 7, "repeat_penalty": 1.2, "mirostat": 2,
         "logit_bias": [[" the", false]], "logprobs": true, "top_logprobs": 2,
     }));
-    let (status, value) = json(post(&app(&engine), CHAT, &body).await).await;
+    let (status, value) = json(post(&app(&engine).await, CHAT, &body).await).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     let sent = engine.submitted();
     assert_eq!(sent.len(), 2);
@@ -430,7 +431,7 @@ async fn n_streams_are_told_apart_by_index_and_end_once() {
     let engine = MockEngine::script(vec![text("hi"), done(FinishReason::Stop, 4, 1)]);
     let body =
         chat_body(json!({"n": 2, "stream": true, "stream_options": {"include_usage": true}}));
-    let response = post(&app(&engine), CHAT, &body).await;
+    let response = post(&app(&engine).await, CHAT, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut stream = response.into_body().into_data_stream();
     let mut raw = String::new();

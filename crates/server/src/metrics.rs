@@ -10,24 +10,15 @@ use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
-use crate::routes::{App, model_in_query};
+use crate::routes::{App, model_in_query, wanted};
 
 /// `GET /metrics`: what an engine has done and holds, in the text format
 /// monitoring systems scrape. The engine is the one of `?model=<id>`, or of
 /// the only model there is; a model that is not loaded has none.
 pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Response {
-    let name = match (model_in_query(request.uri().query()), app.models.offered().as_deref()) {
-        (Some(name), _) => name,
-        (None, Some([only])) => only.clone(),
-        // One engine and no presets: there is nothing to choose.
-        (None, None) => String::new(),
-        (None, Some(_)) => {
-            return ApiError::invalid_param(
-                "model",
-                "several models are served: name one, /metrics?model=<id>",
-            )
-            .into_response();
-        }
+    let name = match wanted(&app, model_in_query(request.uri().query())) {
+        Ok(name) => name,
+        Err(error) => return error.into_response(),
     };
     let lease = match app.models.loaded(&name).await {
         Ok(lease) => lease,

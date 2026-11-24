@@ -210,7 +210,7 @@ fn world(ini: &str, devices: &[u64]) -> World {
 impl World {
     fn status(&self, model: &str) -> (String, Option<String>) {
         let listed = self.models.list();
-        let status = listed.iter().find(|m| m.id == model).expect("listed").status.clone().unwrap();
+        let status = listed.iter().find(|m| m.id == model).expect("listed").status.clone();
         (status.status.to_owned(), status.reason)
     }
 
@@ -258,7 +258,7 @@ async fn a_request_loads_the_model_it_names_by_id_or_alias() {
     assert!(w.machine.log().is_empty(), "nothing is loaded before a request");
 
     let lease = w.models.acquire("gpt-4o").await.unwrap();
-    assert_eq!(lease.id(), Some("a"), "the engine is asked under the model's id");
+    assert_eq!(lease.id(), "a", "the engine is asked under the model's id");
     assert_eq!(lease.engine().models()[0].id, "a");
     assert!(w.is("a", "loaded") && w.is("b", "unloaded"));
     // A second request finds it loaded.
@@ -291,7 +291,7 @@ async fn requests_for_a_model_that_is_loading_wait_for_the_one_load() {
 
     weights.open();
     for request in requests {
-        assert_eq!(request.await.unwrap().unwrap().id(), Some("a"));
+        assert_eq!(request.await.unwrap().unwrap().id(), "a");
     }
     assert_eq!(w.machine.log(), ["load a"], "one load serves all three");
 }
@@ -380,11 +380,11 @@ async fn a_model_that_serves_requests_is_not_unloaded_under_them() {
     // The running request ends: a is unloaded, b loaded, and b's request served.
     drop(running);
     let on_b = for_b.await.unwrap().unwrap();
-    assert_eq!(on_b.id(), Some("b"));
+    assert_eq!(on_b.id(), "b");
     assert_eq!(w.machine.log(), ["load a", "unload a", "load b"]);
     assert!(!for_a.is_finished(), "b is busy now, and a waits for it in turn");
     drop(on_b);
-    assert_eq!(for_a.await.unwrap().unwrap().id(), Some("a"));
+    assert_eq!(for_a.await.unwrap().unwrap().id(), "a");
     assert_eq!(w.machine.log(), ["load a", "unload a", "load b", "unload b", "load a"]);
 }
 
@@ -418,7 +418,7 @@ async fn two_loads_that_wait_for_one_busy_model_are_both_served_when_one_of_them
     for_b.abort();
     let _ = for_b.await;
     drop(running);
-    assert_eq!(for_c.await.unwrap().unwrap().id(), Some("c"));
+    assert_eq!(for_c.await.unwrap().unwrap().id(), "c");
     assert_eq!(w.machine.log(), ["load a", "unload a", "load c"]);
 }
 
@@ -797,21 +797,6 @@ async fn the_event_stream_says_every_state_and_every_change() {
         let wanted = serde_json::json!({ "model": model, "event": "model_status", "data": data });
         assert_eq!(*event, wanted, "{events:?}");
     }
-}
-
-#[tokio::test]
-async fn a_server_over_one_engine_is_as_it_was() {
-    // No presets: the engine decides which names it answers to, the list is
-    // its own, and nothing can be loaded or unloaded.
-    let engine = MockEngine::script(vec![text("hi"), done(FinishReason::Stop, 1, 1)]);
-    let app = common::app(&engine);
-    let (_, list) = json(get(&app, "/v1/models").await).await;
-    assert_eq!(list["data"][0]["id"], "mock");
-    assert!(list["data"][0].get("status").is_none());
-    let (status, _) = json(post(&app, "/models/unload", r#"{"model": "mock"}"#).await).await;
-    assert_eq!(status, 503);
-    let (status, _) = json(get(&app, "/models/sse").await).await;
-    assert_eq!(status, 501);
 }
 
 /// A small model file with a tokenizer and a chat template, and no tensor:

@@ -22,7 +22,7 @@ use crate::Config;
 use crate::bridge::Stop;
 use crate::defaults::LIMIT_HEADER;
 use crate::error::ApiError;
-use crate::models::{AcquireError, Lease, Listed, ModelEvent, Models};
+use crate::models::{Lease, Listed, ModelEvent, Models};
 use crate::openai::reply::model_list;
 use crate::openai::request::{members, read_json};
 
@@ -65,20 +65,23 @@ pub(crate) async fn model_of(app: &App, model: &mut String) -> Result<Lease, Api
         lease = app.models.acquire(model) => lease?,
         () = stop.raised() => return Err(ApiError::cancelled()),
     };
-    match lease.id() {
-        Some(id) => id.clone_into(model),
-        None => {
-            // One engine and no presets: a name it does not serve is not found,
-            // before what the request asks of the model's template (tools, an
-            // effort) is looked at, which would refuse it with another reason.
-            let served = lease.engine().models();
-            if !served.iter().any(|card| card.id == *model) {
-                let available = served.into_iter().map(|card| card.id).collect();
-                return Err(AcquireError::NotFound { model: model.clone(), available }.into());
-            }
-        }
-    }
+    lease.id().clone_into(model);
     Ok(lease)
+}
+
+/// The name of the model a request names (`asked`), or of the only one of the
+/// server; with several, the request must name one.
+pub(crate) fn wanted(app: &App, asked: Option<String>) -> Result<String, ApiError> {
+    if let Some(name) = asked {
+        return Ok(name);
+    }
+    match app.models.offered().as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(ApiError::invalid_param(
+            "model",
+            "several models are served: name one (model, or ?model=<id>)",
+        )),
+    }
 }
 
 /// The body of `POST /models/load` and `/models/unload`.
@@ -133,14 +136,9 @@ fn status_event(model: &str, status: &str, reason: Option<&str>) -> Result<SseEv
 
 /// `GET /models/sse`: the state of every model as it is, then every change.
 pub(crate) async fn model_events(State(app): State<App>) -> Response {
-    let Some((now, changes)) = app.models.watch() else {
-        return ApiError::unsupported(
-            "this server was given one engine and no presets: its model does not change state",
-        )
-        .into_response();
-    };
-    let first = now.into_iter().filter_map(|Listed { status, .. }| status).map(|s| {
-        let ModelEvent { model, status, reason } = s;
+    let (now, changes) = app.models.watch();
+    let first = now.into_iter().map(|Listed { status, .. }| {
+        let ModelEvent { model, status, reason } = status;
         status_event(&model, status, reason.as_deref())
     });
     let later = futures_util::stream::unfold(changes, |mut changes| async move {

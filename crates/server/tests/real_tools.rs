@@ -12,7 +12,7 @@
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
 //! (default 0). With `ARES_TEST_API_MODEL` the tests that are not about one
 //! model run on that file instead, loaded as `ares --model` loads it
-//! (Flash-Next, the 27B: see `api_model/mod.rs`). The tests on the 27B with
+//! (Flash-Next, the 27B: see `gpu/mod.rs`). The tests on the 27B with
 //! its drafts need `ARES_TEST_QWEN35_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf) and
 //! two GPUs.
 //!
@@ -22,159 +22,52 @@
 //!     cargo test --release -p ares-server --test real_tools -- --test-threads=1 --nocapture
 //! ```
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
-use ares_api::Engine;
-use ares_cuda::{Device, Precision, Wait};
-use ares_gguf::Gguf;
-use ares_model::qwen35::device::{Options, Qwen35, Spread};
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
-use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, header};
 use serde_json::{Value, json};
-use tower::ServiceExt;
 
-mod api_model;
+mod common;
+mod gpu;
 
 const CHAT: &str = "/v1/chat/completions";
 
-fn file(variable: &str, what: &str) -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    let path = std::env::var_os(variable).map(PathBuf::from);
-    if path.is_none() {
-        eprintln!("skipped: set {variable} to {what}");
-    }
-    path
-}
-
-fn small() -> Option<PathBuf> {
-    file("ARES_TEST_QWEN35_MODEL", "the Qwen3.5-0.8B model file")
-}
-
-fn large() -> Option<PathBuf> {
-    file("ARES_TEST_QWEN35_27B", "the 27B Q4_K_S file (two GPUs)")
-}
-
 /// The server over the engine.
-struct Served {
-    app: Router,
-    engine: Arc<dyn Engine>,
-    /// The runtime, when it was built here (not for a model loaded as the
-    /// server loads it).
-    runtime: Option<Arc<Runtime>>,
-    path: PathBuf,
-    /// Whether a request gives the same tokens every time.
-    repeatable: bool,
-    /// The model loaded as the server loads it, which this keeps loaded.
-    _loaded: Option<api_model::ApiModel>,
+struct Served(gpu::Served);
+
+impl std::ops::Deref for Served {
+    type Target = gpu::Served;
+
+    fn deref(&self) -> &gpu::Served {
+        &self.0
+    }
 }
 
 impl Served {
     /// The model of `ARES_TEST_API_MODEL` if one is named, else the 0.8B;
     /// `None` (and a note) when neither is.
-    fn any() -> Option<Self> {
-        if let Some(path) = api_model::path() {
-            let model = api_model::ApiModel::load(&path, None);
-            let engine = model.engine();
-            return Some(Self {
-                app: ares_server::router(engine.clone()),
-                engine,
-                runtime: None,
-                path,
-                repeatable: model.repeatable,
-                _loaded: Some(model),
-            });
-        }
-        small().map(|path| Self::start(&path))
-    }
-
-    /// The 0.8B on one device.
-    fn start(path: &PathBuf) -> Self {
-        let options = Options {
-            precision: Precision::Exact,
-            max_rows: 128,
-            logit_rows: 16,
-            window_rows: 8,
-            pipeline_rows: 32,
-            ..Options::default()
-        };
-        let model =
-            Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 4096).unwrap();
-        let config = RuntimeConfig {
-            pages: 96,
-            cells_per_page: 128,
-            max_slots: 4,
-            ..RuntimeConfig::default()
-        };
-        let ordinal =
-            std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
-        Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()], path)
+    async fn any() -> Option<Self> {
+        gpu::Served::any(None).await.map(Self)
     }
 
     /// The 27B over both cards with its MTP block and the n-gram drafter
-    ///, with exact products so that a row computes the same in a window
-    /// as alone. The context is 1024 tokens, as in `real_sampling.rs`: the
-    /// prompt with the tools and the replies of the test fit.
-    fn start_drafting(path: &PathBuf) -> Self {
-        let options = Options {
-            precision: Precision::Exact,
-            max_rows: 128,
-            logit_rows: 16,
-            window_rows: 4,
-            ..Options::default()
-        };
-        let spread = Spread::Tensor(vec![0.625, 0.375]);
-        let model = Qwen35::new(Gguf::open(path).unwrap(), "q", &spread, options, 1024).unwrap();
-        let config = RuntimeConfig {
-            pages: 24,
-            cells_per_page: 128,
-            max_slots: 4,
-            window_rows: 4,
-            ..RuntimeConfig::default()
-        };
-        let devices =
-            vec![Device::open(0, Wait::Block).unwrap(), Device::open(1, Wait::Block).unwrap()];
-        Self::serve(model, config, devices, path)
-    }
-
-    fn serve(model: Qwen35, config: RuntimeConfig, devices: Vec<Device>, path: &Path) -> Self {
-        let as_model: Arc<dyn Model> = Arc::new(model);
-        let gpu = GpuConfig::new(&config, &*as_model);
-        let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
-        let engine: Arc<dyn Engine> = runtime.clone();
-        Self {
-            app: ares_server::router(engine.clone()),
-            engine,
-            runtime: Some(runtime),
-            path: path.to_path_buf(),
-            repeatable: true,
-            _loaded: None,
-        }
+    /// (`gpu::large_model`): the prompt with the tools and the replies of the
+    /// test fit in its 1024 tokens.
+    async fn start_drafting(path: PathBuf) -> Self {
+        let (runtime, _) = gpu::large_model(&path, None);
+        Self(gpu::Served::over(runtime, path).await)
     }
 
     /// Checks that two replies to the same request are the same reply, where
-    /// they must be (`api_model::must_agree`); the caller checks each on its
+    /// they must be (`gpu::must_agree`); the caller checks each on its
     /// own.
     fn agree(&self, reply: &Reply, other: &Reply, what: &str) {
-        if api_model::must_agree(self.repeatable, &reply.hash, &other.hash, what) {
+        if gpu::must_agree(self.repeatable, &reply.hash, &other.hash, what) {
             assert_eq!(reply, other, "{what}");
         }
     }
 
     async fn post(&self, body: &Value) -> (u16, String) {
-        let request = Request::post(CHAT)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status().as_u16();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, String::from_utf8(bytes.to_vec()).unwrap())
+        self.0.ask(CHAT, body).await
     }
 
     /// The reply to a request that is to succeed.
@@ -339,7 +232,7 @@ const WEATHER: &str = "What will the weather be in Paris over the next 3 days?";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_template_of_the_model_declares_the_tagged_calls() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     let format = served.engine.chat_format("q").expect("a chat format");
     let tools = format.tools.expect("a format for calls");
     assert_eq!(tools.trigger(), "<tool_call>");
@@ -348,7 +241,7 @@ async fn the_template_of_the_model_declares_the_tagged_calls() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_that_is_required_or_named_is_a_valid_call() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     for (what, extra) in [
         ("required", json!({"tool_choice": "required"})),
         ("required, one call", json!({"tool_choice": "required", "parallel_tool_calls": false})),
@@ -384,7 +277,7 @@ async fn a_call_that_is_required_or_named_is_a_valid_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_auto_the_model_calls_or_answers_and_a_stream_is_the_same_reply() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     let mut called = 0;
     for question in [
         WEATHER,
@@ -408,7 +301,7 @@ async fn with_auto_the_model_calls_or_answers_and_a_stream_is_the_same_reply() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_none_the_reply_is_text() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     let reply = served.ask(&request(WEATHER, json!({"tool_choice": "none"}))).await;
     println!("RES none: {reply:?}");
     assert!(reply.calls.is_empty() && reply.finish != "tool_calls", "{reply:?}");
@@ -416,7 +309,7 @@ async fn with_none_the_reply_is_text() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_history_with_calls_and_results_is_answered() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     let first = served.ask(&request(WEATHER, json!({"tool_choice": "required"}))).await;
     check(&first);
     let calls: Vec<Value> = first
@@ -444,7 +337,7 @@ async fn a_history_with_calls_and_results_is_answered() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_the_limit_cuts_ends_with_length_and_no_markup() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     for limit in [3, 8, 14, 20] {
         let body = request(WEATHER, json!({"tool_choice": "required", "max_tokens": limit}));
         let reply = served.ask(&body).await;
@@ -490,7 +383,7 @@ fn tools_without_text() -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any().await else { return };
     // The model thinks, and the tag that closes its thinking is banned: a
     // call it makes it has to open inside the thinking. The tag and the
     // marker are the template's.
@@ -507,7 +400,8 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
     let close = format.thinking.expect("the model thinks").end_tag().to_owned();
     let marker = format.tools.expect("a format for calls").trigger().to_owned();
     let tokenizer =
-        ares_tokenizer::Tokenizer::from_gguf(&Gguf::open(&served.path).unwrap()).unwrap();
+        ares_tokenizer::Tokenizer::from_gguf(&ares_gguf::Gguf::open(&served.path).unwrap())
+            .unwrap();
     let options = ares_tokenizer::EncodeOptions { add_special: false, parse_special: true };
     let closing = tokenizer.encode(&close, options);
     assert_eq!(closing.len(), 1, "{close} is {closing:?}");
@@ -563,7 +457,7 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
         raw["reasoning_format"] = json!("none");
         let raw = served.ask(&raw).await;
         assert!(raw.content.starts_with("<think>"), "{what}: {raw:?}");
-        if api_model::must_agree(served.repeatable, &raw.hash, &reply.hash, what) {
+        if gpu::must_agree(served.repeatable, &raw.hash, &reply.hash, what) {
             assert!(
                 !raw.content.contains(&close),
                 "{what}: the model spelled the banned tag out, so no call was inside the thinking"
@@ -624,8 +518,8 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_27b_calls_the_same_with_drafts_and_without() {
-    let Some(path) = large() else { return };
-    let served = Served::start_drafting(&path);
+    let Some(path) = gpu::large() else { return };
+    let served = Served::start_drafting(path).await;
     // The replies of the first two are a call from their first token: the
     // rule binds all of them, and the drafts are the n-gram drafter's. The third
     // thinks first, which the rule leaves free: there the request takes the

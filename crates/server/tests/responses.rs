@@ -22,18 +22,18 @@ const COUNT: &str = "/v1/responses/input_tokens";
 const CHAT: &str = "/v1/chat/completions";
 const CHAT_COUNT: &str = "/v1/chat/completions/input_tokens";
 
-fn serve_with(steps: Vec<Step>, format: Option<ChatFormat>) -> (Arc<MockEngine>, Router) {
+async fn serve_with(steps: Vec<Step>, format: Option<ChatFormat>) -> (Arc<MockEngine>, Router) {
     let engine = MockEngine::script(steps);
     if let Some(format) = format {
         engine.set_chat_format(format);
     }
     engine.set_counting();
-    let app = app(&engine);
+    let app = app(&engine).await;
     (engine, app)
 }
 
-fn serve(steps: Vec<Step>) -> (Arc<MockEngine>, Router) {
-    serve_with(steps, Some(qwen()))
+async fn serve(steps: Vec<Step>) -> (Arc<MockEngine>, Router) {
+    serve_with(steps, Some(qwen())).await
 }
 
 fn tools() -> Value {
@@ -64,7 +64,7 @@ fn no_thinking() -> Value {
 
 /// The request the engine gets for a body.
 async fn submitted(extra: Value) -> GenerateRequest {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
     let (status, answer) = json(post(&app, RESPONSES, &body(extra)).await).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     engine.submitted().remove(0)
@@ -72,7 +72,7 @@ async fn submitted(extra: Value) -> GenerateRequest {
 
 /// The response a body is answered with.
 async fn whole(steps: Vec<Step>, extra: Value) -> Value {
-    let (_, app) = serve(steps);
+    let (_, app) = serve(steps).await;
     let (status, response) = json(post(&app, RESPONSES, &body(extra)).await).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     response
@@ -97,7 +97,7 @@ fn events(body: &str) -> Vec<(String, Value)> {
 
 /// The events a body is answered with when it is streamed.
 async fn streamed(steps: Vec<Step>, extra: Value) -> Vec<(String, Value)> {
-    let (_, app) = serve(steps);
+    let (_, app) = serve(steps).await;
     let mut extra = extra;
     extra["stream"] = json!(true);
     let response = post(&app, RESPONSES, &body(extra)).await;
@@ -231,7 +231,7 @@ fn anonymous(response: Value) -> Value {
 async fn a_plain_request_is_the_chat_request_and_its_reply_one_message() {
     // A model whose template has no thinking: the reply is its text.
     let steps = vec![text("Mild, "), text("12 °C."), done(FinishReason::Stop, 9, 5)];
-    let (engine, app) = serve_with(steps, None);
+    let (engine, app) = serve_with(steps, None).await;
     // The header of OpenAI's clients is accepted.
     let extra = json!({
         "instructions": "Be brief.",
@@ -378,7 +378,7 @@ async fn a_request_as_codex_writes_it_is_served() {
         "prompt_cache_key": "0199a213-81c0-7800-8aa1-bbab2a035a53",
         "client_metadata": {"x-codex-installation-id": "7"},
     });
-    let (engine, app) = serve(says(&format!("{THINKS}Mild."), 4, FinishReason::Stop));
+    let (engine, app) = serve(says(&format!("{THINKS}Mild."), 4, FinishReason::Stop)).await;
     let response = post(&app, RESPONSES, &body.to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let response = assemble(&events(&body_text(response).await));
@@ -504,11 +504,11 @@ async fn reasoning_is_switched_by_the_request_and_comes_back_as_an_item() {
 async fn the_reasoning_is_an_item_whatever_the_format_of_the_chat_route() {
     // `--reasoning-format none` is about reasoning_content.
     let engine = MockEngine::script(says(&format!("{THINKS}Mild."), 7, FinishReason::Stop)).qwen();
-    let config = ares_server::Config {
+    let options = ares_server::options::ModelOptions {
         reasoning_format: ares_server::ReasoningFormat::None,
-        ..ares_server::Config::default()
+        ..Default::default()
     };
-    let app = app_with(&engine, config);
+    let app = router_of(engine.clone(), options, ares_server::Config::default()).await;
     let (status, response) = json(post(&app, RESPONSES, &body(json!({}))).await).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let kinds: Vec<&str> = response["output"]
@@ -783,7 +783,7 @@ async fn what_the_server_does_not_do_is_a_400_that_names_it() {
         (json!({"tools": [tools()[0], tools()[0]]}), "two tools named"),
     ];
     for path in [RESPONSES, COUNT] {
-        let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+        let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
         for (extra, fragment) in &bodies {
             let body = body(extra.clone());
             let message =
@@ -797,7 +797,7 @@ async fn what_the_server_does_not_do_is_a_400_that_names_it() {
     }
 
     // What only the model's template decides.
-    let (engine, app) = serve_with(vec![done(FinishReason::Stop, 1, 0)], None);
+    let (engine, app) = serve_with(vec![done(FinishReason::Stop, 1, 0)], None).await;
     let with_tools = body(json!({"tools": tools()}));
     let message =
         refused(&app, RESPONSES, &with_tools, StatusCode::BAD_REQUEST, "invalid_request").await;
@@ -813,7 +813,7 @@ async fn what_the_server_does_not_do_is_a_400_that_names_it() {
 
 #[tokio::test]
 async fn the_routes_of_a_stored_response_say_that_none_is_kept() {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
     let cases = [
         (Method::GET, "/v1/responses/resp_0123456789abcdef"),
         (Method::DELETE, "/v1/responses/resp_0123456789abcdef"),
@@ -861,7 +861,7 @@ async fn failures_have_the_status_and_the_shape_of_the_chat_route() {
         // has not started then, and gets the status too.
         for plan in [Plan::Reject(error.clone()), Plan::Script(vec![fail(error.clone())])] {
             for stream in [false, true] {
-                let app = common::app(&MockEngine::new(plan.clone()).qwen());
+                let app = common::app(&MockEngine::new(plan.clone()).qwen()).await;
                 refused(&app, RESPONSES, &body(json!({"stream": stream})), status, code).await;
             }
         }
@@ -871,7 +871,7 @@ async fn failures_have_the_status_and_the_shape_of_the_chat_route() {
 #[tokio::test]
 async fn a_failure_inside_a_stream_is_an_error_event_and_the_stream_ends() {
     let steps = vec![text("Mild"), fail(EngineError::Internal("a device failed".into()))];
-    let (_, app) = serve(steps);
+    let (_, app) = serve(steps).await;
     let mut extra = no_thinking();
     extra["stream"] = json!(true);
     let response = post(&app, RESPONSES, &body(extra)).await;
@@ -903,7 +903,7 @@ async fn a_failure_inside_a_stream_is_an_error_event_and_the_stream_ends() {
 #[tokio::test]
 async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
     // Waiting for a whole response.
-    let (engine, app) = serve(vec![Step::UntilCancelled]);
+    let (engine, app) = serve(vec![Step::UntilCancelled]).await;
     let call = tokio::spawn({
         let app = app.clone();
         async move { app.oneshot(post_request(RESPONSES, &body(json!({})))).await }
@@ -915,7 +915,7 @@ async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
     assert_eq!(engine.cancelled(), [engine.submitted()[0].id]);
 
     // Reading a stream.
-    let (engine, app) = serve(vec![text("a"), Step::UntilCancelled]);
+    let (engine, app) = serve(vec![text("a"), Step::UntilCancelled]).await;
     let mut extra = no_thinking();
     extra["stream"] = json!(true);
     let response = post(&app, RESPONSES, &body(extra)).await;
@@ -943,7 +943,7 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
         stream_wait: std::time::Duration::from_millis(50),
         ..ares_server::Config::default()
     };
-    let app = app_with(&engine, config);
+    let app = app_with(&engine, config).await;
     let mut extra = no_thinking();
     extra["stream"] = json!(true);
     let response = post(&app, RESPONSES, &body(extra)).await;
@@ -972,7 +972,7 @@ async fn counted(app: &Router, path: &str, body: &str) -> u64 {
 
 #[tokio::test]
 async fn the_count_of_a_request_is_the_input_the_same_request_reports_when_run() {
-    let app = common::app(&counting());
+    let app = common::app(&counting()).await;
     let conversation = json!([
         {"role": "developer", "content": "You are a coding agent."},
         {"role": "user", "content": [{"type": "input_text", "text": "Weather in Köln?"}]},
@@ -1013,7 +1013,7 @@ async fn the_count_of_a_request_is_the_input_the_same_request_reports_when_run()
 
 #[tokio::test]
 async fn the_count_of_a_chat_request_is_the_prompt_the_same_request_reports_when_run() {
-    let app = common::app(&counting());
+    let app = common::app(&counting()).await;
     let chat_tools = json!([{"type": "function", "function": {
         "name": "get_weather",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
@@ -1065,7 +1065,7 @@ async fn the_count_of_a_chat_request_is_the_prompt_the_same_request_reports_when
 #[tokio::test]
 async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
     let chat = json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}]});
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
     assert!(counted(&app, COUNT, &body(json!({"tools": tools()}))).await > 0);
     assert!(counted(&app, CHAT_COUNT, &chat.to_string()).await > 0);
     assert!(engine.submitted().is_empty(), "nothing is generated for a count");
@@ -1074,7 +1074,7 @@ async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
     refused(&app, COUNT, &unknown, StatusCode::NOT_FOUND, "model_not_found").await;
 
     // The scripted engine alone does not count.
-    let plain = common::app(&instant());
+    let plain = common::app(&instant()).await;
     for (path, body) in [(COUNT, body(json!({}))), (CHAT_COUNT, chat.to_string())] {
         let message =
             refused(&plain, path, &body, StatusCode::NOT_IMPLEMENTED, "not_implemented").await;
@@ -1099,7 +1099,7 @@ async fn truncation_auto_drops_the_oldest_turns_until_the_conversation_fits() {
                "truncation": truncation})
         .to_string()
     };
-    let (engine, app) = serve(says("ok", 2, FinishReason::Stop));
+    let (engine, app) = serve(says("ok", 2, FinishReason::Stop)).await;
     let (status, response) = json(post(&app, RESPONSES, &body("auto")).await).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["truncation"], "auto");
@@ -1120,7 +1120,7 @@ async fn truncation_auto_drops_the_oldest_turns_until_the_conversation_fits() {
     assert!(tokens(&one_more.prompt) >= 4096);
 
     // Without it the conversation is what the client sent.
-    let (engine, app) = serve(says("ok", 2, FinishReason::Stop));
+    let (engine, app) = serve(says("ok", 2, FinishReason::Stop)).await;
     let (status, response) = json(post(&app, RESPONSES, &body("disabled")).await).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["truncation"], "disabled");

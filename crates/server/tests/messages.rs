@@ -22,18 +22,18 @@ use tower::ServiceExt;
 const MESSAGES: &str = "/v1/messages";
 const COUNT: &str = "/v1/messages/count_tokens";
 
-fn serve_with(steps: Vec<Step>, format: Option<ChatFormat>) -> (Arc<MockEngine>, Router) {
+async fn serve_with(steps: Vec<Step>, format: Option<ChatFormat>) -> (Arc<MockEngine>, Router) {
     let engine = MockEngine::script(steps);
     if let Some(format) = format {
         engine.set_chat_format(format);
     }
     engine.set_counting();
-    let app = app(&engine);
+    let app = app(&engine).await;
     (engine, app)
 }
 
-fn serve(steps: Vec<Step>) -> (Arc<MockEngine>, Router) {
-    serve_with(steps, Some(qwen()))
+async fn serve(steps: Vec<Step>) -> (Arc<MockEngine>, Router) {
+    serve_with(steps, Some(qwen())).await
 }
 
 fn tools() -> Value {
@@ -64,7 +64,7 @@ fn body(extra: Value) -> String {
 
 /// The request the engine gets for a body.
 async fn submitted(extra: Value) -> GenerateRequest {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
     let (status, answer) = json(post(&app, MESSAGES, &body(extra)).await).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     engine.submitted().remove(0)
@@ -72,7 +72,7 @@ async fn submitted(extra: Value) -> GenerateRequest {
 
 /// The message a body is answered with.
 async fn whole(steps: Vec<Step>, extra: Value) -> Value {
-    let (_, app) = serve(steps);
+    let (_, app) = serve(steps).await;
     let (status, message) = json(post(&app, MESSAGES, &body(extra)).await).await;
     assert_eq!(status, StatusCode::OK, "{message}");
     message
@@ -97,7 +97,7 @@ fn events(body: &str) -> Vec<(String, Value)> {
 
 /// The events a body is answered with when it is streamed.
 async fn streamed(steps: Vec<Step>, extra: Value) -> Vec<(String, Value)> {
-    let (_, app) = serve(steps);
+    let (_, app) = serve(steps).await;
     let mut extra = extra;
     extra["stream"] = json!(true);
     let response = post(&app, MESSAGES, &body(extra)).await;
@@ -204,7 +204,7 @@ fn anonymous(mut message: Value) -> Value {
 async fn a_plain_request_is_the_chat_request_and_its_reply_one_text_block() {
     // A model whose template has no thinking: the reply is its text.
     let steps = vec![text("Mild, "), text("12 °C."), done(FinishReason::Stop, 9, 5)];
-    let (engine, app) = serve_with(steps, None);
+    let (engine, app) = serve_with(steps, None).await;
     // The headers of Anthropic's clients are accepted, and so is the query
     // Claude Code adds.
     let request = Request::post(format!("{MESSAGES}?beta=true"))
@@ -387,11 +387,11 @@ async fn thinking_is_switched_by_the_request_and_comes_back_as_a_block() {
 async fn the_reasoning_is_a_block_whatever_the_format_of_the_chat_route() {
     // `--reasoning-format none` is about reasoning_content.
     let engine = MockEngine::script(says(&format!("{THINKS}Mild."), 7, FinishReason::Stop)).qwen();
-    let config = ares_server::Config {
+    let options = ares_server::options::ModelOptions {
         reasoning_format: ares_server::ReasoningFormat::None,
-        ..ares_server::Config::default()
+        ..Default::default()
     };
-    let app = app_with(&engine, config);
+    let app = router_of(engine.clone(), options, ares_server::Config::default()).await;
     let (_, message) = json(post(&app, MESSAGES, &body(json!({}))).await).await;
     assert_eq!(message["content"][0]["type"], "thinking", "{message}");
     assert_eq!(message["content"][1], json!({"type": "text", "text": "Mild."}));
@@ -622,7 +622,7 @@ async fn what_the_engine_cannot_do_is_a_400_in_the_shape_of_the_api() {
         ("[1]".to_owned(), "must be a JSON object"),
     ];
     for path in [MESSAGES, COUNT] {
-        let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+        let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
         for (body, fragment) in &bodies {
             if path == COUNT && fragment.starts_with("max_tokens") {
                 continue;
@@ -635,7 +635,7 @@ async fn what_the_engine_cannot_do_is_a_400_in_the_shape_of_the_api() {
     }
 
     // What only the model's template decides.
-    let (engine, app) = serve_with(vec![done(FinishReason::Stop, 1, 0)], None);
+    let (engine, app) = serve_with(vec![done(FinishReason::Stop, 1, 0)], None).await;
     let message = refused(
         &app,
         MESSAGES,
@@ -654,7 +654,7 @@ async fn what_the_engine_cannot_do_is_a_400_in_the_shape_of_the_api() {
 
 #[tokio::test]
 async fn failures_have_the_status_of_the_chat_route_and_the_shape_of_this_api() {
-    let (_, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+    let (_, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
     let response =
         app.clone().oneshot(Request::get(MESSAGES).body(Body::empty()).unwrap()).await.unwrap();
     let (status, value) = json(response).await;
@@ -680,7 +680,7 @@ async fn failures_have_the_status_of_the_chat_route_and_the_shape_of_this_api() 
         // has not started then, and gets the status too.
         for plan in [Plan::Reject(error.clone()), Plan::Script(vec![fail(error.clone())])] {
             for stream in [false, true] {
-                let app = common::app(&MockEngine::new(plan.clone()).qwen());
+                let app = common::app(&MockEngine::new(plan.clone()).qwen()).await;
                 refused(&app, MESSAGES, &body(json!({"stream": stream})), status, kind).await;
             }
         }
@@ -690,7 +690,7 @@ async fn failures_have_the_status_of_the_chat_route_and_the_shape_of_this_api() 
 #[tokio::test]
 async fn a_failure_inside_a_stream_is_an_error_event_and_the_stream_ends() {
     let steps = vec![text("Mild"), fail(EngineError::Internal("a device failed".into()))];
-    let (_, app) = serve(steps);
+    let (_, app) = serve(steps).await;
     let extra = json!({"stream": true, "thinking": {"type": "disabled"}});
     let response = post(&app, MESSAGES, &body(extra)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -709,7 +709,7 @@ async fn a_failure_inside_a_stream_is_an_error_event_and_the_stream_ends() {
 #[tokio::test]
 async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
     // Waiting for a whole message.
-    let (engine, app) = serve(vec![Step::UntilCancelled]);
+    let (engine, app) = serve(vec![Step::UntilCancelled]).await;
     let call = tokio::spawn({
         let app = app.clone();
         async move { app.oneshot(post_request(MESSAGES, &body(json!({})))).await }
@@ -721,7 +721,7 @@ async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
     assert_eq!(engine.cancelled(), [engine.submitted()[0].id]);
 
     // Reading a stream.
-    let (engine, app) = serve(vec![text("a"), Step::UntilCancelled]);
+    let (engine, app) = serve(vec![text("a"), Step::UntilCancelled]).await;
     let extra = json!({"stream": true, "thinking": {"type": "disabled"}});
     let response = post(&app, MESSAGES, &body(extra)).await;
     let mut stream = response.into_body().into_data_stream();
@@ -748,7 +748,7 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
     .qwen();
     let config =
         ares_server::Config { stream_wait: Duration::from_millis(50), ..Default::default() };
-    let app = app_with(&engine, config);
+    let app = app_with(&engine, config).await;
     let extra = json!({"stream": true, "thinking": {"type": "disabled"}});
     let response = post(&app, MESSAGES, &body(extra)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -767,7 +767,7 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
 
 #[tokio::test]
 async fn the_count_of_a_request_is_the_input_the_same_request_reports_when_run() {
-    let app = app(&counting());
+    let app = app(&counting()).await;
     let conversation = json!([
         {"role": "user", "content": [{"type": "text", "text": "Weather in Köln?"}]},
         {"role": "assistant", "content": [
@@ -812,7 +812,7 @@ async fn the_count_of_a_request_is_the_input_the_same_request_reports_when_run()
 
 #[tokio::test]
 async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)]).await;
     let (status, counted) = json(post(&app, COUNT, &body(json!({"tools": tools()}))).await).await;
     assert_eq!(status, StatusCode::OK, "{counted}");
     assert!(counted["input_tokens"].as_u64().unwrap() > 0);
@@ -822,7 +822,7 @@ async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
     refused(&app, COUNT, &unknown, StatusCode::NOT_FOUND, "not_found_error").await;
 
     // The scripted engine alone does not count.
-    let plain = common::app(&instant());
+    let plain = common::app(&instant()).await;
     let message =
         refused(&plain, COUNT, &body(json!({})), StatusCode::NOT_IMPLEMENTED, "api_error").await;
     assert!(message.contains("does not count the tokens of a prompt"), "{message}");
@@ -858,7 +858,7 @@ async fn context_edits_clear_thinking_and_results_and_the_response_says_so() {
          "keep": {"type": "tool_uses", "value": 1}, "exclude_tools": ["now"]},
     ]});
     let extra = json!({"messages": long_conversation(), "context_management": edits});
-    let (engine, app) = serve(says("Dry.", 2, FinishReason::Stop));
+    let (engine, app) = serve(says("Dry.", 2, FinishReason::Stop)).await;
     let (status, message) = json(post(&app, MESSAGES, &body(extra.clone())).await).await;
     assert_eq!(status, StatusCode::OK, "{message}");
     let Prompt::Chat { messages, .. } = engine.submitted().remove(0).prompt else { panic!() };

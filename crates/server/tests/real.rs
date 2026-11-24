@@ -24,6 +24,7 @@ use std::process::ExitStatus;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::model_file;
 use common::process::{Client, Server, ares};
 use common::socket::Reply;
 use serde_json::{Value, json};
@@ -35,17 +36,7 @@ const LIMIT: Duration = Duration::from_secs(60);
 
 /// The model to serve, or `None` (and a note) when the tests are not enabled.
 fn model() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to a small qwen35 model file");
-            None
-        }
-    }
+    model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file")
 }
 
 fn port(offset: u16) -> u16 {
@@ -78,7 +69,7 @@ fn streamed_text(chunks: &[Value]) -> String {
 /// test device (`ARES_TEST_DEVICE`) serves it unless `flags` name
 /// `--devices`.
 fn serve(model: &PathBuf, port: u16, flags: &[&str]) -> Server {
-    let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
+    let device = common::test_device().to_string();
     // The test device, exact products and a context of 8192 unless the test
     // says otherwise.
     let mut base: Vec<&str> = Vec::new();
@@ -734,7 +725,7 @@ fn a_second_turn_starts_from_what_the_first_turn_computed_and_says_so() {
 /// that a server that starts after all takes no other, and such a server is
 /// killed.
 fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitStatus, String) {
-    let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
+    let device = common::test_device().to_string();
     let mut command = ares();
     command
         .arg("--model")
@@ -855,28 +846,14 @@ fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
 // products `ARES_TEST_QWEN35_27B`, the Q4_K_S file, on two cards.
 
 fn draft_model() -> Option<PathBuf> {
-    std::env::var_os("ARES_TEST_CUDA")?;
-    match std::env::var_os("ARES_TEST_DRAFT_MODEL") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_DRAFT_MODEL to a model file with an MTP block");
-            None
-        }
-    }
+    model_file("ARES_TEST_DRAFT_MODEL", "a model file with an MTP block")
 }
 
 /// The 27B with its MTP block for the tests that need exact products and so
 /// a type of weights with a prefill kernel for them: `ARES_TEST_QWEN35_27B`
 /// (Qwen3.8-27B-UD-Q4_K_S.gguf), served on both cards.
 fn two_card_model() -> Option<PathBuf> {
-    std::env::var_os("ARES_TEST_CUDA")?;
-    match std::env::var_os("ARES_TEST_QWEN35_27B") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_27B to the 27B Q4_K_S file (two GPUs)");
-            None
-        }
-    }
+    model_file("ARES_TEST_QWEN35_27B", "the 27B Q4_K_S file (two GPUs)")
 }
 
 /// The reply to `question`, greedy, with drafts or without (`"draft": false`):
@@ -1115,17 +1092,7 @@ const SLOW: Duration = Duration::from_secs(900);
 /// The first part of the split file of Qwen3.8-Flash-Next, or `None` (and a
 /// note) when the tests of it are not enabled.
 fn flash_model() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    match std::env::var_os("ARES_TEST_QWEN4EXP_MODEL") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next");
-            None
-        }
-    }
+    model_file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next")
 }
 
 /// The RAM limit of the servers of Flash-Next (`ARES_TEST_FLASH_RAM`, default

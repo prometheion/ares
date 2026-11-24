@@ -22,7 +22,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,17 +30,14 @@ use ares_api::{
     ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
     GenerateRequest, ModelCard, Prompt, RequestId,
 };
-use ares_cuda::{Device, Precision, Wait};
-use ares_gguf::Gguf;
-use ares_model::qwen35::device::{Options, Qwen35, Spread};
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, TokenFilter};
+use ares_model::qwen35::device::Qwen35;
+use ares_runtime::{Model, Runtime, TokenFilter};
 use ares_sampler::TokenMask;
-use ares_tokenizer::{ChatOptions, Json};
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, header};
 use serde_json::{Value, json};
-use tower::ServiceExt;
+
+mod common;
+mod gpu;
 
 const CHAT: &str = "/v1/chat/completions";
 const COMPLETIONS: &str = "/v1/completions";
@@ -51,35 +48,6 @@ const QUESTION: &str =
     "Write the line 'the quick brown fox jumps over the lazy dog' four times, numbered.";
 const CONTINUE: &str = "the quick brown fox jumps over the lazy dog. the quick brown fox jumps \
                         over the lazy dog. the quick brown";
-
-fn model_path() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
-            None
-        }
-    }
-}
-
-/// The 27B, whose MTP block gives the drafts the tests compare with none.
-fn drafting_model() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    match std::env::var_os("ARES_TEST_QWEN35_27B") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_27B to the 27B Q4_K_S file (two GPUs)");
-            None
-        }
-    }
-}
 
 /// The rules the mask test switches between.
 const NONE: usize = 0;
@@ -141,83 +109,26 @@ struct Served {
 impl Served {
     /// Starts the engine on the 0.8B, which drafts nothing, with `rule` about
     /// the tokens of every reply if there is one.
-    fn start(path: &PathBuf, rule: Option<Rule>) -> Self {
-        let options = Options {
-            precision: Precision::Exact,
-            max_rows: 128,
-            logit_rows: 16,
-            window_rows: 8,
-            pipeline_rows: 32,
-            ..Options::default()
-        };
-        let model =
-            Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 4096).unwrap();
-        let config = RuntimeConfig {
-            pages: 96,
-            cells_per_page: 128,
-            max_slots: 4,
-            ..RuntimeConfig::default()
-        };
-        let ordinal =
-            std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
-        Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()], rule)
+    async fn start(path: &Path, rule: Option<Rule>) -> Self {
+        Self::serve(gpu::small_model(path, Some(false)), rule).await
     }
 
     /// Starts the engine on the 27B over both cards with its MTP block and
-    /// the n-gram drafter, with exact products so that a row computes
-    /// the same in a window as alone.
-    fn start_drafting(path: &PathBuf, rule: Option<Rule>) -> Self {
-        let options = Options {
-            precision: Precision::Exact,
-            max_rows: 128,
-            logit_rows: 16,
-            window_rows: 4,
-            ..Options::default()
-        };
-        let spread = Spread::Tensor(vec![0.625, 0.375]);
-        let model = Qwen35::new(Gguf::open(path).unwrap(), "q", &spread, options, 1024).unwrap();
-        let config = RuntimeConfig {
-            pages: 24,
-            cells_per_page: 128,
-            max_slots: 4,
-            window_rows: 4,
-            ..RuntimeConfig::default()
-        };
-        let devices =
-            vec![Device::open(0, Wait::Block).unwrap(), Device::open(1, Wait::Block).unwrap()];
-        Self::serve(model, config, devices, rule)
+    /// the n-gram drafter (`gpu::large_model`).
+    async fn start_drafting(path: &Path, rule: Option<Rule>) -> Self {
+        Self::serve(gpu::large_model(path, Some(false)), rule).await
     }
 
-    fn serve(
-        model: Qwen35,
-        config: RuntimeConfig,
-        devices: Vec<Device>,
-        rule: Option<Rule>,
-    ) -> Self {
-        let chat = ChatOptions {
-            variables: vec![("enable_thinking".to_owned(), Json::Bool(false))],
-            ..ChatOptions::default()
-        };
-        let model = Arc::new(model.with_chat_options(chat));
-        let as_model: Arc<dyn Model> = model.clone();
-        let gpu = GpuConfig::new(&config, &*as_model);
-        let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
+    async fn serve((runtime, model): (Arc<Runtime>, Arc<Qwen35>), rule: Option<Rule>) -> Self {
         let engine: Arc<dyn Engine> = match rule {
             Some(rule) => Arc::new(Restricted { inner: runtime.clone(), rule }),
             None => runtime.clone(),
         };
-        Self { app: ares_server::router(engine), runtime, model }
+        Self { app: gpu::router(engine).await, runtime, model }
     }
 
     async fn post(&self, path: &str, body: &Value) -> (u16, String) {
-        let request = Request::post(path)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status().as_u16();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, String::from_utf8(bytes.to_vec()).unwrap())
+        gpu::ask(&self.app, path, body).await
     }
 
     /// The answer to a request that is to succeed, as the JSON of the server.
@@ -331,8 +242,8 @@ fn breaks(piece: &str) -> bool {
 /// alternatives after the penalties.
 #[tokio::test]
 async fn presence_and_frequency_penalties_pick_what_their_definition_says() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let served = Served::start(&path, None).await;
     let prompt = served.prompt_ids(CONTINUE);
     let window = 8usize;
     let (presence, frequency) = (2.0f64, 1.5f64);
@@ -402,8 +313,8 @@ async fn presence_and_frequency_penalties_pick_what_their_definition_says() {
 /// within the window, and with a window of 0 the penalty is off.
 #[tokio::test]
 async fn a_repetition_penalty_keeps_the_window_from_repeating_and_a_window_of_0_turns_it_off() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let served = Served::start(&path, None).await;
     let window = 8;
     // The reply does not end early, so that the whole window is looked at.
     let plain = served.chat(json!({"ignore_eos": true})).await;
@@ -434,8 +345,8 @@ async fn a_repetition_penalty_keeps_the_window_from_repeating_and_a_window_of_0_
 /// twice, apart from those the sequence breakers cut.
 #[tokio::test]
 async fn dry_leaves_no_sequence_longer_than_the_allowed_length_repeated() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let served = Served::start(&path, None).await;
     let repeated = |said: &Said| -> usize {
         let triples: Vec<_> = (2..said.ids.len())
             .filter(|i| !said.pieces[i - 2..=*i].iter().any(|p| breaks(p)))
@@ -466,8 +377,8 @@ async fn dry_leaves_no_sequence_longer_than_the_allowed_length_repeated() {
 /// gives its bias to every token that makes it up. `ignore_eos` bans the end.
 #[tokio::test]
 async fn a_logit_bias_forces_and_bans_tokens_and_ignore_eos_bans_the_end() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let served = Served::start(&path, None).await;
     let plain = served.chat(json!({"top_logprobs": 5, "max_tokens": 12})).await;
     let (first, second) = (plain.alternatives[0][0].0, plain.alternatives[0][1].0);
     assert_eq!(first, plain.ids[0]);
@@ -516,8 +427,8 @@ async fn a_logit_bias_forces_and_bans_tokens_and_ignore_eos_bans_the_end() {
 
 #[tokio::test]
 async fn the_probabilities_of_the_tokens_come_back_in_every_form_and_add_up() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let served = Served::start(&path, None).await;
 
     // OpenAI's chat form, the model's own: of a greedy token the most
     // probable, in order, adding to no more than 1, and the bytes of the
@@ -631,7 +542,7 @@ async fn the_probabilities_of_the_tokens_come_back_in_every_form_and_add_up() {
 /// reply is one the rule allowed at its place.
 #[tokio::test]
 async fn a_mask_restricts_every_row_of_a_reply_with_drafts_and_without() {
-    let Some(path) = drafting_model() else { return };
+    let Some(path) = gpu::large() else { return };
     // The rule the engine applies, which the test switches between the
     // replies: none, or one of two. A rule makes a mask for every row, so
     // that no draft of the model's own is verified with it (the host cannot
@@ -655,7 +566,7 @@ async fn a_mask_restricts_every_row_of_a_reply_with_drafts_and_without() {
             _ => {}
         })
     };
-    let served = Served::start_drafting(&path, Some(rule));
+    let served = Served::start_drafting(&path, Some(rule)).await;
     let plain = served.chat(json!({"draft": false})).await;
     let most_said = plain
         .ids
@@ -722,7 +633,7 @@ async fn a_mask_restricts_every_row_of_a_reply_with_drafts_and_without() {
 /// request with mirostat has no drafts.
 #[tokio::test]
 async fn drafts_leave_the_tokens_of_every_setting_alone() {
-    let Some(path) = drafting_model() else { return };
+    let Some(path) = gpu::large() else { return };
     let settings: Vec<(&str, Value)> = vec![
         ("greedy", json!({})),
         ("temperature", json!({"temperature": 0.8, "seed": 1})),
@@ -764,7 +675,7 @@ async fn drafts_leave_the_tokens_of_every_setting_alone() {
         ("mirostat 1", json!({"temperature": 0.8, "seed": 11, "mirostat": 1})),
         ("a stop string", json!({"temperature": 0.8, "seed": 12, "stop": ["lazy"]})),
     ];
-    let served = Served::start_drafting(&path, None);
+    let served = Served::start_drafting(&path, None).await;
     let mut answers: Vec<Vec<Said>> = vec![Vec::new(), Vec::new()];
     for (drafts, said) in answers.iter_mut().enumerate() {
         for (name, extra) in &settings {
@@ -816,7 +727,7 @@ async fn drafts_leave_the_tokens_of_every_setting_alone() {
 /// the same, with drafts and without.
 #[tokio::test]
 async fn requests_with_different_settings_at_once_do_not_affect_each_other() {
-    let Some(path) = drafting_model() else { return };
+    let Some(path) = gpu::large() else { return };
     let a =
         json!({"temperature": 0.8, "top_k": 40, "seed": 21, "top_logprobs": 3, "max_tokens": 60});
     let b = json!({"temperature": 0.7, "seed": 22, "repeat_penalty": 1.4, "frequency_penalty": 0.5,
@@ -825,7 +736,7 @@ async fn requests_with_different_settings_at_once_do_not_affect_each_other() {
         "n_probs": 4, "post_sampling_probs": true, "max_tokens": 60});
     let d = json!({"messages": [{"role": "user", "content": "Name three colours."}],
         "temperature": 0.5, "seed": 24, "typical_p": 0.9, "xtc_probability": 0.2, "max_tokens": 60});
-    let served = Served::start_drafting(&path, None);
+    let served = Served::start_drafting(&path, None).await;
     for drafts in [false, true] {
         let with = |request: &Value| {
             let mut request = request.clone();
@@ -883,8 +794,8 @@ async fn requests_with_different_settings_at_once_do_not_affect_each_other() {
 /// each with its own probabilities, and the usage counts the prompt once.
 #[tokio::test]
 async fn n_completions_are_requests_of_their_own_with_their_own_probabilities() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, None);
+    let Some(path) = gpu::small() else { return };
+    let served = Served::start(&path, None).await;
     // A text that the model is not sure of, so that the seeds make a difference.
     let story = json!([{"role": "user", "content": "Tell me a very short story about a lighthouse keeper."}]);
     let sampled = json!({

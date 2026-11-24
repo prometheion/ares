@@ -22,13 +22,14 @@
 //! idle time is a few seconds and the tests wait for a state, not for a
 //! duration (`tests/models.rs` has the state machine on a clock it sets).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use ares_cuda::{Device, Wait};
 use common::process::{Server, ares};
 use common::scratch;
 use common::socket::Reply;
+use common::{model_file, test_device};
 use serde_json::json;
 
 mod common;
@@ -41,24 +42,8 @@ const LIMIT: Duration = Duration::from_secs(300);
 /// are not a model: the granularity of its allocations.
 const SLACK: u64 = 48 << 20;
 
-fn file(variable: &str, what: &str) -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    let path = std::env::var_os(variable).map(PathBuf::from);
-    if path.is_none() {
-        eprintln!("skipped: set {variable} to {what}");
-    }
-    path
-}
-
 fn port(offset: u16) -> u16 {
     common::process::port(18980, offset)
-}
-
-fn test_device() -> u32 {
-    std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0)
 }
 
 /// Free memory of a device as its driver reports it, to every process alike.
@@ -91,7 +76,9 @@ fn print_times(what: &str, log: &[String]) {
 
 #[test]
 fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
-    let Some(small) = file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else { return };
+    let Some(small) = model_file("ARES_TEST_QWEN35_MODEL", "a small qwen35 model file") else {
+        return;
+    };
     let ordinal = test_device();
     let dir = scratch("router-small");
     let garbage = dir.join("garbage.gguf");
@@ -187,11 +174,12 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
 
 #[test]
 fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
-    let Some(large) = file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices") else {
+    let Some(large) = model_file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices")
+    else {
         return;
     };
     let Some(medium) =
-        file("ARES_TEST_QWEN35_27B_SMALL", "a qwen35 file that fills most of one device")
+        model_file("ARES_TEST_QWEN35_27B_SMALL", "a qwen35 file that fills most of one device")
     else {
         return;
     };
@@ -255,10 +243,11 @@ fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
 /// of Flash-Next's RAM (default `8G`).
 #[test]
 fn flash_next_is_loaded_again_after_an_unload_and_after_the_27b() {
-    let Some(flash) = file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next") else {
+    let Some(flash) = model_file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next") else {
         return;
     };
-    let Some(large) = file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices") else {
+    let Some(large) = model_file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices")
+    else {
         return;
     };
     if ares_cuda::devices().map_or(0, |devices| devices.len()) < 2 {

@@ -17,9 +17,9 @@ const CHAT_BODY: &str = r#"{"model": "mock", "messages": [{"role": "user", "cont
 const MESSAGES_BODY: &str =
     r#"{"model": "mock", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}"#;
 
-fn served(access: Access) -> Router {
+async fn served(access: Access) -> Router {
     let engine = MockEngine::script(vec![text("ok"), done(FinishReason::Stop, 1, 1)]);
-    app_with(&engine, Config { access, ..Config::default() })
+    app_with(&engine, Config { access, ..Config::default() }).await
 }
 
 fn locked() -> Access {
@@ -56,7 +56,7 @@ fn parsed(body: &str) -> Value {
 
 #[tokio::test]
 async fn with_keys_every_route_but_health_wants_one() {
-    let app = served(locked());
+    let app = served(locked()).await;
     let (status, _, _) = send(&app, "GET", "/health", &[], None).await;
     assert_eq!(status, StatusCode::OK, "health stays open");
 
@@ -98,7 +98,7 @@ async fn with_keys_every_route_but_health_wants_one() {
 
 #[tokio::test]
 async fn the_messages_routes_refuse_in_anthropics_shape_and_take_its_header() {
-    let app = served(locked());
+    let app = served(locked()).await;
     for path in ["/v1/messages", "/v1/messages/count_tokens"] {
         let (status, _, text) = send(&app, "POST", path, &[], Some(MESSAGES_BODY)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -114,7 +114,7 @@ async fn the_messages_routes_refuse_in_anthropics_shape_and_take_its_header() {
 
 #[tokio::test]
 async fn a_local_server_answers_only_to_its_local_names() {
-    let app = served(Access { hosts: Some(Vec::new()), ..Access::default() });
+    let app = served(Access { hosts: Some(Vec::new()), ..Access::default() }).await;
     for host in ["localhost:8000", "LocalHost", "127.0.0.1:8000", "[::1]:8000", "app.localhost"] {
         let (status, _, _) = send(&app, "GET", "/v1/models", &[("host", host)], None).await;
         assert_eq!(status, StatusCode::OK, "{host}");
@@ -132,20 +132,21 @@ async fn a_local_server_answers_only_to_its_local_names() {
     assert_eq!(status, StatusCode::OK);
 
     // Names the operator adds, in any case; health is checked too.
-    let app = served(Access { hosts: Some(vec!["gpu.lan".into()]), ..Access::default() });
+    let app = served(Access { hosts: Some(vec!["gpu.lan".into()]), ..Access::default() }).await;
     let (status, _, _) = send(&app, "GET", "/v1/models", &[("host", "GPU.lan:8000")], None).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _, _) = send(&app, "GET", "/health", &[("host", "other.lan")], None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // `None` is every name.
     let (status, _, _) =
-        send(&served(Access::default()), "GET", "/health", &[("host", "other.lan")], None).await;
+        send(&served(Access::default()).await, "GET", "/health", &[("host", "other.lan")], None)
+            .await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn without_keys_a_page_of_another_site_is_refused() {
-    let app = served(Access { hosts: Some(Vec::new()), ..Access::default() });
+    let app = served(Access { hosts: Some(Vec::new()), ..Access::default() }).await;
     let foreign = [("host", "127.0.0.1:8000"), ("origin", "https://attacker.example")];
     let (status, _, text) =
         send(&app, "POST", "/v1/chat/completions", &foreign, Some(CHAT_BODY)).await;
@@ -168,13 +169,13 @@ async fn without_keys_a_page_of_another_site_is_refused() {
         assert_eq!(status, StatusCode::OK, "{origin}");
         assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "no CORS asked");
     }
-    let open = served(Access::default());
+    let open = served(Access::default()).await;
     let own = [("host", "gpu.lan:8000"), ("origin", "http://gpu.lan:8000")];
     let (status, _, _) = send(&open, "GET", "/v1/models", &own, None).await;
     assert_eq!(status, StatusCode::OK);
 
     // With keys the key decides.
-    let app = served(locked());
+    let app = served(locked()).await;
     let keyed = [("origin", "https://attacker.example"), ("authorization", "Bearer first-key")];
     let (status, _, _) = send(&app, "GET", "/v1/models", &keyed, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -183,7 +184,7 @@ async fn without_keys_a_page_of_another_site_is_refused() {
 #[tokio::test]
 async fn cors_lets_the_listed_origins_read_answers_and_answers_their_preflight() {
     let access = Access { origins: vec!["https://chat.example.org".into()], ..locked() };
-    let app = served(access);
+    let app = served(access).await;
     let preflight = [
         ("origin", "https://chat.example.org"),
         ("access-control-request-method", "POST"),
@@ -220,7 +221,8 @@ async fn cors_lets_the_listed_origins_read_answers_and_answers_their_preflight()
 
     // `*` is every origin, and lifts the check of pages for a server without keys.
     let app =
-        served(Access { origins: vec!["*".into()], hosts: Some(Vec::new()), ..Access::default() });
+        served(Access { origins: vec!["*".into()], hosts: Some(Vec::new()), ..Access::default() })
+            .await;
     let headers = [("host", "localhost"), ("origin", "https://anywhere.example")];
     let (status, headers, _) = send(&app, "GET", "/v1/models", &headers, None).await;
     assert_eq!(status, StatusCode::OK);

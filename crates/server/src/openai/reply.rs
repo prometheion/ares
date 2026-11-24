@@ -491,15 +491,12 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
                 model["created"] = card.created.into();
                 model["context_length"] = card.context_length.into();
             }
-            // A server with presets says where each model stands, in the
-            // shape llama-server's router has; a failure is a state here,
-            // with its reason.
-            if let Some(status) = &m.status {
-                model["aliases"] = m.aliases.clone().into();
-                model["status"] = serde_json::json!({ "value": status.status });
-                if let Some(reason) = &status.reason {
-                    model["status"]["reason"] = reason.as_str().into();
-                }
+            // Where each model stands, in the shape llama-server's router
+            // has; a failure is a state here, with its reason.
+            model["aliases"] = m.aliases.clone().into();
+            model["status"] = serde_json::json!({ "value": m.status.status });
+            if let Some(reason) = &m.status.reason {
+                model["status"]["reason"] = reason.as_str().into();
             }
             model
         })

@@ -19,7 +19,9 @@ use ares_api::Engine;
 use ares_cuda::{Device, Wait, devices};
 use ares_runtime::testing::HostExecutor;
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
-use ares_server::{Config, serve};
+use ares_server::models::Models;
+use ares_server::options::ModelOptions;
+use ares_server::{Config, serve_models};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -215,9 +217,13 @@ async fn main() {
     let addr = listener.local_addr().expect("address");
     println!("serving the synthetic model ({}, {} layers) on http://{addr}", o.placement, o.layers);
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(serve(listener, engine, Config::default(), async move {
+    let models = Arc::new(Models::of_engine(engine, ModelOptions::default()).await);
+    let stop_serving = async move {
         let _ = stopped.await;
-    }));
+    };
+    let serving =
+        serve_models(listener, models, Config::default(), stop_serving, std::future::pending());
+    let server = tokio::spawn(serving);
 
     if o.load == 0 {
         tokio::signal::ctrl_c().await.expect("signal handler");

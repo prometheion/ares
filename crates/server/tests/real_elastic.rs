@@ -30,6 +30,8 @@ use ares_runtime::{Machine, Meminfo, MemorySource, Rule};
 use ares_server::load;
 use ares_server::plan::LoadOptions;
 
+mod common;
+
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// The least this machine may have available while the test runs: below it
@@ -110,10 +112,9 @@ fn generate(
 
 #[test]
 fn the_tier_of_flash_next_follows_the_memory_of_a_smaller_machine() {
-    let (Some(_), Some(model)) =
-        (std::env::var_os("ARES_TEST_CUDA"), std::env::var_os("ARES_TEST_QWEN4EXP_MODEL"))
+    let Some(model) =
+        common::model_file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next")
     else {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 and ARES_TEST_QWEN4EXP_MODEL");
         return;
     };
     let hidden = env_u64("ARES_TEST_HIDE").unwrap_or(4 << 30);
@@ -126,7 +127,7 @@ fn the_tier_of_flash_next_follows_the_memory_of_a_smaller_machine() {
     machine.watch();
     assert!(load::follow(machine.clone()), "no watch was in use");
 
-    let mut options = LoadOptions::new(PathBuf::from(model));
+    let mut options = LoadOptions::new(model);
     if let Ok(devices) = std::env::var("ARES_TEST_DEVICES") {
         options.devices = Some(devices.split(',').map(|d| d.parse().expect("a device")).collect());
     }

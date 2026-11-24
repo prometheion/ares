@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use ares_api::{
     DecisionOutcome, DecisionRequest, DecisionResult, EngineError, FinishReason, Usage,
 };
-use ares_server::{Config, serve};
+use ares_server::options::ModelOptions;
+use ares_server::{Config, serve_models};
 use common::socket::{Reply, find, request_bytes};
 use common::*;
 use serde_json::{Value, json};
@@ -31,14 +32,16 @@ async fn start(engine: &Arc<MockEngine>, config: Config) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown, signal) = oneshot::channel();
-    let task = tokio::spawn(serve(listener, engine.clone(), config, async {
+    let models = models_of(engine.clone(), ModelOptions::default()).await;
+    let stop = async {
         let _ = signal.await;
-    }));
+    };
+    let task = tokio::spawn(serve_models(listener, models, config, stop, std::future::pending()));
     Server { addr, shutdown, task }
 }
 
 impl Server {
-    /// Signals shutdown and waits for `serve` to return.
+    /// Signals shutdown and waits for `serve_models` to return.
     async fn stop(self) -> io::Result<()> {
         self.shutdown.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), self.task)
@@ -250,9 +253,9 @@ async fn a_second_signal_ends_running_requests_and_tells_their_clients() {
     let (drain, drained) = oneshot::channel::<()>();
     let (hurry, hurried) = oneshot::channel::<()>();
     // The grace period alone would keep the server up for half a minute.
-    let task = tokio::spawn(ares_server::serve_until(
+    let task = tokio::spawn(serve_models(
         listener,
-        engine.clone(),
+        models_of(engine.clone(), ModelOptions::default()).await,
         Config::default(),
         async {
             let _ = drained.await;

@@ -55,15 +55,16 @@ fn defaults(given: &[(&str, &str)]) -> Defaults {
 }
 
 /// A server over one engine whose model has the defaults of `given`.
-fn served(given: &[(&str, &str)]) -> (Arc<MockEngine>, Router) {
+async fn served(given: &[(&str, &str)]) -> (Arc<MockEngine>, Router) {
     let engine = MockEngine::script(vec![text("ok"), done(FinishReason::Stop, 3, 1)]);
-    let app = app_with(&engine, Config { defaults: defaults(given), ..Config::default() });
+    let options = ModelOptions { defaults: defaults(given), ..ModelOptions::default() };
+    let app = router_of(engine.clone(), options, Config::default()).await;
     (engine, app)
 }
 
 /// What the engine was handed for `body` on `path`.
 async fn submitted(given: &[(&str, &str)], path: &str, body: &str) -> GenerateRequest {
-    let (engine, app) = served(given);
+    let (engine, app) = served(given).await;
     let response = post(&app, path, body).await;
     let (status, value) = json(response).await;
     assert_eq!(status, StatusCode::OK, "{path}: {value}");
@@ -212,7 +213,7 @@ async fn the_values_of_a_request_hold_over_the_model_s_on_every_route() {
 
 #[tokio::test]
 async fn the_completions_of_one_prompt_draw_from_the_model_s_seed_and_the_ones_after_it() {
-    let (engine, app) = served(&[("--seed", "42")]);
+    let (engine, app) = served(&[("--seed", "42")]).await;
     let (status, _) = json(post(&app, CHAT, &body(&routes()[0].1, json!({"n": 3}))).await).await;
     assert_eq!(status, StatusCode::OK);
     let seeds: Vec<_> = engine.submitted().iter().map(|r| r.sampling.seed).collect();
@@ -237,7 +238,7 @@ fn limit_names(path: &str) -> &'static [&'static str] {
 /// Sends `body` and returns the limit the engine got and the header about a
 /// lowered limit.
 async fn limited(given: &[(&str, &str)], path: &str, body: &str) -> (Option<u32>, Option<String>) {
-    let (engine, app) = served(given);
+    let (engine, app) = served(given).await;
     let response = post(&app, path, body).await;
     let header = response.headers().get(LIMIT_HEADER).map(|v| v.to_str().unwrap().to_owned());
     assert_eq!(response.status(), StatusCode::OK, "{path} {body}: {}", body_text(response).await);
@@ -296,25 +297,27 @@ async fn a_request_above_the_model_s_limit_gets_the_limit_and_is_told_so_on_ever
 #[tokio::test]
 async fn a_reply_the_limit_cut_says_that_it_was_cut_and_how_long_it_is() {
     let cut = || MockEngine::script(vec![text("so far"), done(FinishReason::Length, 9, 200)]);
-    let config = || Config { defaults: defaults(LENGTHS), ..Config::default() };
+    let served = |engine: Arc<MockEngine>| {
+        let options = ModelOptions { defaults: defaults(LENGTHS), ..ModelOptions::default() };
+        router_of(engine, options, Config::default())
+    };
     let [chat, completions, messages, responses] = routes();
 
     for (path, base) in [chat, completions] {
-        let (_, answer) = json(
-            post(&app_with(&cut(), config()), path, &body(&base, json!({"max_tokens": 900}))).await,
-        )
-        .await;
+        let (_, answer) =
+            json(post(&served(cut()).await, path, &body(&base, json!({"max_tokens": 900}))).await)
+                .await;
         assert_eq!(answer["choices"][0]["finish_reason"], "length", "{path}");
         assert_eq!(answer["usage"]["completion_tokens"], 200, "{path}");
     }
     let sent = body(&messages.1, json!({"max_tokens": 900}));
-    let (_, answer) = json(post(&app_with(&cut(), config()), MESSAGES, &sent).await).await;
+    let (_, answer) = json(post(&served(cut()).await, MESSAGES, &sent).await).await;
     assert_eq!(answer["stop_reason"], "max_tokens");
     assert_eq!(answer["usage"]["output_tokens"], 200);
 
     // The response object of the Responses API says the limit in effect.
     let sent = body(&responses.1, json!({"max_output_tokens": 900}));
-    let (_, answer) = json(post(&app_with(&cut(), config()), RESPONSES, &sent).await).await;
+    let (_, answer) = json(post(&served(cut()).await, RESPONSES, &sent).await).await;
     assert_eq!(answer["status"], "incomplete");
     assert_eq!(answer["incomplete_details"]["reason"], "max_output_tokens");
     assert_eq!(answer["max_output_tokens"], 200);
@@ -325,7 +328,7 @@ async fn a_reply_the_limit_cut_says_that_it_was_cut_and_how_long_it_is() {
 async fn a_response_of_the_responses_api_says_what_was_applied() {
     let given = [("--temperature", "0.7"), ("--top-p", "0.95"), ("--max-tokens", "100")];
     let base = &routes()[3].1;
-    let (_, app) = served(&given);
+    let (_, app) = served(&given).await;
     // The model's defaults where the request says nothing.
     let (_, answer) = json(post(&app, RESPONSES, &base.to_string()).await).await;
     assert_eq!(
@@ -340,7 +343,7 @@ async fn a_response_of_the_responses_api_says_what_was_applied() {
         (&json!(0.25), &json!(0.5), &json!(30))
     );
     // Null where neither says anything: the engine's own value.
-    let (_, app) = served(&[]);
+    let (_, app) = served(&[]).await;
     let (_, answer) = json(post(&app, RESPONSES, &base.to_string()).await).await;
     assert!(answer["temperature"].is_null() && answer["top_p"].is_null(), "{answer}");
     assert!(answer["max_output_tokens"].is_null(), "{answer}");
@@ -349,7 +352,7 @@ async fn a_response_of_the_responses_api_says_what_was_applied() {
 #[tokio::test]
 async fn a_count_of_tokens_takes_no_harm_from_the_defaults() {
     // The routes that count read a request as the routes that generate do.
-    let (_, app) = served(EVERY);
+    let (_, app) = served(EVERY).await;
     let sent = routes()[0].1.to_string();
     let (status, answer) = json(post(&app, "/v1/chat/completions/input_tokens", &sent).await).await;
     // The scripted engine cannot count; the request got as far as the engine.
@@ -364,7 +367,8 @@ async fn the_model_list_says_what_a_field_means_that_a_request_leaves_out() {
         ("--top-k", "20"),
         ("--max-tokens", "100"),
         ("--max-tokens-limit", "200"),
-    ]);
+    ])
+    .await;
     let (status, list) = json(get(&app, "/v1/models").await).await;
     assert_eq!(status, StatusCode::OK);
     for model in list["data"].as_array().unwrap() {
@@ -375,7 +379,7 @@ async fn the_model_list_says_what_a_field_means_that_a_request_leaves_out() {
         assert_eq!(model["max_tokens_limit"], 200);
     }
     // A server without defaults says that too: the engine's own hold.
-    let (_, app) = served(&[]);
+    let (_, app) = served(&[]).await;
     let (_, list) = json(get(&app, "/v1/models").await).await;
     assert_eq!(list["data"][0]["defaults"], json!({}));
     assert!(list["data"][0].get("max_tokens_limit").is_none());

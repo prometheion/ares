@@ -14,10 +14,10 @@ use serde_json::{Value, json};
 
 const CHAT: &str = "/v1/chat/completions";
 
-fn serve(steps: Vec<Step>, format: ChatFormat) -> (Arc<MockEngine>, axum::Router) {
+async fn serve(steps: Vec<Step>, format: ChatFormat) -> (Arc<MockEngine>, axum::Router) {
     let engine = MockEngine::script(steps);
     engine.set_chat_format(format);
-    let app = app(&engine);
+    let app = app(&engine).await;
     (engine, app)
 }
 
@@ -59,7 +59,7 @@ struct Reply {
 }
 
 async fn whole(steps: Vec<Step>, extra: Value) -> Reply {
-    let (_, app) = serve(steps, qwen());
+    let (_, app) = serve(steps, qwen()).await;
     let (status, body) = json(post(&app, CHAT, &chat(extra)).await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let choice = &body["choices"][0];
@@ -85,7 +85,7 @@ async fn whole(steps: Vec<Step>, extra: Value) -> Reply {
 /// The same request streamed, with the deltas put together and checked for
 /// the shape OpenAI gives them.
 async fn streamed(steps: Vec<Step>, extra: Value) -> Reply {
-    let (_, app) = serve(steps, qwen());
+    let (_, app) = serve(steps, qwen()).await;
     let mut extra = extra;
     extra["stream"] = json!(true);
     let response = post(&app, CHAT, &chat(extra)).await;
@@ -141,7 +141,7 @@ async fn streamed(steps: Vec<Step>, extra: Value) -> Reply {
 }
 
 async fn submitted(extra: Value, format: ChatFormat) -> GenerateRequest {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)], format);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)], format).await;
     let (status, body) = json(post(&app, CHAT, &chat(extra)).await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     engine.submitted().remove(0)
@@ -152,7 +152,7 @@ async fn refused(body: &str, format: ChatFormat) -> Value {
 }
 
 async fn refused_on(path: &str, body: &str, format: ChatFormat) -> Value {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)], format);
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)], format).await;
     let (status, value) = json(post(&app, path, body).await).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
     assert!(engine.submitted().is_empty(), "the engine was not to see the request");
@@ -250,7 +250,7 @@ async fn a_reply_that_calls_a_tool_comes_back_as_tool_calls() {
     assert_eq!(reply.calls, [("get_weather".to_owned(), r#"{"city":"Köln","days":3}"#.to_owned())]);
 
     // A reply that is only a call has the empty content.
-    let (_, app) = serve(says(&format!("{THINKS}{NOW}"), 5, FinishReason::Stop), qwen());
+    let (_, app) = serve(says(&format!("{THINKS}{NOW}"), 5, FinishReason::Stop), qwen()).await;
     let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     let message = &body["choices"][0]["message"];
     assert_eq!(message["content"], "");
@@ -264,7 +264,7 @@ async fn a_reply_without_a_call_is_text_as_before() {
     let reply = whole(says(&said, 4, FinishReason::Stop), json!({})).await;
     assert_eq!(reply.content, "It is sunny, 12 < 14.\n");
     assert_eq!((reply.calls.len(), reply.finish.as_str()), (0, "stop"));
-    let (_, app) = serve(says(&said, 4, FinishReason::Stop), qwen());
+    let (_, app) = serve(says(&said, 4, FinishReason::Stop), qwen()).await;
     let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     assert!(body["choices"][0]["message"].get("tool_calls").is_none(), "{body}");
 }
@@ -364,7 +364,7 @@ async fn a_call_inside_the_thinking_comes_back_as_a_call_and_ends_the_reasoning(
     assert_eq!(reply.calls.len(), 2, "{reply:?}");
     assert_eq!((reply.content.as_str(), reply.finish.as_str()), ("", "tool_calls"));
     assert_eq!(reply, whole(says(&said, 4, FinishReason::Stop), json!({})).await);
-    let (_, app) = serve(says(NOW, 3, FinishReason::Stop), qwen());
+    let (_, app) = serve(says(NOW, 3, FinishReason::Stop), qwen()).await;
     let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     let message = &body["choices"][0]["message"];
     assert!(message.get("reasoning_content").is_none_or(|r| r == ""), "{body}");
@@ -411,7 +411,7 @@ async fn with_tool_choice_none_or_without_tools_a_call_inside_the_thinking_is_re
             let steps = says(&said, size, FinishReason::Stop);
             assert_eq!(whole(steps, extra.clone()).await, expected, "{extra}");
             // The stream, with its reasoning as it is.
-            let (_, app) = serve(says(&said, size, FinishReason::Stop), qwen());
+            let (_, app) = serve(says(&said, size, FinishReason::Stop), qwen()).await;
             let mut body = extra.clone();
             body["stream"] = json!(true);
             let stream = parse_sse(&body_text(post(&app, CHAT, &chat(body)).await).await);
@@ -453,7 +453,7 @@ async fn a_raw_reply_has_the_call_it_opened_inside_the_thinking() {
 
 /// A stream whose content may hold markup.
 async fn streamed_raw(steps: Vec<Step>, extra: Value) -> Reply {
-    let (_, app) = serve(steps, qwen());
+    let (_, app) = serve(steps, qwen()).await;
     let mut extra = extra;
     extra["stream"] = json!(true);
     let stream = parse_sse(&body_text(post(&app, CHAT, &chat(extra)).await).await);
@@ -516,7 +516,7 @@ async fn a_call_a_stop_string_cuts_is_returned_as_llama_server_returns_it() {
 
 #[tokio::test]
 async fn the_calls_and_results_of_earlier_turns_reach_the_template() {
-    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)], qwen());
+    let (engine, app) = serve(vec![done(FinishReason::Stop, 1, 0)], qwen()).await;
     let calls = json!([
         {"id": "call_1", "type": "function",
          "function": {"name": "get_weather", "arguments": "{\"city\": \"Köln\"}"}},
@@ -640,7 +640,7 @@ async fn what_cannot_be_served_is_refused_with_its_reason() {
 #[tokio::test]
 async fn each_completion_of_n_has_calls_with_ids_of_its_own() {
     let said = format!("{THINKS}{NOW}");
-    let (_, app) = serve(says(&said, 8, FinishReason::Stop), qwen());
+    let (_, app) = serve(says(&said, 8, FinishReason::Stop), qwen()).await;
     let (status, body) = json(post(&app, CHAT, &chat(json!({"n": 2}))).await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let id = |choice: usize| body["choices"][choice]["message"]["tool_calls"][0]["id"].clone();

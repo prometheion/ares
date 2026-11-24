@@ -67,7 +67,7 @@ fn failing(error: EngineError) -> DecisionStep {
 /// The request the engine received for `body`.
 async fn received(body: &str) -> DecisionRequest {
     let engine = deciding();
-    let (status, value) = json(post(&app(&engine), SYSTEMONE, body).await).await;
+    let (status, value) = json(post(&app(&engine).await, SYSTEMONE, body).await).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     engine.decided().remove(0)
 }
@@ -141,7 +141,7 @@ async fn the_readme_example_gets_the_documented_response_byte_for_byte() {
         Plan::Reject(EngineError::Unsupported("no generation".into())),
         DecisionPlan::Script(vec![deliver_with(readme_answers)]),
     );
-    let response = post(&app(&engine), SYSTEMONE, README_REQUEST).await;
+    let response = post(&app(&engine).await, SYSTEMONE, README_REQUEST).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
 
@@ -199,7 +199,7 @@ async fn a_choice_is_answered_with_the_option_its_probabilities_and_its_confiden
         "criteria": {"billing": "money", "shipping": null, "technical": {"area": "bugs"}}
     }}}));
     let engine = deciding();
-    let response = post(&app(&engine), SYSTEMONE, &body).await;
+    let response = post(&app(&engine).await, SYSTEMONE, &body).await;
     let text = body_text(response).await;
     let answer: Value = serde_json::from_str(&text).unwrap();
 
@@ -246,7 +246,7 @@ async fn a_score_is_answered_with_the_expected_level_and_a_legend_as_the_client_
         "criteria": ["can wait", {"en": "this week"}, null, ["a", "b"]]
     }}}));
     let engine = deciding();
-    let (status, answer) = json(post(&app(&engine), SYSTEMONE, &body).await).await;
+    let (status, answer) = json(post(&app(&engine).await, SYSTEMONE, &body).await).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
 
     let urgency = &answer["answers"]["urgency"];
@@ -287,7 +287,7 @@ async fn a_noul_question_is_answered_with_the_probability_of_true() {
         "instructions": "Is the customer angry?",
         "criteria": {"true": "shouts", "false": "calm"}
     }}}));
-    let (status, answer) = json(post(&app(&engine), SYSTEMONE, &body).await).await;
+    let (status, answer) = json(post(&app(&engine).await, SYSTEMONE, &body).await).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(answer["answers"]["angry"]["type"], "noul");
     close(&answer["answers"]["angry"]["noul"], 0.88080);
@@ -366,14 +366,23 @@ async fn instructions_and_descriptions_are_text_for_the_model_whatever_their_typ
 #[tokio::test]
 async fn the_model_is_named_or_is_the_only_one_served() {
     // Named: it goes to the engine as it is.
-    let request = received(&decision_body(json!({"model": "mock-2"}))).await;
-    assert_eq!(request.model, "mock-2");
+    let two = vec![
+        ModelCard { id: "mock".into(), context_length: 4096, created: 1 },
+        ModelCard { id: "mock-2".into(), context_length: 8192, created: 2 },
+    ];
+    let decides = || DecisionPlan::Script(vec![deliver_with(favour_the_first)]);
+    let refuses = || Plan::Reject(EngineError::Unsupported("no generation".into()));
+    let engine = MockEngine::with_models(two.clone(), refuses(), decides());
+    let named = decision_body(json!({"model": "mock-2"}));
+    let (status, value) = json(post(&app(&engine).await, SYSTEMONE, &named).await).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(engine.decided()[0].model, "mock-2");
 
     // Two models and none named: the client must say which, and is told what exists.
-    let engine = deciding();
+    let engine = MockEngine::with_models(two, refuses(), decides());
     let body = decision_body(json!({})).replace(r#""model":"mock","#, "");
     for body in [body.clone(), body.replace(r#""state""#, r#""model":null,"state""#)] {
-        let (status, value) = json(post(&app(&engine), SYSTEMONE, &body).await).await;
+        let (status, value) = json(post(&app(&engine).await, SYSTEMONE, &body).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["error"]["param"], "model");
         let message = value["error"]["message"].as_str().unwrap();
@@ -389,7 +398,7 @@ async fn the_model_is_named_or_is_the_only_one_served() {
             Plan::Reject(EngineError::Unsupported("no generation".into())),
             DecisionPlan::Script(vec![deliver_with(favour_the_first)]),
         );
-        let (status, value) = json(post(&app(&engine), SYSTEMONE, &body).await).await;
+        let (status, value) = json(post(&app(&engine).await, SYSTEMONE, &body).await).await;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(value["model"], "only");
         assert_eq!(engine.decided()[0].model, "only");
@@ -399,11 +408,12 @@ async fn the_model_is_named_or_is_the_only_one_served() {
     let engine =
         MockEngine::deciding(DecisionPlan::Reject(EngineError::ModelNotFound("nope".into())));
     let (status, value) =
-        json(post(&app(&engine), SYSTEMONE, &decision_body(json!({"model": "nope"}))).await).await;
+        json(post(&app(&engine).await, SYSTEMONE, &decision_body(json!({"model": "nope"}))).await)
+            .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(value["error"]["code"], "model_not_found");
     assert_eq!(value["error"]["param"], "model");
-    assert!(value["error"]["message"].as_str().unwrap().contains("mock, mock-2"));
+    assert!(value["error"]["message"].as_str().unwrap().contains("models: mock"));
 }
 
 // --- options that only a native decision model has -----------------------------
@@ -421,7 +431,7 @@ async fn images_and_audio_are_refused_with_501_after_the_rest_of_the_request_is_
             {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}]}]}}),
     ];
     let engine = deciding();
-    let app = app(&engine);
+    let app = app(&engine).await;
     for extra in media {
         let (status, value) =
             json(post(&app, SYSTEMONE, &decision_body(extra.clone())).await).await;
@@ -449,7 +459,7 @@ async fn images_and_audio_are_refused_with_501_after_the_rest_of_the_request_is_
 async fn videos_are_refused_as_llama_cpp_refuses_them() {
     let engine = deciding();
     let body = decision_body(json!({"videos": ["data:video/mp4;base64,AAAA"]}));
-    let (status, value) = json(post(&app(&engine), SYSTEMONE, &body).await).await;
+    let (status, value) = json(post(&app(&engine).await, SYSTEMONE, &body).await).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["error"]["param"], "videos");
     assert!(value["error"]["message"].as_str().unwrap().contains("not supported"));
@@ -528,7 +538,7 @@ async fn bad_requests_are_refused_before_the_engine_sees_them_and_name_the_field
     ];
 
     let engine = deciding();
-    let app = app(&engine);
+    let app = app(&engine).await;
     for (body, param, words) in cases {
         let (status, value) = json(post(&app, SYSTEMONE, &body).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {value}");
@@ -545,7 +555,8 @@ async fn bad_requests_are_refused_before_the_engine_sees_them_and_name_the_field
 #[tokio::test]
 async fn an_oversized_body_is_refused_with_413() {
     let engine = deciding();
-    let app = app_with(&engine, ares_server::Config { max_body_bytes: 64, ..Default::default() });
+    let app =
+        app_with(&engine, ares_server::Config { max_body_bytes: 64, ..Default::default() }).await;
     let (status, body) = json(post(&app, SYSTEMONE, &decision_body(json!({}))).await).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["error"]["code"], "request_too_large");
@@ -557,7 +568,7 @@ async fn an_oversized_body_is_refused_with_413() {
 #[tokio::test]
 async fn the_endpoint_is_on_v1_systemone_and_nowhere_else() {
     let engine = deciding();
-    let app = app(&engine);
+    let app = app(&engine).await;
     for path in ["/v1/decision", "/systemone", "/v1/systemone/", "/v1/systemone/x", "/v2/systemone"]
     {
         let (status, body) = json(post(&app, path, &decision_body(json!({}))).await).await;
@@ -576,7 +587,7 @@ async fn the_endpoint_is_on_v1_systemone_and_nowhere_else() {
 async fn an_error_returned_by_decide_maps_to_the_status_of_every_other_endpoint() {
     for case in error_cases("questions.q has too many options") {
         let engine = MockEngine::deciding(DecisionPlan::Reject(case.error.clone()));
-        let response = post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await;
+        let response = post(&app(&engine).await, SYSTEMONE, &decision_body(json!({}))).await;
         assert_error(&case, response, "rejected at decide").await;
     }
 }
@@ -585,7 +596,7 @@ async fn an_error_returned_by_decide_maps_to_the_status_of_every_other_endpoint(
 async fn a_failure_delivered_as_the_outcome_maps_the_same_way() {
     for case in error_cases("questions.q has too many options") {
         let engine = MockEngine::deciding(DecisionPlan::Script(vec![failing(case.error.clone())]));
-        let response = post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await;
+        let response = post(&app(&engine).await, SYSTEMONE, &decision_body(json!({}))).await;
         assert_error(&case, response, "failed outcome").await;
         assert!(engine.cancelled().is_empty(), "the engine ended it; there is nothing to cancel");
     }
@@ -595,7 +606,7 @@ async fn a_failure_delivered_as_the_outcome_maps_the_same_way() {
 async fn a_decision_the_engine_cancelled_under_a_waiting_client_is_an_error() {
     let engine =
         MockEngine::deciding(DecisionPlan::Script(vec![deliver(DecisionOutcome::Cancelled)]));
-    let response = post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await;
+    let response = post(&app(&engine).await, SYSTEMONE, &decision_body(json!({}))).await;
     assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     let (status, body) = json(response).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -607,7 +618,7 @@ async fn a_decision_the_engine_cancelled_under_a_waiting_client_is_an_error() {
 async fn an_engine_that_drops_the_sink_without_an_outcome_is_reported_not_waited_for() {
     let engine = MockEngine::deciding(DecisionPlan::Script(vec![DecisionStep::Abandon]));
     let (status, body) =
-        json(post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await).await;
+        json(post(&app(&engine).await, SYSTEMONE, &decision_body(json!({}))).await).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body["error"]["message"].as_str().unwrap().contains("without finishing"));
     assert_eq!(engine.cancelled(), [engine.decided()[0].id], "the request is released");
@@ -651,7 +662,7 @@ async fn an_answer_that_does_not_match_the_questions_is_an_error_and_not_a_respo
         let outcome = DecisionOutcome::Decided(DecisionResult { answers, usage: usage(1) });
         let engine = MockEngine::deciding(DecisionPlan::Script(vec![deliver(outcome)]));
         let (status, body) =
-            json(post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await).await;
+            json(post(&app(&engine).await, SYSTEMONE, &decision_body(json!({}))).await).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{words}: {body}");
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains(words), "'{message}' should contain '{words}'");
@@ -663,7 +674,7 @@ async fn an_answer_that_does_not_match_the_questions_is_an_error_and_not_a_respo
 #[tokio::test]
 async fn a_client_that_leaves_a_decision_cancels_it_in_the_engine() {
     let engine = MockEngine::deciding(DecisionPlan::Script(vec![DecisionStep::UntilCancelled]));
-    let app = app(&engine);
+    let app = app(&engine).await;
     let call = tokio::spawn({
         let app = app.clone();
         async move {
@@ -684,12 +695,12 @@ async fn a_client_that_leaves_a_decision_cancels_it_in_the_engine() {
 #[tokio::test]
 async fn finished_and_invalid_decisions_are_never_cancelled() {
     let engine = deciding();
-    let app = app(&engine);
+    let app = app(&engine).await;
     for _ in 0..3 {
         assert_eq!(post(&app, SYSTEMONE, &decision_body(json!({}))).await.status(), StatusCode::OK);
     }
     let broken = MockEngine::deciding(DecisionPlan::Script(vec![failing(EngineError::Overloaded)]));
-    let _ = post(&common::app(&broken), SYSTEMONE, &decision_body(json!({}))).await;
+    let _ = post(&common::app(&broken).await, SYSTEMONE, &decision_body(json!({}))).await;
     // Invalid: never started.
     let _ = post(&app, SYSTEMONE, "{").await;
 
@@ -737,7 +748,7 @@ async fn a_decision_completes_while_a_chat_stream_is_open_and_the_stream_then_fi
         ]),
         DecisionPlan::Script(vec![deliver_with(favour_the_first)]),
     );
-    let app = app(&engine);
+    let app = app(&engine).await;
 
     // The stream is open: its first piece arrived, and the engine thread of
     // the stream now waits for the gate, which the test holds shut.
@@ -786,7 +797,7 @@ async fn decisions_between_every_piece_of_a_stream_are_all_answered_and_the_stre
         Plan::Script(steps),
         DecisionPlan::Script(vec![deliver_with(favour_the_first)]),
     );
-    let app = app(&engine);
+    let app = app(&engine).await;
 
     let response = post(&app, CHAT, &chat_body(json!({"stream": true}))).await;
     let mut stream = response.into_body().into_data_stream();
@@ -839,7 +850,7 @@ async fn a_slow_decision_does_not_hold_up_a_chat_completion() {
             deliver_with(favour_the_first),
         ]),
     );
-    let app = app(&engine);
+    let app = app(&engine).await;
     let slow = tokio::spawn({
         let app = app.clone();
         async move { json(post(&app, SYSTEMONE, &decision_body(json!({}))).await).await }

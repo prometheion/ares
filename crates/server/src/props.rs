@@ -31,7 +31,7 @@ use crate::error::ApiError;
 use crate::generate::prepare;
 use crate::models::{AcquireError, Lease};
 use crate::openai::request::{self, Endpoint, Fields};
-use crate::routes::{App, json_response, next_request_id, read_body};
+use crate::routes::{App, json_response, next_request_id, read_body, wanted};
 
 /// `GET /props`.
 pub(crate) async fn props(State(app): State<App>, request: Request) -> Response {
@@ -42,43 +42,11 @@ pub(crate) async fn props(State(app): State<App>, request: Request) -> Response 
     }
 }
 
-/// The name of the model a request names, or of the only one of the server.
-fn wanted(app: &App, asked: Option<String>) -> Result<String, ApiError> {
-    Ok(match (asked, app.models.offered().as_deref()) {
-        (Some(name), _) => name,
-        (None, Some([only])) => only.clone(),
-        (None, None) => String::new(),
-        (None, Some(_)) => {
-            return Err(ApiError::invalid_param(
-                "model",
-                "several models are served: name one (model, or ?model=<id>)",
-            ));
-        }
-    })
-}
-
 /// The loaded model a request names, or the only one of the server, and its
 /// id. A model that is not loaded is not loaded for this.
 async fn loaded(app: &App, asked: Option<String>) -> Result<(Lease, String), ApiError> {
-    let name = wanted(app, asked)?;
-    let lease = app.models.loaded(&name).await?;
-    named_lease(lease, name)
-}
-
-/// The id of the model of `lease`, which a request named `name`.
-fn named_lease(lease: Lease, name: String) -> Result<(Lease, String), ApiError> {
-    let id = match lease.id() {
-        Some(id) => id.to_owned(),
-        None if !name.is_empty() => name,
-        // One engine: its first model.
-        None => lease
-            .engine()
-            .models()
-            .into_iter()
-            .next()
-            .map(|card| card.id)
-            .ok_or_else(|| ApiError::internal("the engine serves no model"))?,
-    };
+    let lease = app.models.loaded(&wanted(app, asked)?).await?;
+    let id = lease.id().to_owned();
     Ok((lease, id))
 }
 
@@ -89,7 +57,7 @@ async fn describe(app: &App, asked: Option<String>) -> Result<serde_json::Value,
         Err(AcquireError::NotLoaded { model }) => return unloaded(app, &model).await,
         Err(error) => return Err(error.into()),
     };
-    let (lease, id) = named_lease(lease, name)?;
+    let id = lease.id().to_owned();
     let engine = lease.engine();
     let card = engine.models().into_iter().find(|card| card.id == id);
     let mut body = body_of(&id, lease.defaults(), engine.chat_format(&id).as_ref());

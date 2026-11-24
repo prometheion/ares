@@ -11,7 +11,9 @@ use ares_api::{
     Event, EventSink, FinishReason, GenerateRequest, ModelCard, Prompt, RequestId, ThinkingFormat,
     ToolFormat, Usage,
 };
-use ares_server::Config;
+use ares_server::models::Models;
+use ares_server::options::ModelOptions;
+use ares_server::{Config, router_over};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode, header};
@@ -256,12 +258,10 @@ impl MockEngine {
         Self::both(Plan::Reject(refusal), decisions)
     }
 
-    /// Serves both kinds of request.
+    /// Serves both kinds of request, of the one model `mock`.
     pub fn both(plan: Plan, decisions: DecisionPlan) -> Arc<Self> {
-        let models = vec![
-            ModelCard { id: "mock".into(), context_length: 4096, created: 1_700_000_000 },
-            ModelCard { id: "mock-2".into(), context_length: 8192, created: 1_700_000_001 },
-        ];
+        let models =
+            vec![ModelCard { id: "mock".into(), context_length: 4096, created: 1_700_000_000 }];
         Self::with_models(models, plan, decisions)
     }
 
@@ -480,7 +480,7 @@ pub async fn submitted(
 /// The request a fresh [`instant`] engine got for `body` on `path`.
 pub async fn received(path: &str, body: &str) -> GenerateRequest {
     let engine = instant();
-    submitted(&engine, &app(&engine), path, body).await
+    submitted(&engine, &app(&engine).await, path, body).await
 }
 
 // --- errors -----------------------------------------------------------------
@@ -504,7 +504,7 @@ pub fn error_cases(invalid: &'static str) -> Vec<ErrorCase> {
             status: StatusCode::NOT_FOUND,
             kind: "invalid_request_error",
             code: "model_not_found",
-            mentions: vec!["'nope'", "mock, mock-2"],
+            mentions: vec!["'nope'", "mock"],
         },
         ErrorCase {
             error: EngineError::InvalidRequest(invalid.into()),
@@ -563,14 +563,27 @@ pub async fn assert_error(case: &ErrorCase, response: Response<Body>, how: &str)
     assert_eq!(retry_after.as_ref().and_then(|v| v.to_str().ok()), expected_retry, "{how}");
 }
 
-// --- driving the router -----------------------------------------------------
+// --- serving an engine ------------------------------------------------------
 
-pub fn app(engine: &Arc<MockEngine>) -> Router {
-    ares_server::router(engine.clone())
+/// The models of a server over `engine`, as `ares --model` serves one
+/// ([`Models::of_engine`]).
+pub async fn models_of(engine: Arc<dyn Engine>, options: ModelOptions) -> Arc<Models> {
+    Arc::new(Models::of_engine(engine, options).await)
 }
 
-pub fn app_with(engine: &Arc<MockEngine>, config: Config) -> Router {
-    ares_server::router_with(engine.clone(), config)
+/// The routes of a server over `engine`, whose models have `options`.
+pub async fn router_of(engine: Arc<dyn Engine>, options: ModelOptions, config: Config) -> Router {
+    router_over(models_of(engine, options).await, config)
+}
+
+// --- driving the router -----------------------------------------------------
+
+pub async fn app(engine: &Arc<MockEngine>) -> Router {
+    app_with(engine, Config::default()).await
+}
+
+pub async fn app_with(engine: &Arc<MockEngine>, config: Config) -> Router {
+    router_of(engine.clone(), ModelOptions::default(), config).await
 }
 
 pub fn post_request(path: &str, body: &str) -> Request<Body> {
@@ -632,6 +645,26 @@ pub fn parse_sse(body: &str) -> Stream {
     Stream { chunks, done }
 }
 
+/// The model file `variable` names, for a test that opens GPUs: `None`, and
+/// a note of what to set, unless `ARES_TEST_CUDA` enables those tests and
+/// the variable is set.
+pub fn model_file(variable: &str, what: &str) -> Option<PathBuf> {
+    if std::env::var_os("ARES_TEST_CUDA").is_none() {
+        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+        return None;
+    }
+    let path = std::env::var_os(variable).map(PathBuf::from);
+    if path.is_none() {
+        eprintln!("skipped: set {variable} to {what}");
+    }
+    path
+}
+
+/// The device of the tests that run on one (`ARES_TEST_DEVICE`, 0 if not set).
+pub fn test_device() -> u32 {
+    std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0)
+}
+
 /// A fresh directory of the build's for the files of a test: `name` must be
 /// unique among the tests of every suite.
 pub fn scratch(name: &str) -> PathBuf {
@@ -643,6 +676,23 @@ pub fn fresh(dir: PathBuf) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// The text that `base64` (the standard alphabet, padded) stands for: what a
+/// test reads of a signature that carries a text.
+pub fn from_base64(base64: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut bits, mut count, mut out) = (0u32, 0, Vec::new());
+    for c in base64.bytes().filter(|c| *c != b'=') {
+        let value = ALPHABET.iter().position(|a| *a == c).expect("a character of base64");
+        bits = bits << 6 | value as u32;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    String::from_utf8(out).expect("the text is UTF-8")
 }
 
 /// Polls until `condition` holds; fails the test after a few seconds.

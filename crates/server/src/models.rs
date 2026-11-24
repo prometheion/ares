@@ -1,5 +1,7 @@
-//! Router mode: the models a server offers, of which those are loaded that
-//! requests ask for.
+//! The models a server offers, of which those are loaded that requests ask
+//! for: the presets of a preset file (router mode), or the one preset of
+//! `ares --model`, which is loaded before the server listens. Every request
+//! takes its model here; there is no other way to serve one.
 //!
 //! A [`Models`] holds the presets ([`crate::preset`]) and, for each, whether
 //! its model is loaded. A request names a model by its id or an alias and
@@ -48,6 +50,7 @@ use tokio::sync::{Notify, broadcast, watch};
 use crate::ReasoningFormat;
 use crate::bridge::Flight;
 use crate::defaults::Defaults;
+use crate::options::ModelOptions;
 use crate::preset::{Preset, Presets};
 
 /// What a load finds next to it.
@@ -91,6 +94,36 @@ pub trait Unit: Send + 'static {
     /// Ends what still runs and gives back everything the model holds.
     /// Returns when that is done; called from a thread that may block.
     fn unload(self: Box<Self>);
+}
+
+/// The loader of an engine that is already there, for a program that builds
+/// its engine itself and serves it (a test, an example): every preset it
+/// loads is that engine, and an unload leaves the engine to its owner.
+#[derive(Clone)]
+pub struct Given(pub Arc<dyn Engine>);
+
+impl std::fmt::Debug for Given {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Given").finish_non_exhaustive()
+    }
+}
+
+impl Loader for Given {
+    fn load(&self, _: &Preset, _: &Site) -> Result<Box<dyn Unit>, LoadFailure> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl Unit for Given {
+    fn engine(&self) -> Arc<dyn Engine> {
+        self.0.clone()
+    }
+
+    fn ram(&self) -> u64 {
+        0
+    }
+
+    fn unload(self: Box<Self>) {}
 }
 
 /// The time the idle unload goes by.
@@ -138,9 +171,7 @@ pub struct Listed {
     pub aliases: Vec<String>,
     /// The card of its engine: of the loaded model, or as it was last loaded.
     pub card: Option<ModelCard>,
-    /// `None` for the model of a server that was given an engine and no
-    /// presets ([`Models::fixed`]).
-    pub status: Option<ModelEvent>,
+    pub status: ModelEvent,
     /// What a request to the model gets for the fields it leaves out.
     pub defaults: Arc<Defaults>,
 }
@@ -463,7 +494,11 @@ impl Shared {
         let failed = match result {
             Ok(loaded) => {
                 let entry = &mut state.entries[index];
-                entry.card = loaded.engine.models().into_iter().next().or(entry.card.take());
+                // The card of the model the preset names, which the engine
+                // knows by the preset's id.
+                let cards = loaded.engine.models();
+                let own = cards.iter().position(|card| card.id == entry.preset.id);
+                entry.card = cards.into_iter().nth(own.unwrap_or(0)).or(entry.card.take());
                 entry.loaded = Some(loaded);
                 entry.phase = Phase::Loaded;
                 (entry.wanted, entry.asked, entry.failure) = (None, false, None);
@@ -591,18 +626,19 @@ impl Drop for Waiter<'_> {
 struct Hold {
     engine: Option<Arc<dyn Engine>>,
     flight: Arc<Flight>,
-    /// The id of the model in its engine, when it is not the name a request
-    /// may have used.
-    id: Option<String>,
+    /// The id of the model in its engine, which a request may have named by
+    /// an alias.
+    id: String,
     reasoning_format: ReasoningFormat,
     defaults: Arc<Defaults>,
-    home: Option<(Arc<Shared>, usize)>,
+    /// The models and the model's place among them.
+    home: (Arc<Shared>, usize),
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
         let engine = self.engine.take();
-        let Some((shared, index)) = &self.home else { return };
+        let (shared, index) = &self.home;
         let broken = engine.as_ref().and_then(|engine| engine.failure());
         // The engine's handle goes before the model counts as free.
         drop(engine);
@@ -639,10 +675,10 @@ impl Lease {
         &self.0.flight
     }
 
-    /// The id the engine knows the model by, when the server has presets: a
-    /// request that named an alias is handed to the engine under this one.
-    pub fn id(&self) -> Option<&str> {
-        self.0.id.as_deref()
+    /// The id the engine knows the model by: a request that named an alias
+    /// is handed to the engine under this one.
+    pub fn id(&self) -> &str {
+        &self.0.id
     }
 
     /// How the reasoning of a reply is returned when a request does not say.
@@ -657,21 +693,11 @@ impl Lease {
     }
 }
 
-enum Kind {
-    Fixed {
-        engine: Arc<dyn Engine>,
-        flight: Arc<Flight>,
-        reasoning_format: ReasoningFormat,
-        defaults: Arc<Defaults>,
-    },
-    Presets {
-        shared: Arc<Shared>,
-        manager: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    },
-}
-
 /// The models of a server. See the [module documentation](self).
-pub struct Models(Kind);
+pub struct Models {
+    shared: Arc<Shared>,
+    manager: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
 
 impl std::fmt::Debug for Models {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -680,18 +706,6 @@ impl std::fmt::Debug for Models {
 }
 
 impl Models {
-    /// One engine that is there from the start to the end, and decides for
-    /// itself which names it answers to: nothing is loaded or unloaded.
-    /// `reasoning_format` and `defaults` hold for every model it serves.
-    pub fn fixed(
-        engine: Arc<dyn Engine>,
-        reasoning_format: ReasoningFormat,
-        defaults: Defaults,
-    ) -> Self {
-        let flight = Arc::new(Flight::new(&*engine));
-        Self(Kind::Fixed { engine, flight, reasoning_format, defaults: Arc::new(defaults) })
-    }
-
     /// The models of `presets`, none loaded yet; those that are to be loaded
     /// at start are put in line. Without a RAM limit of the presets the
     /// engines share what the machine has available instead of parts of a
@@ -734,7 +748,29 @@ impl Models {
             ram: presets.ram,
         });
         let manager = tokio::spawn(shared.clone().manage());
-        Self(Kind::Presets { shared, manager: Mutex::new(Some(manager)) })
+        Self { shared, manager: Mutex::new(Some(manager)) }
+    }
+
+    /// The models of a server over `engine`, which is already there ([`Given`]),
+    /// as `ares --model` serves one: a preset with `options` for each model the
+    /// engine serves, loaded before this returns. Must be called inside a
+    /// Tokio runtime.
+    pub async fn of_engine(engine: Arc<dyn Engine>, options: ModelOptions) -> Self {
+        let presets = engine.models().into_iter().map(|card| Preset {
+            id: card.id,
+            aliases: Vec::new(),
+            options: options.clone(),
+            load_on_startup: true,
+            idle_unload: None,
+        });
+        let presets = Presets { ram: None, models: presets.collect() };
+        let clock = Arc::new(SystemClock::default());
+        let models = Self::start(presets, Arc::new(Given(engine)), clock);
+        for id in models.offered() {
+            // A load of a given engine does not fail.
+            let _ = models.wait_loaded(&id).await;
+        }
+        models
     }
 
     /// The model `name` for one request: loaded if it is not, which the
@@ -750,19 +786,7 @@ impl Models {
     }
 
     async fn take(&self, name: &str, load: bool) -> Result<Lease, AcquireError> {
-        let shared = match &self.0 {
-            Kind::Fixed { engine, flight, reasoning_format, defaults } => {
-                return Ok(Lease(Arc::new(Hold {
-                    engine: Some(engine.clone()),
-                    flight: flight.clone(),
-                    id: None,
-                    reasoning_format: *reasoning_format,
-                    defaults: defaults.clone(),
-                    home: None,
-                })));
-            }
-            Kind::Presets { shared, .. } => shared,
-        };
+        let shared = &self.shared;
         let mut version = shared.version.subscribe();
         let mut waiting: Option<Waiter<'_>> = None;
         loop {
@@ -792,10 +816,10 @@ impl Models {
                     return Ok(Lease(Arc::new(Hold {
                         engine: Some(loaded.engine.clone()),
                         flight: loaded.flight.clone(),
-                        id: Some(entry.preset.id.clone()),
+                        id: entry.preset.id.clone(),
                         reasoning_format: entry.preset.options.reasoning_format,
                         defaults: entry.defaults.clone(),
-                        home: Some((shared.clone(), index)),
+                        home: (shared.clone(), index),
                     })));
                 }
                 if !load {
@@ -835,9 +859,7 @@ impl Models {
     /// Asks for the model `name` to be loaded, as `POST /models/load` does.
     /// Returns at once; the load is seen in the list and in the events.
     pub fn ask_load(&self, name: &str) -> Result<(), AcquireError> {
-        let Kind::Presets { shared, .. } = &self.0 else {
-            return Ok(());
-        };
+        let shared = &self.shared;
         let mut state = shared.lock();
         if state.stopping {
             return Err(AcquireError::Stopping);
@@ -859,9 +881,7 @@ impl Models {
     /// ended. Requests that come for it meanwhile load it again afterwards.
     /// Returns at once.
     pub fn ask_unload(&self, name: &str) -> Result<(), AcquireError> {
-        let Kind::Presets { shared, .. } = &self.0 else {
-            return Err(AcquireError::NotLoaded { model: name.to_owned() });
-        };
+        let shared = &self.shared;
         let mut state = shared.lock();
         let index = shared.resolve(&state, name)?;
         let entry = &mut state.entries[index];
@@ -875,66 +895,41 @@ impl Models {
         Ok(())
     }
 
-    /// The ids of the presets, or `None` for a server that was given one
-    /// engine and no presets.
-    pub fn offered(&self) -> Option<Vec<String>> {
-        match &self.0 {
-            Kind::Fixed { .. } => None,
-            Kind::Presets { shared, .. } => {
-                Some(shared.lock().entries.iter().map(|e| e.preset.id.clone()).collect())
-            }
-        }
+    /// The ids of the presets.
+    pub fn offered(&self) -> Vec<String> {
+        self.shared.lock().entries.iter().map(|e| e.preset.id.clone()).collect()
     }
 
     /// The preset that answers to `name` (an id or an alias), loaded or not;
-    /// `None` for a server of one engine and for a name no preset has.
+    /// `None` for a name no preset has.
     pub fn preset(&self, name: &str) -> Option<crate::preset::Preset> {
-        let Kind::Presets { shared, .. } = &self.0 else { return None };
-        let state = shared.lock();
-        let index = shared.resolve(&state, name).ok()?;
+        let state = self.shared.lock();
+        let index = self.shared.resolve(&state, name).ok()?;
         Some((*state.entries[index].preset).clone())
     }
 
     /// Every model with its state, in the order of the preset file.
     pub fn list(&self) -> Vec<Listed> {
-        match &self.0 {
-            Kind::Fixed { engine, defaults, .. } => engine
-                .models()
-                .into_iter()
-                .map(|card| Listed {
-                    id: card.id.clone(),
-                    aliases: Vec::new(),
-                    card: Some(card),
-                    status: None,
-                    defaults: defaults.clone(),
-                })
-                .collect(),
-            Kind::Presets { shared, .. } => shared
-                .lock()
-                .entries
-                .iter()
-                .map(|entry| {
-                    let (status, reason) = entry.status();
-                    let model = entry.preset.id.clone();
-                    Listed {
-                        id: model.clone(),
-                        aliases: entry.preset.aliases.clone(),
-                        card: entry.card.clone(),
-                        status: Some(ModelEvent { model, status, reason }),
-                        defaults: entry.defaults.clone(),
-                    }
-                })
-                .collect(),
-        }
+        let state = self.shared.lock();
+        let listed = state.entries.iter().map(|entry| {
+            let (status, reason) = entry.status();
+            let model = entry.preset.id.clone();
+            Listed {
+                id: model.clone(),
+                aliases: entry.preset.aliases.clone(),
+                card: entry.card.clone(),
+                status: ModelEvent { model, status, reason },
+                defaults: entry.defaults.clone(),
+            }
+        });
+        listed.collect()
     }
 
-    /// The changes of state from now on, with the list as it is now. `None`
-    /// for a server without presets, where nothing changes.
-    pub fn watch(&self) -> Option<(Vec<Listed>, broadcast::Receiver<ModelEvent>)> {
-        let Kind::Presets { shared, .. } = &self.0 else { return None };
+    /// The changes of state from now on, with the list as it is now.
+    pub fn watch(&self) -> (Vec<Listed>, broadcast::Receiver<ModelEvent>) {
         // Subscribed first: a change between the two is sent twice, not lost.
-        let events = shared.events.subscribe();
-        Some((self.list(), events))
+        let events = self.shared.events.subscribe();
+        (self.list(), events)
     }
 
     /// Completes when the load of `name` that is in line or runs has ended:
@@ -948,10 +943,9 @@ impl Models {
     /// finished first, since the weights' way to the devices is not
     /// interrupted. Returns when everything is released.
     pub async fn shutdown(&self) {
-        let Kind::Presets { shared, manager } = &self.0 else { return };
-        shared.lock().stopping = true;
-        shared.changed();
-        let manager = manager.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.shared.lock().stopping = true;
+        self.shared.changed();
+        let manager = self.manager.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(manager) = manager {
             let _ = manager.await;
         }

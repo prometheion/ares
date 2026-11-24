@@ -20,6 +20,8 @@ use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sam
 use ares_server::load;
 use ares_server::plan::{AttentionShares, LoadOptions, SplitKind};
 
+mod common;
+
 /// The text of a greedy answer of `max_tokens` tokens to `text`.
 fn answer(engine: &Arc<dyn Engine>, model: &str, text: &str, max_tokens: u32) -> String {
     let (done, wait) = mpsc::channel();
@@ -58,10 +60,7 @@ fn answer(engine: &Arc<dyn Engine>, model: &str, text: &str, max_tokens: u32) ->
 
 #[test]
 fn the_attention_heads_go_where_the_room_is_and_the_context_grows() {
-    let (Some(_), Some(model)) =
-        (std::env::var_os("ARES_TEST_CUDA"), std::env::var_os("ARES_TEST_QWEN35_27B"))
-    else {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 and ARES_TEST_QWEN35_27B");
+    let Some(model) = common::model_file("ARES_TEST_QWEN35_27B", "the 27B Q4_K_S file") else {
         return;
     };
     if ares_cuda::devices().map_or(0, |d| d.len()) < 2 {

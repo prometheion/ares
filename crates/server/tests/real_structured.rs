@@ -9,113 +9,40 @@
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
 //! (default 0). With `ARES_TEST_API_MODEL` the tests run on that file instead,
 //! loaded as `ares --model` loads it (Flash-Next, the 27B: see
-//! `api_model/mod.rs`).
+//! `gpu/mod.rs`).
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test --release -p ares-server --test real_structured -- --test-threads=1
 //! ```
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use ares_api::Engine;
-use ares_cuda::{Device, Precision, Wait};
 use ares_gguf::Gguf;
-use ares_model::qwen35::device::{Options, Qwen35, Spread};
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
-use ares_tokenizer::{ChatOptions, EncodeOptions, Json, Tokenizer};
-use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, header};
+use ares_tokenizer::{EncodeOptions, Tokenizer};
 use serde_json::{Value, json};
-use tower::ServiceExt;
 
-mod api_model;
+mod common;
+mod gpu;
 
 const CHAT: &str = "/v1/chat/completions";
 const COMPLETIONS: &str = "/v1/completions";
 
-/// The 0.8B, or the model of `ARES_TEST_API_MODEL`.
-fn model_path() -> Option<PathBuf> {
-    if let Some(path) = api_model::path() {
-        return Some(path);
-    }
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
-            None
-        }
-    }
-}
-
 /// The server over the engine.
-struct Served {
-    app: Router,
-    engine: Arc<dyn Engine>,
-    path: PathBuf,
-    /// Whether a request gives the same tokens every time.
-    repeatable: bool,
-    /// The model loaded as the server loads it, which this keeps loaded.
-    _loaded: Option<api_model::ApiModel>,
+struct Served(gpu::Served);
+
+impl std::ops::Deref for Served {
+    type Target = gpu::Served;
+
+    fn deref(&self) -> &gpu::Served {
+        &self.0
+    }
 }
 
 impl Served {
-    /// Starts the engine on the 0.8B, or loads the model of
-    /// `ARES_TEST_API_MODEL`. With `thinking` the model thinks when a request
-    /// does not say otherwise; without, it does not.
-    fn start(path: &PathBuf, thinking: bool) -> Self {
-        if api_model::path().is_some() {
-            let model = api_model::ApiModel::load(path, Some(thinking));
-            let engine = model.engine();
-            return Self {
-                app: ares_server::router(engine.clone()),
-                engine,
-                path: path.clone(),
-                repeatable: model.repeatable,
-                _loaded: Some(model),
-            };
-        }
-        let options = Options {
-            precision: Precision::Exact,
-            max_rows: 128,
-            logit_rows: 16,
-            window_rows: 8,
-            pipeline_rows: 32,
-            ..Options::default()
-        };
-        let model =
-            Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 4096).unwrap();
-        let config = RuntimeConfig {
-            pages: 96,
-            cells_per_page: 128,
-            max_slots: 4,
-            ..RuntimeConfig::default()
-        };
-        let ordinal =
-            std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
-        let chat = ChatOptions {
-            variables: vec![("enable_thinking".to_owned(), Json::Bool(thinking))],
-            ..ChatOptions::default()
-        };
-        let model = Arc::new(model.with_chat_options(chat));
-        let as_model: Arc<dyn Model> = model;
-        let gpu = GpuConfig::new(&config, &*as_model);
-        let devices = vec![Device::open(ordinal, Wait::Block).unwrap()];
-        let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
-        let engine: Arc<dyn Engine> = runtime;
-        Self {
-            app: ares_server::router(engine.clone()),
-            engine,
-            path: path.clone(),
-            repeatable: true,
-            _loaded: None,
-        }
+    /// The 0.8B, or the model of `ARES_TEST_API_MODEL`. With `thinking` the
+    /// model thinks when a request does not say otherwise; without, it does
+    /// not.
+    async fn start(thinking: bool) -> Option<Self> {
+        gpu::Served::any(Some(thinking)).await.map(Self)
     }
 
     /// The token of the tag that closes the thinking, which the chat template
@@ -131,14 +58,7 @@ impl Served {
     }
 
     async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
-        let request = Request::post(path)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status().as_u16();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let (status, text) = self.ask(path, body).await;
         (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
 
@@ -191,8 +111,7 @@ fn content(choice: &Value) -> &str {
 
 #[tokio::test]
 async fn a_json_schema_is_obeyed_and_the_reply_parses() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, false);
+    let Some(served) = Served::start(false).await else { return };
     let wrapped = json!({
         "type": "json_schema",
         "json_schema": {"name": "person", "strict": true, "schema": person_schema()},
@@ -229,8 +148,7 @@ async fn a_json_schema_is_obeyed_and_the_reply_parses() {
 
 #[tokio::test]
 async fn json_object_gives_an_object_that_parses() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, false);
+    let Some(served) = Served::start(false).await else { return };
     for seed in 1..=4 {
         let extra = json!({"response_format": {"type": "json_object"}, "seed": seed});
         let choice = served.chat("Tell me about the weather today.", extra).await;
@@ -254,8 +172,7 @@ fn is_list(text: &str) -> bool {
 
 #[tokio::test]
 async fn a_gbnf_grammar_is_obeyed() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, false);
+    let Some(served) = Served::start(false).await else { return };
     let list = "root ::= (\"- \" [a-z]+ \"\\n\"){3}";
     for seed in 1..=4 {
         let choice = served
@@ -282,8 +199,7 @@ async fn a_gbnf_grammar_is_obeyed() {
 
 #[tokio::test]
 async fn a_grammar_that_is_wrong_is_a_400_that_names_it() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, false);
+    let Some(served) = Served::start(false).await else { return };
     let ask = |extra: Value| {
         let mut body = json!({"model": "q", "messages": [{"role": "user", "content": "hi"}]});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -301,8 +217,7 @@ async fn a_grammar_that_is_wrong_is_a_400_that_names_it() {
 
 #[tokio::test]
 async fn with_thinking_on_the_thinking_is_free_and_the_answer_obeys() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, true);
+    let Some(served) = Served::start(true).await else { return };
     let schema = json!({
         "type": "object",
         "properties": {"answer": {"type": "integer"}, "unit": {"enum": ["apples", "pears"]}},
@@ -424,8 +339,7 @@ fn speed(answer: &Value) -> f64 {
 
 #[tokio::test]
 async fn the_grammar_costs_what_the_mask_costs_per_step() {
-    let Some(path) = model_path() else { return };
-    let served = Served::start(&path, false);
+    let Some(served) = Served::start(false).await else { return };
     // About 400 tokens of numbers either way.
     let schema = json!({"type": "array", "items": {"type": "integer"}, "minItems": 150});
     let free = json!({

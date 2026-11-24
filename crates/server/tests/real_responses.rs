@@ -11,96 +11,34 @@
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
 //! (default 0). With `ARES_TEST_API_MODEL` the tests run on that file instead,
 //! loaded as `ares --model` loads it (Flash-Next, the 27B: see
-//! `api_model/mod.rs`).
+//! `gpu/mod.rs`).
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
 //!     cargo test --release -p ares-server --test real_responses -- --test-threads=1 --nocapture
 //! ```
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use ares_cuda::{Device, Precision, Wait};
-use ares_gguf::Gguf;
-use ares_model::qwen35::device::{Options, Qwen35, Spread};
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, header};
+use gpu::Served;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-mod api_model;
+mod common;
+mod gpu;
 
 const RESPONSES: &str = "/v1/responses";
 const COUNT: &str = "/v1/responses/input_tokens";
 
-fn small() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
+/// Checks that a stream put together is the response the same request gave
+/// whole, where they must be the same (`gpu::must_agree`, by the hash of the
+/// tokens in the timings).
+fn agree(served: &Served, streamed: Value, whole: Value, what: &str) {
+    let hash = |r: &Value| r["timings"]["token_hash"].as_str().unwrap_or_default().to_owned();
+    if gpu::must_agree(served.repeatable, &hash(&streamed), &hash(&whole), what) {
+        assert_eq!(anonymous(streamed), anonymous(whole), "{what}");
     }
-    let path = std::env::var_os("ARES_TEST_QWEN35_MODEL").map(PathBuf::from);
-    if path.is_none() {
-        eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
-    }
-    path
-}
-
-/// The server, and what it serves.
-struct Served {
-    app: Router,
-    /// Whether a request gives the same tokens every time.
-    repeatable: bool,
-    /// The model loaded as the server loads it, which this keeps loaded.
-    _loaded: Option<api_model::ApiModel>,
-}
-
-impl Served {
-    /// The model of `ARES_TEST_API_MODEL` if one is named, else the 0.8B;
-    /// `None` (and a note) when neither is.
-    fn any() -> Option<Self> {
-        if let Some(path) = api_model::path() {
-            let model = api_model::ApiModel::load(&path, None);
-            let app = ares_server::router(model.engine());
-            return Some(Self { app, repeatable: model.repeatable, _loaded: Some(model) });
-        }
-        let app = served(&small()?);
-        Some(Self { app, repeatable: true, _loaded: None })
-    }
-
-    /// Checks that a stream put together is the response the same request
-    /// gave whole, where they must be the same (`api_model::must_agree`, by
-    /// the hash of the tokens in the timings).
-    fn agree(&self, streamed: Value, whole: Value, what: &str) {
-        let hash = |r: &Value| r["timings"]["token_hash"].as_str().unwrap_or_default().to_owned();
-        if api_model::must_agree(self.repeatable, &hash(&streamed), &hash(&whole), what) {
-            assert_eq!(anonymous(streamed), anonymous(whole), "{what}");
-        }
-    }
-}
-
-/// The server over the 0.8B on one device.
-fn served(path: &PathBuf) -> Router {
-    let options = Options {
-        precision: Precision::Exact,
-        max_rows: 128,
-        logit_rows: 16,
-        window_rows: 8,
-        pipeline_rows: 32,
-        ..Options::default()
-    };
-    let model =
-        Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 4096).unwrap();
-    let config =
-        RuntimeConfig { pages: 96, cells_per_page: 128, max_slots: 4, ..RuntimeConfig::default() };
-    let ordinal = std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
-    let devices = vec![Device::open(ordinal, Wait::Block).unwrap()];
-    let model: Arc<dyn Model> = Arc::new(model);
-    let gpu = GpuConfig::new(&config, &*model);
-    let runtime = Runtime::start_gpu(model, devices, config, gpu).unwrap();
-    ares_server::router(Arc::new(runtime))
 }
 
 async fn send(app: &Router, method: Method, path: &str, body: &Value) -> (u16, String) {
@@ -247,7 +185,7 @@ async fn counted(app: &Router, body: &Value) -> u64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_response_is_items_and_its_stream_is_the_same_response() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any(None).await else { return };
     let app = &served.app;
 
     // Thinking off: one message.
@@ -260,7 +198,7 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
     assert_eq!(plain["status"], "completed");
     assert!(plain["usage"]["output_tokens"].as_u64().unwrap() > 0);
     assert_eq!(counted(app, &body).await, plain["usage"]["input_tokens"].as_u64().unwrap());
-    served.agree(streamed(app, &body).await, plain, "plain");
+    agree(&served, streamed(app, &body).await, plain, "plain");
 
     // Thinking as the template has it: if the model thinks, its reasoning is
     // the first item, with the reasoning itself as its content.
@@ -277,7 +215,7 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
     } else {
         println!("RES thinking: the template leaves thinking off without a request for it");
     }
-    served.agree(streamed(app, &body).await, thought.clone(), "thinking");
+    agree(&served, streamed(app, &body).await, thought.clone(), "thinking");
 
     // The output sent back with the next question: counted, and run with
     // the count as its input. How much of it the cache gave is printed.
@@ -308,7 +246,7 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any(None).await else { return };
     let app = &served.app;
     let question = json!({"role": "user", "content": "How is the weather in Paris, in celsius?"});
     for choice in [json!("required"), json!({"type": "function", "name": "get_weather"})] {
@@ -330,7 +268,7 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
         let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
         assert!(arguments["city"].is_string(), "{call}");
         assert!(["celsius", "fahrenheit"].contains(&arguments["unit"].as_str().unwrap()));
-        served.agree(streamed(app, &body).await, called.clone(), "a call");
+        agree(&served, streamed(app, &body).await, called.clone(), "a call");
 
         // The output goes back, and the model answers in text.
         let mut input = vec![question.clone()];
@@ -402,7 +340,7 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_count_of_a_chat_request_is_the_prompt_it_reports() {
-    let Some(served) = Served::any() else { return };
+    let Some(served) = Served::any(None).await else { return };
     let app = &served.app;
     let chat_tools = json!([{"type": "function", "function": weather()[0]}]);
     let bodies = [

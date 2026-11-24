@@ -13,6 +13,7 @@ use std::time::Duration;
 use ares_api::{ChatFormat, Engine, Event, FinishReason, ThinkingFormat, Usage};
 use ares_runtime::testing::HostExecutor;
 use ares_runtime::{Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_server::options::ModelOptions;
 use axum::Router;
 use axum::http::{StatusCode, header};
 use common::*;
@@ -54,9 +55,9 @@ fn synthetic(close: Option<&str>, queue: Option<u32>) -> Arc<Runtime> {
     Arc::new(runtime.with_chat_template(Some("{{ messages }}".into())))
 }
 
-fn served(runtime: &Arc<Runtime>) -> Router {
+async fn served(runtime: &Arc<Runtime>) -> Router {
     let engine: Arc<dyn Engine> = runtime.clone();
-    ares_server::router_with(engine, ares_server::Config::default())
+    router_of(engine, ModelOptions::default(), ares_server::Config::default()).await
 }
 
 async fn call(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -70,7 +71,7 @@ fn bytes(text: &str) -> Vec<u32> {
 
 #[tokio::test]
 async fn text_and_conversations_become_the_tokens_a_request_gets() {
-    let app = served(&synthetic(None, None));
+    let app = served(&synthetic(None, None)).await;
     let (status, body) = call(&app, "/tokenize", json!({"content": "Hi!"})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({"tokens": bytes("Hi!")}));
@@ -140,7 +141,7 @@ async fn text_and_conversations_become_the_tokens_a_request_gets() {
 
 #[tokio::test]
 async fn props_say_what_the_model_is() {
-    let app = served(&synthetic(Some("</think>"), None));
+    let app = served(&synthetic(Some("</think>"), None)).await;
     let (status, body) = json(get(&app, "/props").await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["model"], "synthetic");
@@ -162,7 +163,7 @@ async fn props_say_what_the_model_is() {
 #[tokio::test]
 async fn the_stop_string_that_ended_a_reply_is_named() {
     let runtime = synthetic(None, None);
-    let app = served(&runtime);
+    let app = served(&runtime).await;
     let ask = |extra: Value| {
         let mut body = json!({
             "model": "synthetic",
@@ -237,12 +238,14 @@ async fn the_tokens_of_the_thinking_are_counted() {
     // A prompt that opens the thinking: the reply begins inside it.
     let prompt = "think about it <think>";
     let ask = json!({"model": "synthetic", "prompt": prompt, "max_tokens": 200});
-    let (_, free) = call(&served(&synthetic(None, None)), "/v1/completions", ask.clone()).await;
+    let (_, free) =
+        call(&served(&synthetic(None, None)).await, "/v1/completions", ask.clone()).await;
     let text = free["choices"][0]["text"].as_str().unwrap().to_owned();
     assert!(free["usage"].get("completion_tokens_details").is_none(), "{free}");
     // The same model thinks until a text from the middle of that reply.
     let close: String = text.chars().skip(12).take(2).collect();
-    let (_, thought) = call(&served(&synthetic(Some(&close), None)), "/v1/completions", ask).await;
+    let (_, thought) =
+        call(&served(&synthetic(Some(&close), None)).await, "/v1/completions", ask).await;
     assert_eq!(thought["choices"][0]["text"], text, "the same greedy reply");
     let at = text.find(&close).unwrap();
     let expected = text[..at].chars().count() + close.chars().count();
@@ -252,14 +255,15 @@ async fn the_tokens_of_the_thinking_are_counted() {
     );
     // A prompt that does not open it: the reply never does either.
     let other = json!({"model": "synthetic", "prompt": "no tags", "max_tokens": 20});
-    let (_, body) = call(&served(&synthetic(Some(&close), None)), "/v1/completions", other).await;
+    let (_, body) =
+        call(&served(&synthetic(Some(&close), None)).await, "/v1/completions", other).await;
     assert_eq!(body["usage"]["completion_tokens_details"]["reasoning_tokens"], 0, "{body}");
 }
 
 #[tokio::test]
 async fn a_continued_message_goes_on_where_it_stands() {
     let close = "</think>";
-    let app = served(&synthetic(Some(close), None));
+    let app = served(&synthetic(Some(close), None)).await;
     // A reply that continues reasoning is reasoning until the closing tag.
     let request = json!({
         "model": "synthetic",
@@ -337,7 +341,8 @@ async fn anthropics_prefill_is_continued() {
         "max_tokens": 8,
         "messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "{\"x\":"}],
     });
-    let (status, reply) = json(post(&app(&engine), "/v1/messages", &body.to_string()).await).await;
+    let (status, reply) =
+        json(post(&app(&engine).await, "/v1/messages", &body.to_string()).await).await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     let ares_api::Prompt::Chat { messages, continue_final, .. } = &engine.submitted()[0].prompt
     else {
@@ -362,7 +367,7 @@ async fn the_reports_of_a_scripted_engine_reach_every_api() {
         ])
     };
     let chat = json!({"model": "mock", "messages": [{"role": "user", "content": "a"}], "stop": ["x", "END"]});
-    let (_, body) = call(&app(&script()), "/v1/chat/completions", chat).await;
+    let (_, body) = call(&app(&script()).await, "/v1/chat/completions", chat).await;
     assert_eq!(body["choices"][0]["stop_reason"], "END");
     assert_eq!(body["usage"]["completion_tokens_details"], json!({"reasoning_tokens": 5}));
     let messages = json!({
@@ -370,19 +375,19 @@ async fn the_reports_of_a_scripted_engine_reach_every_api() {
         "messages": [{"role": "user", "content": "a"}],
         "stop_sequences": ["x", "END"],
     });
-    let (_, body) = call(&app(&script()), "/v1/messages", messages).await;
+    let (_, body) = call(&app(&script()).await, "/v1/messages", messages).await;
     assert_eq!(
         (body["stop_reason"].clone(), body["stop_sequence"].clone()),
         (json!("stop_sequence"), json!("END"))
     );
     let responses = json!({"model": "mock", "input": "a"});
-    let (_, body) = call(&app(&script()), "/v1/responses", responses).await;
+    let (_, body) = call(&app(&script()).await, "/v1/responses", responses).await;
     assert_eq!(body["usage"]["output_tokens_details"], json!({"reasoning_tokens": 5}), "{body}");
 }
 
 #[tokio::test]
 async fn a_full_line_refuses_and_says_when_to_retry() {
-    let app = served(&synthetic(None, Some(0)));
+    let app = served(&synthetic(None, Some(0))).await;
     let long = json!({
         "model": "synthetic",
         "messages": [{"role": "user", "content": "go on"}],
@@ -425,7 +430,7 @@ async fn metrics_have_the_times_of_the_requests() {
         Step::Send(Event::Done { finish: FinishReason::Stop, usage }),
     ]);
     engine.set_stats(ares_api::EngineStats::default());
-    let app = app(&engine);
+    let app = app(&engine).await;
     let body = json!({"model": "mock", "messages": [{"role": "user", "content": "a"}]});
     for _ in 0..2 {
         let (status, _) = call(&app, "/v1/chat/completions", body.clone()).await;
@@ -449,7 +454,7 @@ async fn metrics_have_the_times_of_the_requests() {
 async fn a_body_that_does_not_come_is_given_up() {
     let engine = instant();
     let config = ares_server::Config { timeout: Duration::from_millis(100), ..Default::default() };
-    let app = app_with(&engine, config);
+    let app = app_with(&engine, config).await;
     let never = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
     let request = axum::http::Request::post("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
