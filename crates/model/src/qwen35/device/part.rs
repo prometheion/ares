@@ -45,6 +45,7 @@ use crate::blocks::invalid;
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::slots::{Arena, Checkpoint, Extent, Places, SlotLayout};
+use crate::blocks::step;
 
 pub use crate::blocks::slots::CopyTimes;
 pub use mtp::{MtpBytes, MtpChain, MtpStep, MtpTimes};
@@ -1631,28 +1632,8 @@ impl Part {
                 dims.n_rows
             )));
         }
-        for s in env.segments {
-            let end = u64::from(s.pos0.max(0) as u32) + u64::from(s.n_rows);
-            if s.slot >= self.max_slots
-                || s.pos0 < 0
-                || end > u64::from(self.table_stride) * u64::from(ENTRY_CELLS)
-            {
-                return Err(invalid(format!(
-                    "segment {s:?} is outside {} slots of {} cells",
-                    self.max_slots,
-                    u64::from(self.table_stride) * u64::from(ENTRY_CELLS)
-                )));
-            }
-        }
-        if let Some(limit) = kv::Group::window_limit(self.opts.kv.0, self.opts.kv.1)
-            && let Some(s) = env.segments.iter().find(|s| !s.direct && s.n_rows > limit)
-        {
-            return Err(invalid(format!(
-                "a draft window of {} rows; with K/V as {:?} and {:?} a window has at most {limit} \
-                 rows (a tile that leaves the exact cells inside it must have been full before it)",
-                s.n_rows, self.opts.kv.0, self.opts.kv.1
-            )));
-        }
+        let cells = u64::from(self.table_stride) * u64::from(ENTRY_CELLS);
+        step::check_segments(env.segments, self.max_slots, cells, self.opts.kv)?;
         let deferred = env.segments.iter().any(|s| !s.direct);
         if deferred && dims.n_rows > self.opts.window_rows {
             return Err(invalid(format!(

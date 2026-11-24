@@ -80,6 +80,7 @@ use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::rows::{self, HostTable};
 use crate::blocks::slots::{Arena, SlotLayout, TAILS_PER_SLOT};
+use crate::blocks::step;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
@@ -2215,34 +2216,15 @@ impl Part {
                 dims.n_out, self.opts.logit_rows
             )));
         }
-        let stride = self.opts.table_stride();
-        for s in env.segments {
-            if s.slot >= self.opts.max_slots {
-                return Err(invalid(format!("slot {} of {}", s.slot, self.opts.max_slots)));
-            }
-            let end = s.pos0 as i64 + i64::from(s.n_rows);
-            if s.pos0 < 0 || end > i64::from(stride) * i64::from(ENTRY_CELLS) {
-                return Err(invalid(format!(
-                    "cells {}..{end} of a sequence of {} cells",
-                    s.pos0,
-                    stride * ENTRY_CELLS
-                )));
-            }
-            let unkept = self.holds_state() && !self.keeps_windows();
-            if !s.direct && (unkept || s.n_rows > self.opts.window_rows) {
-                return Err(invalid(format!(
-                    "a draft window of {} rows; {} were reserved",
-                    s.n_rows, self.opts.window_rows
-                )));
-            }
-        }
-        if let Some(limit) = kv::Group::window_limit(self.opts.kv.0, self.opts.kv.1)
-            && let Some(s) = env.segments.iter().find(|s| !s.direct && s.n_rows > limit)
+        let cells = u64::from(self.opts.table_stride()) * u64::from(ENTRY_CELLS);
+        step::check_segments(env.segments, self.opts.max_slots, cells, self.opts.kv)?;
+        let unkept = self.holds_state() && !self.keeps_windows();
+        if let Some(s) =
+            env.segments.iter().find(|s| !s.direct && (unkept || s.n_rows > self.opts.window_rows))
         {
             return Err(invalid(format!(
-                "a draft window of {} rows; with K/V as {:?} and {:?} a window has at most {limit} \
-                 rows (a tile that leaves the exact cells inside it must have been full before it)",
-                s.n_rows, self.opts.kv.0, self.opts.kv.1
+                "a draft window of {} rows; {} were reserved",
+                s.n_rows, self.opts.window_rows
             )));
         }
         if self.expert_at.len() != self.w.layers.len() {

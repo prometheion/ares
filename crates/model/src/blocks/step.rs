@@ -15,9 +15,10 @@
 
 use std::ops::Range;
 
-use ares_cuda::{DevicePtr, Segment};
+use ares_cuda::{CacheFormat, DevicePtr, Segment};
 use ares_runtime::{Drafter as ModelDrafter, DrafterKind, ModelDrafts, ModelError, RecordView};
 
+use super::kv;
 use super::mtp::{Driver, MtpChain};
 use crate::dflash::{Drafter, PassSeq};
 
@@ -160,6 +161,35 @@ impl StepInputs {
         }
         Ok(())
     }
+}
+
+/// An error when a segment of a step lies outside `max_slots` sequence slots
+/// of `cells` cells each, or a draft window has more rows than a K/V group of
+/// the formats `kv` lets a window have ([`kv::Group::window_limit`]).
+pub(crate) fn check_segments(
+    segments: &[Segment],
+    max_slots: u32,
+    cells: u64,
+    kv: (CacheFormat, CacheFormat),
+) -> Result<(), ModelError> {
+    for s in segments {
+        let end = i64::from(s.pos0) + i64::from(s.n_rows);
+        if s.slot >= max_slots || s.pos0 < 0 || end > cells as i64 {
+            return Err(ModelError::Invalid(format!(
+                "segment {s:?} is outside {max_slots} slots of {cells} cells"
+            )));
+        }
+    }
+    if let Some(limit) = kv::Group::window_limit(kv.0, kv.1)
+        && let Some(s) = segments.iter().find(|s| !s.direct && s.n_rows > limit)
+    {
+        return Err(ModelError::Invalid(format!(
+            "a draft window of {} rows; with K/V as {:?} and {:?} a window has at most {limit} \
+             rows (a tile that leaves the exact cells inside it must have been full before it)",
+            s.n_rows, kv.0, kv.1
+        )));
+    }
+    Ok(())
 }
 
 /// The page-table updates of `record`: each one's slot, its first entry, and
