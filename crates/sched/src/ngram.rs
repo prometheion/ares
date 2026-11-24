@@ -460,16 +460,10 @@ impl NgramCorpus {
     /// The acceptance the corpus expects for a context of `len` tokens whose
     /// `occurrences` earlier occurrences went on with the proposed token
     /// `agreeing` times.
-    pub fn expected_acceptance(&self, len: u32, occurrences: u32, agreeing: u32) -> f64 {
+    #[cfg(test)]
+    fn expected_acceptance(&self, len: u32, occurrences: u32, agreeing: u32) -> f64 {
         let cell = cell(len, occurrences, agreeing) as usize;
         f64::from(self.rate[cell / AGREEMENTS][cell % AGREEMENTS])
-    }
-
-    /// The acceptance table as it stands: a row per context length (1, 2, 3,
-    /// 4, 5-6, 7-8, 9-12, 13-16, 17-32, more) and a column per agreement
-    /// (once, always, mostly, seldom).
-    pub fn table(&self) -> [[f32; AGREEMENTS]; LENGTHS] {
-        self.rate
     }
 
     fn rotate(&mut self) {

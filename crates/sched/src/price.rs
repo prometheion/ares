@@ -149,11 +149,6 @@ impl Curve {
         Self { estimate, ..Self::default() }
     }
 
-    /// Whether anything was measured.
-    pub fn is_empty(&self) -> bool {
-        self.points.is_empty()
-    }
-
     /// The measured counts and their prices.
     pub fn points(&self) -> impl Iterator<Item = (u32, f64)> + '_ {
         self.points.iter().map(|(n, point)| (*n, self.price_of(*n, point)))
@@ -165,7 +160,7 @@ impl Curve {
 
     /// Whether `n` is tried again at [`Curve::trial_ms`]: its price is old,
     /// or it was never measured, or it was old and has been measured once.
-    pub fn is_due(&self, n: u32) -> bool {
+    fn is_due(&self, n: u32) -> bool {
         self.points.get(&n).is_none_or(|point| point.again || self.is_old(point))
     }
 
@@ -247,8 +242,9 @@ impl Curve {
         }
     }
 
-    /// The price to try `n` at: its price, and for a count that is due
-    /// ([`Curve::is_due`]) no more than the price of the nearest smaller
+    /// The price to try `n` at: its price, and for a count that is due (its
+    /// price is old, or it was never measured, or it was old and has been
+    /// measured once) no more than the price of the nearest smaller
     /// count that is current. Whoever chooses by this price takes such a
     /// count whenever it could pay at all, and the step that runs measures
     /// it.
@@ -298,11 +294,6 @@ impl PriceTable {
         self.context.fit().map_or(0.0, |(_, _, per_cell)| per_cell)
     }
 
-    /// Whether the table holds a measurement.
-    pub fn is_ready(&self) -> bool {
-        !self.rows.is_empty()
-    }
-
     /// The measured steps: rows and milliseconds with next to no context.
     pub fn points(&self) -> impl Iterator<Item = (u32, f64)> + '_ {
         self.rows.points()
@@ -343,7 +334,8 @@ impl PriceTable {
 
     /// The price of `rows` rows with no context, or `None` before anything
     /// was measured.
-    pub fn rows_ms(&self, rows: u32) -> Option<f64> {
+    #[cfg(test)]
+    fn rows_ms(&self, rows: u32) -> Option<f64> {
         self.rows.ms(rows)
     }
 }
@@ -600,7 +592,7 @@ mod tests {
         table.observe(Load::chunk(0, 4), f64::NAN);
         table.observe(Load::chunk(0, 4), -3.0);
         table.observe(Load { rows: 0, cells: 0 }, 5.0);
-        assert!(!table.is_ready());
+        assert_eq!(table.points().count(), 0);
         assert_eq!(table.ms(Load::chunk(0, 4)), None);
     }
 }

@@ -97,11 +97,6 @@ impl Confidence {
         };
         (share(&self.tested), share(&self.accepted))
     }
-
-    /// What was counted in each range: drafts verified and drafts accepted.
-    pub fn counts(&self) -> [(f64, f64); BINS] {
-        std::array::from_fn(|bin| (self.tested[bin], self.accepted[bin]))
-    }
 }
 
 /// The reach a chain needs for one more link to pay: the link takes `link_ms`

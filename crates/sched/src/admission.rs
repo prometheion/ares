@@ -273,12 +273,13 @@ impl Admission {
     }
 
     /// Whether `seq` was admitted and neither ended nor was spilled.
-    pub fn is_running(&self, seq: SeqId) -> bool {
+    fn is_running(&self, seq: SeqId) -> bool {
         self.running.iter().any(|r| r.seq == seq)
     }
 
     /// How many passes found the pool too small for the running requests.
-    pub fn shortages(&self) -> u64 {
+    #[cfg(test)]
+    fn shortages(&self) -> u64 {
         self.shortages
     }
 
