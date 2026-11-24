@@ -494,8 +494,8 @@ impl Active {
     ) {
         for (i, &token) in picked.iter().enumerate() {
             self.completion += 1;
-            self.stop.token();
             if model.ends(token) {
+                self.stop.token(&[]);
                 self.stop.flush(&mut self.emitted);
                 self.sampler.reply_ended();
                 self.finished = Some(FinishReason::Stop);
@@ -508,6 +508,7 @@ impl Active {
             self.drafter.push(corpus, token);
             let piece_at = self.pending.len();
             model.piece(token, &mut self.pending);
+            self.stop.token(&self.pending[piece_at..]);
             if self.sampler.wants_probs() {
                 self.sampler.token_taken(model, i, token, &self.pending[piece_at..]);
             }

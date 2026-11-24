@@ -16,9 +16,11 @@
 //! Qwen3.8 writes it), or may open it with its first text (a template that
 //! leaves the tag to the model). It ends at the closing tag, whose tokens are
 //! the thinking's, or at the start of a call of a tool that the model opens
-//! inside its thinking, whose tokens are not. The count is exact: tokens are
-//! numbered as they are accepted, and every character of their text carries
-//! the number of the token it came with.
+//! inside its thinking, whose tokens are not. [`Tracker`] follows that over
+//! the bytes of the tokens, for this count and for the guard that bounds the
+//! thinking (`guard.rs`). The count is exact: tokens are numbered as they are
+//! taken, and every byte of their text carries the number of the token it
+//! came with.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -44,25 +46,139 @@ pub struct Thinking {
 
 /// Where the reply is with respect to its thinking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
+pub(crate) enum Place {
     /// Nothing but white space so far; the thinking may still open.
     Before,
-    /// Thinking since the token after `from`.
-    Inside { from: u32 },
+    /// Thinking since the token after `from`; the opening tag ended in token
+    /// `opened` (0: the reply began inside).
+    Inside { from: u32, opened: u32 },
     /// The thinking took this many tokens (0: it never opened).
     Done(u32),
+}
+
+/// Follows the tags of a reply's thinking ([`Thinking`]) over the bytes of
+/// its tokens, a token at a time.
+#[derive(Debug, Clone)]
+pub(crate) struct Tracker {
+    place: Place,
+    /// The last bytes of the text, each with the number of its token, as many
+    /// as the longest tag has.
+    recent: VecDeque<(u8, u32)>,
+    /// Tokens taken so far; the token being read is number `tokens`.
+    tokens: u32,
+}
+
+impl Tracker {
+    pub fn new(thinking: &Thinking) -> Self {
+        let place =
+            if thinking.inside { Place::Inside { from: 0, opened: 0 } } else { Place::Before };
+        Self { place, recent: VecDeque::new(), tokens: 0 }
+    }
+
+    pub fn place(&self) -> Place {
+        self.place
+    }
+
+    /// The tokens of the thinking so far, its tags included.
+    pub fn count(&self) -> u32 {
+        match self.place {
+            Place::Before => 0,
+            Place::Inside { from, .. } => self.tokens - from,
+            Place::Done(tokens) => tokens,
+        }
+    }
+
+    /// The tokens since the opening tag while the thinking is open: what a
+    /// budget of the thinking counts.
+    pub fn used(&self) -> Option<u32> {
+        match self.place {
+            Place::Inside { opened, .. } => Some(self.tokens - opened),
+            _ => None,
+        }
+    }
+
+    /// Takes the next token, whose text is `piece` (empty for a token that
+    /// writes nothing).
+    pub fn token(&mut self, thinking: &Thinking, piece: &[u8]) {
+        self.tokens += 1;
+        for &byte in piece {
+            if matches!(self.place, Place::Done(_)) {
+                return;
+            }
+            self.byte(thinking, byte);
+        }
+    }
+
+    /// Follows the thinking through one more byte.
+    fn byte(&mut self, thinking: &Thinking, byte: u8) {
+        self.recent.push_back((byte, self.tokens));
+        let longest = [Some(&thinking.open), Some(&thinking.close), thinking.interrupt.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .max()
+            .unwrap_or(0);
+        while self.recent.len() > longest.max(1) {
+            self.recent.pop_front();
+        }
+        // The token the last bytes began with, if they are `tag`.
+        let ends_with = |recent: &VecDeque<(u8, u32)>, tag: &str| {
+            let tag = tag.as_bytes();
+            if tag.is_empty() || recent.len() < tag.len() {
+                return None;
+            }
+            let start = recent.len() - tag.len();
+            let same = recent.iter().skip(start).map(|(b, _)| *b).eq(tag.iter().copied());
+            same.then(|| recent[start].1)
+        };
+        match self.place {
+            Place::Before => {
+                if let Some(first) = ends_with(&self.recent, &thinking.open) {
+                    self.place = Place::Inside { from: first - 1, opened: self.tokens };
+                    self.recent.clear();
+                    return;
+                }
+                // White space, or the beginning of the opening tag, may still
+                // come before the tag; anything else is an answer without
+                // thinking. A character that is not whole yet is waited for;
+                // the end of one that left the bytes kept is white space.
+                let bytes: Vec<u8> =
+                    self.recent.iter().map(|(b, _)| *b).skip_while(|b| b & 0xc0 == 0x80).collect();
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => text,
+                    Err(error) if error.error_len().is_none() => {
+                        // SAFETY: `valid_up_to` bytes are valid UTF-8 by its contract.
+                        unsafe { std::str::from_utf8_unchecked(&bytes[..error.valid_up_to()]) }
+                    }
+                    Err(_) => {
+                        self.place = Place::Done(0);
+                        return;
+                    }
+                };
+                let trimmed = text.trim_start();
+                if !trimmed.is_empty() && !thinking.open.starts_with(trimmed) {
+                    self.place = Place::Done(0);
+                }
+            }
+            Place::Inside { from, .. } => {
+                if let Some(first) =
+                    thinking.interrupt.as_deref().and_then(|t| ends_with(&self.recent, t))
+                {
+                    self.place = Place::Done(first - 1 - from);
+                } else if ends_with(&self.recent, &thinking.close).is_some() {
+                    self.place = Place::Done(self.tokens - from);
+                }
+            }
+            Place::Done(_) => {}
+        }
+    }
 }
 
 /// See the module documentation.
 #[derive(Debug)]
 pub struct Watch {
     stop: StopMatcher,
-    thinking: Option<(Thinking, Phase)>,
-    /// The last characters of the text, each with the number of its token,
-    /// as many as the longest tag has.
-    recent: VecDeque<(char, u32)>,
-    /// Tokens accepted so far; the token being read is number `tokens`.
-    tokens: u32,
+    thinking: Option<(Thinking, Tracker)>,
     submitted: Instant,
     started: Option<Instant>,
 }
@@ -73,17 +189,10 @@ impl Watch {
     /// model thinks. The request is in line from now on.
     pub fn new(stops: &[String], thinking: Option<Thinking>) -> Self {
         let thinking = thinking.map(|thinking| {
-            let phase = if thinking.inside { Phase::Inside { from: 0 } } else { Phase::Before };
-            (thinking, phase)
+            let tracker = Tracker::new(&thinking);
+            (thinking, tracker)
         });
-        Self {
-            stop: StopMatcher::new(stops),
-            thinking,
-            recent: VecDeque::new(),
-            tokens: 0,
-            submitted: Instant::now(),
-            started: None,
-        }
+        Self { stop: StopMatcher::new(stops), thinking, submitted: Instant::now(), started: None }
     }
 
     /// The request leaves the line and starts; only the first time counts.
@@ -91,15 +200,17 @@ impl Watch {
         self.started.get_or_insert_with(Instant::now);
     }
 
-    /// The next token's text follows.
-    pub fn token(&mut self) {
-        self.tokens += 1;
+    /// The next token was taken; it writes `piece`, whose characters follow
+    /// ([`Watch::push`]).
+    pub fn token(&mut self, piece: &[u8]) {
+        if let Some((thinking, tracker)) = &mut self.thinking {
+            tracker.token(thinking, piece);
+        }
     }
 
     /// Feeds one character of the text: see [`StopMatcher::push`], whose
     /// answer this is.
     pub fn push(&mut self, ch: char, out: &mut String) -> bool {
-        self.look(ch);
         self.stop.push(ch, out)
     }
 
@@ -119,12 +230,7 @@ impl Watch {
 
     /// The tokens of the reply's thinking so far, for a model that thinks.
     pub fn reasoning_tokens(&self) -> Option<u32> {
-        let (_, phase) = self.thinking.as_ref()?;
-        Some(match *phase {
-            Phase::Before => 0,
-            Phase::Inside { from } => self.tokens - from,
-            Phase::Done(tokens) => tokens,
-        })
+        self.thinking.as_ref().map(|(_, tracker)| tracker.count())
     }
 
     /// When the request was put in line.
@@ -135,61 +241,6 @@ impl Watch {
     /// How long the request waited before it first started.
     pub fn queued(&self) -> Option<Duration> {
         self.started.map(|started| started.duration_since(self.submitted))
-    }
-
-    /// Follows the thinking through one more character.
-    fn look(&mut self, ch: char) {
-        let Some((thinking, phase)) = &mut self.thinking else { return };
-        if matches!(phase, Phase::Done(_)) {
-            return;
-        }
-        self.recent.push_back((ch, self.tokens));
-        let longest = [Some(&thinking.open), Some(&thinking.close), thinking.interrupt.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(|tag| tag.chars().count())
-            .max()
-            .unwrap_or(0);
-        while self.recent.len() > longest.max(1) {
-            self.recent.pop_front();
-        }
-        // The token the last `count` characters began with, if they are `tag`.
-        let ends_with = |recent: &VecDeque<(char, u32)>, tag: &str| {
-            let count = tag.chars().count();
-            if count == 0 || recent.len() < count {
-                return None;
-            }
-            let start = recent.len() - count;
-            let same = recent.iter().skip(start).map(|(c, _)| *c).eq(tag.chars());
-            same.then(|| recent[start].1)
-        };
-        match *phase {
-            Phase::Before => {
-                if let Some(first) = ends_with(&self.recent, &thinking.open) {
-                    *phase = Phase::Inside { from: first - 1 };
-                    self.recent.clear();
-                    return;
-                }
-                // White space, or the beginning of the opening tag, may still
-                // come before the tag; anything else is an answer without
-                // thinking.
-                let text: String = self.recent.iter().map(|(c, _)| *c).collect();
-                let trimmed = text.trim_start();
-                if !trimmed.is_empty() && !thinking.open.starts_with(trimmed) {
-                    *phase = Phase::Done(0);
-                }
-            }
-            Phase::Inside { from } => {
-                if let Some(first) =
-                    thinking.interrupt.as_deref().and_then(|t| ends_with(&self.recent, t))
-                {
-                    *phase = Phase::Done(first - 1 - from);
-                } else if ends_with(&self.recent, &thinking.close).is_some() {
-                    *phase = Phase::Done(self.tokens - from);
-                }
-            }
-            Phase::Done(_) => {}
-        }
     }
 }
 
@@ -211,7 +262,7 @@ mod tests {
     fn feed(watch: &mut Watch, tokens: &[&str]) -> (Option<u32>, String) {
         let mut out = String::new();
         for token in tokens {
-            watch.token();
+            watch.token(token.as_bytes());
             for ch in token.chars() {
                 if watch.push(ch, &mut out) {
                     return (watch.reasoning_tokens(), out);
@@ -255,6 +306,27 @@ mod tests {
         // the thinking: the marker began there.
         let mut watch = Watch::new(&[], Some(thinking(true, Some("<tool_call>"))));
         assert_eq!(feed(&mut watch, &["I", " call\n<tool", "_call>"]).0, Some(1));
+    }
+
+    #[test]
+    fn the_tags_are_found_in_bytes_whatever_the_tokens_cut() {
+        // A tag and its end in one token; a character of white space split
+        // over two tokens before the tag; text before the tag in its token.
+        let mut tracker = Tracker::new(&thinking(false, None));
+        let tags = thinking(false, None);
+        tracker.token(&tags, b"<think>x</think>");
+        assert_eq!((tracker.place(), tracker.count()), (Place::Done(1), 1));
+        let mut tracker = Tracker::new(&tags);
+        let space = "\u{3000}".as_bytes();
+        tracker.token(&tags, &space[..1]);
+        tracker.token(&tags, &space[1..]);
+        tracker.token(&tags, b"<think>");
+        assert_eq!(tracker.place(), Place::Inside { from: 2, opened: 3 });
+        tracker.token(&tags, b"a");
+        assert_eq!((tracker.count(), tracker.used()), (2, Some(1)));
+        let mut tracker = Tracker::new(&tags);
+        tracker.token(&tags, b"a<think>");
+        assert_eq!(tracker.place(), Place::Done(0), "an answer that names the tag");
     }
 
     #[test]

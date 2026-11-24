@@ -2,8 +2,10 @@
 //!
 //! [`Guard`] is a [`TokenFilter`] around the request's own rule (a grammar, or
 //! none). It follows the reply token by token, as text: where the thinking
-//! opens and closes (the tags the model's template declares), how many tokens
-//! it has taken, and whether the last tokens go round in a cycle.
+//! opens and closes (the tags the model's template declares, followed by the
+//! [`Tracker`] that also counts the thinking's tokens for the reply's usage),
+//! how many tokens it has taken, and whether the last tokens go round in a
+//! cycle.
 //!
 //! - **The budget** (llama.cpp's `reasoning_budget_tokens`): once the thinking
 //!   has taken that many tokens, the next rows may each pick one token only,
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use ares_sampler::TokenMask;
 
 use crate::sampling::TokenFilter;
-use crate::watch::Thinking;
+use crate::watch::{Place, Thinking, Tracker};
 
 /// The tokens of thinking that, all one cycle, end the thinking.
 pub const LOOP_TOKENS: usize = 512;
@@ -37,13 +39,11 @@ pub const LOOP_PERIOD: usize = 64;
 /// The times one token in a row that end a reply.
 pub const RUN_TOKENS: usize = 256;
 
-/// Where the thinking of a reply is.
+/// What the guard does about the thinking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Nothing but white space so far; the model may still open its thinking.
-    Before,
-    /// Thinking; `used` tokens of it so far.
-    Inside { used: u32 },
+    /// The thinking opens and ends where the text says ([`Tracker`]).
+    Following,
     /// The thinking is to end, after the character that is cut in two.
     Waiting,
     /// Token `at` of the forced end is next.
@@ -56,9 +56,8 @@ enum Phase {
 #[derive(Debug, Clone)]
 struct State {
     phase: Phase,
-    /// The last bytes of the text, as many as the longest tag less one, to
-    /// find a tag that the tokens cut.
-    tail: Vec<u8>,
+    /// Where the thinking is, for a model that thinks.
+    thinking: Option<Tracker>,
     /// The bytes of a character that is not whole yet.
     pending: Vec<u8>,
     /// The last tokens, the newest last, and for each period `p` how many
@@ -100,22 +99,7 @@ impl Guard {
         budget: Option<u32>,
         forced: Vec<u32>,
     ) -> Self {
-        let phase = match &tags {
-            Some(tags) if tags.inside => Phase::Inside { used: 0 },
-            Some(_) => Phase::Before,
-            None => Phase::After,
-        };
-        let mut state = State {
-            phase,
-            tail: Vec::new(),
-            pending: Vec::new(),
-            recent: Vec::with_capacity(LOOP_PERIOD + 1),
-            runs: [0; LOOP_PERIOD],
-            cut: false,
-        };
-        if budget == Some(0) && matches!(phase, Phase::Inside { .. }) {
-            state.phase = Phase::Forcing { at: 0 };
-        }
+        let state = start(tags.as_ref(), budget);
         Self { pieces, inner, tags, budget, forced, state, read: 0, piece: Vec::new() }
     }
 
@@ -123,17 +107,10 @@ impl Guard {
     fn at(&mut self, reply: &[u32]) -> State {
         if reply.len() < self.read {
             // The reply does not shrink; start again if it did.
-            let fresh = Guard::new(
-                self.pieces.clone(),
-                None,
-                self.tags.clone(),
-                self.budget,
-                self.forced.clone(),
-            );
-            self.state = fresh.state;
+            self.state = start(self.tags.as_ref(), self.budget);
             self.read = 0;
         }
-        let mut state = std::mem::replace(&mut self.state, empty());
+        let mut state = std::mem::replace(&mut self.state, start(None, None));
         for &token in &reply[self.read..] {
             self.advance(&mut state, token);
         }
@@ -175,51 +152,36 @@ impl Guard {
         if whole {
             state.pending.clear();
         }
-        let Some(tags) = &self.tags else {
+        let (Some(tags), Some(thinking)) = (&self.tags, &mut state.thinking) else {
             state.cut = state.runs[0] as usize + 1 >= RUN_TOKENS;
             return;
         };
-        // The text that may hold a tag: what was kept and this token's.
-        let mut text = std::mem::take(&mut state.tail);
-        text.extend_from_slice(&self.piece);
-        let has =
-            |tag: &str| !tag.is_empty() && text.windows(tag.len()).any(|w| w == tag.as_bytes());
-        let ends = has(&tags.close) || tags.interrupt.as_deref().is_some_and(has);
+        let was = thinking.place();
+        thinking.token(tags, &self.piece);
+        let (place, used) = (thinking.place(), thinking.used());
+        let ended = matches!(place, Place::Done(_));
         match state.phase {
-            Phase::Before => {
-                let so_far = String::from_utf8_lossy(&text);
-                let so_far = so_far.trim_start();
-                if has(&tags.open) {
-                    state.phase = Phase::Inside { used: 0 };
+            Phase::Following if ended => state.phase = Phase::After,
+            Phase::Following if was == Place::Before => {
+                if matches!(place, Place::Inside { .. }) {
+                    // The model opened its thinking with this token.
                     state.runs = [0; LOOP_PERIOD];
                     if self.budget == Some(0) {
                         state.phase = Phase::Forcing { at: 0 };
                     }
-                    text.clear();
-                } else if !tags.open.starts_with(so_far) {
-                    state.phase = Phase::After;
-                }
-                // Until it is decided, all of the text is kept.
-                if state.phase == Phase::Before {
-                    state.tail = text;
-                    return;
                 }
             }
-            Phase::Inside { used } => {
-                let used = used + 1;
+            Phase::Following => {
+                let used = used.unwrap_or(0);
                 let spent = self.budget.is_some_and(|budget| used >= budget);
                 let looped = used as usize >= LOOP_TOKENS
                     && (1..=LOOP_PERIOD).any(|p| state.runs[p - 1] as usize + p >= LOOP_TOKENS);
-                state.phase = if ends {
-                    Phase::After
-                } else if spent || looped {
-                    if whole { Phase::Forcing { at: 0 } } else { Phase::Waiting }
-                } else {
-                    Phase::Inside { used }
-                };
+                if spent || looped {
+                    state.phase = if whole { Phase::Forcing { at: 0 } } else { Phase::Waiting };
+                }
             }
             Phase::Waiting => {
-                state.phase = match (ends, whole) {
+                state.phase = match (ended, whole) {
                     (true, _) => Phase::After,
                     (false, true) => Phase::Forcing { at: 0 },
                     (false, false) => Phase::Waiting,
@@ -235,13 +197,6 @@ impl Guard {
             }
             Phase::After => state.cut = state.runs[0] as usize + 1 >= RUN_TOKENS,
         }
-        let keep =
-            [tags.open.len(), tags.close.len(), tags.interrupt.as_ref().map_or(0, String::len)]
-                .into_iter()
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(1);
-        state.tail = text.split_off(text.len().saturating_sub(keep));
         if self.forced.is_empty() && matches!(state.phase, Phase::Forcing { .. } | Phase::Waiting) {
             state.phase = Phase::After;
         }
@@ -256,10 +211,20 @@ impl Guard {
     }
 }
 
-fn empty() -> State {
+/// The state before the first token of a reply whose thinking `tags`
+/// describe, with a budget of `budget` tokens of thinking.
+fn start(tags: Option<&Thinking>, budget: Option<u32>) -> State {
+    let thinking = tags.map(Tracker::new);
+    let phase = match &thinking {
+        Some(t) if budget == Some(0) && matches!(t.place(), Place::Inside { .. }) => {
+            Phase::Forcing { at: 0 }
+        }
+        Some(_) => Phase::Following,
+        None => Phase::After,
+    };
     State {
-        phase: Phase::After,
-        tail: Vec::new(),
+        phase,
+        thinking,
         pending: Vec::new(),
         recent: Vec::new(),
         runs: [0; LOOP_PERIOD],
