@@ -1498,6 +1498,10 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         quantizes 32 hidden values as `ares_quant::act::Group` does but keeps its own sums per
         16 (a hot CPU path, left as it is); the kernel side's type lists per module (an X-macro
         list, optional).
+  - [ ] In the pass over all kernels: the many-row down kernel's branch of the ordered sum, which
+        the host no longer takes: without it nvcc gives ErQ20's kernel of 16 pairs 64 registers
+        instead of 70 and it was 5 % slower (`kernels/expertrows_down.cuh`), so it stays until a
+        layout without it is measured.
   - [ ] Moved to phase 2: one `time_best` for the five timing loops at load (they decide
         measured choices, so a merge is a change of measurements), the names (`Eng*`/`EngMm*`/
         `Er*`/`AresCodes*` decoders, `q4` for qwen4exp beside the Q4 types, tile names `_n1` for
