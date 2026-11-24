@@ -61,11 +61,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ares_state::{Chain, ChainHash, CheckpointId, Owner, PageId, PagePool, PageState, Sequence};
+use ares_state::{Chain, ChainHash, Owner, PageId, PagePool, Sequence};
 use ares_store::{Aligned, Fingerprint, Kind, Located, PageStore, Part};
 
 use super::ram::{Entry, Item};
-use super::{Cache, Note, RESERVE, StateOut};
+use super::{Cache, Note, RESERVE, StateOut, deepest, keeps_form, run_of, run_pages};
 use crate::exec::{Executor, HostBytes, Transfer, TransferKind, TransitPart};
 use crate::model::Durable;
 
@@ -607,8 +607,8 @@ impl Ssd {
 
     /// Looks for the pages of a prompt after the `have` the index has, among
     /// the `total` full pages the prompt may take from a cache. Starts
-    /// bringing a run of them back and returns its first page, which the
-    /// index then says is being computed.
+    /// bringing a run of them back for `owner` and returns its first page,
+    /// which the index then says is being computed.
     ///
     /// For a model with recurrent state the run ends at its deepest
     /// checkpoint in the store: the pages after it would be replayed row by
@@ -620,18 +620,13 @@ impl Ssd {
         chain: &Chain,
         have: usize,
         total: usize,
+        owner: Owner,
     ) -> Option<(ChainHash, Owner)> {
         let names = chain.hashes().get(have..total)?;
         let (run, state) = {
             let store = self.shared.store();
-            let run = names
-                .iter()
-                .take_while(|hash| {
-                    store.contains(Kind::Page, **hash) && index.state(**hash) == PageState::Unknown
-                })
-                .count();
-            let state = (0..run).rev().find(|i| store.contains(Kind::State, names[*i]));
-            (run, state)
+            let run = run_of(index, names, |hash| store.contains(Kind::Page, hash));
+            (run, deepest(names, run, |hash| store.contains(Kind::State, hash)))
         };
         let run = match (self.recurrent, state) {
             (true, Some(state)) => state + 1,
@@ -641,12 +636,10 @@ impl Ssd {
         if run == 0 {
             return None;
         }
-        let owner = Owner(u64::MAX - self.next_job);
-        let pages = (0..run).map(|i| (names[i], chain.before(have + i), (have + i) as u32 + 1));
         self.jobs.push_back(Import {
             id: self.next_job,
             owner,
-            pages: pages.collect(),
+            pages: run_pages(chain, have, run),
             state: state.filter(|_| self.recurrent),
             state_parts: None,
             state_asked: false,
@@ -950,18 +943,12 @@ impl Cache {
                 if with_state && job.state_parts.is_none() {
                     break;
                 }
-                // A page of the pool for it; cached pages nobody holds make
-                // room, and leave for RAM before it comes in.
-                let mut grown = job.held.append(pool, per_page);
-                if grown.is_err() {
-                    self.evict(pool, 1);
-                    self.push_leaving(pool, exec, &mut batch, &mut notes);
-                    let ssd = self.ssd.as_mut().expect("only with a level on SSD");
-                    grown = ssd.jobs[at].held.append(pool, per_page);
-                }
+                let mut held = std::mem::take(&mut job.held);
+                let grown = self.take_page(pool, exec, &mut held, per_page, &mut batch, &mut notes);
                 let ssd = self.ssd.as_mut().expect("only with a level on SSD");
                 let job = &mut ssd.jobs[at];
-                if grown.is_err() {
+                job.held = held;
+                if !grown {
                     job.failed = true;
                     break;
                 }
@@ -997,7 +984,7 @@ impl Cache {
                 let parts = job.ready.remove(&next).expect("checked above");
                 let depth = job.pages[next].2;
                 let behind = (job.pages.len() - 1 - next) as u64 * per_page;
-                let keep_form = depth == 1 || behind <= settle + per_page;
+                let keep_form = keeps_form(depth, behind, settle, per_page);
                 batch.push(Transfer {
                     kind: TransferKind::PageIn,
                     object: page.0,
@@ -1062,19 +1049,10 @@ impl Cache {
             job.failed = true;
         }
         let owner = job.owner;
-        if let (true, Some((_, place, state_ok))) = (with_state, state) {
-            let id = CheckpointId(u64::from(place));
-            let attached =
-                (came && state_ok).then(|| self.index.attach_checkpoint(hash, id, owner));
-            match attached {
-                Some(Ok(before)) => {
-                    self.placed.insert(place, hash);
-                    if let Some(before) = before {
-                        self.release(before);
-                    }
-                }
-                Some(Err(_)) | None => self.free(place),
-            }
+        if let (true, Some((_, place, state_ok))) = (with_state, state)
+            && !(came && state_ok && self.hang(hash, place, owner, false))
+        {
+            self.free(place);
         }
         match (came, &mut self.in_ram) {
             (true, Some(ram)) if ram.get(hash).is_none() => {

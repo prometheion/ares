@@ -170,6 +170,42 @@ enum Note {
     },
 }
 
+/// How many of `names`, the pages of a prompt after those the index has, a
+/// level below the devices can bring back: the leading ones it has (`has`)
+/// that the index does not know.
+fn run_of(index: &PrefixIndex, names: &[ChainHash], has: impl Fn(ChainHash) -> bool) -> usize {
+    names.iter().take_while(|hash| has(**hash) && index.state(**hash) == PageState::Unknown).count()
+}
+
+/// The deepest of the first `run` of `names` whose checkpoint the level has
+/// too (`has_state`): for a model with recurrent state a run that comes back
+/// ends there, since the pages after it would be replayed row by row, which
+/// takes as long as computing them.
+fn deepest(
+    names: &[ChainHash],
+    run: usize,
+    has_state: impl Fn(ChainHash) -> bool,
+) -> Option<usize> {
+    (0..run).rev().find(|i| has_state(names[*i]))
+}
+
+/// The pages of a run of `run` pages that comes back after the `have` of
+/// `chain` the index has: each page's name, the name of the one before it
+/// and its depth.
+fn run_pages(chain: &Chain, have: usize, run: usize) -> Vec<(ChainHash, ChainHash, u32)> {
+    (0..run)
+        .map(|i| (chain.hashes()[have + i], chain.before(have + i), (have + i) as u32 + 1))
+        .collect()
+}
+
+/// Whether a page of a run that comes back keeps the form it has, at `depth`
+/// and `behind` cells before the run's end: the first page and those among
+/// the newest cells (the device's settled cells and a page more) do; the
+/// others take the one a sequence that went on would have given them.
+fn keeps_form(depth: u32, behind: u64, settle: u64, per_page: u64) -> bool {
+    depth == 1 || behind <= settle + per_page
+}
+
 pub(crate) struct Cache {
     pub index: PrefixIndex,
     policy: CheckpointPolicy,
@@ -501,9 +537,11 @@ impl Cache {
         }
         // What the index does not have may be on SSD: a run of pages that is
         // brought back holds the prompt as a page that is being computed does.
-        if let (Some(ssd), None) = (&mut self.ssd, found.computing) {
+        if self.ssd.is_some() && found.computing.is_none() {
             let total = looked.len() / self.cells_per_page as usize;
-            found.computing = ssd.want(&mut self.index, chain, found.pages.len(), total);
+            let owner = self.import_owner();
+            let ssd = self.ssd.as_mut().expect("checked above");
+            found.computing = ssd.want(&mut self.index, chain, found.pages.len(), total, owner);
         }
         let cached = found.cells(self.cells_per_page).min(tokens.len() as u64);
         let resume = if self.recurrent {
@@ -859,19 +897,11 @@ impl Cache {
         // inside it before this one: room is made now, as a save at a step's end makes it,
         // so that a later save pushes an earlier one out as it would after a cut.
         let dropped = self.make_room_for_one();
-        match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
-            Ok(_) => {
-                if root {
-                    self.index.mark_root(hash);
-                }
-                self.placed.insert(place, hash);
-                Saved { taken: true, dropped }
-            }
-            Err(id) => {
-                self.free(id.0 as u32);
-                Saved { taken: false, dropped }
-            }
+        let taken = self.hang(hash, place, owner, root);
+        if !taken {
+            self.free(place);
         }
+        Saved { taken, dropped }
     }
 
     /// A place reserved for a save inside a step that holds nothing after all.
@@ -897,21 +927,12 @@ impl Cache {
         }
         let (place, dropped) = self.new_place();
         let Some(place) = place else { return Saved { taken: false, dropped } };
-        match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
-            Ok(before) => {
-                debug_assert!(before.is_none(), "the entry had no checkpoint");
-                if root {
-                    self.index.mark_root(hash);
-                }
-                self.saves.push(StateCopy { kind: StateCopyKind::Save, slot, place });
-                self.placed.insert(place, hash);
-                Saved { taken: true, dropped }
-            }
-            Err(id) => {
-                self.free(id.0 as u32);
-                Saved { taken: false, dropped }
-            }
+        let taken = self.hang(hash, place, owner, root);
+        match taken {
+            true => self.saves.push(StateCopy { kind: StateCopyKind::Save, slot, place }),
+            false => self.free(place),
         }
+        Saved { taken, dropped }
     }
 
     /// Takes the checkpoint of a request's live state at its end, as
@@ -1344,6 +1365,54 @@ impl Cache {
         dropped
     }
 
+    /// The owner a run that comes back from RAM or the drive is announced to
+    /// the index under: one no sequence has.
+    fn import_owner(&mut self) -> Owner {
+        self.next_import += 1;
+        Owner(u64::MAX - self.next_import)
+    }
+
+    /// A page of the pool for `cells` more cells of `held`, a run that comes
+    /// back: when the pool has none free, a cached page nobody holds leaves
+    /// the devices, and its copy into RAM goes into `batch` before what comes
+    /// in. `false` when there is none either.
+    fn take_page(
+        &mut self,
+        pool: &mut PagePool,
+        exec: &mut dyn Executor,
+        held: &mut Sequence,
+        cells: u64,
+        batch: &mut Vec<Transfer>,
+        notes: &mut Vec<Note>,
+    ) -> bool {
+        if held.append(pool, cells).is_ok() {
+            return true;
+        }
+        self.evict(pool, 1);
+        self.push_leaving(pool, exec, batch, notes);
+        held.append(pool, cells).is_ok()
+    }
+
+    /// Hangs the checkpoint in `place` on the page or tail named `hash` for
+    /// `owner`, kept longest with `root`; the checkpoint it replaces there is
+    /// released. `false` when the index has no such entry: the place holds
+    /// nothing it keeps.
+    fn hang(&mut self, hash: ChainHash, place: u32, owner: Owner, root: bool) -> bool {
+        match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
+            Ok(before) => {
+                if root {
+                    self.index.mark_root(hash);
+                }
+                self.placed.insert(place, hash);
+                if let Some(before) = before {
+                    self.release(before);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Copies what RAM holds after the `found` pages of the index for a
     /// prompt of `tokens` (named in `chain`) back to the devices, where it
     /// enters the index. For a model with recurrent state the run ends at
@@ -1364,10 +1433,7 @@ impl Cache {
         let have = found.pages.len();
         let total = (looked.len() / per_page).min(chain.hashes().len());
         let names = &chain.hashes()[have.min(total)..total];
-        let run = names
-            .iter()
-            .take_while(|hash| ram.ready(**hash) && self.index.state(**hash) == PageState::Unknown)
-            .count();
+        let run = run_of(&self.index, names, |hash| ram.ready(hash));
         // A tail where the run ends, unless the index has a better one.
         let rest = &looked[(have + run) * per_page..];
         let tail = (found.tail.is_none() || run > 0)
@@ -1380,9 +1446,9 @@ impl Cache {
             .flatten()
             .map(|((hash, checkpoint), shared, whole)| (shared, whole, checkpoint, hash));
         let (run, tail) = if self.recurrent {
-            let deepest = (0..run)
-                .rev()
-                .find(|i| ram.get(names[*i]).is_some_and(|entry| entry.checkpoint.is_some()));
+            let deepest = deepest(names, run, |hash| {
+                ram.get(hash).is_some_and(|entry| entry.checkpoint.is_some())
+            });
             let drive = self.ssd.as_ref().is_some_and(|ssd| ssd.reaches_state(&names[run..]));
             match tail {
                 Some((_, true, true, hash)) => (run, Some(hash)),
@@ -1399,8 +1465,7 @@ impl Cache {
         // not take it; the run is taken out of RAM's order first, so that
         // room made for pages that leave the devices does not take it either.
         let kept = Sequence::from_shared(pool, &found.table(), found.cells(per_page as u32));
-        let run: Vec<(ChainHash, ChainHash, u32)> =
-            (0..run).map(|i| (names[i], chain.before(have + i), (have + i) as u32 + 1)).collect();
+        let run = run_pages(chain, have, run);
         let tail = tail.map(|hash| {
             let entry = self.in_ram.as_ref().and_then(|ram| ram.get(hash)).expect("listed above");
             (hash, entry.parent, entry.tail.as_ref().map_or(0, Vec::len))
@@ -1417,34 +1482,23 @@ impl Cache {
                 None => break,
             }
         }
-        let owner = Owner(u64::MAX / 2 - self.next_import);
-        self.next_import += 1;
+        let owner = self.import_owner();
         let settle = u64::from(self.durable.as_ref().map_or(0, |durable| durable.settle_cells));
         let (mut batch, mut notes) = (Vec::new(), Vec::new());
         let mut held = Sequence::new();
         let mut left = Vec::new();
         let count = taken.len();
         for (i, (hash, parent, cells, parts)) in taken.into_iter().enumerate() {
-            let mut grown = held.append(pool, u64::from(cells));
-            if grown.is_err() {
-                // Room in the pool: a cached page nobody holds leaves the
-                // devices, and its copy into RAM runs before this one.
-                self.evict(pool, 1);
-                self.push_leaving(pool, exec, &mut batch, &mut notes);
-                grown = held.append(pool, u64::from(cells));
-            }
-            if grown.is_err() {
+            if !self.take_page(pool, exec, &mut held, u64::from(cells), &mut batch, &mut notes) {
                 left.push((hash, parts));
                 continue;
             }
             let page = *held.pages().last().expect("a page was appended");
-            // The first page and the pages among the newest cells of the run
-            // keep the form they have; the others take the one a sequence
-            // that went on would have given them.
+            // A tail keeps the form it has, as the newest cells of a run do.
             let tail_page = tail.is_some() && i + 1 == count;
             let behind = (count - 1 - i) as u64 * per_page as u64;
             let depth = run.get(i).map_or(0, |(_, _, depth)| *depth);
-            let keep_form = tail_page || depth == 1 || behind <= settle + per_page as u64;
+            let keep_form = tail_page || keeps_form(depth, behind, settle, per_page as u64);
             batch.push(Transfer {
                 kind: TransferKind::PageIn,
                 object: page.0,
@@ -1570,19 +1624,10 @@ impl Cache {
                             }
                         }
                     }
-                    if let Some(held) = held {
-                        let id = CheckpointId(u64::from(held.place));
-                        match self.index.attach_checkpoint(hash, id, owner) {
-                            Ok(before) => {
-                                if held.root {
-                                    self.index.mark_root(hash);
-                                }
-                                if let Some(before) = before {
-                                    self.release(before);
-                                }
-                            }
-                            Err(_) => self.give_up(held.place, None),
-                        }
+                    if let Some(held) = held
+                        && !self.hang(hash, held.place, owner, held.root)
+                    {
+                        self.give_up(held.place, None);
                     }
                 }
                 Note::CardsOut { hash, parent, depth } => {
