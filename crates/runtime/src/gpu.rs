@@ -235,6 +235,9 @@ pub struct GpuExecutor {
     /// The model, which changes its page-locked memory before each step
     /// ([`Model::before_step`]).
     model: Arc<dyn Model>,
+    /// Held while the devices run a job: page-locked memory does not change
+    /// meanwhile ([`ares_cuda::gate`]).
+    steps: Option<ares_cuda::gate::Steps>,
 }
 
 impl std::fmt::Debug for GpuExecutor {
@@ -386,6 +389,7 @@ impl GpuExecutor {
             in_flight: false,
             ram,
             model,
+            steps: None,
         };
         let mut failure = None;
         for _ in 0..executor.handles.len() {
@@ -442,6 +446,7 @@ impl Executor for GpuExecutor {
             });
         };
         let handle = &self.handles[device];
+        let _steps = ares_cuda::gate::Steps::begin();
         let taken = TowerJob {
             image: job.image.clone(),
             units: job.units.clone(),
@@ -490,6 +495,7 @@ impl Executor for GpuExecutor {
                 .map_err(|e| failed(format!("the checkpoint places of the step: {e}")))?;
             self.model.before_step(&view).map_err(|e| failed(e.to_string()))?;
         }
+        self.steps = Some(ares_cuda::gate::Steps::begin());
         self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
         let dispatched_ns = self.shared.clock.now_ns();
         for handle in &self.handles {
@@ -510,6 +516,9 @@ impl Executor for GpuExecutor {
         let (count, woke) = self.shared.done.wait_past(self.seen, spin);
         self.seen = count;
         self.in_flight = false;
+        // Every device has ended the step: what was given back during it is
+        // freed now, before the next one.
+        drop(self.steps.take());
         out.picks.clear();
         out.logprobs.clear();
         out.drafts.clear();
@@ -582,6 +591,7 @@ impl Executor for GpuExecutor {
                 message: format!("the checkpoint places of a transfer: {error}"),
             });
         }
+        let steps = ares_cuda::gate::Steps::begin();
         self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
         for (device, handle) in self.handles.iter().enumerate() {
             let shares = batch.iter_mut().map(|transfer| {
@@ -603,6 +613,7 @@ impl Executor for GpuExecutor {
         self.shared.done.bind();
         let (count, _) = self.shared.done.wait_past(self.seen, Duration::from_millis(1));
         self.seen = count;
+        drop(steps);
         for transfer in batch.iter_mut() {
             transfer.ok = true;
         }
@@ -792,6 +803,9 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
             Woke::Parked => mailbox.parked.fetch_add(1, Ordering::Relaxed),
         };
         let job = mailbox.job.lock().expect("job slot").take();
+        // Inside a job of the devices: what this thread gives back of page-locked
+        // memory waits for its end, and it locks none.
+        let _inside = ares_cuda::gate::InStep::mark();
         match job {
             Some(Job::Step { meta, dispatched_ns }) => {
                 let outcome =
