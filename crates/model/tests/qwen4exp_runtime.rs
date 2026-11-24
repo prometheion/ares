@@ -683,9 +683,21 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
 fn start_near(
     path: &std::path::Path,
     placement: Placement,
+    rows: (u32, u32),
+    kv: CacheFormat,
+    near: Option<u32>,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    start_near_serving(path, placement, rows, kv, near, Serve::Measured)
+}
+
+/// [`start_near`] with the misses served as `serve` says.
+fn start_near_serving(
+    path: &std::path::Path,
+    placement: Placement,
     (rows, own): (u32, u32),
     kv: CacheFormat,
     near: Option<u32>,
+    serve: Serve,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
     let gguf = Gguf::open(path).unwrap();
@@ -695,6 +707,7 @@ fn start_near(
     opts.part.own_rows = own;
     opts.part.near_pages = near;
     opts.part.kv = (kv, kv);
+    opts.serve = serve;
     let inner =
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config =
@@ -715,7 +728,7 @@ fn start_near(
 /// with every expert in a slot the answers are the same token for token, also with K and V in
 /// `q6`, whose tiles are converted into the far pool as they leave the newest cells. Wide steps
 /// on lent VRAM read a copy of a layer's far entries; their slots lend, so experts are fetched
-/// there and the answer starts as the reference's (as in the test of lent steps).
+/// there: with every miss uploaded, they answer token for token as with every page in VRAM.
 #[test]
 fn k_and_v_beyond_vram_change_no_token() {
     if !enabled() {
@@ -761,10 +774,20 @@ fn k_and_v_beyond_vram_change_no_token() {
                 assert!(leading(&answers[1], &answers[0]) >= 2, "{placement:?}, {rows} rows");
             }
         }
+        // Every miss of the lent steps uploaded: the GPU computes every expert. Where the CPU
+        // takes a share of their misses, lent steps answer one of two first tokens here (the
+        // reference ranks them 0.43 apart), every page in VRAM or not (OPEN.md: "Lent steps
+        // with the CPU's share").
         let mut lent = Vec::new();
         for near in [None, Some(1)] {
-            let (runtime, model) =
-                start_near(&lending, placement, (LENT_ROWS, MAX_ROWS), CacheFormat::Q8, near);
+            let (runtime, model) = start_near_serving(
+                &lending,
+                placement,
+                (LENT_ROWS, MAX_ROWS),
+                CacheFormat::Q8,
+                near,
+                Serve::Stream,
+            );
             assert_eq!(runtime_rows(&model), (LENT_ROWS, MAX_ROWS));
             lent.push(ask(&runtime, 1, &prompt, 16));
             let stats = model.take_store_stats().expect("the parts are open");
@@ -778,7 +801,8 @@ fn k_and_v_beyond_vram_change_no_token() {
             leading(&lent[1], &reference),
             leading(&lent[0], &lent[1])
         );
-        assert!(leading(&lent[1], &reference) >= 2, "{placement:?}: {:?}", lent[1]);
+        assert!(leading(&lent[0], &reference) >= 2, "{placement:?}: {:?}", lent[0]);
+        assert_eq!(lent[1], lent[0], "{placement:?}: lent steps with K and V beyond VRAM");
         // The session with its pages beyond the first in RAM says what the session says.
         let want = session_answer(1, placement, &prompt, 24);
         assert_eq!(session_answer_near(placement, &prompt, 24, 1), want, "{placement:?}");
