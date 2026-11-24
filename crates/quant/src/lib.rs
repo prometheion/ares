@@ -9,7 +9,9 @@
 //!
 //! The engine's own KV-cache formats (`f16` and the rotated `q8` to `q4`) are
 //! specified and implemented in the [`kv`] module, which is the reference the
-//! attention kernels are held to.
+//! attention kernels are held to; the int8 form of activations the integer
+//! weight kernels read is in [`act`], the device layouts of weight matrices in
+//! [`layout`].
 //!
 //! Correctness and readability come first: plain scalar Rust, no SIMD, no
 //! `unsafe`, and every function ports its ggml counterpart statement by
@@ -36,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod act;
 mod blocks;
 mod encode;
 mod error;
