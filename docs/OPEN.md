@@ -1675,6 +1675,12 @@ the agents' builds):
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- Take code, not ideas (the owner, 2026-11-24): where an open engine has what Ares needs, its
+  code is taken and adapted instead of rebuilt from its docs. Allowed: MIT, BSD, Apache-2.0
+  (Ares is Apache-2.0); not GPL, AGPL or code with no license. Kernels come over nearly as they
+  are, host logic (C++, Python) is translated into Rust from the source. Every piece names its
+  origin (repository, file, commit) in a header comment and in THIRD-PARTY-NOTICES with the
+  license text. A/B and the owner's rules apply as to any change.
 - A named `--context` overflows like the model's own (the owner, 2026-11-24: an operator always
   names it, e.g. 4 sequences of 128k = `--context 524288` for all together). For Flash-Next the
   indexer's keys and the near pages stay in VRAM and the rest lies in RAM, whether the context
