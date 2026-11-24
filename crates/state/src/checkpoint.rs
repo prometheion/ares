@@ -142,9 +142,15 @@ pub struct CheckpointPolicy {
 const MAX_REQUESTS_BELOW: u32 = 5;
 
 impl CheckpointPolicy {
-    /// Every 8192 cells in a prompt (the llama.cpp fork's spacing; ExLlamaV3
-    /// has 32768), every 2048 while generating (ExLlamaV3), message
-    /// boundaries 1024 apart at least, LMDeploy's one volatile row, the
+    /// The cells between checkpoints in a prompt: the llama.cpp fork's
+    /// spacing (ExLlamaV3 has 32768).
+    pub const PROMPT_INTERVAL: u32 = 8192;
+    /// The cells between checkpoints while generating (ExLlamaV3).
+    pub const GENERATION_INTERVAL: u32 = 2048;
+    /// The fewest cells between the checkpoints of two message boundaries.
+    pub const BOUNDARY_INTERVAL: u32 = 1024;
+
+    /// Checkpoints at the intervals above, LMDeploy's one volatile row, the
     /// newest three checkpoints of a conversation fresh (the fork), for
     /// checkpoints of `bytes_per_checkpoint` within `budget_bytes`.
     ///
@@ -155,9 +161,9 @@ impl CheckpointPolicy {
         assert!(cells_per_page > 0, "a page holds at least one cell");
         Self {
             cells_per_page,
-            prompt_interval: 8192,
-            generation_interval: 2048,
-            boundary_interval: 1024,
+            prompt_interval: Self::PROMPT_INTERVAL,
+            generation_interval: Self::GENERATION_INTERVAL,
+            boundary_interval: Self::BOUNDARY_INTERVAL,
             boundary_reach: 0,
             volatile_rows: 1,
             bytes_per_checkpoint,

@@ -246,8 +246,17 @@ impl Cache {
     /// The checkpoint places the budget of `config` holds for a model of this
     /// `spec`. The conductor and the device parts both use this number.
     pub(crate) fn places(spec: &PrefixCache, config: &RuntimeConfig) -> u32 {
-        let policy = CheckpointPolicy::new(config.cells_per_page, spec.bytes(), config.cache_ram);
-        u32::try_from(policy.capacity()).unwrap_or(u32::MAX)
+        u32::try_from(Self::policy(spec, config).capacity()).unwrap_or(u32::MAX)
+    }
+
+    /// The checkpoint policy of `config` for a model of this `spec`.
+    fn policy(spec: &PrefixCache, config: &RuntimeConfig) -> CheckpointPolicy {
+        CheckpointPolicy {
+            prompt_interval: config.checkpoint_prompt_interval,
+            generation_interval: config.checkpoint_generation_interval,
+            boundary_interval: config.checkpoint_boundary_interval,
+            ..CheckpointPolicy::new(config.cells_per_page, spec.bytes(), config.cache_ram)
+        }
     }
 
     /// `durable` is what the model offers the levels below the devices: the
@@ -258,8 +267,8 @@ impl Cache {
         spec: &PrefixCache,
         durable: Option<&Durable>,
         config: &RuntimeConfig,
-        cells_per_page: u32,
     ) -> Self {
+        let cells_per_page = config.cells_per_page;
         let recurrent = spec.bytes() > 0;
         let (ssd, ssd_problem) = match (&config.ssd, durable) {
             (Some(at), Some(durable)) => {
@@ -280,19 +289,14 @@ impl Cache {
             }
             _ => ChainHash::root(model_name.as_bytes()),
         };
-        let policy = CheckpointPolicy {
-            prompt_interval: config.checkpoint_prompt_interval,
-            generation_interval: config.checkpoint_generation_interval,
-            boundary_interval: config.checkpoint_boundary_interval,
-            ..CheckpointPolicy::new(cells_per_page, spec.bytes(), config.cache_ram)
-        };
+        let policy = Self::policy(spec, config);
         let index = match spec.tails_per_slot {
             Some(per_slot) => {
                 PrefixIndex::new().with_tail_limit(per_slot as usize * config.max_slots as usize)
             }
             None => PrefixIndex::new(),
         };
-        let capacity = Self::places(spec, config);
+        let capacity = u32::try_from(policy.capacity()).unwrap_or(u32::MAX);
         Self {
             index,
             root,
@@ -1660,13 +1664,16 @@ mod tests {
     /// A cache for a model whose checkpoints take 100 bytes, with room for
     /// `places` of them.
     fn cache(places: u64) -> Cache {
-        let config = RuntimeConfig { cache_ram: places * 100, ..RuntimeConfig::default() };
+        let config = RuntimeConfig {
+            cells_per_page: PER_PAGE,
+            cache_ram: places * 100,
+            ..RuntimeConfig::default()
+        };
         Cache::new(
             "m",
             &PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None },
             None,
             &config,
-            PER_PAGE,
         )
     }
 
@@ -1826,9 +1833,10 @@ mod tests {
 
     #[test]
     fn a_model_that_keeps_state_per_tail_limits_the_tails_per_slot() {
-        let config = RuntimeConfig { max_slots: 2, ..RuntimeConfig::default() };
+        let config =
+            RuntimeConfig { cells_per_page: PER_PAGE, max_slots: 2, ..RuntimeConfig::default() };
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: Some(1) };
-        let mut cache = Cache::new("m", &spec, None, &config, PER_PAGE);
+        let mut cache = Cache::new("m", &spec, None, &config);
         let mut pool = PagePool::new(16, PER_PAGE);
         let root = ChainHash::root(b"m");
         let mut dropped = Vec::new();
@@ -1850,7 +1858,7 @@ mod tests {
 
         // No limit without the model asking for one.
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None };
-        let mut cache = Cache::new("m", &spec, None, &config, PER_PAGE);
+        let mut cache = Cache::new("m", &spec, None, &config);
         for i in 0..3u32 {
             let mut seq = Sequence::new();
             seq.append(&mut pool, 2).unwrap();
@@ -1931,6 +1939,7 @@ mod tests {
                 settle_cells: 0,
             };
             let config = RuntimeConfig {
+                cells_per_page: PER_PAGE,
                 cache_ram: budget,
                 // A text of one page is deep enough to be written.
                 ssd: ssd
@@ -1938,8 +1947,8 @@ mod tests {
                 ..RuntimeConfig::default()
             };
             let spec = PrefixCache { checkpoint_bytes: vec![STATE], tails_per_slot: None };
-            let mut cache = Cache::new("m", &spec, Some(&durable), &config, PER_PAGE)
-                .with_ram(Some(ram.clone()));
+            let mut cache =
+                Cache::new("m", &spec, Some(&durable), &config).with_ram(Some(ram.clone()));
             assert!(cache.ssd_problem.is_none(), "{:?}", cache.ssd_problem);
             let mut pool = PagePool::new(64, PER_PAGE);
             let hashes = three_pages(&mut cache, &mut pool);
@@ -2079,10 +2088,10 @@ mod tests {
         // Without a level on SSD the floor is the one place, without pages:
         // the same books still let a checkpoint be taken, and the next one
         // takes the place over.
-        let config = RuntimeConfig { cache_ram: 400, ..RuntimeConfig::default() };
+        let config =
+            RuntimeConfig { cells_per_page: PER_PAGE, cache_ram: 400, ..RuntimeConfig::default() };
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None };
-        let mut plain =
-            Cache::new("m", &spec, None, &config, PER_PAGE).with_ram(Some(f.ram.clone()));
+        let mut plain = Cache::new("m", &spec, None, &config).with_ram(Some(f.ram.clone()));
         assert_eq!(f.ram.cache_allowance(), 100, "one place");
         let hashes = three_pages(&mut plain, &mut f.pool);
         assert!(plain.save(0, hashes[0], Owner(1), false).taken);

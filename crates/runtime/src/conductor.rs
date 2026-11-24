@@ -852,16 +852,10 @@ impl Conductor {
             pool: PagePool::new(config.pages, config.cells_per_page),
             cache: model.prefix_cache().map(|spec| {
                 let durable = model.durable(config.cells_per_page);
-                Cache::new(
-                    &model.card().id,
-                    &spec,
-                    durable.as_ref(),
-                    &config,
-                    config.cells_per_page,
-                )
-                .with_reach(model.prompt_rows().min(max_rows))
-                .with_ram(exec.ram())
-                .with_far(model.far_pages())
+                Cache::new(&model.card().id, &spec, durable.as_ref(), &config)
+                    .with_reach(model.prompt_rows().min(max_rows))
+                    .with_ram(exec.ram())
+                    .with_far(model.far_pages())
             }),
             admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),

@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use ares_sched::NgramConfig;
+use ares_state::CheckpointPolicy;
 
 /// The settings of the conductor and its bookkeeping.
 #[derive(Clone, Debug)]
@@ -131,9 +132,9 @@ impl Default for RuntimeConfig {
             output_ratio: 0.7,
             cache_ram: 0,
             image_rows: 256 << 20,
-            checkpoint_prompt_interval: 8192,
-            checkpoint_generation_interval: 2048,
-            checkpoint_boundary_interval: 1024,
+            checkpoint_prompt_interval: CheckpointPolicy::PROMPT_INTERVAL,
+            checkpoint_generation_interval: CheckpointPolicy::GENERATION_INTERVAL,
+            checkpoint_boundary_interval: CheckpointPolicy::BOUNDARY_INTERVAL,
             ssd: None,
             max_rows: 0,
             window_rows: 8,
