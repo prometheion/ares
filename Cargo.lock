@@ -115,6 +115,7 @@ dependencies = [
  "ares-tokenizer",
  "ares-vulkan",
  "ares-weights",
+ "libc",
  "sha2",
  "thiserror",
 ]

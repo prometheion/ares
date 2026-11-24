@@ -1591,11 +1591,16 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       45d2e4d6): every GPU suite of both models and the server's `real`, `real_cache`,
       `real_devices` as on main (the known near-bound and tensor-split failures only); alternating
       A/B against main: Flash-Next and the 27B decode, an 8k prompt and two at once as fast, the
-      same plan and the same role kept at load. One change at load: Flash-Next's dense weights now
-      come through the shared arena's ordinary reads (the 27B's way, for a machine short of
-      memory, where faulting a mapping in read 38 MB/s) and upload in 0.6 s instead of 0.3 s from a
-      warm page cache (3.3 GiB on the RTX 4070), so the role trial takes 4.2 s against 3.6 to 3.8 s.
-      Whether both models should take the mapping when the file is in the page cache is open.
+      same plan and the same role kept at load. The shared arena uploads from the file's mapping
+      and reads with ordinary reads only on a machine short of memory for the load (less than
+      twice its bytes available), the 27B's reason for them; neither model loads slower than on
+      main (alternating loads, warm and cold page cache, medians): the 27B on the two local cards
+      warm 3.2 s against 5.9 s for the weights (ready 9.6 against 12.2 s), cold 13.3 against 14.2 s
+      (ready 23.4 against 22.7 s, means 24.1 and 23.8: noise); on the test machine's RTX 4060 Ti
+      (the 27B at IQ2_XXS) warm 1.9 against 2.3 s (ready 7.1 against 7.6), cold 6.8 against 7.4 s
+      (ready 14.4 against 15.1). Flash-Next uploads its 3.3 GiB of dense weights as main does: on
+      the local cards 0.3 s warm and 0.6 s cold, on the test machine 0.9 and 2.0 s, time to ready
+      and the role trial alike.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from

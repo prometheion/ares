@@ -21,6 +21,7 @@ ares-state.workspace = true
 ares-tokenizer.workspace = true
 # How far ahead of a layer the experts of a prompt are read.
 ares-weights.workspace = true
+libc.workspace = true
 # The names of images: a digest of the pixels the tower is given.
 sha2 = "0.10"
 thiserror.workspace = true

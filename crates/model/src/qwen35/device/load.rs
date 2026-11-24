@@ -461,7 +461,7 @@ impl DeviceWeights {
             .max();
         let scratch = scratch_bytes.map(|b| DeviceBuffer::new(device, b.max(ALIGN))).transpose()?;
         let stream = Stream::new(device, 0)?;
-        let mut reader = Reader::new();
+        let mut reader = Reader::new(arena.len());
         for item in &items {
             let Some((ty, n_out, n_in)) = item.rearrange else {
                 item.source.write(&arena, item.at, &mut reader)?;

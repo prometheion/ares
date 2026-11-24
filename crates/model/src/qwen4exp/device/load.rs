@@ -558,7 +558,7 @@ impl DeviceWeights {
         ledger.reserve("qwen4exp dense weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
         let started = Instant::now();
-        let mut reader = Reader::new();
+        let mut reader = Reader::new(arena.len());
         for (at, source) in &layout.parts {
             source.write(&arena, *at, &mut reader)?;
         }
@@ -591,7 +591,7 @@ impl DeviceWeights {
         ledger.reserve("qwen4exp MTP block weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
         let started = Instant::now();
-        let mut reader = Reader::new();
+        let mut reader = Reader::new(arena.len());
         for (at, source) in &layout.parts {
             source.write(&arena, *at, &mut reader)?;
         }

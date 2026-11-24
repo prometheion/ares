@@ -3,14 +3,16 @@
 //! columns of a matrix gathered into a matrix of their own (the same bytes per
 //! value, never decoded), or values the host made.
 //!
-//! The bytes are read from the model file with ordinary reads and uploaded
-//! from the loader's memory ([`MappedFiles`]).
+//! The bytes of the model file are uploaded from its mapping; on a machine
+//! short of memory for them, the pages that are not in the page cache are read
+//! from the file with ordinary reads into the loader's memory and uploaded from
+//! there ([`MappedFiles`]).
 
 use std::ops::Range;
 
 use ares_core::GgmlType;
 use ares_cuda::{DeviceBuffer, WeightRange};
-use ares_runtime::ModelError;
+use ares_runtime::{MemorySource, ModelError};
 
 use crate::files::Matrix;
 
@@ -109,19 +111,24 @@ impl Source<'_> {
 const PIECE: usize = 16 << 20;
 
 /// The files behind the mapped bytes of a model, for reading them with
-/// ordinary reads.
+/// ordinary reads where that is faster than the mapping.
 ///
 /// The stored bytes of a matrix are a slice of a mapping of the model file.
 /// Uploading from the mapping makes the driver fault the file in page by
 /// page, and the kernel stops reading ahead on a mapping whose faults keep
 /// missing the page cache: on a machine short of memory a load of
 /// Qwen3.8-27B then read 38 MB per second from a drive that gives 900 to an
-/// ordinary read. So the loader reads the same bytes from the file itself, a
-/// piece at a time into its own memory, and uploads from there; reads of a
-/// file are read ahead whatever the page cache does. Which file and where is
-/// taken from the process's table of mappings, so nothing above the loader
-/// needs to know; bytes that are not a file's (a model built in memory) are
-/// uploaded from where they are.
+/// ordinary read. So on a machine short of memory for a load (less than twice
+/// its bytes available), bytes whose pages are not all in the page cache are
+/// read from the file itself, a piece at a time into the loader's memory, and
+/// uploaded from there; reads of a file are read ahead whatever the page cache
+/// does. Otherwise the bytes are uploaded from the mapping, which saves that
+/// copy and is faster from a cold file too: 3.3 GiB of Flash-Next's dense
+/// weights upload in 0.3 to 0.6 s from the mapping against 0.6 to 2.0 s
+/// through the reads (RTX 4070, 2026-11-24). Which file and where is taken
+/// from the process's table of mappings, so nothing above the loader needs to
+/// know; bytes that are not a file's (a model built in memory) are uploaded
+/// from where they are.
 #[derive(Default)]
 struct MappedFiles {
     /// The file mappings of the process: start and end address, the file's
@@ -129,11 +136,16 @@ struct MappedFiles {
     regions: Vec<(usize, usize, u64, std::path::PathBuf)>,
     /// The files opened so far, by index of their first region.
     open: Vec<(std::path::PathBuf, std::fs::File)>,
+    /// Whether the machine is short of memory for the bytes read: then the
+    /// pages that are not in the page cache are read with ordinary reads.
+    short: bool,
 }
 
 impl MappedFiles {
-    /// The file mappings of the process as they are now.
-    fn of_process() -> Self {
+    /// The file mappings of the process as they are now, for reading `bytes`
+    /// bytes of them: the machine is short of memory for them when it has
+    /// less than twice that available.
+    fn of_process(bytes: u64) -> Self {
         let mut regions = Vec::new();
         // start-end perms offset dev inode path
         for line in std::fs::read_to_string("/proc/self/maps").unwrap_or_default().lines() {
@@ -157,13 +169,18 @@ impl MappedFiles {
                 regions.push((start, end, offset, path.into()));
             }
         }
-        Self { regions, open: Vec::new() }
+        let available = ares_runtime::Meminfo.available();
+        let short = available.is_some_and(|available| available < 2 * bytes);
+        Self { regions, open: Vec::new(), short }
     }
 
     /// The bytes of `mapped`: read from its file into `staging` when it lies
     /// in a file mapping and the read succeeds, `mapped` itself otherwise.
     fn read<'a>(&mut self, mapped: &'a [u8], staging: &'a mut Vec<u8>) -> &'a [u8] {
         use std::os::unix::fs::FileExt;
+        if !self.short || resident(mapped) {
+            return mapped;
+        }
         let at = mapped.as_ptr() as usize;
         let Some((start, _, offset, path)) =
             self.regions.iter().find(|(start, end, ..)| at >= *start && at + mapped.len() <= *end)
@@ -189,10 +206,29 @@ impl MappedFiles {
     }
 }
 
-/// Reads the stored bytes of `m` into `into`, which has their length: with
-/// ordinary reads, a piece at a time, as the uploads do.
+/// Whether every page of `bytes` is in memory: for bytes of a file mapping,
+/// in the page cache (one `mincore` over their pages).
+fn resident(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    // SAFETY: `sysconf` reads a constant of the system.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    let start = bytes.as_ptr() as usize / page * page;
+    let end = (bytes.as_ptr() as usize + bytes.len()).next_multiple_of(page);
+    let mut pages = vec![0u8; (end - start) / page];
+    // SAFETY: `start..end` are the whole pages that `bytes` lies in, all of
+    // them mapped while `bytes` is borrowed; `mincore` writes one byte per page
+    // into `pages`, which has that many.
+    let done =
+        unsafe { libc::mincore(start as *mut libc::c_void, end - start, pages.as_mut_ptr()) };
+    done == 0 && pages.iter().all(|page| page & 1 == 1)
+}
+
+/// Reads the stored bytes of `m` into `into`, which has their length: a
+/// piece at a time, from the mapping or with ordinary reads as the uploads do.
 pub(crate) fn read_matrix(m: &Matrix<'_>, into: &mut [u8]) {
-    let mut files = MappedFiles::of_process();
+    let mut files = MappedFiles::of_process(m.bytes().len() as u64);
     let mut staging = Vec::new();
     for (piece, to) in m.bytes().chunks(PIECE).zip(into.chunks_mut(PIECE)) {
         to.copy_from_slice(files.read(piece, &mut staging));
@@ -209,19 +245,24 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
-    /// The uploads of a load, reading through the file mappings the process
-    /// has now.
-    pub(crate) fn new() -> Self {
-        Self { files: MappedFiles::of_process(), ..Self::default() }
+    /// The uploads of a load of `bytes` bytes, reading through the file
+    /// mappings the process has now.
+    pub(crate) fn new(bytes: u64) -> Self {
+        Self { files: MappedFiles::of_process(bytes), ..Self::default() }
     }
 
-    /// Uploads `bytes` to offset `at` of `arena`, a piece at a time.
+    /// Uploads `bytes` to offset `at` of `arena`: at once from where they are
+    /// when their pages are in memory, otherwise a piece at a time.
     pub(crate) fn upload(
         &mut self,
         arena: &DeviceBuffer,
         at: u64,
         bytes: &[u8],
     ) -> Result<(), ModelError> {
+        if !self.files.short || resident(bytes) {
+            arena.write(at, bytes)?;
+            return Ok(());
+        }
         for (i, piece) in bytes.chunks(PIECE).enumerate() {
             let read = self.files.read(piece, &mut self.staging);
             arena.write(at + (i * PIECE) as u64, read)?;
@@ -250,7 +291,8 @@ impl Ranges {
         if let Some((_, range)) = self.known.iter().find(|(known, _)| *known == at) {
             return *range;
         }
-        let files = self.files.get_or_insert_with(MappedFiles::of_process);
+        let bytes = m.bytes().len() as u64;
+        let files = self.files.get_or_insert_with(|| MappedFiles::of_process(bytes));
         let mut range = WeightRange::Any;
         for piece in m.bytes().chunks(PIECE) {
             range = range.and(WeightRange::of(m.ty(), files.read(piece, &mut self.staging)));
