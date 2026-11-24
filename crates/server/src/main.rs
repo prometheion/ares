@@ -18,7 +18,7 @@ use ares_server::load::DeviceLoader;
 use ares_server::models::{AcquireError, Models, SystemClock};
 use ares_server::options::ModelOptions;
 use ares_server::preset::Presets;
-use ares_server::{Config, plan, serve_models};
+use ares_server::{Config, serve_models};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
@@ -141,20 +141,13 @@ async fn run(
     }
     let config = Config { access, timeout, log_text, ..Config::default() };
 
-    // The most RAM of all loaded models together, when nobody names it: all
-    // the machine has. The engines hold what is available below it.
-    let total = ares_runtime::Meminfo::total();
     let offered = presets.models.len();
     // What a request to each model gets for the fields it leaves out, once.
     for preset in &presets.models {
         tracing::info!(model = preset.id.as_str(), "{}", preset.options.defaults);
     }
-    let models = Arc::new(Models::start(
-        presets,
-        Arc::new(DeviceLoader),
-        Arc::new(SystemClock::default()),
-        plan::default_ram(total),
-    ));
+    let models =
+        Arc::new(Models::start(presets, Arc::new(DeviceLoader), Arc::new(SystemClock::default())));
 
     match &single {
         // One model on the command line is loaded before the server listens,

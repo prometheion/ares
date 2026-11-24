@@ -453,7 +453,7 @@ async fn every_model_of_a_preset_file_has_its_own_defaults() {
     let presets = Presets::parse(TWO, Path::new("models.ini"), &[], &|_| true).unwrap();
     let loader = Scripted::default();
     let clock = Arc::new(SystemClock::default());
-    let models = Arc::new(Models::start(presets, Arc::new(loader.clone()), clock, 1 << 30));
+    let models = Arc::new(Models::start(presets, Arc::new(loader.clone()), clock));
     let app = router_over(models.clone(), Config::default());
 
     // The list has them before a model is loaded.

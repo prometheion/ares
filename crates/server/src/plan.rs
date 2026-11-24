@@ -488,16 +488,6 @@ impl ContextPlan {
     }
 }
 
-/// The most host RAM the engine may ever use when the operator names no
-/// limit: all the machine has (`total`, its `MemTotal`). Below it, as below a
-/// limit that was named, the engine holds what the machine has available less
-/// a headroom and gives memory back when other programs need it
-/// (`ares_runtime::Machine`). Nothing when the machine reports nothing (the
-/// engine then keeps to what it needs to run).
-pub fn default_ram(total: Option<u64>) -> u64 {
-    total.unwrap_or(0)
-}
-
 /// What the server says when the RAM limit `ram` is less than what the engine
 /// must hold to run at all. `needs` is that memory by what it is for:
 /// the message names every share and the whole in bytes, the number that
@@ -512,14 +502,6 @@ pub fn too_little_ram(ram: u64, needs: &[(&str, u64)]) -> String {
         Bytes(required),
         shares.join(", ")
     )
-}
-
-/// The bytes of memory available for new programs in the text of
-/// `/proc/meminfo` (`MemAvailable`), or `None` when it is not there.
-pub fn parse_available_ram(meminfo: &str) -> Option<u64> {
-    let line = meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:"))?;
-    let kib: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
-    kib.checked_mul(1024)
 }
 
 /// Parses a size on the command line: a number of bytes, or a number with a
@@ -583,18 +565,6 @@ mod tests {
         for bad in ["", "G", "-1", "1.", ".5G", "1x", "1 000", "nan", "1GB2", "99999999999T"] {
             assert_eq!(parse_size(bad), None, "{bad:?}");
         }
-    }
-
-    #[test]
-    fn the_ram_default_is_half_of_what_the_machine_has_available() {
-        let meminfo = "MemTotal:       32768000 kB\nMemFree:         1000000 kB\n\
-                       MemAvailable:   20000000 kB\nBuffers:           10000 kB\n";
-        assert_eq!(parse_available_ram(meminfo), Some(20_000_000 * 1024));
-        assert_eq!(default_ram(Some(32_768_000 * 1024)), 32_768_000 * 1024);
-        // A machine that says nothing: no spare RAM.
-        assert_eq!(parse_available_ram("MemTotal: 1 kB\n"), None);
-        assert_eq!(parse_available_ram("MemAvailable: lots\n"), None);
-        assert_eq!(default_ram(None), 0);
     }
 
     #[test]

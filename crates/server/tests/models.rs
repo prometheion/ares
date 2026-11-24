@@ -203,7 +203,7 @@ fn world(ini: &str, devices: &[u64]) -> World {
     let machine = Machine::new(devices);
     let clock = ManualClock::new();
     let loader = Arc::new(Loads(machine.clone()));
-    let models = Arc::new(Models::start(presets(ini), loader, clock.clone(), 1000));
+    let models = Arc::new(Models::start(presets(ini), loader, clock.clone()));
     World { machine, clock, models }
 }
 
@@ -608,7 +608,7 @@ load-on-startup = true
     let mut options = ares_server::options::ModelOptions::default();
     ares_server::options::set(&mut options, "--model", "/models/only.gguf").unwrap();
     let models =
-        Models::start(Presets::single(options), Arc::new(Loads(machine.clone())), clock.clone(), 9);
+        Models::start(Presets::single(options), Arc::new(Loads(machine.clone())), clock.clone());
     models.wait_loaded("only").await.unwrap();
     assert_eq!(machine.site("only"), Site { beside: false, ram: None, ram_is_rest: false });
     clock.advance(1_000_000);
@@ -619,7 +619,7 @@ load-on-startup = true
     machine.broken_files.lock().unwrap().insert("only".into());
     let mut options = ares_server::options::ModelOptions::default();
     ares_server::options::set(&mut options, "--model", "/models/only.gguf").unwrap();
-    let models = Models::start(Presets::single(options), Arc::new(Loads(machine)), clock, 9);
+    let models = Models::start(Presets::single(options), Arc::new(Loads(machine)), clock);
     assert!(matches!(models.wait_loaded("only").await, Err(AcquireError::Failed { .. })));
 }
 

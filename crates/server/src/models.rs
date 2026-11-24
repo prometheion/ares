@@ -248,10 +248,9 @@ struct Shared {
     /// Counts the changes of state, for the requests that wait for one.
     version: watch::Sender<u64>,
     events: broadcast::Sender<ModelEvent>,
-    /// The most RAM of all loaded models together, and whether the operator
-    /// named it.
-    ram: u64,
-    ram_named: bool,
+    /// The most RAM of all loaded models together, when the operator named
+    /// it.
+    ram: Option<u64>,
 }
 
 enum Job {
@@ -412,17 +411,18 @@ impl Shared {
         let others = || state.entries.iter().filter_map(|e| e.loaded.as_ref());
         let booked: u64 = others().map(|loaded| loaded.ram).sum();
         let beside = others().next().is_some();
-        let left = self.ram.saturating_sub(booked);
-        match state.entries[index].preset.options.load.ram {
-            // Without a limit of the server there is nothing to fit into:
-            // every engine follows the memory the machine has, and they
-            // share it through the one watch over it.
-            Some(own) if !self.ram_named => Ok(Site { beside, ram: Some(own), ram_is_rest: false }),
-            None if !self.ram_named => Ok(Site { beside, ram: None, ram_is_rest: false }),
+        let own = state.entries[index].preset.options.load.ram;
+        // Without a limit of the server there is nothing to fit into: every
+        // engine follows the memory the machine has, and they share it
+        // through the one watch over it.
+        let Some(limit) = self.ram else {
+            return Ok(Site { beside, ram: own, ram_is_rest: false });
+        };
+        let left = limit.saturating_sub(booked);
+        match own {
             Some(own) if own > left => Err(format!(
                 "its {own} bytes of RAM do not fit in the {left} bytes that the server's limit \
-                 of {} bytes has left",
-                self.ram
+                 of {limit} bytes has left"
             )),
             Some(own) => Ok(Site { beside, ram: Some(own), ram_is_rest: false }),
             // Alone, the whole of a limit the operator named is as asked.
@@ -689,17 +689,11 @@ impl Models {
     }
 
     /// The models of `presets`, none loaded yet; those that are to be loaded
-    /// at start are put in line. `default_ram` is the most RAM of all loaded
-    /// models together when the presets name none: all the machine has, and
-    /// the engines then share what is available instead of parts of a limit.
-    /// Must be called inside a
-    /// Tokio runtime: the manager's task starts here.
-    pub fn start(
-        presets: Presets,
-        loader: Arc<dyn Loader>,
-        clock: Arc<dyn Clock>,
-        default_ram: u64,
-    ) -> Self {
+    /// at start are put in line. Without a RAM limit of the presets the
+    /// engines share what the machine has available instead of parts of a
+    /// limit. Must be called inside a Tokio runtime: the manager's task
+    /// starts here.
+    pub fn start(presets: Presets, loader: Arc<dyn Loader>, clock: Arc<dyn Clock>) -> Self {
         let entries: Vec<Entry> = presets
             .models
             .into_iter()
@@ -733,8 +727,7 @@ impl Models {
             wake: Notify::new(),
             version: watch::channel(0).0,
             events: broadcast::channel(256).0,
-            ram: presets.ram.unwrap_or(default_ram),
-            ram_named: presets.ram.is_some(),
+            ram: presets.ram,
         });
         let manager = tokio::spawn(shared.clone().manage());
         Self(Kind::Presets { shared, manager: Mutex::new(Some(manager)) })

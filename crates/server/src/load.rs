@@ -990,7 +990,7 @@ pub(crate) fn ram_limit_of(
         Some(ram) => (ram, format!("as asked; {follows}")),
         None => match Meminfo::total() {
             Some(total) => (
-                plan::default_ram(Some(total)).max(required),
+                total.max(required),
                 format!("all the machine has; {follows}; --ram sets a lower limit"),
             ),
             None => (
