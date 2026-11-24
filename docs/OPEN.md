@@ -1410,6 +1410,8 @@ the agents' builds):
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- The cleanup comes first (the owner, 2026-11-24): the SSD comparison (item 3, UD-Q4_K_XL and
+  UD-Q5_K_XL against the newest Strata) starts after cleanup phases 1 and 2, not beside them.
 - `--parallel` defaults to 4 (the owner, 2026-11-24; was 2). At the owner's settings (27B,
   262144 cells, two cards) four cost +80 / +440 MiB on the RTX 4070 / 3060 and gave 133 / 127 /
   125 tokens/s for 3 / 4 / 8 requests at once with every first token within 0.33 s; eight gave
