@@ -60,8 +60,43 @@ const MAX_SAMPLES: f32 = 512.0;
 /// four rows of the tables) and place in its list.
 #[derive(Clone, Debug, Default)]
 struct Odds {
-    named: [[f32; PLACES]; 4],
-    picked: [[f32; PLACES]; 4],
+    tallies: [[Tally; PLACES]; 4],
+}
+
+/// How often something that was named was then picked, over the recent samples: the
+/// counts are halved beyond a most, so that they follow the text and the tiers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Tally {
+    named: f32,
+    picked: f32,
+}
+
+impl Tally {
+    /// One more was named, and `picked` says whether it was picked; beyond `kept`
+    /// samples the counts are halved.
+    pub(super) fn record(&mut self, picked: bool, kept: f32) {
+        self.named += 1.0;
+        self.picked += f32::from(u8::from(picked));
+        if self.named > kept {
+            self.named /= 2.0;
+            self.picked /= 2.0;
+        }
+    }
+
+    /// The counts, (named, picked), the newer weighing more.
+    pub(super) fn counts(&self) -> (f32, f32) {
+        (self.named, self.picked)
+    }
+
+    /// Whether at least `samples` were counted.
+    pub(super) fn counted(&self, samples: f32) -> bool {
+        self.named >= samples
+    }
+
+    /// Whether at least half of what was named was picked.
+    pub(super) fn half_picked(&self) -> bool {
+        2.0 * self.picked >= self.named
+    }
 }
 
 impl Odds {
@@ -74,17 +109,12 @@ impl Odds {
 
     /// Whether a read ahead at this place is used at least as often as not.
     fn worth(&self, (d, p): (usize, usize)) -> bool {
-        let named = self.named[d][p];
-        named >= MIN_SAMPLES && 2.0 * self.picked[d][p] >= named
+        let tally = self.tallies[d][p];
+        tally.counted(MIN_SAMPLES) && tally.half_picked()
     }
 
     fn record(&mut self, (d, p): (usize, usize), picked: bool) {
-        self.named[d][p] += 1.0;
-        self.picked[d][p] += f32::from(u8::from(picked));
-        if self.named[d][p] > MAX_SAMPLES {
-            self.named[d][p] /= 2.0;
-            self.picked[d][p] /= 2.0;
-        }
+        self.tallies[d][p].record(picked, MAX_SAMPLES);
     }
 }
 
@@ -118,9 +148,8 @@ pub(super) struct Ahead {
     expert_bytes: u64,
     /// Bytes of the demand reads started in the running step.
     pub(super) demand_bytes: u64,
-    /// Whether a prediction arrived in the running step, and when the step began.
+    /// Whether a prediction arrived in the running step.
     predicted: bool,
-    began: Option<Instant>,
     /// Means over the steps that predicted: the milliseconds of a step and the bytes its
     /// demand reads took.
     step_ms: Option<f64>,
@@ -145,7 +174,6 @@ impl Ahead {
             expert_bytes,
             demand_bytes: 0,
             predicted: false,
-            began: None,
             step_ms: None,
             demand_mean: 0.0,
             picked: HashMap::new(),
@@ -177,7 +205,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// in the prediction's list (the last place counts every later one).
     pub fn ahead_odds(&self) -> [[(f32, f32); PLACES]; 4] {
         let odds = &self.ahead.odds;
-        std::array::from_fn(|d| std::array::from_fn(|p| (odds.named[d][p], odds.picked[d][p])))
+        std::array::from_fn(|d| std::array::from_fn(|p| odds.tallies[d][p].counts()))
     }
 
     /// A prediction made `distance` layers ahead (1 or 2) in a step of `rows` rows says that
@@ -313,13 +341,12 @@ impl<D: SlotDevice> ExpertStore<D> {
         ahead.bytes = 0;
         ahead.demand_bytes = 0;
         ahead.predicted = false;
-        ahead.began = Some(Instant::now());
     }
 
-    /// The step has ended: what was predicted for layers it never routed is done with (a
-    /// read on its way comes back as an unused guess), and the bounds of the next step
-    /// follow what this one took.
-    pub(super) fn ahead_end_step(&mut self) {
+    /// The step has ended after `step_ms`: what was predicted for layers it never routed is
+    /// done with (a read on its way comes back as an unused guess), and the bounds of the
+    /// next step follow what this one took.
+    pub(super) fn ahead_end_step(&mut self, step_ms: Option<f64>) {
         for (_, (state, _)) in std::mem::take(&mut self.ahead.named) {
             match state {
                 State::Held => {}
@@ -327,10 +354,9 @@ impl<D: SlotDevice> ExpertStore<D> {
                 State::Reading(_) | State::Arrived => self.stats.ahead_wasted += 1,
             }
         }
-        let (Some(began), true) = (self.ahead.began.take(), self.ahead.predicted) else {
+        let (Some(ms), true) = (step_ms, self.ahead.predicted) else {
             return;
         };
-        let ms = began.elapsed().as_secs_f64() * 1e3;
         let ahead = &mut self.ahead;
         let demand = ahead.demand_bytes as f64;
         match ahead.step_ms {

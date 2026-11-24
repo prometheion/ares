@@ -50,6 +50,8 @@ use std::time::Instant;
 use ares_io::Class;
 use ares_weights::{Start, Swap, SwapRule, Want};
 
+use super::ahead::Tally;
+use super::hybrid::pow2_class;
 use super::{ExpertStore, Phase, SlotDevice, Source, StoreError, ram_source, read_of};
 
 /// The transit and staging slots of a store: what [`super::StorePlan`] works
@@ -137,7 +139,7 @@ const GUESS_KEPT: f32 = 512.0;
 fn guess_class(rows: Option<u32>) -> usize {
     match rows {
         None => 0,
-        Some(rows) => 1 + (rows.max(1).next_power_of_two().trailing_zeros() as usize).min(7),
+        Some(rows) => 1 + pow2_class(rows as usize, 8),
     }
 }
 
@@ -148,23 +150,17 @@ fn guess_class(rows: Option<u32>) -> usize {
 /// comes back when its guesses are named again.
 #[derive(Clone, Copy, Debug, Default)]
 struct GuessOdds {
-    named: [f32; GUESS_CLASSES],
-    picked: [f32; GUESS_CLASSES],
+    tallies: [Tally; GUESS_CLASSES],
 }
 
 impl GuessOdds {
     fn worth(&self, class: usize) -> bool {
-        let named = self.named[class];
-        named < GUESS_SAMPLES || 2.0 * self.picked[class] >= named
+        let tally = self.tallies[class];
+        !tally.counted(GUESS_SAMPLES) || tally.half_picked()
     }
 
     fn record(&mut self, class: usize, picked: bool) {
-        self.named[class] += 1.0;
-        self.picked[class] += f32::from(u8::from(picked));
-        if self.named[class] > GUESS_KEPT {
-            self.named[class] /= 2.0;
-            self.picked[class] /= 2.0;
-        }
+        self.tallies[class].record(picked, GUESS_KEPT);
     }
 }
 
@@ -406,9 +402,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// counts weighing more: the misses of the step before first, then what a prediction
     /// named for 1, 2, 3 to 4, 5 to 8, 9 to 16, 17 to 32, 33 to 64 and more rows.
     pub fn transit_odds(&self) -> [(f32, f32); 9] {
-        std::array::from_fn(|class| {
-            (self.transit.odds.named[class], self.transit.odds.picked[class])
-        })
+        std::array::from_fn(|class| self.transit.odds.tallies[class].counts())
     }
 
     /// Adds to `out` the experts of `layer` that have arrived in transit since

@@ -539,6 +539,9 @@ pub struct ExpertStore<D: SlotDevice> {
     ram_skip: Vec<Vec<[u32; 3]>>,
     step: u64,
     in_step: bool,
+    /// When the running step began: the one clock of a step, which the CPU
+    /// half and the read-ahead both take its time from.
+    step_began: Option<Instant>,
     /// The tiers are being filled and no step has begun since.
     phase: Vec<Phase>,
     reads: HashMap<u64, ReadOp>,
@@ -939,6 +942,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             ram_skip,
             step: 0,
             in_step: false,
+            step_began: None,
             phase: vec![Phase::Passed; layers.len()],
             reads: HashMap::new(),
             next_read: 0,
@@ -1072,6 +1076,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// enqueued so far (`CudaSlots::fence`).
     pub fn begin_step(&mut self) {
         self.in_step = true;
+        self.step_began = Some(Instant::now());
         self.phase.fill(Phase::Ahead);
         self.windows.set(&[], None);
         self.cpu_begin_step();
@@ -1178,10 +1183,11 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// The running step has ended on the devices. Guesses for it are over,
     /// heat ages, and every layer gets its free slots back.
     pub fn end_step(&mut self) -> Result<(), StoreError> {
-        self.cpu_end_step();
+        let step_ms = self.step_began.take().map(|began| began.elapsed().as_secs_f64() * 1e3);
+        self.cpu_end_step(step_ms);
         self.in_step = false;
         self.phase.fill(Phase::Passed);
-        self.ahead_end_step();
+        self.ahead_end_step(step_ms);
         self.step += 1;
         self.stats.steps += 1;
         // Memory the machine wants back goes before anything new is started,

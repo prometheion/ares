@@ -90,7 +90,13 @@ impl Mean {
 const SIZES: usize = 6;
 
 fn size_class(pairs: usize) -> usize {
-    (pairs.max(1).next_power_of_two().trailing_zeros() as usize).min(SIZES - 1)
+    pow2_class(pairs, SIZES)
+}
+
+/// The class of a count `n` among `classes` classes by its power of two: 1,
+/// 2, 3 to 4, 5 to 8 and so on, the last class for everything beyond.
+pub(super) fn pow2_class(n: usize, classes: usize) -> usize {
+    (n.max(1).next_power_of_two().trailing_zeros() as usize).min(classes - 1)
 }
 
 /// The types of a layer's experts, of gate and up and of down: what a CPU job of the layer
@@ -338,10 +344,6 @@ pub(super) struct Hybrid {
     /// many it has not finished.
     last_upload: Vec<Instant>,
     pub(super) queued_uploads: Vec<usize>,
-    /// When the running step began, the seconds a step takes, and per device
-    /// the uploads a step waited for (those of the running step, and their
-    /// mean): what the link has time for beside them is the promotions'.
-    step_began: Option<Instant>,
     step_time: Mean,
     step_uploads: Vec<u32>,
     demand_uploads: Vec<Mean>,
@@ -386,7 +388,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             in_flight: vec![0; self.devices.len()],
             last_upload: vec![Instant::now(); self.devices.len()],
             queued_uploads: vec![0; self.devices.len()],
-            step_began: None,
             step_time: Mean::default(),
             step_uploads: vec![0; self.devices.len()],
             demand_uploads: vec![Mean::default(); self.devices.len()],
@@ -960,18 +961,17 @@ impl<D: SlotDevice> ExpertStore<D> {
     pub(super) fn cpu_begin_step(&mut self) {
         if let Some(hybrid) = self.hybrid.as_mut() {
             hybrid.claimed.clear();
-            hybrid.step_began = Some(Instant::now());
             hybrid.step_uploads.fill(0);
         }
     }
 
-    /// The running step has ended: its time and the uploads it waited for go
-    /// into the means the room for promotions is taken from.
-    pub(super) fn cpu_end_step(&mut self) {
+    /// The running step has ended after `step_ms`: its time and the uploads
+    /// it waited for go into the means the room for promotions is taken from.
+    pub(super) fn cpu_end_step(&mut self, step_ms: Option<f64>) {
         if let Some(hybrid) = self.hybrid.as_mut()
-            && let Some(began) = hybrid.step_began.take()
+            && let Some(ms) = step_ms
         {
-            hybrid.step_time.add(began.elapsed().as_secs_f64());
+            hybrid.step_time.add(ms / 1e3);
             for (mean, uploads) in hybrid.demand_uploads.iter_mut().zip(&hybrid.step_uploads) {
                 mean.add(f64::from(*uploads));
             }
