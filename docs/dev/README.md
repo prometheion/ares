@@ -149,7 +149,7 @@ renaming a paragraph.
 ## Where the former ARCHITECTURE.md went
 
 On 2026-11-24 the former `docs/ARCHITECTURE.md` was split into `architecture/` and
-`experiments/`, its text moved verbatim (commit aeb133de). A branch that still edits
+`experiments/`, its text moved verbatim (commit 128c474a). A branch that still edits
 the old file moves its text into the file below.
 
 | Section of the old file | Now in |
@@ -183,13 +183,13 @@ the old file moves its text into the file below.
 | Server | [`architecture/server.md`](architecture/server.md); from "The defaults of a model's requests" to "The Responses API" in [`architecture/api.md`](architecture/api.md) |
 | Open questions | [`architecture/overview.md`](architecture/overview.md) |
 
-By lines of the old file (at main b9dd2e1b); a heading in brackets is the one a
+By lines of the old file (at main 528d14d3); a heading in brackets is the one a
 measurement log got in its new place:
 
 <details>
 <summary>Every range of lines</summary>
 
-| Lines at main b9dd2e1b | Now in |
+| Lines at main 528d14d3 | Now in |
 | --- | --- |
 | 1-574 | `architecture/overview.md` |
 | 575-1019 | `architecture/sequence-state.md` |

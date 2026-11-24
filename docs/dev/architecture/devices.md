@@ -216,7 +216,7 @@ decision of the placement.
 
 Measured on 2026-11-12 with `qwen35_run` on an RTX 4070 and an RTX 3060, a
 context of 32 768 tokens, K and V in `q5`, against the commit before
-(92aedff, the table on the first device). The columns are the VRAM the
+(b245771, the table on the first device). The columns are the VRAM the
 process took on each card, in MiB, the page-locked RAM the model books and
 what the kernel counted more for the process (`RssShmem`, where it counts
 what the driver locks; `VmLck` and `VmPin` stay at zero):

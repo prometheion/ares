@@ -70,7 +70,7 @@ while memory is short, kept again afterwards).
 The rule that page-locked memory changes only while no device runs a job
 (`fix/far-free`; "When page-locked memory changes" in
 [`../architecture/host-memory.md`](../architecture/host-memory.md)), against main
-9b6d7df0 on the RTX 4070 and RTX 3060, alternating main, the branch, main, the
+be0023db on the RTX 4070 and RTX 3060, alternating main, the branch, main, the
 branch; the load average was 4 to 18 from other work on the machine.
 
 *The deadlock gone.* The requests of `real_cache`'s Flash-Next resume test alone

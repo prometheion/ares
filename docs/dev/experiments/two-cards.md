@@ -25,7 +25,7 @@ numbers are older measurements of the same setup.
 ## The tensor split's step scratch and draft link, measured (2026-11-12)
 
 The same day, same cards, the speed of three trees: the commit before
-(92aedff), the change as it was first merged (6c27759) and the tree with the
+(b245771), the change as it was first merged (e19be3b) and the tree with the
 step scratch put right (below), run in turn two to six times each while
 other builds ran on the machine (load 3 to 25). Staging a prompt step of 512
 rows was timed by itself: 0.12 ms to 0.31 ms for the host to copy the rows

@@ -401,7 +401,7 @@ Everything `user/features.md` lists for the 27B and not for Flash-Next is owed:
   They differ slightly when the CPU computes missed experts, and that is accepted.
 
 ## Qwen3.8 27B (`qwen35`)
-- [ ] Seen 2026-11-17 (main 4bec4b9 as well): with `max_tokens` 40 the first greedy reply to
+- [ ] Seen 2026-11-17 (main 6bcc626 as well): with `max_tokens` 40 the first greedy reply to
       real_drafts.rs' German question after a start (IQ2_XXS, one card, fast kernels) and the same
       request again, its prefix from the cache, are different tokens (hashes 4d9a1bef2efe92d9
       and c1f7796b6753a9e5), with drafts and without; at 160 tokens all agree. Not looked into.
@@ -684,8 +684,8 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
         loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
         -2.20..-2.25 in most runs and 58 -2.14, 22 -2.10 in the others, the same values every time
-        (the token after it follows: 39 at -1.89 or -1.74): two states, not a spread. Main 852cc02
-        8 of 12 runs (7 answered 22), main ae836d2 One 6 of 8 and by layers 1 of 8, this branch
+        (the token after it follows: 39 at -1.89 or -1.74): two states, not a spread. Main 2340ca0
+        8 of 12 runs (7 answered 22), main acb2587 One 6 of 8 and by layers 1 of 8, this branch
         alike with and without far pages; with every miss uploaded (`Serve::Stream`) 0 of 16, in wide steps of the
         own scratch (about 32 experts on the CPU a step, against 370 on a loan) 0 of 24, with every
         miss the CPU can take on it (`Serve::Cpu`) 5 of 16. The rows' int8 input of the CPU against
@@ -811,7 +811,7 @@ them), cached turns, one request alone. What it does worse, and why:
       2026-11-23).
 - [ ] Two prompts at once are read one after the other (shortest first, the order that gives the
       lower mean wait); the second then takes turns with the first's generation, now at the
-      floor and not at half. The agents' turn with a 5.8k tool result sent at once (main ae836d2, two
+      floor and not at half. The agents' turn with a 5.8k tool result sent at once (main acb2587, two
       rounds, cold and warm): the second agent's first token 17.0 / 17.4 / 17.0 / 19.2 s before, 16.6
       / 14.7 / 18.5 / 14.9 s now (fork 9-17); the first agent's turn ends 3 to 5 s later (its 200 tokens
       now at the floor), so the two turns' ends together are even to worse: for replies this short
@@ -834,7 +834,7 @@ them), cached turns, one request alone. What it does worse, and why:
       times), the generation keeps 20.6 of 28.1 tokens/s, its longest gap 3.0 s: alone the prompt
       runs in 9 wide steps on lent VRAM, beside it in pieces in the model's own memory that each
       read the experts again (5.3 million expert picks against 51 thousand, 240 s of expert waits
-      against 32). The layer-major passes now on main (574d741) read that prompt alone in 17.7 s
+      against 32). The layer-major passes now on main (3b8d526) read that prompt alone in 17.7 s
       against 26.6 (same machine state) but not beside a generating request (523 s against 496 s,
       machine load 20 to 55 from builds; Flash-Next's decode fell to 9 to 15 tokens/s under it):
       the pieces next to generation are still narrow and read the experts again.
@@ -861,7 +861,7 @@ them), cached turns, one request alone. What it does worse, and why:
 The first push to GitHub comes after the whole cleanup (phase 1 and phase 2) and the restructured
 docs (the owner, 2026-11-23); then the unpushed history is scrubbed of the test machine's address
 and home paths (2 and 6 commits) and pushed without force.
-Audit of main e6d7676 by area, reports and the plan in `/var/tmp/ares-audit/` (`PLAN.md`). The core
+Audit of main ae3a334 by area, reports and the plan in `/var/tmp/ares-audit/` (`PLAN.md`). The core
 designs are sound (the shared blocks, one reader and core for all routes, one record writer and
 reader, an independent host oracle); the debt is where the code grew: copied bookkeeping beside
 each new path, replaced designs left behind for a bench or a test, hand-kept lists, test helpers
@@ -923,16 +923,16 @@ The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history
       with K and V in `q7` to `q4`, can take more (the 27B's failure of 2026-11-23). To size it
       with `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs.
 - [ ] `qwen4exp_device` with both cards on every layer (`ARES_TEST_SPREAD=tensor`, the share 0.5
-      and experts only alike), 2026-11-23 on main e33779a: `every_layer_of_wide_steps_matches_the_reference`
+      and experts only alike), 2026-11-23 on main a36d379: `every_layer_of_wide_steps_matches_the_reference`
       (attention core 5.16e-2 against a bound of 3e-2 for the shipped types) and
       `experts_of_every_weight_type_on_the_cpu_change_nothing_4` (f32 and q2_K: 4 of 480 misses
-      not computed on the CPU) fail; they passed on the evening's main (c5d27e9).
+      not computed on the CPU) fail; they passed on the evening's main (753dcb1).
 - [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
       qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 - [ ] `qwen4exp_device` with several tests at once on the same cards (2026-11-23, both local
-      cards, `cuda/tested-archs` and its base e6d7676 alike): with four test threads
+      cards, `cuda/tested-archs` and its base ae3a334 alike): with four test threads
       `every_layer_matches_the_reference`, `every_layer_of_wide_steps_matches_the_reference` and
       `a_long_step_that_misses_experts_ends` fail and the tests with experts on the CPU or
       uploaded run past 15 minutes; one at a time each passes in seconds, and the whole suite
@@ -948,11 +948,15 @@ The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history
   paths, the fork comparisons from `/var/tmp/ares-survey/src/`); llama-swap's configuration is
   cleaned up and the program updated (restarts and installs are the owner's, with sudo).
   The history scrub, measured 2026-11-24: of 900 unpushed commits (GitHub has one), 3 to 7 hold
-  the test machine's address, `/home/<user>` or `chat.example.org` in a diff, none in a message, none in
+  the test machine's address, `/home/<user>` or a host name of the owner's network in a diff, none
+  in a message, none in
   today's tree. Plan: rewrite origin/main..main with `git filter-branch` (nothing to install),
   replacing those with "the test machine", `~` and `chat.example.org`; nearly every hash
   changes, so a script then maps the commit hashes cited in today's docs and comments to the
   new ones in one commit; push without force, on the owner's word.
+  Done 2026-11-25: the 911 unpushed commits rewritten (none of them holds those any more; today's
+  tree unchanged but for this paragraph; messages, authors and dates the same; a bundle of the
+  history before is kept locally), and the 40 commit hashes cited in the docs mapped.
 - Take code, not ideas (the owner, 2026-11-24): where an open engine has what Ares needs, its
   code is taken and adapted instead of rebuilt from its docs. Allowed: MIT, BSD, Apache-2.0
   (Ares is Apache-2.0); not GPL, AGPL or code with no license. Kernels come over nearly as they

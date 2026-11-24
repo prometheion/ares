@@ -229,7 +229,7 @@ the CPU). The mixers took 2.5 ms a step on the RTX 4070 and 4.7 ms on the RTX 30
 ## The usage profile, measured (2026-11-16)
 
 *Measured* (2026-11-16, RTX 4070 and RTX 3060, `--ram 8G`, `--chat-var
-enable_thinking=false`; the server of before, bc26683, and the one with the profile started
+enable_thinking=false`; the server of before, a2c3834, and the one with the profile started
 one after the other; three questions of 35 to 44 tokens, German, English and code, 128 tokens
 each, greedy, sent as soon as the server answered, then the same three again. "Profile of the
 warm-up" is the one a start without a profile writes right after its warm-up, so both start
@@ -289,7 +289,7 @@ the higher load in the first pairs):
 
 *Measured* (2026-11-22, the test machine: RTX 4060 Ti 16 GB on a PCIe 4.0 x4 link, Core Ultra 5
 235HX, 62 GiB RAM; UD-Q3_K_XL, `--context 40960`, the bench of the Strata comparison: German,
-English and code, 300 tokens greedy, each asked twice; the build of before, 641a8c7, and this
+English and code, 300 tokens greedy, each asked twice; the build of before, 40f67b0, and this
 one alternating, two rounds each, every session from a fresh cache directory without a usage
 profile, so both fill the tiers from the warm-up; load average 4 to 12 at the starts, from the
 engine before). Tokens per second by the client, rounds 1/2; the expert columns are means over

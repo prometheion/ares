@@ -46,7 +46,7 @@ pair at loads of 17 to 45 gave 64.6, 53.2, 62.7, 103.3, 64.5, 69.2, 73.1
 before and 67.5, 65.7, 58.0, 96.3, 69.1, 67.0, 74.2 with.
 
 Measured 2026-11-16 with the chain in a step of its own (and the round cut
-by the drafter's probabilities), against `main` before it (`bc26683`), the
+by the drafter's probabilities), against `main` before it (`a2c3834`), the
 same tool and settings, three pairs back to back at loads of 1 to 14; tokens
 per second for the same seven requests:
 

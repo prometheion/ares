@@ -52,7 +52,7 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
         waits for the devices' queued work, so neither moves. Proof on the two local cards: the
         test's requests alone (`repro.py`) 10 of 10 with the same answers, `real_cache` 5 of 5
         (4 of 4 each), the merge check's bench flow (an 80k prompt beyond VRAM at `--ram 8G`,
-        then a short request) 5 of 5 without a hang on this branch and 5 of 5 on main 9b6d7df0
+        then a short request) 5 of 5 without a hang on this branch and 5 of 5 on main be0023db
         (no hang on main either); every GPU suite of the server (`real_cache` among them,
         and `real_elastic` once more with a helper that takes 4 GiB: the tier gave memory back
         while generating), `qwen4exp_runtime` (the known near tie of
@@ -77,7 +77,7 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
         as often as with K and V beyond the first page, and on main without this branch: see "Lent
         steps with the CPU's share" below. The far test's lent case now uploads every miss and
         asserts that the far pages change no token (`k_and_v_beyond_vram_change_no_token`, 5 of 5
-        runs in all three placements; the old case failed in 3 of 4 runs of the branch on ae836d2).
+        runs in all three placements; the old case failed in 3 of 4 runs of the branch on acb2587).
   - [x] **A request after a long far request stalls or hangs** (merge check 2026-11-23,
         `integrate2`; `kvfix` 2026-11-24, two local cards, IQ2_XS, `--ram 8G`, the model's own
         context, the bench's flow: a short request, a prompt of 80 507 tokens, an unrelated short
@@ -90,15 +90,15 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
         time; at the merge check's load it was half a minute without an answer to `/metrics`). Far
         pages now go into RAM when it has room and are dropped otherwise (`cache.rs`,
         `far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive`). The hang
-        did not come back in 10 runs of the flow (on 852cc02 under gdb: this branch, an instrumented
+        did not come back in 10 runs of the flow (on 2340ca0 under gdb: this branch, an instrumented
         build and the merge check's very binary; without gdb: before and after the fix; rebased on
-        main e86dcc8f: five with the fix; loads 3 to 56): its cause is not found, and the engine's
+        main 93d11310: five with the fix; loads 3 to 56): its cause is not found, and the engine's
         step watchdog (600 s) stays the guard. Seen on the way, neither of them the far pages': the
         decode right after the long prompt is slow when the machine is busy (3.0 to 15.9 tokens/s
         with the load; the pass's loan gives its slots back empty and the CPU computes the misses
-        beside other programs; main e86dcc8f 7.5 after its own 80k prompt, this branch 7.5 and 7.8
+        beside other programs; main 93d11310 7.5 after its own 80k prompt, this branch 7.5 and 7.8
         at like loads); and "a step stood still for 30s while rows of the n-gram table were read"
-        (one of the five runs with the fix, at load 27 to 34), which main e86dcc8f gives as well
+        (one of the five runs with the fix, at load 27 to 34), which main 93d11310 gives as well
         (its 80k prompt at load 9 to 23; its warm-up at load 56 stood still on a pass's experts):
         the 30-s checks count from the start of a wait, not from the last progress. Main against
         this branch on the same cards: 10 752 VRAM slots (43.8 %) against 13 056 (53.1 %), the 80k
@@ -125,7 +125,7 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
       `mask_allows`; the runtime's defaults from the sampler's constants; `Breakers::of_tokens`
       the tests' own, `keeps_history` gone, `opens` a test helper. Typed tools, one JSON
       value type and the mirostat range stay open in `OPEN.md`.
-- [x] Found on the way (main d15f5d90 as well): `ares-tokenizer --test model`
+- [x] Found on the way (main c1927ac8 as well): `ares-tokenizer --test model`
       `renders_the_prompts_of_llama_cpp` fails with `ARES_TEST_QWEN35_0_8B` set (request 26,
       a message of two text parts, renders nothing here where llama.cpp renders them joined);
       `real_flash_next` `flash_next_answers_in_both_placements` asks for `--split tensor` on a
@@ -157,7 +157,7 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
       executor's places on `PlaceChunks` (its oracle plays the strictest device, which the
       chunks are not); the record's windows and the text half of `impl Model` in both models
       (the model's phase 2); the cache's transfer counter kept twice (a metric's name).
-      Checked on the two local cards (2026-11-24, on main 45d2e4d6): every GPU suite of the
+      Checked on the two local cards (2026-11-24, on main 8493ed1e): every GPU suite of the
       runtime, `qwen35_device_runtime`, `qwen4exp_device`, `qwen4exp_prefix`, `real_devices`,
       `real_cache` and `real` pass; `qwen4exp_runtime` 30 of 30 but once
       `a_request_cuts_in_between_the_pieces_of_a_long_prompt` (the split by layers: the long
@@ -203,7 +203,7 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
       (`enqueue_pass`, Flash-Next's `Part::assemble`, `Config::from_gguf`, `Drafter::pass_layers`;
       `Frame::widest` and the 27B's `open_balanced` went down to 277 and 222 lines in stages) and
       the names of the audit's finding 13. Verified on the two local cards (2026-11-24, rebased on
-      45d2e4d6): every GPU suite of both models and the server's `real`, `real_cache`,
+      8493ed1e): every GPU suite of both models and the server's `real`, `real_cache`,
       `real_devices` as on main (the known near-bound and tensor-split failures only); alternating
       A/B against main: Flash-Next and the 27B decode, an 8k prompt and two at once as fast, the
       same plan and the same role kept at load. The shared arena uploads from the file's mapping
@@ -255,7 +255,7 @@ Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every e
 
 ### From "Qwen3.8 Flash-Next (`qwen4exp`) / Found against Strata on the test machine (2026-11-22; RTX 4060 Ti 16 GB, 62 GiB RAM, UD-Q3_K_XL)"
 
-- [x] The agent suite on the test machine (main e6d7676, 2026-11-23, UD-Q3_K_XL at 40G on the 4060
+- [x] The agent suite on the test machine (main ae3a334, 2026-11-23, UD-Q3_K_XL at 40G on the 4060
       Ti): the second turn failed every time in its first step ("the rows of slot 0 start at cell
       650 and its sequence is at cell 512") and the model was taken down. The first turn's end
       state was saved with the next record into the one place; the second turn restored it in
@@ -321,11 +321,11 @@ Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every e
       pieces of 256 rows, one group of the tensor split, which runs without the overlap of a second
       (2026-11-23, `sched/parallel`). Now generation keeps a floor rate (`--generation-floor`, 20
       tokens/s by default, measured from its rounds, at most half of the time) and a piece of the
-      27B under a split is two groups (512 rows). Measured (old main fa0c0db, alternating, load 2 to
+      27B under a split is two groups (512 rows). Measured (old main b8bb506, alternating, load 2 to
       33): 8k beside a generating request 21.0-21.5 s before, 10.6-12.9 s now (fork 15.2-15.5);
       32k 124.7-127.5 s before, 70.9-73.3 s with pieces of up to a second (82-100 s with half a
       second); the generation keeps 17-20 tokens/s (fork 21-26), its longest gap 0.5-1.0 s (fork
-      0.5-0.6 at 32k). On main ae836d2 with the new prompt attention
+      0.5-0.6 at 32k). On main acb2587 with the new prompt attention
       (two rounds, load 10 to 42): 8k 18.6-18.8 s before, 9.5-15.2 s now (fork 15.2-15.5), 32k
       84.1-87.2 s before, 57.3-59.9 s now (fork 59.8-59.9), the generation 30-31 tokens/s before and 18-20 now, its longest gap 0.31-0.40
       s before and 0.51-0.62 now (fork 0.51-0.66). Priorities stay: a short request of priority 0
@@ -337,7 +337,7 @@ Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every e
       each (pair sums 110.6 / 111.7 / 124.6 against 108.5 / 108.3 / 127.9; many 3 106.0 against 106.2;
       many 4 97.7 against 115.1, whose queued requests' texts differ run to run and copy by n-grams
       differently).
-- [ ] `--parallel` (the owner's call; measured with this branch on main ae836d2, 262144 cells): at 4,
+- [ ] `--parallel` (the owner's call; measured with this branch on main acb2587, 262144 cells): at 4,
       3 / 4 / 8 at once 133 / 127 / 125 tokens/s at load 37 to 45 (the parallel comparison at 4: 117-120
       / 139-149 / 143-150), every first token of 4 within 0.33 s, a 32k prompt beside generation
       56.7 s; VRAM 11 523 / 10 523 MiB (+80 / +440 over 2). At 8: 136 / 150 / 210 tokens/s, every first
@@ -393,7 +393,7 @@ Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every e
 
 ### From "Owed on two cards (the owner's cards are production; run when the owner frees them)"
 
-Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
+Run on 2026-11-22 evening (main 753dcb1, RTX 4070 + RTX 3060, peer access, load about 30 from
 the agents' builds):
 - [x] The two-device suites: `real_cache` 4 of 4, `real_devices`, `qwen35_device_runtime` (the
       attention-split placements) 4 of 4, `qwen4exp_device` with `ARES_TEST_SPREAD=tensor` 23 of
@@ -528,7 +528,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
       layer's given-up number for a slot's owner: the owner kept the slot inside the loan (its
       expert read lent memory) and a later loan stopped the engine ("as many slots were given
       as are lent", the base build on the local cards, the third loan of a session). Fixed
-      (e33779a on main; `flash/prompt`'s d6acafe is the same fix): a moved slot leaves no
+      (a36d379 on main; `flash/prompt`'s d6acafe is the same fix): a moved slot leaves no
       number behind.
 - [x] The default context on that card is 23,552 tokens ("a thirty-second of the expert room"):
       too small for a 32k prompt. Since 2026-11-22 (`kv/overflow`) it is the model's 262 144, the

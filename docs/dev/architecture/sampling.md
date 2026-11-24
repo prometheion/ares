@@ -178,7 +178,7 @@ runs both backends on the same card with the same rows and the same method;
 Corrections are 64 entries a row, a mask allows a third of the tokens,
 probabilities are the five best. Measured on 2026-11-12, each backend alone on
 one card: three runs of the benchmark with CUDA's kernels as they were
-(commit 6c27759) and three with the kernels described below, in pairs back to
+(commit e19be3b) and three with the kernels described below, in pairs back to
 back, while other work compiled and other processes used the cards between
 the runs (load average 4 to 10). A figure is the median of its runs (six
 for Vulkan, whose sampler is the same in all); the run furthest from it was

@@ -4,7 +4,7 @@ Dated measurement logs, moved here verbatim on 2026-11-24 from the architecture 
 
 ## Wide steps, measured (2026-11-12)
 
-**Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`0a43601`,
+**Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`a7cde70`,
 steps of eight rows) and the one with wide steps started one after the other, both with the
 n-gram drafts the server made before the draft policy, greedy, 128 tokens, prompts of about 1000 tokens (German, Rust) and 4700 (the long one: prose,
 code and German), rounds one to three of the same prompts, the numbers of round three; load
@@ -46,7 +46,7 @@ of 512 rows read at 112 and 145 tokens per second warm and 67 and 63 cold, in sl
 ## Float matrices of a wide step, measured (2026-11-12)
 
 **Float matrices of a wide step, measured** (2026-11-12, RTX 4070 and RTX 3060; the engine
-of before (`b8b0271`, the float matrices in launches of eight rows) and the one with the
+of before (`c4e0662`, the float matrices in launches of eight rows) and the one with the
 float tile kernels started one after the other, two or three times; the tool, `qwen4exp_run --prefill 1000
 --rows 512 --repeat 4 --breakdown` on the first 1000 tokens of this document, of which the
 first reading fills the tiers and is left out; load average 3 to 22 from other work):
@@ -98,7 +98,7 @@ rows they are changes from run to run with the misses the CPU serves, as before.
 
 ## Transit, measured (2026-11-12)
 
-**Transit, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`b8b0271`:
+**Transit, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`c4e0662`:
 every miss of a wide step takes a slot of its layer) and the one with transit started one
 after the other, `--chat-var enable_thinking=false`, otherwise the defaults (steps of 512
 rows, no drafts), greedy, 128 tokens; per round a short German question, German prose of
