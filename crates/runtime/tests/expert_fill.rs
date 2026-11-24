@@ -3,122 +3,20 @@
 //! run only when the test says so, as in `tests/expert_store.rs`.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use ares_core::GgmlType;
-use ares_gguf::{Gguf, GgufBuilder};
-use ares_io::{Config, ExpertMap, Reader};
-use ares_runtime::expert_store::{
-    ExpertStore, FillOrder, FillPace, FillTier, HostRegion, LayerSpec, StoreConfig, StorePlan,
-    TierFill,
-};
-use ares_runtime::testing::HostSlots;
+use ares_io::Config;
+use ares_runtime::expert_store::{FillOrder, FillPace, FillTier, TierFill};
 
-const LAYERS: usize = 3;
-const EXPERTS: u32 = 16;
-const LENS: [usize; 3] = [128, 128, 96];
-const OFFSETS: [u64; 3] = [0, 128, 256];
-const SLOT_BYTES: u64 = 352;
+mod expert_rig;
 
-/// A scratch directory that goes away even when the test fails.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ares-expert-fill-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn byte(layer: usize, part: usize, expert: u32, i: usize) -> u8 {
-    (layer * 131 + part * 71 + expert as usize * 29 + i * 7 + 3) as u8
-}
-
-fn expert_bytes(layer: usize, expert: u32) -> Vec<u8> {
-    let mut slot = vec![0u8; SLOT_BYTES as usize];
-    for part in 0..3 {
-        for i in 0..LENS[part] {
-            slot[OFFSETS[part] as usize + i] = byte(layer, part, expert, i);
-        }
-    }
-    slot
-}
-
-/// A model of `LAYERS` layers of `EXPERTS` experts with F32 matrices, the
-/// layers one after the other in the file.
-fn model(dir: &Scratch) -> Gguf {
-    let mut builder = GgufBuilder::new().str("general.architecture", "test");
-    for layer in 0..LAYERS {
-        for (part, (name, dims)) in [
-            ("ffn_gate_exps", [8u64, 4, u64::from(EXPERTS)]),
-            ("ffn_up_exps", [8, 4, u64::from(EXPERTS)]),
-            ("ffn_down_exps", [4, 6, u64::from(EXPERTS)]),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let data: Vec<u8> = (0..EXPERTS)
-                .flat_map(|e| (0..LENS[part]).map(move |i| byte(layer, part, e, i)))
-                .collect();
-            builder =
-                builder.tensor(&format!("blk.{layer}.{name}.weight"), &dims, GgmlType::F32, data);
-        }
-    }
-    let path = dir.0.join("model.gguf");
-    builder.write(&path).unwrap();
-    Gguf::open(&path).unwrap()
-}
-
-struct Rig {
-    store: ExpertStore<HostSlots>,
-    _dir: Scratch,
-}
+use expert_rig::*;
 
 /// A store with `vram_slots` slots per layer in VRAM (one of them kept free
 /// between steps) and `ram_slots` in RAM, the RAM tier in pieces of
 /// `pieces.0` slots of which `pieces.1` are locked at the start.
 fn rig(vram_slots: u64, ram_slots: u64, pieces: Option<(usize, usize)>) -> Rig {
-    let dir = Scratch::new();
-    let gguf = model(&dir);
-    let map =
-        ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
-    let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
-    let layers =
-        [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES, resident: false };
-            LAYERS];
-    let mut config =
-        StoreConfig::new(1, 2, vec![vram_slots * SLOT_BYTES * LAYERS as u64], u64::MAX / 4);
-    config.vram_reserve = 1;
-    config.rebalance_every = 0;
-    let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
-    let ram_slot = probe.ram_slot_bytes(0) as usize;
-    config.ram_bytes = ram_slots * LAYERS as u64 * ram_slot as u64;
-    if let Some((per_piece, _)) = pieces {
-        config.ram_piece = (per_piece * ram_slot) as u64;
-    }
-    let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
-    assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
-    let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
-    let mut region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
-    if let Some((per_piece, start)) = pieces {
-        region = region.starting_with(start * (per_piece * ram_slot).next_multiple_of(4096));
-    }
-    let store = ExpertStore::new(plan, map, reader, vec![device], region).unwrap();
-    Rig { store, _dir: dir }
+    rig_reading(vram_slots, ram_slots, pieces, Config::default(), |_| {})
 }
 
 impl Rig {
@@ -132,21 +30,6 @@ impl Rig {
         self.store.set_heat(layer, &values);
     }
 
-    /// Lets reads finish and the device run until nothing is on its way.
-    fn settle(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            self.store.poll().unwrap();
-            self.store.device_mut(0).run(usize::MAX);
-            self.store.poll().unwrap();
-            if self.store.is_quiet() {
-                return;
-            }
-            assert!(Instant::now() < deadline, "the store does not settle: {:?}", self.store);
-            std::thread::sleep(Duration::from_micros(200));
-        }
-    }
-
     /// Runs a fill to its end.
     fn fill(&mut self, fill: &mut TierFill, pace: FillPace) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -156,18 +39,6 @@ impl Rig {
             assert!(Instant::now() < deadline, "the fill does not end: {fill:?}");
             std::thread::sleep(Duration::from_micros(100));
         }
-    }
-
-    /// The device has the expert's table entry and its bytes in that slot.
-    fn assert_usable(&self, layer: usize, expert: u32) {
-        let entry = self.store.device(0).entry(layer, expert);
-        assert!(entry >= 0, "layer {layer} expert {expert} has no entry");
-        let (_, pool) = self.store.place(layer);
-        assert_eq!(
-            self.store.device(0).slot(pool, entry as u32),
-            expert_bytes(layer, expert),
-            "layer {layer} expert {expert} in slot {entry}"
-        );
     }
 
     /// What VRAM and RAM hold of `layer`.
@@ -253,7 +124,7 @@ fn the_start_reads_in_the_order_of_the_file_and_the_idle_fill_the_hottest_first(
     while !fill.is_done() {
         let before = rig.everything();
         rig.store.advance_fill(&mut fill, one).unwrap();
-        rig.settle();
+        rig.quiet();
         arrived.extend(rig.everything().difference(&before).copied());
     }
     assert_eq!(arrived, [(0, 3), (0, 6), (0, 12), (0, 1), (0, 9), (1, 15), (2, 4), (2, 8)]);
@@ -298,10 +169,10 @@ fn a_step_stops_the_idle_fill_at_once() {
     assert_eq!(fill.left(), planned, "and nothing else of the fill moves");
     // The step's own miss is read and comes into its slot.
     assert_eq!(rig.store.routed(2, &[13]).unwrap(), 1);
-    rig.settle();
+    rig.quiet();
     rig.assert_usable(2, 13);
     rig.store.end_step().unwrap();
-    rig.settle();
+    rig.quiet();
     let stats = rig.store.take_stats();
     assert_eq!((stats.demand_reads, stats.guess_reads), (1, 2));
     // What was on its way arrived and took its slot in RAM; nothing went up.
@@ -349,7 +220,7 @@ fn a_fill_makes_vram_the_hottest_and_evicts_nothing_worth_something_from_ram() {
     // again, the coldest.
     rig.store.begin_step();
     rig.store.end_step().unwrap();
-    rig.settle();
+    rig.quiet();
     let (vram, ram) = rig.held(0);
     assert_eq!(vram, set(&[1, 10]), "the hottest two");
     assert!(ram.contains(&2) && ram.contains(&11) && ram.contains(&3), "{ram:?}");
