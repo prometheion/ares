@@ -240,11 +240,11 @@ pub const OPTIONS: &[Opt] = &[
         "--allowed-hosts",
         "<LIST>",
         "Names in a request's Host that the server answers to besides its local ones \
-         (localhost, addresses), separated by commas, or * for any. A server on a local \
+         (localhost, addresses), separated by commas, or * for any. A server on a loopback \
          address without keys answers only to its local names, against web pages that \
          rebind a name of theirs to it; with these names the check holds for every address \
-         and with keys too [default: the local names on a local address without keys, else \
-         any]",
+         and with keys too [default: the local names on a loopback address without keys, \
+         else any]",
     ),
     Opt::server(
         "--cors-origins",
@@ -445,7 +445,8 @@ pub const OPTIONS: &[Opt] = &[
         "--queue",
         "<N>",
         "The most requests that may wait for a sequence while --parallel run; one more is \
-         refused with 503 and Retry-After [default: no limit, a request waits until it runs]",
+         refused with 503 and Retry-After, or one waiting of a worse priority in its place \
+         [default: no limit, a request waits until it runs]",
     )
     .heading("The line of requests."),
     Opt::model(
