@@ -149,6 +149,28 @@ Merged 2026-11-24 (verified on the two local cards, every GPU suite they touch):
 
 ## 2026-11-23
 
+### From "Against the owner's production (2026-11-23, the 27B UD-Q4_K_S on the RTX 4070 + RTX 3060)"
+
+- [x] Long prompts against the fork: the prompt attention kernel (from the open item "Long
+      prompts" of that section, which stays in `OPEN.md`).
+      Built (`attn/long-context`): a prompt kernel of 128 vectors (`kernels/attn_prompt.cuh`) with
+      integer scores over quantized K (and the tile mean's dot products from the same int8
+      products), P V summed in f16 per chunk of 32 cells, and phases in which decode and the tensor
+      cores overlap; the planner cuts a prompt's tiles into pieces that fill the kernel's waves and
+      orders them so the blocks running at once share K/V in the L2 cache. One attention layer, a
+      step of 256 rows at the end of 98 304 cells, K and V in `q5` (the fork `q5_1`): RTX 3060 with
+      3 KV heads 79.9 ms before, 21.0 ms now, the fork 13.5 ms; RTX 4070 with 1 head 11.3, 3.0 and
+      2.1 ms. At 32 768 cells 26.6, 7.4 and 4.6 ms on the 3060. Output closer to the reference
+      than before (integer scores).
+      Tried and dropped: a single K tile (2.5 % slower), the decode's lanes on rows (q8
+      3 %), cells shared out over one wave of blocks reading several pieces (15 % slower: no L2
+      sharing), P V with f32 sums (11 % slower), 8 vectors per warp in 16 warps (no faster).
+      End to end at these settings (the bench of `/var/tmp/ares-tools/prod-ab/`, prompt suite, two
+      rounds alternating with main, load 1 to 5): 2k / 32k / 98k 1131 / 1000-1002 / 709-710 tokens/s
+      against main's 1082-1103 / 653-655 / 324 and the fork's 840 / 944 / 752: 32k is reached, 98k is
+      6 % short. The state slots of the longer prompt tiles cost about 10 MB of VRAM on the 4070 and
+      6.5 MB on the 3060 (the 27B three ways: 874 / 1754 / 1938 pages against 890 / 1770 / 1946).
+
 ### From "In work now"
 
 Merged 2026-11-23 (verified on the two local cards): CUDA built and run only on the tested classes (Ampere 8.6 and Ada 8.9; a device of another class is refused and is to run through Vulkan), the Flash-Next agent-turn failure at turn 2 (a checkpoint given up while its restore waits keeps its save of the same record), the public README with the thanks, THIRD-PARTY-NOTICES and the index of the documents.

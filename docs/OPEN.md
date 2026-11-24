@@ -34,6 +34,8 @@ from where it serves one of the reasons. Vulkan parity stays last.
 ## The order of 2026-11-17 (after the gap study; items 1 to 7 done, the rest is a store)
 For "CUDA complete", the order in which the items below are taken up; each item stays in its
 section further down.
+Items 1 to 7 are done (2026-11-22; their texts are in [`dev/history.md`](dev/history.md), what is left of them
+is in the sections below).
 8. Then the rest of CUDA complete: image input pieces 4 to 8, gate and up in two types, the
    roles of the cards, the open defects, the server items.
 Later than their place suggests: the classic draft model (VRAM; better with an aux card),
@@ -44,6 +46,8 @@ tree is accepted than a chain), then built; started when the pieces in work leav
 piece at a time.
 
 ## In work now
+What was merged, and when, is in [`dev/history.md`](dev/history.md).
+
 
 | Piece | State |
 | --- | --- |
@@ -59,6 +63,9 @@ between cards stay with the model. Steps 0 to 8 made the K/V group, the recurren
 slot arena with its checkpoints, the token rows, the head view and the MTP driver shared
 (`crates/model/src/blocks`; the rule is in `dev/architecture/overview.md`, "The shared model layer"). Design
 study: `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on its own.
+- [ ] Left of step 5, the token rows (steps 0 to 8 are done, see [`dev/history.md`](dev/history.md)): no image
+      tower uses the second row source yet; DFlash's newest token and mask rows are still
+      decoded on the host for every pass (both models).
 - What trees (9, 10) find from 8: the lattice of every pass is kept (`Drafter::lattice`: 16
   candidates and a 16 x 16 score table per position, tokens already mapped through the head
   view); the walk is one function of it (`Lattice::chain`, kernel `ares_dflash_select`), which a
@@ -78,6 +85,8 @@ study: `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on it
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Found against Strata on the test machine (2026-11-22; RTX 4060 Ti 16 GB, 62 GiB RAM, UD-Q3_K_XL)
+Strata's versions and the runs: [`dev/experiments/against-strata.md`](dev/experiments/against-strata.md); what was found
+and fixed: [`dev/history.md`](dev/history.md).
 - [ ] Ares is behind: decode with drafts 40-55 % of Strata's (15.9-31.0 against 40.0-43.0
       tokens/s), without 43-51 %; prompts 4 to 10 times slower (Strata 398 / 829 / 1257 tokens/s
       at 2k / 8k / 32k, Ares 94-121); the first token of a short repeated prompt 3 to 15 times
@@ -152,6 +161,8 @@ study: `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on it
       five is at its edge. Why the policy keeps asking a block that is never right is open.
 
 ### Speculation that pays (output unchanged)
+The MTP block of Flash-Next, measured: [`dev/experiments/speculation.md`](dev/experiments/speculation.md); the levers built for it:
+[`dev/history.md`](dev/history.md) (2026-11-16 and 2026-11-17).
 - [ ] Experts read ahead from the drafts (the owner's idea, 2026-11-18; no engine has it:
       TensorFold's drafts and routing do not interact, Strata and TokenWing predict within one
       token only). The drafts name the next tokens a round before they are verified; reading
@@ -179,6 +190,8 @@ study: `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on it
       tests measure them).
 
 ### Experts from the SSD
+Found in the run of UD-Q4_K_XL from the SSD against Strata (2026-11-22,
+[`dev/experiments/against-strata.md`](dev/experiments/against-strata.md)):
 - [ ] **Prompts are bound by the link.** A wide step uploads every expert it picks that VRAM
       does not hold (the loan leaves 20-40 a layer), from RAM or staging, once per step: the
       32k prompt uploaded 428 GB in 96 s (4.46 GB/s, ~0.7 ms an expert; ~363 a layer = the
@@ -271,6 +284,14 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       Ling): the part that routes has it only when it computes the shared expert itself
       (not with `--shared worker`), and the routed experts add into the same buffer, so it
       needs a copy on the step's stream. Not built; the prediction reads the router's input.
+- [ ] Left of the large prompt steps on lent VRAM (2026-11-22; the item is in [`dev/history.md`](dev/history.md)):
+      the parcels of a split by layers sized for the widest step (80 KiB a row of VRAM on the
+      receiving card and as much page-locked RAM, for good), the step's inputs in page-locked
+      RAM sized for it (about 20 KiB a row a part), a loan that stays while the engine is idle
+      after a request that ended with its prompt, both cards on every layer not measured (the
+      machine had no driver with peer access).
+- [ ] Long prompts layer by layer (built 2026-11-23, see [`dev/history.md`](dev/history.md)): not measured yet on the
+      test machine against Strata (2k/8k/32k, UD-Q3_K_XL and UD-Q4_K_XL).
 - [ ] Passes, what is left: with both devices on every layer the MTP block's chains after a
       pass agree with the reference's for 1 to 3 links where after steps of the own rows 5 to 7
       (the trunk's tokens are the reference's): not found. Uploads of the next layer's
@@ -360,6 +381,20 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
 
 ### Parity with the 27B (the owner's rule: what one model can, the other must)
 Everything `user/features.md` lists for the 27B and not for Flash-Next is owed:
+- [ ] Left of K and V in `q7` to `q4` (done 2026-11-16): the share of drafts accepted with the
+      MTP block's `q4` K and V was not measured on this model.
+- [ ] Left of the prefix cache with its RAM and SSD levels (done 2026-11-16): the MTP block's
+      last cell of a page waits for the next token (the block is one token behind), so a page
+      that is cached at a sequence's end has it unwritten and a sequence that resumes there
+      writes it into the shared page while its tile is exact; only drafts can differ. The one
+      place holds the newest checkpoint, the end of a turn; a template that writes the reply
+      into the next prompt otherwise than it was generated (the 0.8B's) parts before that end,
+      and the next turn replays every cached row. With one place the cache could keep the last
+      checkpoint at a page boundary instead of a tail (Flash-Next's template continues exactly:
+      1416 of 1436 tokens cached, nothing replayed, at `--ram 8G` without `--cache`). On the
+      made-up Flash-Next under a limit the tier takes whole the place kept its first checkpoint
+      over three turns (1 saved, 2 restored, 242 of 498 found rows replayed): a later
+      checkpoint did not take the place over there; not looked into.
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.
 
@@ -450,6 +485,20 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       (the server's plan counts it).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
+- [ ] Left of the checkpoints at the end of the system prompt and the tool list, at every
+      message boundary and inside long prompts (done 2026-11-22, see [`dev/history.md`](dev/history.md)): a root that
+      comes back from the drive is a plain checkpoint again (the store keeps no mark); message
+      checkpoints that later requests left behind are not written to the drive, so with one
+      checkpoint place in RAM (Flash-Next at `--ram 8G`) an edit far back resumes from the root
+      or from the drive's deepest checkpoint before it; with one place (measured 2026-11-22,
+      Flash-Next `--ram 8G --cache`) the roots do not pay yet: the root leaves the place for
+      later checkpoints and goes to the drive, but a prompt asks the drive only for pages the
+      index does not hold, so a new conversation with the same 12k-token system prompt still
+      replayed 18 304 rows (221 s); wanted: a checkpoint brought back from the drive for a page
+      the index holds (`cache/ssd.rs` imports runs of pages with their deepest state only), or
+      more places (int8 checkpoints); a message boundary is 1024 cells from the last checkpoint
+      at least, and a prompt step that ends a piece before it takes it there (not measured:
+      what a cut step costs Flash-Next with the large prompt chunks of item 3).
 - [ ] Reuse of K/V blocks away from the prefix, as CacheBlend does, opt-in like pruning (the owner,
       2026-11-18; approximate: the output diverges, measured and bounded by a dial, off by
       default). For a conversation whose earlier part changed (an older tool result cut, an
@@ -482,6 +531,21 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       `real_responses` and `real_messages`; the 0.8B was not run again.)
 
 ## Server and API
+- [ ] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
+      TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`.
+- [ ] Left of the thinking budget and the loop guard (K03, K05, done 2026-11-22): the
+      thresholds are fixed (no option); a passage loop of longer cycles (Strata's opt-in #728)
+      is not looked for; `reasoning_control` is not built.
+- [ ] Left of priorities (S06, done 2026-11-22): a prompt of a worse priority still takes its
+      share of the time next to generation of a better one (the floor of generation, not the
+      priority, bounds it); a threshold of the gap before a running request gives way (SGLang's,
+      10 by default) is not there (any gap is enough); the randomized test of admission plays
+      one priority.
+- [ ] Left of the watchdog (S23, done 2026-11-22): no option for the limit (a field of
+      `RuntimeConfig`); the steps of the warm-up are not watched; the memory a stuck device holds
+      stays taken until the process ends.
+- [ ] `/metrics` of a model that is not loaded is still 503 (its `/props` is read from its
+      preset and file since 2026-11-22).
 - [ ] Tool calls: a generic format for other templates; recovery of imperfect calls (T05);
       string constraints `pattern`, `minLength`, `maxLength`, `format`; forced tokens as
       drafts; a guard for `ignore_eos` with a complete grammar; the end-token rule for a
@@ -495,6 +559,8 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       key file (X02), TLS (X03).
 
 ### Claude Code against Ares (2026-11-22, Claude Code 2.1.301, print mode)
+The runs: [`dev/experiments/claude-code.md`](dev/experiments/claude-code.md); what was fixed
+for it: [`dev/history.md`](dev/history.md) (2026-11-22).
 - [ ] Flash-Next with both devices on every layer (the driver with peer access, 2026-11-22
       14:27, load 2 to 6) read the same first prompt at 40.9 tokens/s (the split by layers 61
       at load 13) and answered at 3 to 6 tokens/s, with 5 of 55 and 7 of 127 drafts accepted;
@@ -539,6 +605,18 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       (CPU kernels, SSD streaming), one piece at a time.
 
 ## Whole features not started
+- Image input (F11): built, pieces 0 to 8 (2026-11-15 to 2026-11-22; [`dev/history.md`](dev/history.md)). Left:
+  - [ ] The row kernels between the tower's products take about a third of the time outside
+        the attention (fusing the residual with the norm after it, a bias in the products'
+        epilogue); the tower on Vulkan.
+  - [ ] Which device computes a block of the tower faster is not measured; the share counts a
+        piece with a tower job as one piece.
+  - [ ] The MTP block reads an image cell as the pad token's embedding (llama.cpp gives the
+        draft context the image's rows), DFlash takes cells as positions; drafts after an image
+        may be accepted less often, the output is the main model's.
+  - [ ] Fetching remote image URLs (backlog).
+  - [ ] The store of image rows is not kept on SSD (after a restart a resumed conversation runs
+        the tower once per image).
 - [ ] Documents as input (PDF, text), as Basalt takes them next to images; video stays backlog.
 - [ ] Audio, video and Gemma 4 are backlog: none of them blocks the first release (the owner,
       2026-11-16).
@@ -559,10 +637,10 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       and opens only the tested classes, Ampere (8.6) and Ada (8.9) (`cuda/tested-archs`); Turing,
       Pascal, Hopper, data-centre Blackwell, Jetson and every other GPU are to run through the
       Vulkan backend once it runs models. What was not tuned on CUDA goes there too.
-- [x] K/V of a running sequence beyond VRAM (P16). The owner, 2026-11-22: without `--context` a
+- K/V of a running sequence beyond VRAM (P16). The owner, 2026-11-22: without `--context` a
       model gets its own context always, and what of it does not fit in VRAM overflows into RAM.
-      Built for Flash-Next (2026-11-22, `kv/overflow`; "K and V beyond VRAM" in `dev/architecture/flash-next.md`).
-      Open:
+      Built for Flash-Next (2026-11-22, `kv/overflow`; "K and V beyond VRAM" in `dev/architecture/flash-next.md`;
+      what was done and fixed since is in [`dev/history.md`](dev/history.md)). Open:
   - [ ] The 27B: not built. Its 16 dense layers read every cell, so K and V in RAM cross the link
         once per token: 5.4 ms per 1000 cells on the test machine's x4 link, about 1.4 ms on a x16
         link (`far_attention_bench`); its context beyond VRAM would run at a few tokens per second.
@@ -580,6 +658,15 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
   - [ ] Pages are near or far by their number: the newest pages of a long sequence are the far
         ones, so its newest cells (often picked by the indexer) are read over the link. Keeping the
         newest pages in VRAM needs pages that move between the pools.
+  - [ ] Left of the slower tokens right after a long prompt (2026-11-22, explained in
+        [`dev/history.md`](dev/history.md)): the slots a loan gave back filled with the hottest experts of RAM before
+        the first token after the prompt; the same no-loan control (`-b 512`) on a quiet
+        machine; the A/B of the build with the rows scored 256 at a time.
+  - [ ] K and V beyond VRAM on two cards: not run with the real file (the made-up model's test
+        passes on the RTX 4070 + RTX 3060).
+  - [ ] The hang of a request after a long far request (merge check 2026-11-23) did not come
+        back in 10 runs; its cause is not found, and the engine's step watchdog (600 s) stays
+        the guard. The 30-s checks count from the start of a wait, not from the last progress.
   - [ ] **Lent steps with the CPU's share** (found by `kvfix`, 2026-11-24; main's, not the far
         pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
         loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
@@ -653,7 +740,7 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       types (5400 against 5112 instructions).
 - [ ] An expert from the SSD is three reads (its matrices lie apart in the file): 2.8 to 3.6 ms
       where the drive needs 1.4 ms per read. One read per expert (a layout of the SSD level).
-- [x] Long prompts layer by layer (2026-11-23). [ ] Their read-ahead; the profile's fill in
+- [ ] Long prompts layer by layer (built 2026-11-23): their read-ahead; the profile's fill in
       large ordered reads.
 - [ ] Few-row kernels for windows and trees; attention for wide windows; the F32 tile kernel
       (2.5 times BF16); NVFP4 and IQ2_XXS gaps; the image tower's row kernels fused.
@@ -681,31 +768,18 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       VRAM, quality.
 
 ## Against the owner's production (2026-11-23, the 27B UD-Q4_K_S on the RTX 4070 + RTX 3060)
-- [ ] Long prompts: 32k 31 % and 98k 57 % behind the fork. About 70 % of the heads sit on the RTX
-      3060; the fork puts 75 % there and still reads 98k at 752 tokens/s, so Ares' attention over
-      long contexts on that card is the gap (its flash attention against ours; llama.cpp PR 32407 is
-      in "Optimising").
-      Built (`attn/long-context`): a prompt kernel of 128 vectors (`kernels/attn_prompt.cuh`) with
-      integer scores over quantized K (and the tile mean's dot products from the same int8
-      products), P V summed in f16 per chunk of 32 cells, and phases in which decode and the tensor
-      cores overlap; the planner cuts a prompt's tiles into pieces that fill the kernel's waves and
-      orders them so the blocks running at once share K/V in the L2 cache. One attention layer, a
-      step of 256 rows at the end of 98 304 cells, K and V in `q5` (the fork `q5_1`): RTX 3060 with
-      3 KV heads 79.9 ms before, 21.0 ms now, the fork 13.5 ms; RTX 4070 with 1 head 11.3, 3.0 and
-      2.1 ms. At 32 768 cells 26.6, 7.4 and 4.6 ms on the 3060. Output closer to the reference
-      than before (integer scores). What is left: the kernel reaches about 45 % of the int8/f16
-      tensor rate of the capped cards, the fork about 67 % (its O in f16 over the whole range and
+The settings and the table: [`dev/experiments/against-the-fork.md`](dev/experiments/against-the-fork.md).
+- [ ] Long prompts: 32k 31 % and 98k 57 % behind the fork before the prompt attention kernel
+      (`attn/long-context`, merged 2026-11-23: now 32k is reached and 98k is 6 % short; how it is
+      built and measured is in [`dev/history.md`](dev/history.md), 2026-11-23). About 70 % of the
+      heads sit on the RTX 3060; the fork puts 75 % there and still reads 98k at 752 tokens/s, so
+      Ares' attention over long contexts on that card is the gap (its flash attention against ours;
+      llama.cpp PR 32407 is in "Optimising").
+      What is left: the kernel reaches about 45 % of the int8/f16 tensor rate of the capped cards, the fork about 67 % (its O in f16 over the whole range and
       the query in registers; Ares keeps O in f32, 128 of 255 registers, two warps per scheduler
       whose latencies do not overlap). O in f16 over the whole range was measured: 7 % faster, 8 to
       10 times the error already at 1.4k cells, growing with the length (the owner's call, not
-      built). Tried and dropped: a single K tile (2.5 % slower), the decode's lanes on rows (q8
-      3 %), cells shared out over one wave of blocks reading several pieces (15 % slower: no L2
-      sharing), P V with f32 sums (11 % slower), 8 vectors per warp in 16 warps (no faster).
-      End to end at these settings (the bench of `/var/tmp/ares-tools/prod-ab/`, prompt suite, two
-      rounds alternating with main, load 1 to 5): 2k / 32k / 98k 1131 / 1000-1002 / 709-710 tokens/s
-      against main's 1082-1103 / 653-655 / 324 and the fork's 840 / 944 / 752: 32k is reached, 98k is
-      6 % short. The state slots of the longer prompt tiles cost about 10 MB of VRAM on the 4070 and
-      6.5 MB on the 3060 (the 27B three ways: 874 / 1754 / 1938 pages against 890 / 1770 / 1946).
+      built).
       Levers left, the owner's call: the 3060's 78 pieces run in 2.8 waves; 5 pieces a tile (7.0
       waves) would save about 6 % of its attention for some 25 MB of state slots on each card, the
       VRAM-tight 4070 included; heads by speed need room on the 4070 these settings do not leave
@@ -714,6 +788,8 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] Images on these settings, and a day of the owner's own use as a second llama-swap entry.
 
 ## Parallel requests against the owner's production (2026-11-23, `bench/parallel`)
+The settings and the table: [`dev/experiments/against-the-fork.md`](dev/experiments/against-the-fork.md); the fixes
+that were merged: [`dev/history.md`](dev/history.md).
 What Ares does better: three or more requests (a place each, at the same context), priorities, the
 system prompt two agents send at once (the second waits for the first's announced pages and shares
 them), cached turns, one request alone. What it does worse, and why:
@@ -774,6 +850,7 @@ designs are sound (the shared blocks, one reader and core for all routes, one re
 reader, an independent host oracle); the debt is where the code grew: copied bookkeeping beside
 each new path, replaced designs left behind for a bench or a test, hand-kept lists, test helpers
 copied into every file. About 4,000 to 5,000 lines can go without changing behaviour.
+- Phase 1 (merged 2026-11-24; what was done is in [`dev/history.md`](dev/history.md)), left with the reason:
   - [ ] At Vulkan parity: Vulkan's draft carry (`draft_shift`/`keep`/`commit`, which CUDA no
         longer has, and its test), its delta-rule shape sweep, and its copies of the activation
         layout (`vulkan/src/layers.rs`) and of the quantization (`vulkan/tests/mmvq.rs`): use
@@ -794,6 +871,24 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         measured choices, so a merge is a change of measurements), the names (`Eng*`/`EngMm*`/
         `Er*`/`AresCodes*` decoders, `q4` for qwen4exp beside the Q4 types, tile names `_n1` for
         8 rows) and the splits of `experts.rs`, `kernels.rs`, `mm.cuh` and `mmr_codes.cuh`.
+- Phase 2 (merged 2026-11-24; what was done is in [`dev/history.md`](dev/history.md)), left:
+  - [ ] Runtime: the running means of the store (their weights differ: one would change what
+        the store decides early on); the transit sizing that lives in the model
+        (`plan_transit`) and the store config built twice (the model's files); `write_record`
+        and `step` of the conductor in smaller parts; the host executor's places on
+        `PlaceChunks` (its oracle plays the strictest device, which the chunks are not); the
+        record's windows and the text half of `impl Model` in both models (the model's phase
+        2); the cache's transfer counter kept twice (a metric's name).
+  - [ ] Model: the tools (`qwen4exp_run`, `qwen4exp_prune`) measure the session, not the
+        runtime (moving them drops `--owners routing` and the host time of a step: the owner's
+        call); `roles::Runner` stays the trial's own timing loop (no store, every expert in
+        zeros); Flash-Next's embedding staging written twice (`part.rs`, `part/pass.rs`), the
+        profile marks of both parts, `Balance` beside `Meeting`, the record's token offset read
+        by hand (an `ares-cuda` accessor), the server's draft vocabulary reader (server phase),
+        the large functions left (`enqueue_pass`, Flash-Next's `Part::assemble`,
+        `Config::from_gguf`, `Drafter::pass_layers`; `Frame::widest` and the 27B's
+        `open_balanced` went down to 277 and 222 lines in stages) and the names of the audit's
+        finding 13.
   - [ ] The loaders (finding 1: `load.rs` and `qwen4exp.rs`, their copied tail, the qwen35
         memory estimate in the server), with them the names `qwen4exp::Split` (a saved spread)
         and `load::watch` beside `Models::watch`: after the model crate's phase 2 merges.
@@ -806,6 +901,7 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
         public code (`Breakers::of_tokens`, `keeps_history`/`opens` computed and dropped).
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
+The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history.md).
 - [ ] The trial of the second card's role costs 3.2 to 3.7 s at load (4.1 to 4.2 s of trial, of
       which 1.6 s opening the first role's parts with the prefill paths measured): each role opens its
       parts and runs a wide step of 512 rows. Cheaper: a narrower wide step, the parts of the
