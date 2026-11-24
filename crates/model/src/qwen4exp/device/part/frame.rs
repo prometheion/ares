@@ -162,6 +162,210 @@ pub(super) struct Inbox {
     pub(super) len: u64,
 }
 
+/// What the layers of a part keep and where, before the scratch: the slot of
+/// a sequence (each layer's recurrent state or its indexer's carry, and the
+/// n-gram block's history), the pools of K/V and keys, and what a draft window
+/// keeps of the indexer's inputs.
+struct Layers {
+    slot: SlotLayout,
+    pool_bytes: u64,
+    raw_bytes: u64,
+    rec_layout: recurrent::Layout,
+    recurrent: Vec<Option<RecurrentAt>>,
+    attention: Vec<Option<AttentionAt>>,
+    ngram_history: Option<u64>,
+    layer_slot: Vec<Range<u64>>,
+    any_recurrent: bool,
+    any_attention: bool,
+    any_ngram: bool,
+}
+
+impl Layers {
+    /// The layers of a part of `shape` (one that holds the streams when
+    /// `streams`), with `exact_slots` exact entries of K and V per layer.
+    fn of(c: &Config, opts: &Options, shape: &PartShape, streams: bool, exact_slots: u32) -> Self {
+        let window = u64::from(opts.window_rows);
+        let geo = geometry(c, opts.kv);
+        let ix = indexer_shape(c);
+        let ng = ngram_shape(c);
+        let pages = u64::from(opts.pages());
+        // The converted entries of K and V of the pages in VRAM; the indexer's
+        // keys of every page.
+        let near = u64::from(opts.near_pages());
+        let r = &c.recurrent;
+        let id = c.indexer.key_dim as u64;
+        let mut exact_at = 0u64;
+        let (mut slot, mut pool_bytes, mut raw_bytes) = (SlotLayout::new(), 0u64, 0u64);
+        let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
+        let mut recurrent = Vec::new();
+        let mut attention = Vec::new();
+        let mut ngram_history = None;
+        let (mut any_recurrent, mut any_attention, mut any_ngram) = (false, false, false);
+        let mut keep = |bytes: u64| {
+            let at = raw_bytes;
+            raw_bytes = (raw_bytes + window * bytes).next_multiple_of(64);
+            at
+        };
+        let mut layer_slot = Vec::with_capacity(shape.shares.len());
+        for (i, share) in shape.shares.iter().enumerate() {
+            let layer = shape.first + i;
+            let heads = u64::from(share.heads.end.saturating_sub(share.heads.start));
+            let (mut r_at, mut a_at) = (None, None);
+            let slot_start = slot.bytes();
+            if heads == 0 {
+                // The layer's heads are all on the peer.
+            } else if c.is_attention(layer) {
+                any_attention = true;
+                let kv_pool = pool_bytes;
+                let key_pool = (kv_pool + near * geo.converted_entry_bytes()).next_multiple_of(64);
+                pool_bytes = (key_pool + pages * ix.key_slot_bytes(opts.keys)).next_multiple_of(64);
+                let carry = slot.take(ix.carry_len() * 4);
+                let exact = exact_at;
+                exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
+                let kept_raw = keep(id * 4);
+                a_at = Some(AttentionAt { kv_pool, key_pool, carry, kept_raw, exact });
+            } else {
+                any_recurrent = true;
+                // The part's key heads with their value heads: a narrower
+                // layer.
+                let n_k = heads as u32;
+                let shape = RecurrentShape {
+                    n_k_heads: n_k,
+                    n_v_heads: n_k * (r.n_v_heads / r.n_k_heads) as u32,
+                    head_dim: r.head_dim as u32,
+                    conv_kernel: r.conv_kernel as u32,
+                };
+                r_at = Some(rec_layout.layer(shape, &mut slot));
+            }
+            if streams && c.ngram.as_ref().is_some_and(|g| g.layer == layer) {
+                any_ngram = true;
+                let history = ng.as_ref().map_or(0, NgramShape::history_len);
+                ngram_history = Some(slot.take(history * 4));
+            }
+            recurrent.push(r_at);
+            attention.push(a_at);
+            layer_slot.push(slot_start..slot.bytes());
+        }
+        Self {
+            slot,
+            pool_bytes,
+            raw_bytes,
+            rec_layout,
+            recurrent,
+            attention,
+            ngram_history,
+            layer_slot,
+            any_recurrent,
+            any_attention,
+            any_ngram,
+        }
+    }
+}
+
+/// The scratch of a step as it is carved buffer by buffer, every buffer at a
+/// multiple of 64 bytes, in `pieces` when it is laid out in VRAM the expert
+/// slots lend: a buffer that the end of a piece would cut goes to the start of
+/// the next, and what each piece holds is counted.
+struct PieceCarve {
+    len: u64,
+    /// The pieces as ranges of the layout's offsets, and what each holds.
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    held: Vec<u64>,
+    fits: bool,
+}
+
+impl PieceCarve {
+    fn new(pieces: &[u64]) -> Self {
+        let starts: Vec<u64> = pieces
+            .iter()
+            .scan(0u64, |at, bytes| {
+                let start = *at;
+                *at += bytes / 256 * 256;
+                Some(start)
+            })
+            .collect();
+        let ends: Vec<u64> =
+            starts.iter().zip(pieces).map(|(start, bytes)| start + bytes / 256 * 256).collect();
+        Self { len: 0, starts, ends, held: vec![0; pieces.len()], fits: true }
+    }
+
+    /// The offset of the next buffer, of `bytes` bytes (at least 16).
+    fn take(&mut self, bytes: u64) -> u64 {
+        let bytes = bytes.max(16);
+        let mut at = self.len;
+        if !self.ends.is_empty() {
+            let ends = &self.ends;
+            let mut k = ends.iter().position(|end| at < *end).unwrap_or(ends.len());
+            while k < ends.len() && at + bytes > ends[k] {
+                k += 1;
+                at = at.max(ends[k - 1]);
+            }
+            match self.held.get_mut(k) {
+                Some(held) => *held = (*held).max(at + bytes - self.starts[k]),
+                None => self.fits = false,
+            }
+        }
+        self.len = (at + bytes).next_multiple_of(64);
+        at
+    }
+
+    /// The bytes the scratch takes of each piece; `None` without pieces or when
+    /// it does not fit in them.
+    fn lent(self) -> Option<Vec<u64>> {
+        (!self.held.is_empty() && self.fits).then_some(self.held)
+    }
+}
+
+impl Inbox {
+    /// What the host sends with a step of `opts.max_rows` rows: the record,
+    /// the attention plan with its hands (a part with attention layers), the
+    /// n-gram rows (a part with the block) and the record of the step before,
+    /// the staged rows of the table and the rows they decode to.
+    fn lay_out(
+        opts: &Options,
+        n: u64,
+        geo: &CacheGeometry,
+        ix: &IndexerShape,
+        ng: Option<&NgramShape>,
+        any_attention: bool,
+        any_ngram: bool,
+    ) -> Self {
+        let (att, gram) = (u64::from(any_attention), u64::from(any_ngram));
+        let rows = u64::from(opts.max_rows);
+        let mut inbox = Inbox::default();
+        let mut len = 0u64;
+        let mut take = |bytes: u64| {
+            let at = len;
+            len = (len + bytes.max(16)).next_multiple_of(64);
+            at
+        };
+        // A record: header, a segment per slot, a token and four positions
+        // per row, the output rows.
+        inbox.record_cap = (64 + 32 * u64::from(opts.max_slots) + 28 * rows).next_multiple_of(64);
+        inbox.record = take(inbox.record_cap);
+        // A plan: the planner's dense plans are a few dozen bytes per row and
+        // item; a plan of device-made lists has `MAX_PIECES` items per row
+        // and KV head and three words per range.
+        let listed = rows
+            * (u64::from(MAX_PIECES) * u64::from(geo.kv_heads) * 48
+                + u64::from(ix.max_ranges(0)) * 12
+                + 32);
+        inbox.plan_cap = att * (listed.max(64 << 10) + 96 * rows + 256).next_multiple_of(64);
+        inbox.plan = take(inbox.plan_cap);
+        inbox.hands = take(att * rows * ListHandOver::BYTES as u64);
+        inbox.ngram = take(gram * rows * ng.map_or(0, NgramShape::fetched_row_bytes));
+        inbox.commit = take(inbox.record_cap);
+        // The staged rows of a table of any type, at most four bytes a value,
+        // and the rows they decode to, which only the device writes.
+        inbox.rows = take(rows * n * 4);
+        inbox.x = take(rows * n * 4);
+        inbox.host_len = inbox.x;
+        inbox.len = len;
+        inbox
+    }
+}
+
 /// Every size and offset of a part: what [`Part::open`] allocates and what a
 /// placement counts.
 #[derive(Clone, Debug)]
@@ -348,17 +552,14 @@ impl Frame {
         if opts.window_rows > opts.max_rows {
             return Err(invalid("a draft window has at most the rows of a step"));
         }
-        let (rows, window) = (u64::from(opts.max_rows), u64::from(opts.window_rows));
+        let rows = u64::from(opts.max_rows);
         let (n, hc) = (c.n_embd as u64, c.n_stream as u64);
         let (wide, rank) = (c.wide() as u64, c.mixer_rank as u64);
         let geo = geometry(c, opts.kv);
         let ix = indexer_shape(c);
         let ng = ngram_shape(c);
         let plan_config = PlanConfig::for_multiprocessors(multiprocessors);
-        let pages = u64::from(opts.pages());
-        // The converted entries of K and V of the pages in VRAM; the indexer's
-        // keys of every page.
-        let near = u64::from(opts.near_pages());
+        let (pages, near) = (u64::from(opts.pages()), u64::from(opts.near_pages()));
         // The exact slots of the K/V group, when its formats have a tile mean,
         // with the tails the prefix cache may hold.
         let sizing = kv::Sizing {
@@ -367,7 +568,6 @@ impl Frame {
             tails: opts.max_slots * TAILS_PER_SLOT,
         };
         let exact_slots = kv::slots_for(opts.kv.0, opts.kv.1, sizing);
-        let mut exact_at = 0u64;
 
         let r = &c.recurrent;
         let (cd, kd, vd, nv) =
@@ -377,93 +577,27 @@ impl Frame {
         let iq = (c.indexer.n_head * c.indexer.key_dim) as u64;
         let id = c.indexer.key_dim as u64;
 
-        let (mut slot, mut pool_bytes, mut raw_bytes) = (SlotLayout::new(), 0u64, 0u64);
-        let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
-        let mut recurrent = Vec::new();
-        let mut attention = Vec::new();
-        let mut ngram_history = None;
-        let (mut any_recurrent, mut any_attention, mut any_ngram) = (false, false, false);
-        let mut keep = |bytes: u64| {
-            let at = raw_bytes;
-            raw_bytes = (raw_bytes + window * bytes).next_multiple_of(64);
-            at
-        };
-        let mut layer_slot = Vec::with_capacity(shape.shares.len());
-        for (i, share) in shape.shares.iter().enumerate() {
-            let layer = shape.first + i;
-            let heads = u64::from(share.heads.end.saturating_sub(share.heads.start));
-            let (mut r_at, mut a_at) = (None, None);
-            let slot_start = slot.bytes();
-            if heads == 0 {
-                // The layer's heads are all on the peer.
-            } else if c.is_attention(layer) {
-                any_attention = true;
-                let kv_pool = pool_bytes;
-                let key_pool = (kv_pool + near * geo.converted_entry_bytes()).next_multiple_of(64);
-                pool_bytes = (key_pool + pages * ix.key_slot_bytes(opts.keys)).next_multiple_of(64);
-                let carry = slot.take(ix.carry_len() * 4);
-                let exact = exact_at;
-                exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
-                let kept_raw = keep(id * 4);
-                a_at = Some(AttentionAt { kv_pool, key_pool, carry, kept_raw, exact });
-            } else {
-                any_recurrent = true;
-                // The part's key heads with their value heads: a narrower
-                // layer.
-                let n_k = heads as u32;
-                let shape = RecurrentShape {
-                    n_k_heads: n_k,
-                    n_v_heads: n_k * (r.n_v_heads / r.n_k_heads) as u32,
-                    head_dim: r.head_dim as u32,
-                    conv_kernel: r.conv_kernel as u32,
-                };
-                r_at = Some(rec_layout.layer(shape, &mut slot));
-            }
-            if streams && c.ngram.as_ref().is_some_and(|g| g.layer == layer) {
-                any_ngram = true;
-                let history = ng.as_ref().map_or(0, NgramShape::history_len);
-                ngram_history = Some(slot.take(history * 4));
-            }
-            recurrent.push(r_at);
-            attention.push(a_at);
-            layer_slot.push(slot_start..slot.bytes());
-        }
+        let Layers {
+            slot,
+            pool_bytes,
+            raw_bytes,
+            rec_layout,
+            recurrent,
+            attention,
+            ngram_history,
+            layer_slot,
+            any_recurrent,
+            any_attention,
+            any_ngram,
+        } = Layers::of(c, opts, shape, streams, exact_slots);
 
         // The scratch of a step.
         let mut s = Scratch::default();
-        let mut len = 0u64;
-        // The pieces as ranges of the layout's offsets, and what each holds; a buffer that
-        // the end of a piece would cut goes to the start of the next.
-        let starts: Vec<u64> = pieces
-            .iter()
-            .scan(0u64, |at, bytes| {
-                let start = *at;
-                *at += bytes / 256 * 256;
-                Some(start)
-            })
-            .collect();
-        let ends: Vec<u64> =
-            starts.iter().zip(pieces).map(|(start, bytes)| start + bytes / 256 * 256).collect();
-        let mut held = vec![0u64; pieces.len()];
-        let mut fits = true;
+        let mut carve = PieceCarve::new(pieces);
         macro_rules! take {
-            ($bytes:expr $(,)?) => {{
-                let bytes = ($bytes).max(16);
-                let mut at = len;
-                if !ends.is_empty() {
-                    let mut k = ends.iter().position(|end| at < *end).unwrap_or(ends.len());
-                    while k < ends.len() && at + bytes > ends[k] {
-                        k += 1;
-                        at = at.max(ends[k - 1]);
-                    }
-                    match held.get_mut(k) {
-                        Some(held) => *held = (*held).max(at + bytes - starts[k]),
-                        None => fits = false,
-                    }
-                }
-                len = (at + bytes).next_multiple_of(64);
-                at
-            }};
+            ($bytes:expr $(,)?) => {
+                carve.take($bytes)
+            };
         }
         s.r = take!(rows * wide * 4);
         s.r2 = take!(u64::from(streams) * rows * wide * 4);
@@ -486,15 +620,15 @@ impl Frame {
         // runs before the read of its layer). On lent VRAM (`overlay`) they lie in
         // the same place: a step on a loan verifies no drafts, whose windows keep the
         // n-gram block's `nrm` until their commit. Elsewhere they lie one after the other.
-        let shared_at = len;
-        let mut shared_end = len;
+        let shared_at = carve.len;
+        let mut shared_end = carve.len;
         s.xn = take!(act_bytes(wide, rows));
         s.lo = take!(act_bytes(rank, rows));
         s.down = take!(rows * rank * 4);
         s.gate = take!(rows * wide * 4);
         if overlay {
-            shared_end = shared_end.max(len);
-            len = shared_at;
+            shared_end = shared_end.max(carve.len);
+            carve.len = shared_at;
         }
         s.w1 = take!(rows * (rec * cd).max(att * 2 * hq) * 4);
         s.w2 = take!(rows * (rec * vd).max(att * hkv) * 4);
@@ -530,15 +664,15 @@ impl Frame {
         s.attn_state = take!(attn_state_bytes);
         let gram = u64::from(any_ngram);
         if overlay {
-            shared_end = shared_end.max(len);
-            len = shared_at;
+            shared_end = shared_end.max(carve.len);
+            carve.len = shared_at;
         }
         s.emb = take!(gram * act_bytes(n, rows));
         s.key = take!(gram * rows * wide * 4);
         s.value = take!(gram * rows * n * 4);
         s.gated = take!(gram * rows * wide * 4);
         s.nrm = take!(gram * rows * wide * 4);
-        len = len.max(shared_end);
+        carve.len = carve.len.max(shared_end);
         s.status = take!(16);
         let expert_shape = ares_cuda::ExpertShape {
             n_embd: n as u32,
@@ -598,42 +732,14 @@ impl Frame {
             s.far_stage_len = (pages - near) * geo.converted_entry_bytes();
             s.far_stage = take!(s.far_stage_len);
         }
-        s.len = len;
-        let lent_pieces = (!pieces.is_empty() && fits).then_some(held);
+        s.len = carve.len;
+        let lent_pieces = carve.lent();
 
         // A flag per block of a read, and one for a route record.
         let x_flags = Q4Kernels::read_flags(opts.max_rows, c.n_embd as u32) + 16;
 
         // What the host sends with a step.
-        let mut inbox = Inbox::default();
-        let mut len = 0u64;
-        let mut take = |bytes: u64| {
-            let at = len;
-            len = (len + bytes.max(16)).next_multiple_of(64);
-            at
-        };
-        // A record: header, a segment per slot, a token and four positions
-        // per row, the output rows.
-        inbox.record_cap = (64 + 32 * u64::from(opts.max_slots) + 28 * rows).next_multiple_of(64);
-        inbox.record = take(inbox.record_cap);
-        // A plan: the planner's dense plans are a few dozen bytes per row and
-        // item; a plan of device-made lists has `MAX_PIECES` items per row
-        // and KV head and three words per range.
-        let listed = rows
-            * (u64::from(MAX_PIECES) * u64::from(geo.kv_heads) * 48
-                + u64::from(ix.max_ranges(0)) * 12
-                + 32);
-        inbox.plan_cap = att * (listed.max(64 << 10) + 96 * rows + 256).next_multiple_of(64);
-        inbox.plan = take(inbox.plan_cap);
-        inbox.hands = take(att * rows * ListHandOver::BYTES as u64);
-        inbox.ngram = take(gram * rows * ng.as_ref().map_or(0, NgramShape::fetched_row_bytes));
-        inbox.commit = take(inbox.record_cap);
-        // The staged rows of a table of any type, at most four bytes a value,
-        // and the rows they decode to, which only the device writes.
-        inbox.rows = take(rows * n * 4);
-        inbox.x = take(rows * n * 4);
-        inbox.host_len = inbox.x;
-        inbox.len = len;
+        let inbox = Inbox::lay_out(opts, n, &geo, &ix, ng.as_ref(), any_attention, any_ngram);
 
         let geos = vec![geo; attention.iter().flatten().count()];
         let (exact_device, exact_host) =
