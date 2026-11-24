@@ -43,6 +43,7 @@
 mod admission;
 mod confidence;
 mod draft;
+mod drafting;
 mod ngram;
 mod plan;
 mod price;
@@ -53,6 +54,7 @@ mod window;
 pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
 pub use confidence::{BINS as CONFIDENCE_BINS, Confidence, links_made, need};
 pub use draft::{Acceptance, BELIEF};
+pub use drafting::{Drafting, NGRAM, UNASKED_SEQUENCE};
 pub use ngram::{NgramConfig, NgramCorpus, NgramDrafter, NgramMatch};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
 pub use price::{Curve, Estimate, OLD as PRICE_OLD, PriceTable};

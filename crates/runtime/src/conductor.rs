@@ -101,9 +101,9 @@ use std::time::{Duration, Instant};
 use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling, Usage};
 use ares_sampler::{SampleParams, SampleRow, TokenMask};
 use ares_sched::{
-    Acceptance, Admission, AdmissionConfig, Arrival, Choice, Confidence, Curve, Estimate, Limits,
-    Load, NgramCorpus, NgramDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable,
-    Prices, Request, SeqId, Share, Turn, Want, Wish, choose, plan,
+    Acceptance, Admission, AdmissionConfig, Arrival, Choice, Drafting, Estimate, Limits, Load,
+    NGRAM, NgramCorpus, NgramDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable,
+    Request, SeqId, Share, Turn, UNASKED_SEQUENCE, Want, Wish, plan,
 };
 use ares_state::{
     Boundary, Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
@@ -118,37 +118,6 @@ use crate::record::{self, Commit, ImageRun, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 use crate::watch::Watch;
-
-/// The drafters, as the choice of a window and the step record number them:
-/// the n-gram drafter, which costs nothing to ask, is 0; the model's
-/// drafters ([`Model::drafters`]) follow from 1 in the model's order, each
-/// with the device time its drafts cost.
-const NGRAM: usize = 0;
-
-/// What a round leaves of the measured acceptance of the model's own drafter
-/// for a sequence that was offered it and did not take it, and of the
-/// engine's: a drafter that nobody asks measures nothing, and what it measured
-/// when it was poor would keep it out for ever. The sequence's fades quickly
-/// (it is the text that changed, usually), the engine's slowly.
-const UNASKED_SEQUENCE: f64 = 0.995;
-const UNASKED_ENGINE: f64 = 0.999;
-
-/// What a chain of `links` links of the model's own drafter is expected to
-/// take: link `j` costs what the curve says a chain of `j + 1` links takes
-/// over one of `j`, and is made as often as the draft before it leaves the
-/// chain above its bar (`passes[j]`; a drafter that knows its probabilities
-/// ends a chain there). The price of the whole chain for a drafter that never
-/// ends one early.
-fn expected_chain_ms(chain: &Curve, passes: &[(f64, f64)], links: u32) -> f64 {
-    let (mut ms, mut reach, mut before) = (0.0, 1.0, 0.0);
-    for j in 0..links {
-        let Some(upto) = chain.trial_ms(j + 1) else { return 0.0 };
-        reach *= passes.get(j as usize).map_or(1.0, |(made, _)| *made);
-        ms += reach * (upto - before);
-        before = upto;
-    }
-    ms
-}
 
 /// How long the conductor sleeps on its channel when requests wait and none
 /// can start. Admission starts the first in line whenever nothing runs, so
@@ -734,16 +703,11 @@ pub(crate) struct Conductor {
     active: usize,
     /// What a step costs by its rows, measured at load and kept up to date.
     prices: PriceTable,
-    /// The model's drafters, in its order.
+    /// The model's drafters, in its order, and what the engine knows of them:
+    /// what their drafts are worth and cost, the bars of their links and the
+    /// worth of a token.
     drafters: Vec<Drafter>,
-    /// Per model drafter: what its drafts cost by their number, in
-    /// milliseconds of the step that only drafts.
-    chains: Vec<Curve>,
-    /// Per model drafter: how its drafts have been accepted by every
-    /// sequence, per position (where a new sequence's estimate starts), and
-    /// by the probability it gave them (what a chain is cut by).
-    engines: Vec<Acceptance>,
-    confidences: Vec<Confidence>,
+    drafting: Drafting,
     /// Whose turn it is, rounds of generation or pieces of prompt.
     share: Share,
     /// The rows of each prompt that has started and is not read yet, for the
@@ -801,12 +765,8 @@ pub(crate) struct Conductor {
     /// The draft bars of the step's windows that take the model's own drafts.
     bars: Vec<f32>,
     /// What every row of the step is worth in milliseconds (the record's row
-    /// worth), and what a token costs at the rate the round was chosen for.
+    /// worth).
     worth: Vec<f32>,
-    token_ms: f64,
-    /// Per model drafter, the bar of each link after the first, as the last
-    /// round set them.
-    needs: Vec<Vec<f32>>,
     /// The window a step of the warm-up left uncommitted.
     pending_probe: Option<Commit>,
     /// What the warm-up measured, for the snapshot.
@@ -838,11 +798,9 @@ impl Conductor {
         let slots = config.max_slots as usize;
         let share = Share::new(config.generation_floor);
         let drafters = model.drafters();
-        let engines =
-            drafters.iter().map(|_| Acceptance::new(config.window_rows as usize, 0.999)).collect();
-        let needs = drafters.iter().map(|_| Vec::new()).collect();
         // A step that waits for what it fetches is dear because of what it
         // fetched, not because the machine was busy.
+        let drafting = Drafting::new(drafters.len(), config.window_rows);
         let estimate =
             if model.steps_wait_for_fetches() { Estimate::Mean } else { Estimate::WithoutLargest };
         let admission = AdmissionConfig {
@@ -913,14 +871,10 @@ impl Conductor {
             rx,
             active: 0,
             prices: PriceTable::with_estimate(estimate),
-            chains: drafters.iter().map(|_| Curve::new()).collect(),
-            engines,
-            confidences: drafters.iter().map(|_| Confidence::new(0.999)).collect(),
+            drafting,
             drafters,
             bars: Vec::with_capacity(max_rows as usize),
             worth: Vec::with_capacity(max_rows as usize),
-            token_ms: 0.0,
-            needs,
             share,
             prompt_rows: Vec::with_capacity(slots),
             round_tokens: 0,
@@ -1003,7 +957,7 @@ impl Conductor {
                 for _ in 0..2 {
                     fastest = fastest.min(self.probe(links + 1, Probe::Chain(d))?.0);
                 }
-                self.chains[d].set(links, fastest);
+                self.drafting.chains[d].set(links, fastest);
             }
         }
         // The last probe left a window that nothing has committed.
@@ -1012,7 +966,7 @@ impl Conductor {
             steps: (self.step_no - first_step) as u32,
             seconds: begun.elapsed().as_secs_f64(),
             step_ms: self.prices.points().collect(),
-            chain_ms: self.chains.iter().map(|c| c.points().collect()).collect(),
+            chain_ms: self.drafting.chains.iter().map(|c| c.points().collect()).collect(),
         });
         self.stats.reset();
         Ok(())
@@ -1200,7 +1154,7 @@ impl Conductor {
                     stats: self.stats.clone(),
                     calibration: self.calibration.clone(),
                     step_ms: self.prices.points().collect(),
-                    chain_ms: self.chains.iter().map(|c| c.points().collect()).collect(),
+                    chain_ms: self.drafting.chains.iter().map(|c| c.points().collect()).collect(),
                     pages_free: self.pool.free_pages(),
                     pages_capacity: self.pool.capacity(),
                     cached_pages: self.cache.as_ref().map_or(0, |cache| cache.index.len() as u32),
@@ -1827,21 +1781,7 @@ impl Conductor {
             .saturating_sub(self.active as u32)
             .min(self.model.draft_rows().saturating_sub(generating));
         let drafting = round && !self.drafters.is_empty() && self.config.window_rows > 1;
-        // How often the draft before a link leaves its chain above the link's
-        // bar, by the bars of the round before, per drafter: among all drafts
-        // (how often the link is made, which is what asking for it costs) and
-        // among the drafts that are accepted (how often it is made when its
-        // row counts). The first link has no bar.
-        let passes: Vec<Vec<(f64, f64)>> = self
-            .needs
-            .iter()
-            .zip(&self.confidences)
-            .map(|(needs, confidence)| {
-                std::iter::once((1.0, 1.0))
-                    .chain(needs.iter().map(|need| confidence.share_at_least((*need).into())))
-                    .collect()
-            })
-            .collect();
+        let passes = self.drafting.passes();
         // The windows that offer nothing are rows of the step all the same:
         // the price of the step counts them in.
         let (mut quiet, mut quiet_cells) = (0u32, 0u64);
@@ -1922,7 +1862,7 @@ impl Conductor {
                         let own = if free { cap.min(drafter.drafts as usize) } else { 0 };
                         let chances = &mut a.offered[d];
                         a.model_acceptance[d].rates(
-                            &self.engines[d],
+                            &self.drafting.engines[d],
                             self.config.draft_prior,
                             own,
                             chances,
@@ -1985,30 +1925,10 @@ impl Conductor {
         let step = |load: Load| {
             self.prices.trial_ms(Load { rows: load.rows + quiet, cells: load.cells + quiet_cells })
         };
-        let chain = |drafter: usize, links: u32| match drafter {
-            NGRAM => 0.0,
-            d => expected_chain_ms(&self.chains[d - 1], &passes[d - 1], links),
-        };
-        let prices = Prices { step: &step, chain: &chain, spare_rows };
-        let choices = choose(&wishes, &prices);
-        // Where a chain of a drafter that makes its links one after the other
-        // ends: one more link is made while the chance that its draft counts
-        // (the reach of the chain so far, known to the drafter from its
-        // probabilities, times the chance of a draft it has not made yet) is
-        // worth the link's time at the rate this step is expected to have.
-        let rate = ares_sched::rate(&wishes, &prices, &choices);
-        self.token_ms = if rate > 0.0 { 1.0 / rate } else { 0.0 };
+        let (prior, window_rows) = (self.config.draft_prior, self.config.window_rows);
+        let choices =
+            self.drafting.choose_windows(&wishes, &step, spare_rows, &passes, prior, window_rows);
         drop(wishes);
-        for (d, needs) in self.needs.iter_mut().enumerate() {
-            let curve = &self.chains[d];
-            let mean = self.confidences[d].mean(self.config.draft_prior);
-            let upto = |links: u32| curve.ms(links).unwrap_or(0.0);
-            needs.clear();
-            needs.extend(
-                (1..self.config.window_rows)
-                    .map(|link| ares_sched::need(rate, upto(link + 1) - upto(link), mean) as f32),
-            );
-        }
         let mut asked = vec![false; self.drafters.len()];
         for (slot, choice) in asking.iter().zip(choices) {
             let a = self.slots[*slot].as_mut().expect("asked");
@@ -2026,7 +1946,8 @@ impl Conductor {
                     // The first link is the window's reason: it has no bar.
                     a.model_needs.clear();
                     a.model_needs.push(0.0);
-                    a.model_needs.extend(self.needs[d].iter().take(drafts.saturating_sub(1)));
+                    let needs = &self.drafting.needs[d];
+                    a.model_needs.extend(needs.iter().take(drafts.saturating_sub(1)));
                 }
                 None => {}
             }
@@ -2039,11 +1960,7 @@ impl Conductor {
                 request.want = Want::Window { drafts: drafts as u32 };
             }
         }
-        for (engine, asked) in self.engines.iter_mut().zip(asked) {
-            if !asked {
-                engine.fade(UNASKED_ENGINE);
-            }
-        }
+        self.drafting.fade_unasked(&asked);
     }
 
     /// One turn of the loop with something to do.
@@ -2714,7 +2631,7 @@ impl Conductor {
         // The step's time is each drafter's that ran in it: a step of two
         // drafters is rare (two sequences that chose differently) and prices
         // both a little high.
-        for (chain, links) in self.chains.iter_mut().zip(longest) {
+        for (chain, links) in self.drafting.chains.iter_mut().zip(longest) {
             if links > 0 {
                 chain.observe(links as u32, step_ms);
             }
@@ -2747,10 +2664,10 @@ impl Conductor {
             };
             let mut own = Vec::with_capacity(a.draft.len());
             if a.model_probs.len() == a.draft.len() {
-                own.extend(a.model_probs.iter().map(|p| self.confidences[d].chance(*p)));
+                own.extend(a.model_probs.iter().map(|p| self.drafting.confidences[d].chance(*p)));
             } else {
                 a.model_acceptance[d].rates(
-                    &self.engines[d],
+                    &self.drafting.engines[d],
                     self.config.draft_prior,
                     a.draft.len(),
                     &mut own,
@@ -2777,15 +2694,9 @@ impl Conductor {
         let step = |load: Load| {
             self.prices.trial_ms(Load { rows: load.rows + fixed, cells: load.cells + fixed_cells })
         };
-        let chain = |_: usize, _: u32| 0.0;
         let spare_rows = self.model.draft_rows().saturating_sub(self.parts.len() as u32);
-        let prices = Prices { step: &step, chain: &chain, spare_rows };
-        let choices = choose(&wishes, &prices);
-        let rate = ares_sched::rate(&wishes, &prices, &choices);
+        let choices = self.drafting.shorten(&wishes, &step, spare_rows);
         drop(wishes);
-        if rate > 0.0 {
-            self.token_ms = 1.0 / rate;
-        }
         for ((index, choice), own) in asking.into_iter().zip(choices).zip(chances.iter()) {
             let part = &mut self.parts[index];
             let a = self.slots[part.slot as usize].as_mut().expect("running");
@@ -3022,7 +2933,7 @@ impl Conductor {
                     // drafts up to its own are right, times what a token
                     // costs.
                     // Before the step has a price nothing is known of it.
-                    if !drafts_only && part.rows > 1 && self.token_ms > 0.0 {
+                    if !drafts_only && part.rows > 1 && self.drafting.token_ms > 0.0 {
                         let chances = if a.model_drafter.is_some() {
                             &a.model_chances
                         } else {
@@ -3032,7 +2943,7 @@ impl Conductor {
                         let mut reach = 1.0;
                         for k in 0..part.rows as usize - 1 {
                             reach *= chances.get(k).copied().unwrap_or(0.0);
-                            self.worth.push((reach * self.token_ms) as f32);
+                            self.worth.push((reach * self.drafting.token_ms) as f32);
                         }
                     }
                 }
@@ -3081,7 +2992,7 @@ impl Conductor {
         self.pool.take_freed(record::FREED_PER_RECORD, &mut self.freed);
         writer.freed(&self.freed).map_err(full)?;
         if let Some(d) = bars_of {
-            writer.draft_bars(&self.confidences[d].chances(), &self.bars).map_err(full)?;
+            writer.draft_bars(&self.drafting.confidences[d].chances(), &self.bars).map_err(full)?;
         }
         if !self.worth.is_empty() {
             self.worth.resize(row_index as usize, 0.0);
@@ -3178,7 +3089,7 @@ impl Conductor {
                             // tested.
                             let tested = made.min(right + 1);
                             a.model_acceptance[d].observe(tested, right.min(tested));
-                            self.engines[d].observe(tested, right.min(tested));
+                            self.drafting.engines[d].observe(tested, right.min(tested));
                             // What its probability said of each draft that
                             // was tested.
                             let counters = &mut self.stats.counters;
@@ -3186,8 +3097,8 @@ impl Conductor {
                                 if i > right {
                                     break;
                                 }
-                                self.confidences[d].observe(*p, i < right);
-                                let bin = Confidence::bin(*p);
+                                self.drafting.confidences[d].observe(*p, i < right);
+                                let bin = ares_sched::Confidence::bin(*p);
                                 counters.model_tested_by_p[bin] += 1;
                                 counters.model_accepted_by_p[bin] += u64::from(i < right);
                             }
