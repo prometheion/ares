@@ -38,6 +38,7 @@ pub struct PenaltyParams {
 }
 
 impl PenaltyParams {
+    /// llama.cpp's defaults, which leave the penalties off.
     pub const OFF: PenaltyParams =
         PenaltyParams { last_n: 64, repeat: 1.0, frequency: 0.0, presence: 0.0 };
 
@@ -58,6 +59,7 @@ pub struct DryParams {
 }
 
 impl DryParams {
+    /// llama.cpp's defaults, which leave DRY off.
     pub const OFF: DryParams =
         DryParams { multiplier: 0.0, base: 1.75, allowed_length: 2, last_n: 64 };
 

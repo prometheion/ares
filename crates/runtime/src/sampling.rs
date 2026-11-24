@@ -254,21 +254,23 @@ impl RequestSampler {
         // Mirostat replaces the chain: llama.cpp applies neither penalties nor
         // DRY with it, and neither does this.
         if p.mirostat.is_none() {
-            let last_n = sampling.repeat_last_n.unwrap_or(64);
+            // A field the request leaves out takes llama.cpp's default, which
+            // is the setting that leaves the penalties and DRY off.
+            let (penalties, dry) = (PenaltyParams::OFF, DryParams::OFF);
             corrections.penalties = PenaltyParams {
-                last_n,
-                repeat: sampling.repeat_penalty.unwrap_or(1.0),
-                frequency: sampling.frequency_penalty.unwrap_or(0.0),
-                presence: sampling.presence_penalty.unwrap_or(0.0),
+                last_n: sampling.repeat_last_n.unwrap_or(penalties.last_n),
+                repeat: sampling.repeat_penalty.unwrap_or(penalties.repeat),
+                frequency: sampling.frequency_penalty.unwrap_or(penalties.frequency),
+                presence: sampling.presence_penalty.unwrap_or(penalties.presence),
             };
             if !penalties_on {
                 corrections.penalties = PenaltyParams::OFF;
             }
             corrections.dry = DryParams {
-                multiplier: sampling.dry_multiplier.unwrap_or(0.0),
-                base: sampling.dry_base.unwrap_or(1.75),
-                allowed_length: sampling.dry_allowed_length.unwrap_or(2),
-                last_n: sampling.dry_penalty_last_n.unwrap_or(64),
+                multiplier: sampling.dry_multiplier.unwrap_or(dry.multiplier),
+                base: sampling.dry_base.unwrap_or(dry.base),
+                allowed_length: sampling.dry_allowed_length.unwrap_or(dry.allowed_length),
+                last_n: sampling.dry_penalty_last_n.unwrap_or(dry.last_n),
             };
             if !dry_on {
                 corrections.dry = DryParams::OFF;
