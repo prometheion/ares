@@ -350,7 +350,8 @@ pub const OPTIONS: &[Opt] = &[
          drafter, by the architecture the file names. The n-gram drafter takes part with \
          them and never alone; with none the server does not speculate. The length of a \
          draft and whose it is are chosen for every step from the price of a step and the \
-         acceptance measured [default: all the model has: mtp if the file has an MTP block]",
+         acceptance measured [default: for the 27B all it has, mtp if its file has an MTP \
+         block; for Qwen3.8-Flash-Next none, it speculates only with a drafter named here]",
     ),
     Opt::model(
         "--batch-size",
