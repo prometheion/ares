@@ -26,7 +26,9 @@ fn path() -> Option<PathBuf> {
 }
 
 fn model(path: &PathBuf, chat: ChatOptions) -> Qwen35 {
-    Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, Options::default(), 4096)
+    let gguf = Gguf::open(path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+    Qwen35::new(gguf, tokenizer, "q", &Spread::Single, Options::default(), 4096)
         .unwrap()
         .with_chat_options(chat)
 }

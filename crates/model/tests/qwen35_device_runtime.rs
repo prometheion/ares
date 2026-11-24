@@ -118,9 +118,9 @@ fn every_placement_of_the_0_8b_agrees_with_the_reference() {
                 placements.push(("layer", Spread::Layer(vec![0.5, 0.5]), vec![0, 1]));
             }
             for (name, spread, ordinals) in placements {
+                let (gguf, tokenizer) = common::opened(&path);
                 let model = Arc::new(
-                    Qwen35::new(Gguf::open(&path).unwrap(), "q", &spread, options(precision), 512)
-                        .unwrap(),
+                    Qwen35::new(gguf, tokenizer, "q", &spread, options(precision), 512).unwrap(),
                 );
                 let devices: Vec<Device> =
                     ordinals.iter().map(|d| Device::open(*d, Wait::Block).unwrap()).collect();
@@ -162,9 +162,9 @@ fn every_placement_of_the_0_8b_agrees_with_the_reference() {
             if two {
                 let opts = Options { pipeline_rows: 16, ..options(precision) };
                 let spread = Spread::Layer(vec![0.5, 0.5]);
-                let model = Arc::new(
-                    Qwen35::new(Gguf::open(&path).unwrap(), "q", &spread, opts, 512).unwrap(),
-                );
+                let (gguf, tokenizer) = common::opened(&path);
+                let model =
+                    Arc::new(Qwen35::new(gguf, tokenizer, "q", &spread, opts, 512).unwrap());
                 let devices: Vec<Device> =
                     (0..2).map(|d| Device::open(d, Wait::Block).unwrap()).collect();
                 let mut session = Session::start(model, devices, 1, 512, 256 << 20).unwrap();
@@ -259,15 +259,10 @@ fn the_engine_answers_alone_and_two_at_once() {
         "Z\u{e4}hle von eins bis zwanzig, jede Zahl als Wort in einer eigenen Zeile, und dann noch einmal.",
         "Write the line 'the quick brown fox jumps over the lazy dog' four times, numbered.",
     ];
+    let (gguf, tokenizer) = common::opened(&path);
     let model = Arc::new(
-        Qwen35::new(
-            Gguf::open(&path).unwrap(),
-            "q",
-            &Spread::Single,
-            options(Precision::Exact),
-            1024,
-        )
-        .unwrap(),
+        Qwen35::new(gguf, tokenizer, "q", &Spread::Single, options(Precision::Exact), 1024)
+            .unwrap(),
     );
     let config =
         RuntimeConfig { pages: 32, cells_per_page: 128, max_slots: 2, ..RuntimeConfig::default() };
@@ -487,15 +482,10 @@ fn every_kind_of_sampler_setting_answers_on_the_real_model() {
         ("mirostat 2", sampled(&|s| s.mirostat = Some(2))),
         ("mirostat 1", sampled(&|s| s.mirostat = Some(1))),
     ];
+    let (gguf, tokenizer) = common::opened(&path);
     let model = Arc::new(
-        Qwen35::new(
-            Gguf::open(&path).unwrap(),
-            "q",
-            &Spread::Single,
-            options(Precision::Exact),
-            1024,
-        )
-        .unwrap(),
+        Qwen35::new(gguf, tokenizer, "q", &Spread::Single, options(Precision::Exact), 1024)
+            .unwrap(),
     );
     let vocab = ares_runtime::Model::vocab(&*model);
     let config =
@@ -651,9 +641,8 @@ fn a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement() {
             };
             let prompt = read_ids(&capture.join(language).join("base/prompt.tokens"));
             let opts = Options { kv: (format, format), logit_rows: 16, ..options(Precision::Fast) };
-            let model = Arc::new(
-                Qwen35::new(Gguf::open(&path).unwrap(), "q", &spread, opts, 1024).unwrap(),
-            );
+            let (gguf, tokenizer) = common::opened(&path);
+            let model = Arc::new(Qwen35::new(gguf, tokenizer, "q", &spread, opts, 1024).unwrap());
             let devices: Vec<Device> =
                 ordinals.iter().map(|d| Device::open(*d, Wait::Block).unwrap()).collect();
             let mut session = Session::start(model, devices, 2, 1024, 64 << 20).unwrap();

@@ -19,7 +19,6 @@ use ares_api::{
     Engine, Event, EventSink, GenerateRequest, Message, Prompt, RequestId, Role, Sampling, Usage,
 };
 use ares_cuda::{Device, Precision, Wait, device_count};
-use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
 use ares_tokenizer::ChatOptions;
@@ -266,16 +265,11 @@ fn what_each_drafter_is_worth_on_the_27b() {
         ..Options::default()
     };
     let context = 4096;
+    let (gguf, tokenizer) = common::opened(&path);
     let model = Arc::new(
-        Qwen35::new(
-            Gguf::open(&path).unwrap(),
-            "q",
-            &Spread::Tensor(vec![0.625, 0.375]),
-            options,
-            context,
-        )
-        .unwrap()
-        .with_chat_options(ChatOptions { enable_thinking: false, ..ChatOptions::default() }),
+        Qwen35::new(gguf, tokenizer, "q", &Spread::Tensor(vec![0.625, 0.375]), options, context)
+            .unwrap()
+            .with_chat_options(ChatOptions { enable_thinking: false, ..ChatOptions::default() }),
     );
     let config = RuntimeConfig {
         pages: 2 * context.div_ceil(128) + 2,
@@ -345,9 +339,9 @@ fn more_requests_than_fit_wait_in_line_and_all_answer() {
         window_rows: 7,
         ..Options::default()
     };
-    let model = Arc::new(
-        Qwen35::new(Gguf::open(&path).unwrap(), "q", &Spread::Single, options, 1024).unwrap(),
-    );
+    let (gguf, tokenizer) = common::opened(&path);
+    let model =
+        Arc::new(Qwen35::new(gguf, tokenizer, "q", &Spread::Single, options, 1024).unwrap());
     // Six pages of 128 cells. A request is charged for its prompt (a page)
     // and for the 120 tokens it may write (a page): three fit, six ask.
     let config = RuntimeConfig {

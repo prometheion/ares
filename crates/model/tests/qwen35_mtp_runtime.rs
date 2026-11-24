@@ -120,9 +120,9 @@ fn answers_with(
         dflash: drafting.dflash.clone(),
         ..Options::default()
     });
-    let model = Arc::new(
-        Qwen35::new(Gguf::open(model).unwrap(), "q", &drafting.spread, options, 1024).unwrap(),
-    );
+    let (gguf, tokenizer) = common::opened(model);
+    let model =
+        Arc::new(Qwen35::new(gguf, tokenizer, "q", &drafting.spread, options, 1024).unwrap());
     assert_eq!(model.placement().draft.is_some(), drafts > 0);
     let config = RuntimeConfig {
         pages: 20,

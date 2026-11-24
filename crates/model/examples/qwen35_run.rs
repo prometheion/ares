@@ -92,7 +92,7 @@ use ares_model::qwen35::device::{
     Layouts, Options, PHASES, PartReport, Profile, Qwen35, Rows, Session, Spread, Wanted,
 };
 use ares_runtime::Pick;
-use ares_tokenizer::{ChatOptions, EncodeOptions, Message};
+use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
 
 const MIB: f64 = 1024.0 * 1024.0;
 
@@ -758,9 +758,11 @@ fn main() {
 
     let begun = Instant::now();
     let gguf = Gguf::open(&args.model).expect("the model file");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("the tokenizer");
     let name = args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let model =
-        Arc::new(Qwen35::new(gguf, name, &spread, options, args.context).expect("the model"));
+    let model = Arc::new(
+        Qwen35::new(gguf, tokenizer, name, &spread, options, args.context).expect("the model"),
+    );
     let mut session =
         Session::start(model.clone(), devices.clone(), 1, args.context, 64 << 20).expect("start");
     let load = begun.elapsed();
@@ -1038,6 +1040,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         devices.iter().map(|d| d.mem_info().expect("memory").free).collect();
     let begun = Instant::now();
     let gguf = Gguf::open(&args.model).expect("the model file");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("the tokenizer");
     let chat = ChatOptions {
         variables: args
             .chat_vars
@@ -1047,7 +1050,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         ..ChatOptions::default()
     };
     let model = Arc::new(
-        Qwen35::new(gguf, String::new(), spread, options, args.context)
+        Qwen35::new(gguf, tokenizer, String::new(), spread, options, args.context)
             .expect("model")
             .with_chat_options(chat),
     );
@@ -1401,16 +1404,12 @@ fn conversation(args: &Args, spread: &Spread, history: usize) {
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Block).expect("open device")).collect();
     let chat = ChatOptions { enable_thinking: false, ..ChatOptions::default() };
+    let gguf = Gguf::open(&args.model).expect("the model file");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("the tokenizer");
     let model = Arc::new(
-        Qwen35::new(
-            Gguf::open(&args.model).expect("the model file"),
-            String::new(),
-            spread,
-            options,
-            args.context,
-        )
-        .expect("model")
-        .with_chat_options(chat),
+        Qwen35::new(gguf, tokenizer, String::new(), spread, options, args.context)
+            .expect("model")
+            .with_chat_options(chat),
     );
     let tokenizer = model.tokenizer();
     let ids = tokenizer.encode(&text, EncodeOptions { add_special: false, parse_special: false });

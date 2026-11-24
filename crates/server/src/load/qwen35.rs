@@ -22,6 +22,7 @@ use ares_model::qwen35::Config;
 use ares_model::qwen35::device::{
     EmbeddingReport, Estimate, Footprint, Options, Placement, Qwen35, Spread, fit_shares,
 };
+use ares_tokenizer::Tokenizer;
 
 use super::devices::{
     Held, bandwidth, describe_links, free_of, hold_devices, multiprocessors_of, ordinals, tower_of,
@@ -138,8 +139,11 @@ pub(super) fn load(
     // The model, built for the plan.
     let name = options.name.clone().unwrap_or_else(|| crate::preset::id_of_file(&options.model));
     let (window, drafts) = (asked.window, asked.drafts());
-    let model =
-        Qwen35::new(gguf, name.clone(), &spread, part_options, longest).map_err(model_error)?;
+    let tokenizer = Tokenizer::from_gguf(&gguf).map_err(model_error)?;
+    let (chat, template) = chat_options(options, &tokenizer)?;
+    let model = Qwen35::new(gguf, tokenizer, name.clone(), &spread, part_options, longest)
+        .map_err(model_error)?
+        .with_chat_options(chat);
     let model = match (asked.projector, tower_at) {
         (Some(projector), Some(t)) => {
             tracing::info!(
@@ -151,8 +155,7 @@ pub(super) fn load(
         }
         _ => model,
     };
-    let (chat, template) = chat_options(options, model.tokenizer())?;
-    let model = Arc::new(model.with_chat_options(chat));
+    let model = Arc::new(model);
 
     // Host RAM: the step buffers, and where the token embedding table lies in
     // host memory, the table and the rows of a step. A limit below that is

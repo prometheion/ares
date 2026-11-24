@@ -108,8 +108,6 @@ pub enum OpenError {
     Model(#[from] crate::qwen35::Error),
     #[error(transparent)]
     Placement(#[from] PlacementError),
-    #[error("tokenizer: {0}")]
-    Tokenizer(String),
     #[error("the projector: {0}")]
     Projector(String),
 }
@@ -147,12 +145,14 @@ impl std::fmt::Debug for Qwen35 {
 }
 
 impl Qwen35 {
-    /// Reads the configuration and the tokenizer of `gguf` and decides the
+    /// Reads the configuration of `gguf`, whose text `tokenizer` reads and
+    /// writes (`Tokenizer::from_gguf` of the same file), and decides the
     /// placement. `context` is the longest sequence the model is served with
     /// (at most the model's own context). Nothing is uploaded until the
     /// runtime opens the parts.
     pub fn new(
         gguf: Gguf,
+        tokenizer: Tokenizer,
         name: impl Into<String>,
         spread: &Spread,
         options: Options,
@@ -170,8 +170,6 @@ impl Qwen35 {
                 .fits(config.n_embd, config.n_layer, config.n_vocab)
                 .map_err(|e| PlacementError(e.to_string()))?;
         }
-        let tokenizer =
-            Tokenizer::from_gguf(&gguf).map_err(|e| OpenError::Tokenizer(e.to_string()))?;
         let context = context.clamp(1, config.n_ctx as u32);
         let balance = (placement.split == Split::Tensor && placement.n_devices() > 1)
             .then(|| Balance::new(placement.n_devices()));

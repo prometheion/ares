@@ -640,15 +640,10 @@ fn answers(
         draft_vocabulary: vocabulary.cloned(),
         ..Options::default()
     };
+    let (gguf, tokenizer) = common::opened(model);
     let model = Arc::new(
-        Qwen35::new(
-            Gguf::open(model).unwrap(),
-            "q",
-            &Spread::Tensor(vec![0.625, 0.375]),
-            options,
-            1024,
-        )
-        .unwrap(),
+        Qwen35::new(gguf, tokenizer, "q", &Spread::Tensor(vec![0.625, 0.375]), options, 1024)
+            .unwrap(),
     );
     let config = RuntimeConfig {
         pages: 20,

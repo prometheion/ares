@@ -25,6 +25,7 @@ use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::testing::{Failure, Fault, Faulty};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, RuntimeError};
+use ares_tokenizer::Tokenizer;
 
 /// How long a failure may take to arrive. A hang is forever; nothing here
 /// takes more than a few seconds when the runtime works.
@@ -56,9 +57,10 @@ fn model(path: &PathBuf, fault: Fault) -> Faulty<Qwen35> {
         window_rows: 0,
         ..Options::default()
     };
+    let gguf = Gguf::open(path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
     let inner =
-        Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Tensor(vec![0.5, 0.5]), options, 1024)
-            .unwrap();
+        Qwen35::new(gguf, tokenizer, "q", &Spread::Tensor(vec![0.5, 0.5]), options, 1024).unwrap();
     Faulty::new(inner, fault)
 }
 

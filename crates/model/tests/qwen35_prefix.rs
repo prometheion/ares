@@ -37,7 +37,6 @@ use ares_api::{
     Sampling, Usage,
 };
 use ares_cuda::{Device, Precision, Wait, device_count};
-use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Rows, Session, Spread, Wanted};
 use ares_runtime::{
     Clock, ExecError, Executor, GpuConfig, GpuExecutor, Model, Pick, Runtime, RuntimeConfig,
@@ -193,8 +192,9 @@ fn rig_following(
     // words that follow with a wide margin, which the rounding of a row does
     // not tip.
     let chat = ChatOptions { enable_thinking: false, ..ChatOptions::default() };
+    let (gguf, tokenizer) = common::opened(path);
     let model = Arc::new(
-        Qwen35::new(Gguf::open(path).unwrap(), "q", &layout.spread(), options, 4096)
+        Qwen35::new(gguf, tokenizer, "q", &layout.spread(), options, 4096)
             .unwrap()
             .with_chat_options(chat),
     );
@@ -651,9 +651,9 @@ fn a_row_computed_in_a_step_of_another_size_differs_by_rounding_only() {
         window_rows: 4,
         ..Options::default()
     };
-    let model = Arc::new(
-        Qwen35::new(Gguf::open(&path).unwrap(), "q", &Spread::Single, options, 2048).unwrap(),
-    );
+    let (gguf, tokenizer) = common::opened(&path);
+    let model =
+        Arc::new(Qwen35::new(gguf, tokenizer, "q", &Spread::Single, options, 2048).unwrap());
     let text = passage(5, 30);
     let ids = model
         .tokenizer()

@@ -294,8 +294,10 @@ impl Server {
             variables: vec![("preserve_reasoning".to_owned(), Json::Bool(true))],
             ..ChatOptions::default()
         };
+        let gguf = Gguf::open(path).unwrap();
+        let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
         let qwen = Arc::new(
-            Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 8192)
+            Qwen35::new(gguf, tokenizer, "q", &Spread::Single, options, 8192)
                 .unwrap()
                 .with_chat_options(chat.clone()),
         );

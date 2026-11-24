@@ -41,6 +41,7 @@ use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
 use ares_server::Config;
 use ares_server::load::{self, Loaded};
 use ares_server::options::{self, Kind, ModelOptions};
+use ares_tokenizer::Tokenizer;
 use ares_tokenizer::{ChatOptions, Json};
 use axum::Router;
 
@@ -70,8 +71,9 @@ pub fn small_model(path: &Path, thinking: Option<bool>) -> (Arc<Runtime>, Arc<Qw
         pipeline_rows: 32,
         ..Options::default()
     };
-    let model =
-        Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 4096).unwrap();
+    let gguf = Gguf::open(path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+    let model = Qwen35::new(gguf, tokenizer, "q", &Spread::Single, options, 4096).unwrap();
     let config =
         RuntimeConfig { pages: 96, cells_per_page: 128, max_slots: 4, ..RuntimeConfig::default() };
     let devices = vec![Device::open(test_device(), Wait::Block).unwrap()];
@@ -91,7 +93,9 @@ pub fn large_model(path: &Path, thinking: Option<bool>) -> (Arc<Runtime>, Arc<Qw
         ..Options::default()
     };
     let spread = Spread::Tensor(vec![0.625, 0.375]);
-    let model = Qwen35::new(Gguf::open(path).unwrap(), "q", &spread, options, 1024).unwrap();
+    let gguf = Gguf::open(path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+    let model = Qwen35::new(gguf, tokenizer, "q", &spread, options, 1024).unwrap();
     let config = RuntimeConfig {
         pages: 24,
         cells_per_page: 128,

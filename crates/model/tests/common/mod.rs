@@ -17,10 +17,18 @@ pub mod gpu;
 pub mod helpers;
 pub mod model;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ares_core::GgmlType;
-use ares_gguf::GgufBuilder;
+use ares_gguf::{Gguf, GgufBuilder};
+use ares_tokenizer::Tokenizer;
+
+/// The model file at `path` and its tokenizer, which a model is opened with.
+pub fn opened(path: impl AsRef<Path>) -> (Gguf, Tokenizer) {
+    let gguf = Gguf::open(path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+    (gguf, tokenizer)
+}
 
 /// The shape of a made-up model. Defaults give eight blocks (blocks 3 and 7 are
 /// attention), three value heads per key head and two query heads per
