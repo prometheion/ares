@@ -3,7 +3,9 @@
 Ares speaks the OpenAI chat, completion and Responses APIs, Anthropic's Messages
 API, and llama.cpp's `/props`, `/tokenize` and `/detokenize`. A request is served
 in full or refused: a field the server does not serve is a 400 that names it,
-never dropped. `null` counts as "not set".
+never dropped. On the chat and completion routes this holds for the members of
+the body; members inside a message, a tool or `stream_options` that the server
+does not read are passed over. `null` counts as "not set".
 
 ## Routes
 
@@ -34,27 +36,28 @@ the server has one.
 | Status | When |
 | --- | --- |
 | 400 | a field the server does not serve, a wrong value, a prompt longer than the context (`context_length_exceeded`), an image without `--mmproj` |
-| 401 | a key is missing or wrong (with `WWW-Authenticate: Bearer`) |
+| 401 | a key is missing or wrong (with `WWW-Authenticate: Bearer`, except on `/v1/messages`) |
 | 403 | a `Host` or a web page's `Origin` the server does not answer to (see [Keys and access](#keys-and-access)) |
 | 404 / 405 | an unknown route or model / a wrong method |
 | 408 / 413 | the body did not arrive within `--timeout` / the body is larger than 64 MiB |
-| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/metrics`), the server is stopping |
+| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/metrics`, and `/tokenize` and `/detokenize` without a `model`), the server is stopping |
 
 Errors have OpenAI's shape `{"error": {"message", "type", "param", "code"}}`,
 and Anthropic's `{"type": "error", "error": {"type", "message"}}` on `/v1/messages`.
 
 ## Chat and completions
 
-`/v1/chat/completions` and `/v1/completions` take the same fields, except the prompt.
+`/v1/chat/completions` and `/v1/completions` take the same fields, except the
+prompt and those marked "chat".
 
 | Field | Meaning | Notes |
 | --- | --- | --- |
 | `messages` | chat: the conversation | roles `system` (or `developer`), `user`, `assistant`, `tool`; `content` a string or parts `text` and `image_url`; also `name`, `tool_call_id`, `tool_calls`, `reasoning_content` |
 | `prompt` | completions: the text | one string (or an array of one string); token ids and several prompts are refused |
-| `max_tokens`, `max_completion_tokens`, `n_predict` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit` |
+| `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; of several, `n_predict` holds, then `max_completion_tokens` |
 | `stop` | stop strings | a string or an array; not empty |
 | `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
-| `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once |
+| `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
 | `priority` | the request's priority | see [Priorities](#priorities) |
 | `draft` | `false` turns drafting off for this request | default `true` |
@@ -71,7 +74,7 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 | `top_k`, `seed`, `repeat_last_n` | `top_k` `0` or `-1` is no cut; `seed: -1` draws a seed of its own; a window of `-1` (the whole context) is refused |
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |
-| `ignore_eos`, `min_keep` | the reply does not end at the end token; `min_keep` `0` or `1` only |
+| `ignore_eos`, `min_keep` | the reply does not end at the end token; a `min_keep` above 1 is refused |
 
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
 `functions` and `function_call`, adaptive-p (`adaptive_target`,
@@ -81,9 +84,10 @@ no chat template.
 The answer has OpenAI's shape and more: `usage.prompt_tokens_details.cached_tokens`
 (the part of the prompt the prompt cache gave), `usage.completion_tokens_details.reasoning_tokens`,
 `timings` (`prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, their rates,
-`draft_n`, `draft_n_accepted`, and `token_hash`, a hash of the reply's token ids),
-and `stop_reason` with the stop string that ended the reply. A reply that the
-server's `--max-tokens-limit` cut has the header `x-ares-max-tokens-limit`.
+`draft_n` and `draft_n_accepted` for a request that ran alone, and `token_hash`, a
+hash of the reply's token ids), and `stop_reason` with the stop string that ended
+the reply. A request that asked for more tokens than `--max-tokens-limit` gets the
+limit, and its response the header `x-ares-max-tokens-limit` with it.
 
 ## Messages
 
@@ -91,7 +95,7 @@ server's `--max-tokens-limit` cut has the header `x-ares-max-tokens-limit`.
 
 | Field | Notes |
 | --- | --- |
-| `model`, `max_tokens` | both required (`max_tokens` not on `count_tokens`) |
+| `model`, `max_tokens` | both required (`max_tokens` not on `count_tokens`); `max_tokens` at least 1 |
 | `temperature`, `top_p`, `top_k`, `stream` | as on the chat route; other sampling fields are refused |
 | `system` | a string or text blocks |
 | `messages` | `user`, `assistant` and `system` turns, a string or blocks. User: `text`, `image`, `tool_result` (text and images; `is_error` puts `Error: ` before the text). Assistant: `text`, `thinking`, `redacted_thinking` (kept out of the prompt), `tool_use`. A later `system` turn becomes a user turn for templates that take the system message first only. A last assistant turn is a prefill, which the reply continues |
@@ -100,15 +104,16 @@ server's `--max-tokens-limit` cut has the header `x-ares-max-tokens-limit`.
 | `thinking` | see [Thinking](#thinking) |
 | `stop_sequences` | stop strings; `stop_reason` is `stop_sequence` and `stop_sequence` names it |
 | `output_config` | `format: {"type": "json_schema", "schema": ...}`; `effort` is the reasoning effort |
-| `context_management` | the edits `clear_thinking_20251015` and `clear_tool_uses_20250919`, as Anthropic's service makes them; the response lists them in `applied_edits` |
+| `context_management` | the edits `clear_thinking_20251015` and `clear_tool_uses_20250919`, as Anthropic's service makes them; the response's `context_management.applied_edits` lists those that changed the prompt, with what they cleared; `count_tokens` adds `context_management.original_input_tokens`, the count before the edits |
 | `cache_control` | accepted on the body, blocks and tools, without effect: every prefix is cached anyway |
 | `metadata`, `service_tier` | accepted, without effect |
 
 Refused: `document` blocks, citations, tools that Anthropic's service runs
 (`web_search_...`, `bash_...`) and their blocks, `mcp_servers`, `container`,
 `defer_loading: true`, images from a URL, and other edits of `context_management`.
-The usage has `input_tokens`, `cache_read_input_tokens` (from the prompt cache)
-and `cache_creation_input_tokens` (always 0).
+The usage has `input_tokens` (the prompt less what the prompt cache gave),
+`cache_read_input_tokens` (from the prompt cache), `cache_creation_input_tokens`
+(always 0) and `output_tokens`.
 
 ## Responses
 
@@ -121,14 +126,19 @@ state: every response says `"store": false`.
 | `instructions` | a system message |
 | `input` | a string, or items: messages (`user`, `assistant`, `system`, `developer`; parts `input_text`, `output_text`, `input_image`), `function_call`, `function_call_output`, `reasoning` |
 | `tools`, `tool_choice`, `parallel_tool_calls` | functions only; `tool_choice` `auto`, `none`, `required`, `{"type": "function", "name"}` |
-| `max_output_tokens` | a reply it cuts is `incomplete` |
+| `max_output_tokens` | at least 1; a reply it cuts is `incomplete` |
 | `reasoning` | `effort`; `summary: "auto"` is accepted, no summary is written |
 | `thinking_token_budget` | a budget of thinking tokens (vLLM's field) |
 | `text.format` | `text`, `json_object`, `json_schema` |
 | `include` | `reasoning.encrypted_content` is accepted and adds nothing |
 | `truncation` | `disabled` (default): too long is an error; `auto`: the oldest whole turns leave until it fits |
+| `stream_options` | `include_obfuscation: false` only |
 | `store`, `background` | `false` only |
 | `metadata`, `user`, `safety_identifier`, `service_tier`, `client_metadata`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_options` | accepted, without effect |
+
+The usage has `input_tokens` (the whole prompt), `input_tokens_details.cached_tokens`,
+`output_tokens`, `output_tokens_details.reasoning_tokens` for a model that thinks,
+and `total_tokens`; the response carries `timings` as on the chat route.
 
 Refused: `previous_response_id`, `conversation`, `item_reference`, `prompt`
 templates, `top_logprobs`, `max_tool_calls`, tools that are not functions,
@@ -161,9 +171,11 @@ that generates (for clients that cannot add a field, such as Claude Code with
 | format | `reasoning_format`: `auto` or `none` | thinking blocks | a `reasoning` item |
 
 The defaults come from `--reasoning`, `--reasoning-effort`, `--reasoning-format`
-and `--reasoning-budget-tokens`. An effort the chat template refuses is a 400,
-except `high`, which then means the template's default (Flash-Next's template
-knows `low`, `medium` and `xhigh`, its default). A budget is a bound: when it is
+and `--reasoning-budget-tokens`. An effort is a 400 when the chat template does not
+read one, and a level the template refuses is a 400, except `high`, which then
+means the template's default (Flash-Next's template knows `low`, `medium` and
+`xhigh`, its default); Messages takes `high` always, as the template's default.
+`"none"` is a 400 when the template cannot switch thinking off. A budget is a bound: when it is
 spent, the budget's message and the end of the thinking are written and the
 answer follows. A budget on a model without thinking is refused. Thinking that
 loops is ended the same way, and one token repeated 256 times ends a reply.
@@ -191,9 +203,9 @@ checked against `pattern`, `minLength`, `maxLength` or `format`).
 `parallel_tool_calls: false` allows one call. A call the model opens inside its
 thinking ends the thinking and is returned as a call. Calls stream as OpenAI
 deltas, Anthropic `input_json_delta` or Responses argument deltas;
-`finish_reason` is `tool_calls`. A template whose calls the server cannot read
-gets no tools, and tools next to a structured-output field are refused unless
-`tool_choice` is `none`.
+`finish_reason` is `tool_calls`. Tools for a model whose template writes calls in
+a form the server cannot read are a 400 unless `tool_choice` is `none`, and so are
+tools next to a structured-output field.
 
 ## Structured output
 
@@ -205,7 +217,9 @@ gets no tools, and tools next to a structured-output field are refused unless
 | `output_config.format` | Messages | `{"type": "json_schema", "schema": ...}` |
 | `text.format` | Responses | `text`, `json_object`, `json_schema` with `schema` |
 
-`grammar` with another of them is refused. The thinking stays free; the rule
+`grammar` with another of them is refused. `json_schema` next to a
+`response_format` gives way to the format's schema, as in llama-server (with
+`json_object` without a `schema` it holds). The thinking stays free; the rule
 binds the answer after it.
 
 ## Images
@@ -239,12 +253,12 @@ an HTTP status, or after 10 seconds without it. A failure later is an error even
 
 | Route | Fields and answer |
 | --- | --- |
-| `/v1/models` | `{"object": "list", "data": [...]}`; each model has `id`, `aliases`, `status` (`unloaded`, `loading`, `loaded`, `unloading`, `failed`, with a `reason`), `defaults` (what a request gets for the fields it leaves out), `max_tokens_limit` if set, and `created` and `context_length` once loaded |
+| `/v1/models` | `{"object": "list", "data": [...]}`; each model has `id`, `aliases`, `status` (`{"value": ...}`: `unloaded`, `loading`, `loaded`, `unloading` or `failed`, with a `reason` for a failure or a load that waits for room), `defaults` (what a request gets for the fields it leaves out), `max_tokens_limit` if set, and `created` and `context_length` from its last load |
 | `/props` | `model`, `loaded`, `context_length`, `default_generation_settings` (`params`, `n_ctx`), `chat_template`, `chat_template_caps` (tools, reasoning, effort, `enable_thinking`, thinks by default), `reasoning` (its tags), `modalities` (`vision` true when the model was loaded with `--mmproj`, or its preset names one; `audio` false); a model that is not loaded is described from its file without a load |
-| `/tokenize` | `content` (a text, read as a completion prompt) or a chat request (`messages` and the chat fields); `with_pieces` adds each token's text; `parse_special: false` and `add_special` are refused; answers `{"tokens": [...]}` |
+| `/tokenize` | `content` (a text, read as a completion prompt) or a chat request (`messages` and the chat fields); `parse_special: false` and `add_special` are refused; answers `{"tokens": [...]}`, with `with_pieces` `{"tokens": [{"id", "piece"}, ...]}` (the text, or its bytes where a token is not whole characters) |
 | `/detokenize` | `tokens`; answers `{"content": "..."}`; control tokens write nothing |
 | `/metrics` | the histograms `ares_request_queue_seconds`, `ares_request_prompt_seconds`, `ares_time_to_first_token_seconds`, `ares_time_per_output_token_seconds`, `ares_request_seconds`, and counters and gauges of requests, tokens, drafts, the prompt cache in RAM and on the SSD, and Flash-Next's experts |
-| `/models/load`, `/models/unload` | with `--models-preset` (see [options.md](options.md#the-preset-file)); an unload takes new requests away and unloads the model when its running requests have ended |
+| `/models/load`, `/models/unload` | an unload takes new requests away and unloads the model when its running requests have ended; the next request loads it again. Also with one `--model` (see [options.md](options.md#the-preset-file) for several) |
 
 ## Keys and access
 
@@ -252,9 +266,9 @@ an HTTP status, or after 10 seconds without it. A failure later is an error even
 | --- | --- |
 | key | with `--api-key` or `--api-key-file`, every route but `/health` wants `Authorization: Bearer <key>` or `x-api-key: <key>` |
 | `Host` | a server on a loopback address without keys answers only to `localhost` and to addresses; `--allowed-hosts` adds names |
-| `Origin` | without keys, a request a browser sends from a page of another site is refused; local pages and `--cors-origins` pass |
+| `Origin` | without keys, a request a browser sends from a page of another site is refused; local pages, pages of the server's own name or of an `--allowed-hosts` name, and `--cors-origins` pass |
 | CORS | answers to an origin of `--cors-origins` carry the CORS headers, and its preflight is answered without a key |
 
-With keys, the key decides, and names and pages are checked only when
+With keys, the key decides: pages are not checked, and names only when
 `--allowed-hosts` names hosts. A server that listens beyond this machine without
 keys warns at start. [features.md](features.md) lists what Ares can do.

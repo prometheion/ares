@@ -26,8 +26,8 @@
 //!    header, which its SDKs send). It is compared in constant time with every
 //!    key. Without, 401 in the error shape of the route's API.
 //!
-//! With a key the key decides: the name and the page are not checked unless
-//! `--allowed-hosts` names hosts (the server's start sets that, see
+//! With a key the key decides: the page is not checked, and the name only
+//! when `--allowed-hosts` names hosts (the server's start sets that, see
 //! `crate::Access`). An answer to an origin of `--cors-origins` carries the
 //! headers that let the page read it, errors included.
 

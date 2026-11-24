@@ -47,7 +47,7 @@ All four are server options.
 | `--api-key <KEYS>` | Keys a request must carry one of, separated by commas, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` stays open. | none: no key is asked for |
 | `--api-key-file <FILE>` | More keys, one on each line; lines that begin with `#` are comments. A file without a key is an error. | none |
 | `--allowed-hosts <LIST>` | Names in a request's `Host` header that the server answers to besides its local ones (`localhost`, addresses), separated by commas, or `*` for any. Names given here are checked on every address and with keys too. | the local names only, when the server listens on a loopback address without keys; else any name |
-| `--cors-origins <LIST>` | Origins whose web pages may call the server from a browser and read its answers, such as `https://chat.example.org`, separated by commas, or `*` for any. Without keys, a request from a page of another site is refused unless the page is local. | none |
+| `--cors-origins <LIST>` | Origins whose web pages may call the server from a browser and read its answers, such as `https://chat.example.org`, separated by commas, or `*` for any. Without keys, a request from a page of another site is refused unless the page is local or of the server's own name or an `--allowed-hosts` name; with keys pages are not checked. | none |
 
 ## Where the model goes
 

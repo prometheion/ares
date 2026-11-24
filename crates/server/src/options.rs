@@ -252,7 +252,8 @@ pub const OPTIONS: &[Opt] = &[
         "Origins whose web pages may call the server from a browser and read its answers \
          (CORS), such as https://chat.example.org, separated by commas, or * for any. Without \
          keys a request from a page of any other site is refused, unless the page is local \
-         (localhost, an address) [default: none]",
+         (localhost, an address) or of the server's own name or an allowed host [default: \
+         none]",
     ),
     Opt::model(
         "--devices",
