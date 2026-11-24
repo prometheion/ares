@@ -30,6 +30,8 @@
 mod kernels;
 mod pool;
 mod tables;
+#[cfg(test)]
+mod test_rig;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -917,112 +919,7 @@ pub fn quantize_activations(x: &[f32], n_in: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// A small generator with a fixed sequence (xorshift64*).
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-
-        fn unit(&mut self) -> f32 {
-            (self.next() >> 40) as f32 / (1u64 << 24) as f32
-        }
-
-        /// Roughly normal, with a rare value ten times as large.
-        fn activation(&mut self) -> f32 {
-            let v: f32 = (0..6).map(|_| self.unit() - 0.5).sum();
-            if self.next().is_multiple_of(61) { 10.0 * v } else { v }
-        }
-    }
-
-    /// Random blocks of `ty` with scales of moderate size.
-    fn random_matrix(rng: &mut Rng, ty: GgmlType, values: usize) -> Vec<u8> {
-        let block = ty.block_bytes() as usize;
-        let mut bytes = vec![0u8; values / ty.block_values() as usize * block];
-        for b in &mut bytes {
-            *b = rng.next() as u8;
-        }
-        for blk in bytes.chunks_exact_mut(block) {
-            // An f16 between 1/64 and 1/8, wherever the type keeps it.
-            let d = (0x2400u16 + (rng.next() % 0xC00) as u16).to_le_bytes();
-            match ty {
-                GgmlType::IQ1_M => {
-                    blk[49] = blk[49] & 0x0f | (d[0] & 0x0f) << 4;
-                    blk[51] = blk[51] & 0x0f | d[0] & 0xf0;
-                    blk[53] = blk[53] & 0x0f | (d[1] & 0x0f) << 4;
-                    blk[55] = blk[55] & 0x0f | d[1] & 0xf0;
-                }
-                _ => blk[..2].copy_from_slice(&d),
-            }
-        }
-        bytes
-    }
-
-    fn decoded(ty: GgmlType, bytes: &[u8]) -> Vec<f32> {
-        let mut out =
-            vec![0.0; bytes.len() / ty.block_bytes() as usize * ty.block_values() as usize];
-        ares_quant::dequantize(ty, bytes, &mut out).expect("whole blocks");
-        out
-    }
-
-    /// The activations the kernels see: codes times scales.
-    fn dequantized_act(act: &[u8], n_in: usize, n_rows: usize) -> Vec<f64> {
-        let ds_at = (n_rows * n_in).next_multiple_of(16);
-        (0..n_rows * n_in)
-            .map(|i| {
-                let at = ds_at + 8 * (i / 32);
-                let d = f32::from_le_bytes([act[at], act[at + 1], act[at + 2], act[at + 3]]);
-                f64::from(act[i] as i8) * f64::from(d)
-            })
-            .collect()
-    }
-
-    /// The expert in exact arithmetic on the decoded weights. `quantized`
-    /// rounds the hidden values as the kernels do; without it nothing is
-    /// rounded.
-    fn reference(
-        gate: &[f32],
-        up: &[f32],
-        down: &[f32],
-        x: &[f64],
-        n_ff: usize,
-        quantized: bool,
-    ) -> Vec<f64> {
-        let n_in = x.len();
-        let dot =
-            |w: &[f32], x: &[f64]| w.iter().zip(x).map(|(w, x)| f64::from(*w) * x).sum::<f64>();
-        let mut h: Vec<f64> = (0..n_ff)
-            .map(|j| {
-                let g = dot(&gate[j * n_in..(j + 1) * n_in], x);
-                let u = dot(&up[j * n_in..(j + 1) * n_in], x);
-                if quantized {
-                    let (g, u) = (g as f32, u as f32);
-                    f64::from(g / (1.0 + (-g).exp()) * u)
-                } else {
-                    g / (1.0 + (-g).exp()) * u
-                }
-            })
-            .collect();
-        if quantized {
-            for chunk in h.as_chunks_mut::<{ act::GROUP }>().0.iter_mut() {
-                let group = act::Group::of(&chunk.map(|v| v as f32));
-                for (i, v) in chunk.iter_mut().enumerate() {
-                    *v = f64::from(group.value(i));
-                }
-            }
-        }
-        (0..n_in).map(|i| dot(&down[i * n_ff..(i + 1) * n_ff], &h)).collect()
-    }
-
-    fn relative_rms(got: &[f64], want: &[f64]) -> f64 {
-        let err: f64 = got.iter().zip(want).map(|(g, w)| (g - w) * (g - w)).sum();
-        let norm: f64 = want.iter().map(|w| w * w).sum();
-        (err / norm).sqrt()
-    }
+    use super::test_rig::*;
 
     /// A layer of `n_experts` random experts and `n_rows` rows, each row
     /// using a few of the experts: the job's sums against the reference.
