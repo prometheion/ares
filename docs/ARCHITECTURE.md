@@ -2526,7 +2526,9 @@ cached. What is refused, by name: `min_keep` above 1, `repeat_last_n` or
 `dry_penalty_last_n` above 1024 or -1, `dry_allowed_length` above 1024, more than 1024 biased tokens, more than
 20 alternatives, `n` above 16, `adaptive_target`, `adaptive_decay`, the sampler
 names `infill` and `adaptive_p`, and a `samplers` list that puts penalties or
-DRY after a sampler that cuts. Structured output is read from `grammar`,
+DRY after a sampler that cuts, names one of them twice or more than 16 samplers
+that cut or scale (`SamplerKind::order_problem` in `ares-api`, the one rule
+that requests and the server's `--samplers` are held to). Structured output is read from `grammar`,
 `json_schema` and `response_format` (below), and the calls of tools are held
 to a grammar the server writes (see [Server](#server), "Tool calls").
 
@@ -4558,14 +4560,16 @@ its context is the smallest.
 
 So the heads are a choice between context and the speed of long sequences,
 and the room decides how far they must move: with the most context as the
-goal, heads by room (`plan::attention_by_room`: device `i` gets the share of
+goal, heads by room (`attention_by_room`: device `i` gets the share of
 the heads that its room without heads is of all rooms, which makes every
 device full at the same page: M's 0.33 is what the rule gives from the rooms
 measured in A, and there both cards had room for 232 000 to 236 000 more
 tokens),
 and for a context that fits with fewer moved, only as many as it needs
-(`plan::attention_for_context`: the weights' shares lowered where a device's
-room is short, `fit_shares`). That is how the plan places the heads
+(`heads_for_context`: the weights' shares lowered where a device's room is
+short, `fit_shares`; all three in `ares_model::qwen35::device`, `plan.rs`, with
+the model's estimate of what each device takes, `Estimate`). That is how the
+plan places the heads
 (`AttentionShares::ByContext`), with no option of its own (the owner,
 2026-11-22): the context steers it, `--context` or, without it, the model's
 own, and when that does not fit wherever the heads are, the heads go by room
@@ -4582,7 +4586,7 @@ over until none is. (The owner's production settings, `--shares 0.625,0.375
 --context 262144 --parallel 2 --kv q5` with the MTP block, planned the RTX
 4070 20 MiB above its free memory with 0.363 of the heads before, and the load
 died; the plan now gives it 0.320 and 11 491 of its 11 796 MiB free,
-`load.rs` `the_27b_at_the_owners_settings_plans_within_free_memory`.) Shares
+`qwen35/device/plan.rs` `the_27b_at_the_owners_settings_plans_within_free_memory`.) Shares
 given (`AttentionShares::Given`) are for tests and measurements.
 
 **The partial states of the attention plans** (`PlanConfig::state_slots_bound`). A
@@ -7407,7 +7411,7 @@ look by look. The users:
 Both elastic users meet in the books of a Flash-Next engine: the tier of
 experts, and the prompt cache of its recurrent state (`Model::prefix_cache`,
 and with `--cache` its level on SSD), whose floor of one checkpoint place the
-server books before the tier (`qwen4exp.rs`); the ranks above decide between
+server books before the tier (`load/ram.rs`, `Budget`); the ranks above decide between
 them. A dense model has no tier. A prompt's working memory, staging and
 checkpoints do not borrow from each other at run time (staging is a fixed
 part of the tier, sized at load for the tier as it starts). The ranks also
@@ -7665,8 +7669,21 @@ the handlers). `routes.rs` has the routes that are no API's own (health, the
 model list, the loads and events of router mode) and what every handler
 uses; `metrics.rs` is `/metrics`, with `metrics/latency.rs`. The options are
 `options.rs` (the table), `defaults.rs`, `ini.rs`, `preset.rs` and the
-binary's `cli.rs`; `models.rs` keeps the models of router mode, and
-`load.rs`, `qwen4exp.rs` and `plan.rs` load one onto the devices.
+binary's `cli.rs`; `models.rs` keeps the models of router mode, and `load/`
+with `plan.rs` loads one onto the devices: `load/qwen35.rs` the dense model and
+`load/qwen4exp.rs` Flash-Next, each in its phases (what was asked and can be
+refused before a device is touched, the devices and the split, the shares or
+the role of the second device, the context, the rows of a step, the plan in
+the log, the model built, the engine started, what it took), sharing
+`load/files.rs` (the drafters, the draft vocabulary, the projector, the chat
+template), `load/devices.rs` (the devices and their links), `load/ram.rs` (one
+budget of host RAM for both: the limit, what the engine needs to run, the
+plan's line of the RAM, the machine's memory the engines follow) and
+`load/start.rs` (the runtime's settings, the start, what the engine found).
+What a device takes is the model's to say, not the server's: the 27B's
+estimate is `ares_model::qwen35::device::Estimate` (`plan.rs`, the placement
+`Qwen35::new` makes and each device's `Footprint`), Flash-Next's placement,
+pages, slot floors and lent rows are `ares_model::qwen4exp::device::runtime::plan`.
 
 **The defaults of a model's requests.** A model has its own value for every
 sampling field a request can leave out, and its own limits for the length of
@@ -7764,14 +7781,19 @@ a reply that `max_tokens` cuts inside the thinking has reasoning and an empty
 content. An assistant message of a request may carry `reasoning_content` back,
 and the chat template writes it into the prompt. What marks the reasoning is
 read off the model's own template, not looked up by the name of a model: when a
-model is set up, `ReasoningFormat::detect` (`ares-tokenizer`) renders small
+model is set up, `ChatTemplate::thinking_format` (`ares-tokenizer`) renders small
 conversations and compares the texts, as llama.cpp's autoparser does. An
 assistant message with and without `reasoning_content` gives the pair of tags
 and the white space the template writes around them; the end of the prompt with
 `enable_thinking` on and off says whether the model continues inside the block
-or the template closes an empty one; earlier turns with `preserve_reasoning` and
-a few values of `reasoning_effort` say which of the two variables the template
-reads. The result travels as `ares_api::ChatFormat` (`Model::chat_format`,
+or the template closes an empty one; a few values of `reasoning_effort` say
+whether the template reads it and which values it refuses. The tokenizer gives
+the API's own types (`ares_api::ThinkingFormat`, and `ares_api::ToolFormat` for
+the calls of tools, `ChatTemplate::tool_format`), and whether the model thinks
+when a request does not say comes from the options the model is rendered with.
+Whether the template takes a system message only first (Qwen's raise an
+exception for a later one) is read the same way (`ChatTemplate::system_first`:
+a system message rendered before a user's and after one). The result travels as `ares_api::ChatFormat` (`Model::chat_format`,
 `Engine::chat_format`) and the server's `Splitter` sorts the text with it as it
 streams: it holds back what may still be a tag and the white space the template
 writes around the reasoning, and gives the same text however the pieces are cut.
@@ -8151,8 +8173,8 @@ a field of a beta is served or refused by its name in the body.
   for notes of progress between calls, which the server does not have; the
   thinking comes back whole, which is also what writes it into the next prompt
   as the model generated it. A system turn after another turn is a turn of the
-  user by the rule of every route (`openai::request::place_system_messages`, see "The
-  Responses API").
+  user for a template that takes a system message only first, by the rule of
+  every route (`generate::place_system_messages`, see "The Responses API").
 - **`thinking.display: "omitted"`.** Anthropic's API answers it with thinking
   blocks whose `thinking` is the empty text and whose signature carries the
   thinking it does not show, so that a client that sends the block back
@@ -8278,11 +8300,14 @@ head of `input` and sends no `instructions` (read in its source, not tried),
 and the chat template of Qwen3.5-0.8B refuses a system message that is not
 the first one (`System message must be at the beginning.`, read in the model
 file). Such a message inside a conversation is a message of the user with its
-text, by the rule of every route: the reader of the chat body
-(`openai::request::place_system_messages`) makes the system messages before every other
-message one system message (joined by an empty line) and a later one a turn
-of the user, which is where the Messages route always put a system turn
-between the others.
+text, by the rule of every route for a template that declares it
+(`ChatFormat::system_first`, read off the template, which the three models'
+templates do): where a request takes its model (`generate::prepare`,
+`place_system_messages`), the system messages before every other message
+become one system message (joined by an empty line) and a later one a turn of
+the user, which is where the Messages route always put a system turn between
+the others. A template that takes a system message anywhere gets it where the
+client put it.
 
 Everything else is refused with a 400 that names it, in OpenAI's shape of an
 error, as on the chat route: `input_image`, `input_file` and `input_audio`
