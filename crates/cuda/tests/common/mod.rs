@@ -69,25 +69,40 @@ pub fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// The bytes of u32 values.
+pub fn u32_bytes(values: &[u32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
 /// The f32 values of bytes.
 pub fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
     bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
+/// The first `len` bytes of a device buffer.
+pub fn download(buffer: &DeviceBuffer, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    buffer.read(0, &mut bytes).unwrap();
+    bytes
+}
+
 /// The first `n` f32 values of a device buffer.
 pub fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 4];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes_f32(&bytes)
+    bytes_f32(&download(buffer, n * 4))
+}
+
+/// A device buffer that holds `bytes` (at least 16 bytes, for an empty list).
+pub fn upload(device: &Device, bytes: &[u8]) -> DeviceBuffer {
+    let buffer = DeviceBuffer::new(device, (bytes.len() as u64).max(16)).unwrap();
+    if !bytes.is_empty() {
+        buffer.write(0, bytes).unwrap();
+    }
+    buffer
 }
 
 /// A device buffer that holds `values` (at least 16 bytes, for an empty list).
 pub fn upload_f32(device: &Device, values: &[f32]) -> DeviceBuffer {
-    let buffer = DeviceBuffer::new(device, (values.len() as u64 * 4).max(16)).unwrap();
-    if !values.is_empty() {
-        buffer.write(0, &f32_bytes(values)).unwrap();
-    }
-    buffer
+    upload(device, &f32_bytes(values))
 }
 
 /// Largest absolute difference, relative to the largest value of `reference`.

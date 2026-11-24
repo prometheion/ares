@@ -14,15 +14,9 @@ use ares_cuda::{
     DeviceBuffer, DevicePtr, HeadShape, Kernels, PositionGrid, PrefillPath, Stream, TowerKernels,
 };
 use ares_quant::{f16_to_f32, f32_to_f16};
-use common::{Rng, gpus, read_f32, upload_f32};
+use common::{Rng, download, gpus, read_f32, upload_f32};
 
 mod common;
-
-fn bytes_of(buffer: &DeviceBuffer, n: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; n];
-    buffer.read(0, &mut bytes).unwrap();
-    bytes
-}
 
 /// The f32 values of `n_rows` rows of `n_in` f16 activations (the form of
 /// `prepare_prefill_activations` on the f16 path): each value times its row's
@@ -69,7 +63,7 @@ fn convert(
             .unwrap();
     }
     stream.synchronize().unwrap();
-    bytes_of(&out, bytes as usize)
+    download(&out, bytes as usize)
 }
 
 /// The layer norm and the GELU write the form of `prepare_prefill_activations`:
@@ -118,7 +112,7 @@ fn norm_and_gelu_write_the_f16_form_of_the_tile_kernels() {
                     .unwrap();
             }
             stream.synchronize().unwrap();
-            let ours = bytes_of(&out, bytes as usize);
+            let ours = download(&out, bytes as usize);
             let decoded = decode_act(&ours, width, n_rows);
             assert_eq!(convert(&kernels, &stream, &decoded, width, n_rows), ours, "group {group}");
             // Against the host's norm in f64.
@@ -162,7 +156,7 @@ fn norm_and_gelu_write_the_f16_form_of_the_tile_kernels() {
                 .unwrap();
         }
         stream.synchronize().unwrap();
-        let ours = bytes_of(&out, bytes as usize);
+        let ours = download(&out, bytes as usize);
         let decoded = decode_act(&ours, pad, n_rows);
         assert_eq!(convert(&kernels, &stream, &decoded, pad, n_rows), ours, "GELU");
         for (row, out) in y.chunks(n).zip(decoded.chunks(pad)) {
@@ -367,7 +361,7 @@ fn rotation_and_attention_match_the_host() {
             unsafe { tower.attention(&stream, heads.ptr(), out.ptr(), shape, scale).unwrap() };
             stream.synchronize().unwrap();
             let pitch = shape.pitch() as usize;
-            let raw = bytes_of(&heads, shape.bytes() as usize);
+            let raw = download(&heads, shape.bytes() as usize);
             let half_at = |part: usize, head: usize, p: usize, k: usize| {
                 let at = 2 * (((part * n_head + head) * patches + p) * pitch + k);
                 f16_to_f32(u16::from_le_bytes([raw[at], raw[at + 1]]))

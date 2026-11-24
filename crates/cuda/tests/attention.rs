@@ -18,47 +18,20 @@
 //! - *Reading*: attention equals `KvHead::attend` within the stated error.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use ares_cuda::{
     AttendBuffers, AttentionKernels, AttnRow, CacheFormat, CacheGeometry, Device, DeviceBuffer,
-    PlanConfig, Planner, Stream, Wait, device_count,
+    PlanConfig, Planner, Stream,
 };
 use ares_quant::{KvFormat, KvHead, KvPolicy, encode_row, encode_tile};
+use common::{Rng, download, f32_bytes, gpus, u32_bytes, upload};
+
+mod common;
 
 const TILE: usize = 128;
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
+/// What the rows of K and V are drawn from.
 impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// A value in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
     fn gaussian(&mut self) -> f32 {
         let u1 = (self.unit() + 1.0) * 0.5 + 1e-7;
         let u2 = self.unit();
@@ -77,30 +50,10 @@ fn cache_format(f: KvFormat) -> CacheFormat {
     CacheFormat::ALL[KvFormat::ALL.iter().position(|x| *x == f).unwrap()]
 }
 
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn u32_bytes(values: &[u32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn upload(device: &Device, bytes: &[u8]) -> DeviceBuffer {
-    let buffer = DeviceBuffer::new(device, bytes.len().max(16) as u64).unwrap();
-    buffer.write(0, bytes).unwrap();
-    buffer
-}
-
 fn zeroed(device: &Device, len: u64) -> DeviceBuffer {
     let buffer = DeviceBuffer::new(device, len.max(16)).unwrap();
     buffer.write(0, &vec![0u8; len.max(16) as usize]).unwrap();
     buffer
-}
-
-fn download(buffer: &DeviceBuffer, len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    buffer.read(0, &mut out).unwrap();
-    out
 }
 
 fn status_of(buffer: &DeviceBuffer) -> u32 {

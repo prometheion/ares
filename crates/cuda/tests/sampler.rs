@@ -23,7 +23,7 @@ use ares_sampler::{
     Entry, LogprobOut, Logprobs, Mirostat, Order, SAMPLE_STATUS_EMPTY, SAMPLE_STATUS_NONFINITE,
     SampleParams, SamplePick, SampleRow, Stage, TokenMask, sample_reference,
 };
-use common::{f32_bytes, gpus};
+use common::{f32_bytes, gpus, u32_bytes, upload};
 
 mod common;
 
@@ -173,10 +173,6 @@ fn settings(vocab: u32) -> Vec<SampleParams> {
     ]
 }
 
-fn u32_bytes(values: &[u32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
 /// What the rows of a batch carry besides their settings.
 #[derive(Clone, Default)]
 struct Extras {
@@ -226,12 +222,6 @@ struct Slice {
     batch: SampleBatch,
 }
 
-fn buffer(device: &Device, bytes: &[u8]) -> DeviceBuffer {
-    let buffer = DeviceBuffer::new(device, bytes.len().max(16) as u64).unwrap();
-    buffer.write(0, bytes).unwrap();
-    buffer
-}
-
 impl Slice {
     /// Columns `range` of `rows` (each of the whole vocabulary) as device
     /// `rank` of `devices` holds them. With `map`, column `i` is token
@@ -256,10 +246,10 @@ impl Slice {
         for row in rows {
             flat.extend_from_slice(&row[range.clone()]);
         }
-        let logits = buffer(device, &f32_bytes(&flat));
+        let logits = upload(device, &f32_bytes(&flat));
         let words = TokenMask::words_for(vocab as u32);
         let (rows_with, entries, masks) = extras.attach(params, words);
-        let tokens = map.map(|map| buffer(device, &u32_bytes(&map[range.clone()])));
+        let tokens = map.map(|map| upload(device, &u32_bytes(&map[range.clone()])));
         let inverse = tokens.as_ref().map(|tokens| {
             let inverse = DeviceBuffer::new(device, vocab as u64 * 4).unwrap();
             // SAFETY: the buffers hold `n_local` and `vocab` values.
@@ -270,10 +260,10 @@ impl Slice {
             inverse
         });
         let params_bytes: Vec<u8> = rows_with.iter().flat_map(|p| p.to_bytes()).collect();
-        let params_buffer = buffer(device, &params_bytes);
+        let params_buffer = upload(device, &params_bytes);
         let entry_bytes: Vec<u8> = entries.iter().flat_map(Entry::to_bytes).collect();
-        let entries = (!entries.is_empty()).then(|| buffer(device, &entry_bytes));
-        let masks = (!masks.is_empty()).then(|| buffer(device, &u32_bytes(&masks)));
+        let entries = (!entries.is_empty()).then(|| upload(device, &entry_bytes));
+        let masks = (!masks.is_empty()).then(|| upload(device, &u32_bytes(&masks)));
         let out = DeviceBuffer::new(device, (rows.len() * SamplePick::BYTES) as u64).unwrap();
         let lp = DeviceBuffer::new(device, (rows.len() * LogprobOut::BYTES) as u64).unwrap();
         let scratch = DeviceBuffer::new(device, SamplerKernels::scratch_bytes(n_rows)).unwrap();
