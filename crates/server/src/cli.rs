@@ -76,12 +76,38 @@ fn spelling(opt: &Opt) -> String {
 }
 
 /// `text` in lines of at most `width` characters, where they can be cut
-/// between words; a `\n` in it starts a line.
+/// between words, and a list wider than a line (a,b,c) after a comma; a `\n`
+/// in it starts a line.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for part in text.split('\n') {
         let mut line = String::new();
-        for word in part.split_whitespace() {
+        for mut word in part.split_whitespace() {
+            while word.chars().count() > width {
+                let used = if line.is_empty() { 0 } else { line.chars().count() + 1 };
+                let room = width.saturating_sub(used);
+                let cut = word
+                    .match_indices(',')
+                    .map(|(at, _)| at + 1)
+                    .take_while(|end| word[..*end].chars().count() <= room)
+                    .last();
+                match cut {
+                    Some(end) => {
+                        if !line.is_empty() {
+                            line.push(' ');
+                        }
+                        line.push_str(&word[..end]);
+                        lines.push(std::mem::take(&mut line));
+                        word = &word[end..];
+                    }
+                    None if !line.is_empty() => lines.push(std::mem::take(&mut line)),
+                    // No comma to cut at: the word stands alone, wider than the line.
+                    None => break,
+                }
+            }
+            if word.is_empty() {
+                continue;
+            }
             if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
                 lines.push(std::mem::take(&mut line));
             }
@@ -921,6 +947,16 @@ mod tests {
         for line in help.lines() {
             assert!(line.chars().count() <= WIDTH, "a line wider than {WIDTH}: {line}");
         }
+    }
+
+    #[test]
+    fn a_list_wider_than_a_line_is_cut_after_a_comma() {
+        let list = "[default: aaaa,bbbb,cccc,dddd,eeee]";
+        assert_eq!(wrap(list, 20), ["[default: aaaa,bbbb,", "cccc,dddd,eeee]"]);
+        let after = "x [default: aaaa,bbbb,cccc,dddd]";
+        assert_eq!(wrap(after, 16), ["x [default:", "aaaa,bbbb,cccc,", "dddd]"]);
+        // A word without a comma stands alone, wider than the line.
+        assert_eq!(wrap("x abcdefghijkl y", 5), ["x", "abcdefghijkl", "y"]);
     }
 
     #[test]

@@ -685,7 +685,7 @@ pub const OPTIONS: &[Opt] = &[
          each, at most 16 others (penalties,dry,top_n_sigma,top_k,typ_p,top_p,min_p,xtc,\
          temperature)",
         "The samplers that apply and their order, by name [default: \
-         penalties,dry,top_n_sigma,top_k,typ_p, top_p,min_p,xtc,temperature]"
+         penalties,dry,top_n_sigma,top_k,typ_p,top_p,min_p,xtc,temperature]"
     ),
     field!(
         "--seed",
