@@ -375,8 +375,10 @@ pub const OPTIONS: &[Opt] = &[
         "--window",
         "<ROWS>",
         "Most rows of one sequence's window, its newest token and the drafts verified with \
-         it. The room for them is VRAM (about 5 MiB a row for the 27B, for every sequence) \
-         [default: 8, the rows one launch of the few-row weight kernels takes]",
+         it, at least 2; Qwen3.8-Flash-Next takes at most 8. The room for them is VRAM \
+         (about 5 MiB a row for the 27B, for every sequence) [default: 8 for the 27B, the \
+         rows one launch of the few-row weight kernels takes; 4 for Qwen3.8-Flash-Next, \
+         where a rejected draft costs what a token costs]",
     ),
     Opt::model(
         "--draft-vocab",
