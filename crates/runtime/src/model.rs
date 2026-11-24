@@ -241,6 +241,24 @@ pub struct Durable {
     pub settle_cells: u32,
 }
 
+impl Durable {
+    /// The bytes a page takes in RAM and on the drive, its share of every
+    /// device each padded to a block of direct I/O.
+    pub fn page_room(&self) -> u64 {
+        Self::padded(&self.page_bytes)
+    }
+
+    /// The bytes a checkpoint takes in transit and on the drive, padded as a
+    /// page's.
+    pub fn state_room(&self) -> u64 {
+        Self::padded(&self.state_bytes)
+    }
+
+    fn padded(shares: &[u64]) -> u64 {
+        shares.iter().map(|bytes| ares_store::padded(*bytes as usize) as u64).sum()
+    }
+}
+
 /// What a device part is given to carry out a transfer.
 #[derive(Debug)]
 pub struct TransferContext<'a> {

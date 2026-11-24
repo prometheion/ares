@@ -616,8 +616,7 @@ pub(crate) fn load(
     });
     let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
     let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
-    let floor =
-        durable.as_ref().map_or(checkpoint, |durable| SsdConfig::floor_ram(durable, checkpoint));
+    let floor = checkpoint + durable.as_ref().map_or(0, SsdConfig::floor_pages);
     let mut needs = vec![("its step buffers", required - tower_ram)];
     if tower_ram > 0 {
         needs.push((

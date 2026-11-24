@@ -1644,8 +1644,7 @@ fn load_qwen35(
     });
     let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
     let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
-    let floor =
-        durable.as_ref().map_or(checkpoint, |durable| SsdConfig::floor_ram(durable, checkpoint));
+    let floor = checkpoint + durable.as_ref().map_or(0, SsdConfig::floor_pages);
     let through = durable.is_some() && floor > 0;
     match (floor, through) {
         (0, _) => {}

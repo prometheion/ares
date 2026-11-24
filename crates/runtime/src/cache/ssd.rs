@@ -106,21 +106,17 @@ impl SsdConfig {
     /// It is not in the books of the page-locked RAM
     /// ([`crate::PinnedRam`]); who sets the engine's RAM limit counts it
     /// next to them. Pages pass through buffers of the prompt cache in RAM,
-    /// which are in those books ([`SsdConfig::floor_ram`]).
+    /// which are in those books ([`SsdConfig::floor_pages`]).
     pub fn transit_ram(durable: &Durable) -> u64 {
-        STATE_BUFFERS as u64 * Self::room(&durable.state_bytes)
+        STATE_BUFFERS as u64 * durable.state_room()
     }
 
-    /// The page-locked RAM the prompt cache keeps whatever the machine has
-    /// when it has a level on SSD, for a model that is `durable` and whose
-    /// checkpoints take `checkpoint` bytes: one checkpoint place, and the
-    /// pages that pass through RAM on their way to the drive and back.
-    pub fn floor_ram(durable: &Durable, checkpoint: u64) -> u64 {
-        checkpoint + RESERVE * Self::room(&durable.page_bytes)
-    }
-
-    fn room(bytes: &[u64]) -> u64 {
-        bytes.iter().map(|b| ares_store::padded(*b as usize) as u64).sum()
+    /// The pages of page-locked RAM the prompt cache keeps whatever the
+    /// machine has when it has a level on SSD, for a model that is
+    /// `durable`: what state passes through on its way to the drive and
+    /// back. Beside them the cache keeps one checkpoint place.
+    pub fn floor_pages(durable: &Durable) -> u64 {
+        RESERVE * durable.page_room()
     }
 
     /// The engine's own numbers for a store in `dir` of at most `max_bytes`.
@@ -524,7 +520,7 @@ impl Ssd {
             store_states: store.states() as u64,
             store_bytes: store.bytes(),
             write_ns: self.counters.write_ns + self.shared.sync_ns.load(Ordering::Relaxed),
-            transit_bytes: self.made_states as u64 * SsdConfig::room(&self.durable.state_bytes),
+            transit_bytes: self.made_states as u64 * self.durable.state_room(),
             pending: self.writing as u64,
             ..self.counters
         }

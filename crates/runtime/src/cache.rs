@@ -360,12 +360,12 @@ impl Cache {
     /// checkpoint at least. With the level on SSD in use, [`RESERVE`] pages
     /// are kept as well: state passes through them to the drive and back.
     pub(crate) fn with_ram(mut self, books: Option<PinnedRam>) -> Self {
-        let page = self.durable.as_ref().map_or(0, |durable| {
-            durable.page_bytes.iter().map(|b| ares_store::padded(*b as usize) as u64).sum()
-        });
         let through = self.ssd.is_some();
         let place = if self.recurrent && self.capacity > 0 { self.bytes } else { 0 };
-        let pages = if through { RESERVE * page } else { 0 };
+        let pages = match (through, &self.durable) {
+            (true, Some(durable)) => SsdConfig::floor_pages(durable),
+            _ => 0,
+        };
         let want = self.policy.budget_bytes.max(place + pages);
         let books = match (books, &self.durable) {
             (Some(books), _) => Some(books),
