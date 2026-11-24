@@ -3435,7 +3435,9 @@ Three stages, all on the device, none needing the host to read the picks:
   scratch of `top_k * n_embd` f32 per row and a kernel adding a row's picks in the order
   of the router) gave the same bits everywhere; nothing used it, and since the owner's
   rule of 2026-11-23 (greedy output may differ from run to run, as long as it is not
-  wrong) it is gone (2026-11-24).
+  wrong) the host has it no more (2026-11-24). The down kernel keeps its branch: without
+  it nvcc lays out the kernel of 16 pairs of Q2_0 in 64 registers instead of 70, and it
+  was 5 % slower.
 
 An expert of the plan without an address is not read: its pairs add nothing, are
 counted in the plan (`missing_pairs`) and the expert is flagged, so the caller

@@ -1697,10 +1697,14 @@ impl ExpertRowKernels {
             .ptr(hidden)
             .ptr(hidden.offset(shape.rows_hidden_scales_offset(n_rows)))
             .ptr(out)
+            // No scratch and the atomic sum: the kernel's other branch is kept for the layout
+            // nvcc gives it (`kernels/expertrows_down.cuh`).
+            .ptr(DevicePtr::NULL)
             .u32(shape.n_ff)
             .u32(shape.n_embd)
             .u32(shape.n_experts)
-            .u32(pairs);
+            .u32(pairs)
+            .u32(1);
         let grid = [layout.max_items(), shape.n_embd / ROWS_WEIGHT_ROWS, 1];
         let Some((table, kernels)) = types::index(shape.down_ty).map(|i| &self.down[i]) else {
             return Err(invalid("expert shape", "no many-row kernel for the types".into()));
