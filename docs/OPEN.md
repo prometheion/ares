@@ -1,10 +1,7 @@
 # What is still open
 
-Updated 2026-11-22, `main` at the prefill path measured per type on full-rate cards (after the
-shared layer's steps 5 and 6: one MTP driver, drafter kinds `ngram`, `mtp`, `dflash`; nothing
-pushed). What is there is listed in
-[`user/features.md`](user/features.md).
-This file is brought up to date at every merge into `main`. It lists work, defects and
+What Ares does is listed in [`user/features.md`](user/features.md), what was done, by date, in
+[`dev/history.md`](dev/history.md). This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
 [`dev/studies/feature-checklist.md`](dev/studies/feature-checklist.md) (223 rows: 70 done,
 42 partly, 88 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out

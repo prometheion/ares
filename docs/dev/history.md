@@ -353,6 +353,12 @@ the agents' builds):
 
 ## 2026-11-22
 
+### From the head of `OPEN.md`
+
+Updated 2026-11-22, `main` at the prefill path measured per type on full-rate cards (after the
+shared layer's steps 5 and 6: one MTP driver, drafter kinds `ngram`, `mtp`, `dflash`; nothing
+pushed).
+
 ### From "The order of 2026-11-17 (after the gap study; items 1 to 7 done, the rest is a store)"
 
 1. [x] Pin Claude Code's billing stamp at the start of its system prompt as upstream llama.cpp does
