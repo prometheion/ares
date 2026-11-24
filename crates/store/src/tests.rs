@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use ares_state::ChainHash;
-use ares_store::{Aligned, BLOCK, Config, Error, Fingerprint, Kind, PageStore, Part, padded};
+
+use crate::{Aligned, BLOCK, Config, Error, Fingerprint, Kind, PageStore, Part, padded};
 
 const PER_PAGE: u32 = 4;
 /// Bytes of a test page and of its record on disk (a header block and the

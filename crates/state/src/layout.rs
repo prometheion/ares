@@ -55,21 +55,6 @@ impl PageLayout {
     pub fn parts(&self) -> impl Iterator<Item = (usize, &str, u64)> {
         self.parts.iter().map(|(device, name, bytes)| (*device, name.as_str(), *bytes))
     }
-
-    /// The number of pages that fit when device `i` may spend `budgets[i]`
-    /// bytes on pages. The tightest device decides.
-    pub fn pages_within(&self, budgets: &[u64]) -> u32 {
-        assert_eq!(budgets.len(), self.bytes_per_page.len(), "one budget per device");
-        let pages = self
-            .bytes_per_page
-            .iter()
-            .zip(budgets)
-            .filter(|(per_page, _)| **per_page > 0)
-            .map(|(per_page, budget)| budget / per_page)
-            .min()
-            .unwrap_or(0);
-        u32::try_from(pages).unwrap_or(u32::MAX)
-    }
 }
 
 #[cfg(test)]
@@ -93,22 +78,15 @@ mod tests {
         // The model's full context of 262 144 tokens.
         let full_context = 262_144 / 4 * layout.bytes_per_page(0);
         assert_eq!(full_context, 3_724_541_952, "3.47 GiB");
-        assert_eq!(layout.pages_within(&[full_context]), 65_536);
-        // 2 GiB of VRAM for pages hold about 151 000 tokens across all
-        // sequences, however many there are.
-        assert_eq!(layout.pages_within(&[2 << 30]) * 4, 151_144);
     }
 
     #[test]
-    fn the_tightest_device_decides() {
+    fn each_device_has_the_bytes_of_its_parts() {
         // An attention split of 1:3 KV heads over two devices.
         let layout =
             PageLayout::new(2, 64).per_cell(0, "KV head 0", 100).per_cell(1, "KV heads 1-3", 300);
-        assert_eq!(layout.pages_within(&[6_400_000, 6_400_000]), 333);
-        assert_eq!(layout.pages_within(&[640_000, 64_000_000]), 100);
-        assert_eq!(layout.parts().count(), 2);
-        // A device without paged state does not limit the pool.
-        let one_sided = PageLayout::new(2, 64).per_cell(1, "KV", 100);
-        assert_eq!(one_sided.pages_within(&[0, 6_400]), 1);
+        assert_eq!((layout.bytes_per_page(0), layout.bytes_per_page(1)), (6_400, 19_200));
+        let parts: Vec<_> = layout.parts().collect();
+        assert_eq!(parts, [(0, "KV head 0", 6_400), (1, "KV heads 1-3", 19_200)]);
     }
 }

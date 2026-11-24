@@ -53,8 +53,9 @@
 //! (LMDeploy's read-only blocks). That keeps the pages shared and saves the
 //! scale search of the low-bit formats; it does not save the rows' time.
 //!
-//! **Which are dropped** ([`PrefixIndex::make_room_for_checkpoints`]). There
-//! is a budget in bytes. When it is full:
+//! **Which are dropped** ([`PrefixIndex::checkpoint_ranks`], the order in which
+//! the runtime's cache gives them up). There is a budget in bytes. When it is
+//! full:
 //!
 //! 1. Aged checkpoints go before fresh ones. The checkpoints form a tree by
 //!    their text; a checkpoint on one branch is aged when more than
@@ -370,8 +371,8 @@ impl PrefixIndex {
     /// `hash`. Returns the checkpoint that was attached before, which the
     /// caller owns again; `Err` gives `id` back when there is no such entry.
     ///
-    /// The caller makes room first
-    /// ([`PrefixIndex::make_room_for_checkpoints`]).
+    /// The caller makes room first ([`PrefixIndex::checkpoint_ranks`] says
+    /// which go).
     pub fn attach_checkpoint(
         &mut self,
         hash: ChainHash,
@@ -547,8 +548,9 @@ impl PrefixIndex {
     ///
     /// When the budget holds fewer than `incoming` checkpoints, every
     /// checkpoint is returned and the caller keeps as many of the new ones as
-    /// [`CheckpointPolicy::capacity`] allows.
-    pub fn make_room_for_checkpoints(
+    /// [`CheckpointPolicy::capacity`] allows. For the tests of the order.
+    #[cfg(test)]
+    pub(crate) fn make_room_for_checkpoints(
         &mut self,
         policy: &CheckpointPolicy,
         incoming: usize,

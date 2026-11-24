@@ -149,8 +149,15 @@ impl World {
         if self.index.checkpoint(hash).is_some() || self.policy.capacity() == 0 {
             return;
         }
-        for id in self.index.make_room_for_checkpoints(&self.policy, 1) {
-            self.forget(Some(id));
+        // Room for one more: the checkpoints go in the order of their ranks,
+        // as the runtime's cache gives up those of its index.
+        while self.index.checkpoints() > 0 && self.index.checkpoints() >= self.policy.capacity() {
+            let Some(first) = self.index.checkpoint_ranks(&self.policy).first().copied() else {
+                break;
+            };
+            if let Ok(Some(id)) = self.index.set_checkpoint(first.hash, None) {
+                self.forget(Some(id));
+            }
         }
         self.next_checkpoint += 1;
         let id = CheckpointId(self.next_checkpoint);

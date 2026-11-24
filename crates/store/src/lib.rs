@@ -246,7 +246,8 @@ pub struct Part<'a> {
 
 impl<'a> Part<'a> {
     /// All of `bytes`, with tag 0.
-    pub fn whole(bytes: &'a [u8]) -> Self {
+    #[cfg(test)]
+    pub(crate) fn whole(bytes: &'a [u8]) -> Self {
         Self { buf: bytes, len: bytes.len(), tag: 0 }
     }
 }
@@ -255,8 +256,9 @@ impl<'a> Part<'a> {
 pub type Parts = Vec<(u32, u32)>;
 
 /// What the store knows about a record without reading it.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stored {
+pub(crate) struct Stored {
     pub parent: ChainHash,
     /// The number of the page in its chain, 1 for a first page.
     pub depth: u32,
@@ -719,7 +721,8 @@ impl PageStore {
     }
 
     /// The segments the size limit has removed since the store was opened.
-    pub fn evicted_segments(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn evicted_segments(&self) -> u64 {
         self.evicted
     }
 
@@ -729,7 +732,8 @@ impl PageStore {
     }
 
     /// What is stored under `hash`, without reading it or counting as a use.
-    pub fn stat(&self, kind: Kind, hash: ChainHash) -> Option<Stored> {
+    #[cfg(test)]
+    pub(crate) fn stat(&self, kind: Kind, hash: ChainHash) -> Option<Stored> {
         let location = self.index_of(kind).get(&hash.to_bytes())?;
         Some(Stored {
             parent: ChainHash::from_bytes(location.parent),
@@ -757,7 +761,8 @@ impl PageStore {
 
     /// The longest prefix of `tokens` (the names of cells, `ares_state`) whose pages are all in the store, as
     /// their hashes in order, starting from `root`. The pages count as used.
-    pub fn lookup(
+    #[cfg(test)]
+    pub(crate) fn lookup(
         &mut self,
         root: ChainHash,
         tokens: &[u64],
@@ -888,7 +893,8 @@ impl PageStore {
     /// Stores a record in one call: [`PageStore::begin`], [`Pending::write`]
     /// and [`PageStore::commit`]. Returns `false` and writes nothing when the
     /// record is stored already.
-    pub fn put(
+    #[cfg(test)]
+    pub(crate) fn put(
         &mut self,
         kind: Kind,
         hash: ChainHash,
@@ -932,7 +938,8 @@ impl PageStore {
     ///
     /// Returns `None` when there is no such record, or when its bytes no
     /// longer match their checksum; a damaged record is forgotten.
-    pub fn read(
+    #[cfg(test)]
+    pub(crate) fn read(
         &mut self,
         kind: Kind,
         hash: ChainHash,
@@ -1032,3 +1039,6 @@ impl PageStore {
         before - self.bytes
     }
 }
+
+#[cfg(test)]
+mod tests;
