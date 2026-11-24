@@ -193,6 +193,8 @@ fn check_matvec(
         DeviceBuffer::new(device, Kernels::quantized_activation_bytes(n_in as u32, n_batch as u32))
             .unwrap();
     let dy = DeviceBuffer::new(device, (n_batch * n_out * 4) as u64).unwrap();
+    // NaN in every output, so that one the kernel leaves unwritten fails the comparison.
+    dy.write(0, &vec![0xFF; n_batch * n_out * 4]).unwrap();
     // SAFETY: the buffers were sized for these shapes just above.
     unsafe {
         kernels
@@ -238,7 +240,8 @@ fn check_matvec(
                 squares += (w * f64::from(xb[k])).powi(2);
             }
             let h = f64::from(have[b * n_out + r]);
-            worst_tight = worst_tight.max((h - emulated).abs() / magnitude.max(1e-30));
+            let off = (h - emulated).abs() / magnitude.max(1e-30);
+            worst_tight = worst_tight.max(if off.is_nan() { f64::INFINITY } else { off });
             err2 += (h - exact).powi(2);
             ref2 += exact.powi(2);
             scale2 += squares;
@@ -343,6 +346,33 @@ fn fast_matvec_computes_the_dequantized_product_on_every_type() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// A matrix with more tiles of rows than the launch of a type's kernel has thread blocks:
+/// the kernels whose codebook is large walk several tiles per block, and the launch gives
+/// them fewer blocks than there are tiles. Every row must still be written, for every type,
+/// whichever of them walk (sixteen blocks of 8 rows per multiprocessor is more than any
+/// launch has).
+#[test]
+fn every_row_of_a_matrix_taller_than_a_launch_is_written() {
+    let Some(gpus) = gpus() else { return };
+    let mut rng = Rng(0x6a09e667f3bcc909);
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        let n_out = 16 * 8 * device.info().multiprocessors as usize + 5;
+        for (ty, _) in TYPES {
+            let n_in = ty.block_values().max(32) as usize;
+            let w = random_blocks(&mut rng, ty, n_in / ty.block_values() as usize * n_out);
+            let x: Vec<f32> = (0..n_in * 2).map(|_| rng.activation()).collect();
+            let dev = check_matvec(device, &kernels, ty, &w, &x, n_in, n_out, 2);
+            assert!(
+                dev.tight < 5e-5,
+                "{ty} {n_out}x{n_in} on {}: differs from the emulation: {}",
+                device.info().name,
+                dev.describe()
+            );
         }
     }
 }
