@@ -25,6 +25,7 @@
 
 use ares_core::GgmlType;
 use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, Stream};
+use ares_quant::act;
 use common::blocks::{TYPES, is_float, random_blocks};
 use common::{Rng, f32_bytes, gpus, read_f32};
 
@@ -59,26 +60,6 @@ fn shapes_for(ty: GgmlType) -> Vec<(usize, usize, usize)> {
         // Many thread blocks.
         (bv * 4, 3000, 3),
     ]
-}
-
-/// The quantization of activations as `ares_quantize_act` does it, on the CPU:
-/// per group of 32 values `d = max|x| / 127`, `q = round(x / d)` (halves away
-/// from zero) and `s = d * sum(q)`. Returns the codes and the `(d, s)` pairs.
-fn quantize_like_the_gpu(x: &[f32]) -> (Vec<i8>, Vec<(f32, f32)>) {
-    let mut codes = Vec::with_capacity(x.len());
-    let mut pairs = Vec::with_capacity(x.len() / 32);
-    for group in x.chunks(32) {
-        let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        let mut sum = 0f32;
-        for v in group {
-            let code = if amax == 0.0 { 0.0 } else { (v / d).round() };
-            codes.push(code as i8);
-            sum += code;
-        }
-        pairs.push((d, d * sum));
-    }
-    (codes, pairs)
 }
 
 /// How far a kernel result is from the two references.
@@ -164,7 +145,9 @@ fn check_matvec(
     let (mut err2, mut ref2, mut err_max, mut ref_max, mut scale2) = (0f64, 0f64, 0f64, 0f64, 0f64);
     for b in 0..n_batch {
         let xb = &x[b * n_in..][..n_in];
-        let (codes, pairs) = quantize_like_the_gpu(xb);
+        // The float types take any row length; their activations are not quantized.
+        let groups: Vec<act::Group> =
+            if is_float(ty) { Vec::new() } else { act::groups(xb).collect() };
         for r in 0..n_out {
             let row = &weights[r * n_in..][..n_in];
             let (mut emulated, mut magnitude, mut exact, mut squares) = (0f64, 0f64, 0f64, 0f64);
@@ -174,7 +157,8 @@ fn check_matvec(
                 let xq = if is_float(ty) {
                     f64::from(xb[k])
                 } else {
-                    f64::from(pairs[k / 32].0) * f64::from(codes[k])
+                    let group = &groups[k / act::GROUP];
+                    f64::from(group.d) * f64::from(group.codes[k % act::GROUP])
                 };
                 emulated += w * xq;
                 magnitude += (w * xq).abs();
@@ -234,15 +218,17 @@ fn activation_quantization_matches_the_cpu_bit_for_bit() {
             dq.read(0, &mut got).unwrap();
 
             let n_values = n_in * n_batch;
-            let (codes, pairs) = quantize_like_the_gpu(&x);
+            let groups: Vec<act::Group> = act::groups(&x).collect();
             let got_codes: Vec<i8> = got[..n_values].iter().map(|b| *b as i8).collect();
+            let codes: Vec<i8> = groups.iter().flat_map(|g| g.codes).collect();
             assert_eq!(got_codes, codes, "codes, {n_batch} x {n_in}");
-            let ds_at = n_values.next_multiple_of(16);
-            for (g, (d, s)) in pairs.iter().enumerate() {
+            let ds_at = act::Layout::of(n_values as u64).pairs_at as usize;
+            for (g, group) in groups.iter().enumerate() {
                 let at = ds_at + 8 * g;
                 let gd = f32::from_le_bytes(got[at..at + 4].try_into().unwrap());
                 let gs = f32::from_le_bytes(got[at + 4..at + 8].try_into().unwrap());
-                assert_eq!((gd.to_bits(), gs.to_bits()), (d.to_bits(), s.to_bits()), "group {g}");
+                let want = (group.d.to_bits(), group.s.to_bits());
+                assert_eq!((gd.to_bits(), gs.to_bits()), want, "group {g}");
             }
         }
     }

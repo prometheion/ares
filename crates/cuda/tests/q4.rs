@@ -17,8 +17,9 @@ use ares_cuda::{
     AttendBuffers, AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry,
     CommitSet, Device, DeviceBuffer, IndexerShape, Kernels, KeyFormat, LayerKernels, ListHandOver,
     MixerMatrix, NgramShape, Plan, Q4Kernels, RopeParams, Segment, SelectionRule, StepRecord,
-    Stream, quantized_activation_bytes,
+    Stream,
 };
+use ares_quant::act;
 use common::blocks::{TYPES, random_blocks};
 use common::{Rng, gpus, rel_max};
 
@@ -227,7 +228,7 @@ fn the_stream_mixer_matches_its_formulas() {
                 let xn = rng.floats(rows * d, 2.0);
                 let gate = rng.floats(rows * d, 5.0);
                 let (xn_b, gate_b) = (gpu.floats(&xn), gpu.floats(&gate));
-                let bytes = quantized_activation_bytes((rows * n) as u64);
+                let bytes = act::Layout::of((rows * n) as u64).bytes;
                 let act = gpu.empty(bytes);
                 unsafe {
                     gpu.q4
@@ -359,7 +360,7 @@ fn the_fused_read_takes_every_weight_type() {
                 let r = rng.floats(rows * d, 3.0);
                 let norm = rng.floats(d, 1.5);
                 let (r_b, norm_b) = (gpu.floats(&r), gpu.floats(&norm));
-                let act_bytes = quantized_activation_bytes((rows * n) as u64);
+                let act_bytes = act::Layout::of((rows * n) as u64).bytes;
                 let run = |ty: GgmlType, down: &[u8], inject: &[u8], up: &[u8]| {
                     let (down_b, inject_b, up_b) =
                         (gpu.bytes(down), gpu.bytes(inject), gpu.bytes(up));

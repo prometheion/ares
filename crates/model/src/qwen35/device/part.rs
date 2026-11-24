@@ -22,6 +22,7 @@ use ares_cuda::{
     PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout, WeightRange,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
+use ares_quant::act;
 use ares_runtime::{Links, Logits, ModelError, PinnedRam, Split};
 
 use super::choose::{Balance, LayoutReport, Layouts, decode_in_batches, file_path};
@@ -1340,7 +1341,7 @@ impl Part {
         let rows = if have.int8 {
             // The f32 copy at the end of the quantized layout.
             let values = u64::from(n_in) * u64::from(n);
-            act_q.offset(ares_cuda::quantized_activation_bytes(values) - values * 4)
+            act_q.offset(act::Layout::of(values).values_at)
         } else {
             x
         };

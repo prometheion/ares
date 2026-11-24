@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 use ares_cuda::ExpertShape;
+use ares_quant::act;
 
 use kernels::{DownExpert, DownKind, GateKind, Hidden, Order, Planes, RowIn};
 pub use pool::{CpuPool, Placement, Topology};
@@ -896,33 +897,20 @@ impl LayerJob {
 }
 
 /// Bytes of the activations of `n_rows` rows of `n_in` values that a job
-/// reads: the codes and the `(d, s)` pairs, as `ares_quantize_act` lays them
-/// out (the `f32` copy behind them is not read).
+/// reads: the codes and the `(d, s)` pairs of [`ares_quant::act`], as
+/// `ares_quantize_act` lays them out (the `f32` copy behind them is not read).
 pub fn act_bytes(n_in: usize, n_rows: usize) -> usize {
-    let codes = n_rows * n_in;
-    codes.next_multiple_of(16) + codes / 32 * 8
+    act::Layout::of((n_rows * n_in) as u64).pairs_end as usize
 }
 
 /// Quantizes rows of activations on the host exactly as `ares_quantize_act`
 /// does on the device, into the layout a [`LayerJob`] reads: for tests and
 /// for measuring the kernels without a device.
 pub fn quantize_activations(x: &[f32], n_in: usize) -> Vec<u8> {
-    let n_rows = x.len() / n_in;
-    let mut act = vec![0u8; act_bytes(n_in, n_rows)];
-    let ds_at = (n_rows * n_in).next_multiple_of(16);
-    for (chunk, values) in x.as_chunks::<32>().0.iter().enumerate() {
-        let amax = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        let mut sum = 0.0f32;
-        for (i, v) in values.iter().enumerate() {
-            let code = if amax == 0.0 { 0.0 } else { (v / d).round() };
-            act[32 * chunk + i] = code as i8 as u8;
-            sum += code;
-        }
-        act[ds_at + 8 * chunk..ds_at + 8 * chunk + 4].copy_from_slice(&d.to_le_bytes());
-        act[ds_at + 8 * chunk + 4..ds_at + 8 * chunk + 8].copy_from_slice(&(d * sum).to_le_bytes());
-    }
-    act
+    let values = x.len() / n_in * n_in;
+    let mut bytes = act::quantize(&x[..values]);
+    bytes.truncate(act::Layout::of(values as u64).pairs_end as usize);
+    bytes
 }
 
 #[cfg(test)]
@@ -1020,11 +1008,10 @@ mod tests {
             })
             .collect();
         if quantized {
-            for chunk in h.as_chunks_mut::<32>().0.iter_mut() {
-                let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs() as f32));
-                let d = amax / 127.0;
-                for v in chunk {
-                    *v = if amax > 0.0 { f64::from((*v as f32 / d).round() * d) } else { 0.0 };
+            for chunk in h.as_chunks_mut::<{ act::GROUP }>().0.iter_mut() {
+                let group = act::Group::of(&chunk.map(|v| v as f32));
+                for (i, v) in chunk.iter_mut().enumerate() {
+                    *v = f64::from(group.value(i));
                 }
             }
         }

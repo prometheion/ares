@@ -95,6 +95,7 @@ use ares_cuda::{
     ActivationForm, Device, DeviceBuffer, DevicePtr, Event, Kernels, LayerKernels, MAX_BATCH,
     OutputGate, Precision, PrefillChoice, PrefillPath, Stream, WeightLayout,
 };
+use ares_quant::act;
 use ares_runtime::ModelError;
 
 /// How the layout of each weight matrix is chosen when a model is loaded.
@@ -910,7 +911,7 @@ impl<'a> Chooser<'a> {
         }
         // The f32 copy that the quantizing kernels leave, for a row too wide
         // for the fused kernel that writes f16.
-        let copy = act_q.offset(ares_cuda::quantized_activation_bytes(values) - values * 4);
+        let copy = act_q.offset(act::Layout::of(values).values_at);
         let (int8, f16) = (ActivationForm::Int8, ActivationForm::F16);
         let gate = OutputGate::Silu;
         let launch = |stream: &Stream, as_f16: bool| -> Result<(), ModelError> {

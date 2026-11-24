@@ -21,8 +21,9 @@
 use ares_core::GgmlType;
 use ares_cuda::{
     AttentionShape, Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels,
-    NormKind, OutputGate, RopeParams, Segment, StepRecord, Stream, quantized_activation_bytes,
+    NormKind, OutputGate, RopeParams, Segment, StepRecord, Stream,
 };
+use ares_quant::act;
 use common::{Rng, gpus, rel_max};
 
 mod common;
@@ -522,7 +523,7 @@ fn the_gather_of_output_rows_copies_and_norms() {
 /// wrote into its own output. Equal bytes mean the fused kernel's codes, scales
 /// and sums are those of the separate kernel for the values it computed.
 fn check_fused_layout(gpu: &Gpu, fused: &DeviceBuffer, n_values: usize, what: &str) -> Vec<f32> {
-    let total = quantized_activation_bytes(n_values as u64) as usize;
+    let total = act::Layout::of(n_values as u64).bytes as usize;
     let fused_bytes = gpu.read_bytes(fused, total);
     let x_at = total - n_values * 4;
     let copy: Vec<f32> =
@@ -558,7 +559,7 @@ fn swiglu_with_quantization_is_the_separate_kernels() {
             let gate = rng.floats(n_values, 6.0);
             let up = rng.floats(n_values, 2.0);
             let (gb, ub) = (gpu.floats(&gate), gpu.floats(&up));
-            let act = gpu.empty(quantized_activation_bytes(n_values as u64));
+            let act = gpu.empty(act::Layout::of(n_values as u64).bytes);
             unsafe {
                 gpu.layers
                     .swiglu_quant(&gpu.stream, gb.ptr(), ub.ptr(), act.ptr(), n_values as u32)
@@ -598,7 +599,7 @@ fn the_gated_norm_with_quantization_matches_its_formula_and_the_layout() {
                 let z = rng.floats(n, 5.0);
                 let weight: Vec<f32> = (0..width).map(|_| 0.3 + rng.unit().abs()).collect();
                 let (ob, zb, wb) = (gpu.floats(&o), gpu.floats(&z), gpu.floats(&weight));
-                let act = gpu.empty(quantized_activation_bytes(n as u64));
+                let act = gpu.empty(act::Layout::of(n as u64).bytes);
                 unsafe {
                     gpu.layers
                         .gated_norm_quant(

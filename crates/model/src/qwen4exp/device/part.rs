@@ -55,6 +55,7 @@ use ares_cuda::{
     PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape, RopeParams, Segment,
     SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
 };
+use ares_quant::act;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 use ares_runtime::{ModelError, PinnedRam};
 
@@ -665,8 +666,9 @@ fn invalid(message: impl Into<String>) -> ModelError {
     ModelError::Invalid(message.into())
 }
 
+/// The bytes of the quantized form of `rows` rows of `n_in` activations.
 fn act_bytes(n_in: u64, rows: u64) -> u64 {
-    Kernels::quantized_activation_bytes(n_in as u32, rows as u32)
+    act::Layout::of(n_in * rows).bytes
 }
 
 /// The K/V geometry of an attention layer: every KV head on the layer's
@@ -1980,8 +1982,7 @@ impl Part {
     /// The f32 values of the activations of `rows` rows of `n_in` values at
     /// `offset` of the scratch.
     fn act_values(&self, offset: u64, n_in: u32, rows: u32) -> DevicePtr {
-        let values = u64::from(n_in) * u64::from(rows);
-        self.at(offset + act_bytes(u64::from(n_in), u64::from(rows)) - values * 4)
+        self.at(offset + act::Layout::of(u64::from(n_in) * u64::from(rows)).values_at)
     }
 
     fn inbox_at(&self, offset: u64) -> DevicePtr {
@@ -2972,8 +2973,7 @@ impl Part {
             self.at(s.m_raw)
         } else {
             let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
-            let values = u64::from(rows) * u64::from(self.n) * 4;
-            m.offset(act_bytes(u64::from(self.n), u64::from(rows)) - values)
+            m.offset(act::Layout::of(u64::from(rows) * u64::from(self.n)).values_at)
         };
         let gate = layer.moe.shared.map(|sh| (self.w.mat(&sh.inp), m_values, self.at(s.s)));
         let wait = self.exchange_no(env, i, X_MOE_INPUT);

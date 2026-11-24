@@ -29,6 +29,7 @@
 //!   round, which adds to the same output. The plan is made once per layer.
 
 use ares_cuda::{ExpertShape, PrefillPath};
+use ares_quant::act;
 
 use super::*;
 
@@ -332,8 +333,7 @@ impl Part {
         let wide =
             self.wide_state.as_ref().ok_or_else(|| invalid("a wide step without wide state"))?;
         let row_bytes = 4 * u64::from(m.n_in);
-        let f32_at =
-            |k: u32| Kernels::quantized_activation_bytes(m.n_in, k) - row_bytes * u64::from(k);
+        let f32_at = |k: u32| act::Layout::of(u64::from(m.n_in) * u64::from(k)).values_at;
         let tile = m.n_in.is_multiple_of(32) && m.n_in <= wide.float_width;
         if let Some(path) = m.range.path(tile.then_some(PrefillPath::F16)) {
             let f16 = self.at(self.f.s.float_f16);

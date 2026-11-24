@@ -26,8 +26,9 @@ use ares_cuda::{
     AttendBuffers, AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry,
     CommitSet, Device, DeviceBuffer, Event, IndexerShape, KeyFormat, LayerKernels, ListHandOver,
     NgramShape, Plan, Q4Kernels, Result, RopeParams, Segment, SelectionRule, StepRecord, Stream,
-    Wait, quantized_activation_bytes,
+    Wait,
 };
+use ares_quant::act;
 
 const HC: u32 = 4;
 const N: u32 = 2560;
@@ -152,7 +153,7 @@ fn mixer_and_ngram(rig: &mut Rig, rows: u32, floor: f64) -> Result<(f64, f64)> {
     let gate = rig.floats(rd);
     let down = rig.floats(u64::from(rr));
     let lo = rig.zeros(u64::from(rr) * 4);
-    let act = rig.zeros(quantized_activation_bytes(rn));
+    let act = rig.zeros(act::Layout::of(rn).bytes);
     let (q4, s) = (rig.q4.clone(), &rig.stream);
     let norm_us = rig.time(it, || unsafe {
         q4.stream_norm(s, r.ptr(), norm.ptr(), xn.ptr(), rows, HC, N, EPS).unwrap()

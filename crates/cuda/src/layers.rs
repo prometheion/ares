@@ -452,13 +452,6 @@ fn invalid(what: &'static str, detail: String) -> Error {
     Error::Invalid { what, detail }
 }
 
-/// The bytes of the quantized activations the fused kernels write for
-/// `n_values` values: the layout of `Kernels::quantize_activations`.
-pub fn quantized_activation_bytes(n_values: u64) -> u64 {
-    let pairs_end = n_values.next_multiple_of(16) + n_values.div_ceil(32) * 8;
-    pairs_end.next_multiple_of(16) + n_values * 4
-}
-
 impl LayerKernels {
     /// Loads the layer kernels on `device`.
     pub fn load(device: &Device) -> Result<Self> {
@@ -1037,7 +1030,7 @@ impl LayerKernels {
     /// its result for the output projection: for every of `items` (row, head)
     /// pairs of `width` values, `rms_norm(o) * weight * gate(z)`, written as
     /// quantized activations (the layout of `Kernels::quantize_activations`, over
-    /// `items * width` values; [`quantized_activation_bytes`] bytes, 16-byte
+    /// `items * width` values; [`ares_quant::act::Layout`]'s bytes, 16-byte
     /// aligned) that every weight kernel takes. `width` is 64, 128 or 256.
     ///
     /// # Safety
@@ -1088,7 +1081,7 @@ impl LayerKernels {
     /// # Safety
     ///
     /// `gate` and `up` must address `n_values` f32 values (16-byte aligned),
-    /// `act` [`quantized_activation_bytes`] bytes.
+    /// `act` the bytes [`ares_quant::act::Layout`] gives for them.
     pub unsafe fn swiglu_quant(
         &self,
         stream: &Stream,
@@ -1280,7 +1273,7 @@ pub enum MergeNorm {
     Rows { weight: DevicePtr, out: DevicePtr },
     /// The RMS norm with `weight`, quantized into `act` for the weight
     /// kernels: the layout of `Kernels::quantize_activations` over all rows
-    /// ([`quantized_activation_bytes`] bytes).
+    /// (the bytes [`ares_quant::act::Layout`] gives).
     Quantized { weight: DevicePtr, act: DevicePtr },
     /// The RMS norm with `weight`, as f16 activations at `act` for the
     /// products that read those (matrices in their device layout): the layout

@@ -11,6 +11,7 @@ use ares_cuda::{
     Device, DeviceBuffer, Kernels, LayerKernels, MergeNorm, Mesh, Route, Stream, Wait, Wire,
     device_count, partial_wire_bytes, peer_access,
 };
+use ares_quant::act;
 use common::{f32_bytes, read_f32, upload_f32};
 
 mod common;
@@ -287,7 +288,7 @@ fn merges_give_every_device_the_same_sum_and_its_norm() {
                 }
                 sync();
                 if n <= ares_cuda::MAX_BATCH {
-                    let len = ares_cuda::quantized_activation_bytes(u64::from(n * D)) as usize;
+                    let len = act::Layout::of(u64::from(n * D)).bytes as usize;
                     for side in &sides {
                         let (mut have, mut want) = (vec![0u8; len], vec![0u8; len]);
                         side.act.read(0, &mut have).unwrap();

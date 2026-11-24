@@ -33,6 +33,7 @@ use ares_cuda::{
     Device, DeviceBuffer, ExpertKernels, ExpertShape, HostShare, Kernels, NearEntry, PinnedBuffer,
     PredictedList, PrefillPath, Prune, PruneLayer, PruneRule, PruneWeights, RouteRecord, Stream,
 };
+use ares_quant::act;
 use common::blocks::{blocks_of, random_blocks_of_one_size, real_blocks};
 use common::{Rng, bytes_f32, f32_bytes, gpus};
 
@@ -119,19 +120,6 @@ fn reference_route(layer: &Layer<'_>, x: &[f32]) -> (Vec<f32>, Vec<(u32, f32)>) 
     let picks =
         order[..k].iter().map(|i| (*i, prob[*i as usize] / sum.max(1.0 / 16384.0))).collect();
     (prob, picks)
-}
-
-/// The activations as the quantizing kernel leaves them: `d * q` per value.
-fn dequantized(x: &[f32]) -> Vec<f32> {
-    let mut out = vec![0.0; x.len()];
-    for (group, out) in x.chunks(32).zip(out.chunks_mut(32)) {
-        let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        for (v, o) in group.iter().zip(out) {
-            *o = if amax == 0.0 { 0.0 } else { d * (v / d).round() };
-        }
-    }
-    out
 }
 
 fn silu(x: f64) -> f64 {
@@ -453,7 +441,7 @@ fn check_run(layer: &Layer<'_>, x: &[f32], n_rows: u32, run: &Run) -> Deviation 
 
             // Tight, stage 1: the device's hidden values against the same
             // formula on the dequantized activations.
-            let xq = dequantized(xr);
+            let xq = act::dequantized(xr);
             let g = product(shape.gate_ty, &gate, n, &xq);
             let u = product(shape.gate_ty, &up, n, &xq);
             let q = &run.hidden[pair * ff..(pair + 1) * ff];

@@ -1866,6 +1866,7 @@ mod tests {
 
     use ares_core::GgmlType;
     use ares_cuda::ExpertShape;
+    use ares_quant::act;
 
     use super::super::{CpuExpert, Features, LayerJob, MAX_ROWS, quantize_activations};
 
@@ -1958,11 +1959,10 @@ mod tests {
                 f64::from(g / (1.0 + (-g).exp()) * u)
             })
             .collect();
-        for chunk in h.as_chunks_mut::<32>().0.iter_mut() {
-            let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs() as f32));
-            let d = amax / 127.0;
-            for v in chunk {
-                *v = if amax > 0.0 { f64::from((*v as f32 / d).round() * d) } else { 0.0 };
+        for chunk in h.as_chunks_mut::<{ act::GROUP }>().0.iter_mut() {
+            let group = act::Group::of(&chunk.map(|v| v as f32));
+            for (i, v) in chunk.iter_mut().enumerate() {
+                *v = f64::from(group.value(i));
             }
         }
         (0..n_in).map(|i| dot(&down[i * n_ff..(i + 1) * n_ff], &h)).collect()

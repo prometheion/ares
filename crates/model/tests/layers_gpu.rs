@@ -29,9 +29,10 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use ares_cuda as backend;
+use ares_quant::act;
 use backend::{
     Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, Precision,
-    PrefillPath, StateFormat, StepDims, Stream, quantized_activation_bytes,
+    PrefillPath, StateFormat, StepDims, Stream,
 };
 use common::gpu::gpus;
 use layers::DeviceMatrix;
@@ -153,7 +154,7 @@ impl<'a> Chain<'a> {
             Mode::Fast => Prepared { buf: fused, n_in, n },
             Mode::Exact => {
                 let n_values = u64::from(n_in) * u64::from(n);
-                let copy = fused.ptr().offset(quantized_activation_bytes(n_values) - n_values * 4);
+                let copy = fused.ptr().offset(act::Layout::of(n_values).values_at);
                 let p = self.prepare(copy, n_in, n);
                 drop(fused);
                 p

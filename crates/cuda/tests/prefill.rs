@@ -31,7 +31,7 @@ use ares_core::GgmlType;
 use ares_cuda::{
     Device, DeviceBuffer, DevicePtr, Kernels, Precision, PrefillPath, Stream, WeightRange,
 };
-use ares_quant::{f16_to_f32, f32_to_bf16, f32_to_f16};
+use ares_quant::{act, f16_to_f32, f32_to_bf16, f32_to_f16};
 use common::blocks::{put_iq1_m_scale, scale_offsets};
 use common::{Rng, f32_bytes, gpus, read_f32};
 
@@ -143,22 +143,6 @@ fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
         }
     }
     bytes
-}
-
-/// The quantization of activations as `ares_quantize_act` does it, on the CPU:
-/// per group of 32 values `d = max|x| / 127`, `q = round(x / d)` (halves away
-/// from zero). Returns the activations as the kernels see them, `d * q`.
-fn quantized_like_the_gpu(x: &[f32]) -> Vec<f64> {
-    let mut out = Vec::with_capacity(x.len());
-    for group in x.chunks(32) {
-        let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        for v in group {
-            let code = if amax == 0.0 { 0.0 } else { (v / d).round() };
-            out.push(f64::from(d) * f64::from(code));
-        }
-    }
-    out
 }
 
 fn through_f16(v: f32) -> f64 {
@@ -324,7 +308,9 @@ fn deviation(
             0.0
         };
         let xs: Vec<f64> = match path {
-            PrefillPath::Int8 => quantized_like_the_gpu(xb),
+            PrefillPath::Int8 => act::groups(xb)
+                .flat_map(|g| g.codes.map(|q| f64::from(g.d) * f64::from(q)))
+                .collect(),
             PrefillPath::F16 | PrefillPath::F16Flush => {
                 xb.iter().map(|v| through_f16(*v)).collect()
             }

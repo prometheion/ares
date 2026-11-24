@@ -22,7 +22,8 @@
 //! [`Board::ahead_list`]: super::super::board::Board::ahead_list
 
 use ares_core::GgmlType;
-use ares_cuda::{DeviceBuffer, DevicePtr, Event, Kernels, PrefillPath, Stream};
+use ares_cuda::{DeviceBuffer, DevicePtr, Event, PrefillPath, Stream};
+use ares_quant::act;
 use ares_runtime::ModelError;
 
 use super::{Frame, Part, invalid};
@@ -156,8 +157,7 @@ impl Part {
             base.offset(state.wide_logits),
             base.offset(state.wide_record),
         );
-        let row_bytes = 4 * u64::from(n_in);
-        let f32_at = Kernels::quantized_activation_bytes(n_in, rows) - row_bytes * u64::from(rows);
+        let f32_at = act::Layout::of(u64::from(n_in) * u64::from(rows)).values_at;
         let ids = 4 * u64::from(moe.shape.top_k) * u64::from(rows);
         state.stream.wait_event(&self.routed[i])?;
         // SAFETY: `act` holds the activations of `rows` rows, which the step's stream does

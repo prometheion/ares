@@ -24,8 +24,9 @@ use ares_core::GgmlType;
 use ares_cuda::{
     AttentionShape, CommitSet, Device, DeviceBuffer, DevicePtr, EmbedRows, Event, KeptRows,
     LayerKernels, NormKind, OutputGate, RecurrentShape, Result, RopeParams, Segment, StateFormat,
-    StepDims, StepRecord, Stream, Wait, devices, quantized_activation_bytes,
+    StepDims, StepRecord, Stream, Wait, devices,
 };
+use ares_quant::act;
 
 const D: u32 = 5120;
 const FF: u32 = 17408;
@@ -168,7 +169,7 @@ fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool) {
     let out = rig.buf(rows * u64::from(vd) * 4, 0);
     let z = rig.half_floats(rows * u64::from(vd));
     let norm_w = rig.half_floats(256);
-    let act_o = rig.buf(quantized_activation_bytes(rows * u64::from(vd)), 0);
+    let act_o = rig.buf(act::Layout::of(rows * u64::from(vd)).bytes, 0);
     let layers_n = if with_state_rotation { LAYERS } else { 1 };
     let conv_state = rig.buf(layers_n as u64 * u64::from(max_seqs) * (conv_len + 16) * 4, 0);
     let delta32 = rig.buf(layers_n as u64 * u64::from(max_seqs) * (delta_len + 16) * 4, 0);
@@ -194,7 +195,7 @@ fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool) {
     // Feed-forward.
     let gate = rig.half_floats(rows * u64::from(FF));
     let up = rig.half_floats(rows * u64::from(FF));
-    let act_ff = rig.buf(quantized_activation_bytes(rows * u64::from(FF)), 0);
+    let act_ff = rig.buf(act::Layout::of(rows * u64::from(FF)).bytes, 0);
     // Output rows.
     let hidden = rig.half_floats(rows * u64::from(D));
     let head_in = rig.buf(rows * u64::from(D) * 4, 0);

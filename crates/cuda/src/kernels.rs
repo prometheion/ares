@@ -591,12 +591,10 @@ impl Kernels {
     /// rows of `n_in` activations: the int8 values, then (from the next
     /// multiple of 16 bytes) one `(scale, sum)` pair of f32 per group of 32
     /// values, then (again from the next multiple of 16) the activations
-    /// themselves as f32, which the float weight types multiply exactly. See
-    /// `kernels/quantize_act.cuh` for the format.
+    /// themselves as f32, which the float weight types multiply exactly
+    /// ([`ares_quant::act`], `kernels/quantize_act.cuh`).
     pub fn quantized_activation_bytes(n_in: u32, n_batch: u32) -> u64 {
-        let values = u64::from(n_in) * u64::from(n_batch);
-        let pairs_end = values.next_multiple_of(16) + values.div_ceil(32) * 8;
-        pairs_end.next_multiple_of(16) + values * 4
+        ares_quant::act::Layout::of(u64::from(n_in) * u64::from(n_batch)).bytes
     }
 
     /// Whether [`Kernels::matvec`] has a kernel for weights of type `ty`.

@@ -32,8 +32,8 @@
 //! file stores them in (float matrices in most files, Q8_0 in some):
 //! [`Kernels::matvec_exact`](crate::Kernels::matvec_exact) reads only the f32 section
 //! of an activation buffer, so `stream_norm` and `squash` write plain f32: point them
-//! at that section ([`quantized_activation_bytes`](crate::quantized_activation_bytes)
-//! minus four bytes per value from the start) and no quantization runs in front of
+//! at that section (`values_at` of [`ares_quant::act::Layout`]) and no quantization runs in
+//! front of
 //! those products. For more rows than the decode kernels take, the prefill
 //! activations are prepared from the same f32 values. The fused read
 //! ([`Q4Kernels::read_down`], [`Q4Kernels::read_up`]) takes every weight type too.
@@ -633,8 +633,8 @@ impl Q4Kernels {
     /// The gated mean of a read, `m[row] = (1 / hc) * sum_c xn[row][c] *
     /// sigmoid(gate[row][c])`, written as quantized activations over
     /// `rows * n` values (the layout of `Kernels::quantize_activations`,
-    /// [`quantized_activation_bytes`](crate::quantized_activation_bytes) bytes;
-    /// the f32 values are its last section). `n` is a multiple of 32.
+    /// [`ares_quant::act::Layout`]; the f32 values are its last section). `n` is a multiple
+    /// of 32.
     ///
     /// # Safety
     ///

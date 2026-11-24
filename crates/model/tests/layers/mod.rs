@@ -13,10 +13,11 @@ use ares_gguf::Gguf;
 use ares_model::qwen35::reference::pieces::{conv_silu, delta_step, l2_norm, sigmoid, softplus};
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, StateStorage, Weights};
+use ares_quant::act;
 
 use super::backend::{
     CommitSet, DeviceBuffer, LayerKernels, OutputGate, RecurrentShape, Segment, StateFormat,
-    StepRecord, quantized_activation_bytes,
+    StepRecord,
 };
 use super::{
     Chain, F16_OUTPUT_LIMIT, Gpu, Mode, ROUNDED_EVERY_ROW, add_residual, delta_shapes,
@@ -707,7 +708,7 @@ fn run_block(
             )
             .unwrap();
     }
-    let fused = gpu.empty(quantized_activation_bytes((n * vd) as u64));
+    let fused = gpu.empty(act::Layout::of((n * vd) as u64).bytes);
     unsafe {
         gpu.layers
             .gated_norm_quant(
@@ -737,7 +738,7 @@ fn run_block(
     let act = chain.prepare(xn2.ptr(), d as u32, n32);
     let gate = chain.product(&bw.gate, &act);
     let up = chain.product(&bw.up, &act);
-    let fused = gpu.empty(quantized_activation_bytes((n * c.n_ff) as u64));
+    let fused = gpu.empty(act::Layout::of((n * c.n_ff) as u64).bytes);
     unsafe {
         gpu.layers
             .swiglu_quant(stream, gate.ptr(), up.ptr(), fused.ptr(), (n * c.n_ff) as u32)

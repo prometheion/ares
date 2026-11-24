@@ -58,15 +58,10 @@ pub fn product(m: &Matrix<'_>, x: &[f32]) -> Vec<f32> {
 }
 
 /// `x` as the device's weight kernels read it: each 32 values as integers of
-/// at most 127 times the largest magnitude among them over 127.
+/// at most 127 times the largest magnitude among them over 127
+/// ([`ares_quant::act`]).
 pub fn round_activations(x: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(x.len());
-    for block in x.chunks(32) {
-        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        out.extend(block.iter().map(|v| if amax == 0.0 { 0.0 } else { (v / d).round() * d }));
-    }
-    out
+    ares_quant::act::dequantized(x)
 }
 
 /// Row `token` of a table of rows (the selector's), decoded.

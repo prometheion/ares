@@ -24,11 +24,12 @@ use ares_api::{
 };
 use ares_cuda::{
     ActivationForm, Device, DeviceBuffer, Kernels, LayerKernels, MergeNorm, OutputGate, Precision,
-    Segment, Stream, Wait, Wire, device_count, partial_wire_bytes, quantized_activation_bytes,
+    Segment, Stream, Wait, Wire, device_count, partial_wire_bytes,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Harness, Layouts, Options, Qwen35, Spread};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
+use ares_quant::act;
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
 use common::gpu::{download, gpu, upload};
 use common::helpers::{argmax, argmax_lead, env_path, rel_l2};
@@ -75,7 +76,7 @@ fn the_fused_kernels_write_the_f16_activations_of_a_conversion() {
     let stream = Stream::new(device, 0).unwrap();
     let f16_bytes = |n_in: u32, n: u32| Kernels::activation_bytes(ActivationForm::F16, n_in, n);
     // Where the f32 copy of the values is in the quantized layout.
-    let copy_at = |values: u64| quantized_activation_bytes(values) - values * 4;
+    let copy_at = |values: u64| act::Layout::of(values).values_at;
     let convert = |rows: ares_cuda::DevicePtr, n_in: u32, n: u32| -> Vec<u8> {
         let out = DeviceBuffer::new(device, f16_bytes(n_in, n)).unwrap();
         // SAFETY: `rows` holds `n` rows of `n_in` f32 values, `out` their f16 form.
@@ -100,7 +101,7 @@ fn the_fused_kernels_write_the_f16_activations_of_a_conversion() {
         let o = upload(device, &noise(11 + case as u64, values as usize, 3.0));
         let z = upload(device, &noise(23 + case as u64, values as usize, 4.0));
         let weight = upload(device, &noise(31 + case as u64, width as usize, 2.0));
-        let act = DeviceBuffer::new(device, quantized_activation_bytes(values)).unwrap();
+        let act = DeviceBuffer::new(device, act::Layout::of(values).bytes).unwrap();
         let got = DeviceBuffer::new(device, f16_bytes(n_in, n)).unwrap();
         for gate in [OutputGate::Silu, OutputGate::Sigmoid] {
             // SAFETY: the buffers hold `n * heads` items of `width` values and
@@ -147,7 +148,7 @@ fn the_fused_kernels_write_the_f16_activations_of_a_conversion() {
         let values = u64::from(n) * u64::from(n_in);
         let gate = upload(device, &noise(41 + case as u64, values as usize, 5.0));
         let up = upload(device, &noise(53 + case as u64, values as usize, 3.0));
-        let act = DeviceBuffer::new(device, quantized_activation_bytes(values)).unwrap();
+        let act = DeviceBuffer::new(device, act::Layout::of(values).bytes).unwrap();
         let got = DeviceBuffer::new(device, f16_bytes(n_in, n)).unwrap();
         // SAFETY: the buffers hold `n` rows of `n_in` values and their
         // activations in either form.
@@ -173,8 +174,8 @@ fn the_fused_kernels_write_the_f16_activations_of_a_conversion() {
             let weight = upload(device, &noise(71 + case as u64, d as usize, 2.0));
             let parcel = DeviceBuffer::new(device, partial_wire_bytes(wire, n, d)).unwrap();
             let xn = DeviceBuffer::new(device, values * 4).unwrap();
-            let quantized = DeviceBuffer::new(device, quantized_activation_bytes(values)).unwrap();
-            let both_q = DeviceBuffer::new(device, quantized_activation_bytes(values)).unwrap();
+            let quantized = DeviceBuffer::new(device, act::Layout::of(values).bytes).unwrap();
+            let both_q = DeviceBuffer::new(device, act::Layout::of(values).bytes).unwrap();
             let (half, both_h) = (
                 DeviceBuffer::new(device, f16_bytes(d, n)).unwrap(),
                 DeviceBuffer::new(device, f16_bytes(d, n)).unwrap(),
@@ -224,7 +225,7 @@ fn the_fused_kernels_write_the_f16_activations_of_a_conversion() {
                 f16_rows(&download(&both_h, bytes), d, n) == want,
                 "merge {wire:?} {n} x {d}: f16 of both"
             );
-            let bytes = quantized_activation_bytes(values);
+            let bytes = act::Layout::of(values).bytes;
             assert!(
                 download(&both_q, bytes) == download(&quantized, bytes),
                 "merge {wire:?} {n} x {d}: quantized of both"
@@ -302,7 +303,7 @@ fn the_fused_kernels_by_form() {
         let weight = upload(device, &noise(7, d as usize, 2.0));
         let parcel = DeviceBuffer::new(device, partial_wire_bytes(Wire::F16, n, d)).unwrap();
         let xn = DeviceBuffer::new(device, values * 4).unwrap();
-        let act_q = DeviceBuffer::new(device, quantized_activation_bytes(values)).unwrap();
+        let act_q = DeviceBuffer::new(device, act::Layout::of(values).bytes).unwrap();
         let act_h = DeviceBuffer::new(device, Kernels::activation_bytes(ActivationForm::F16, d, n))
             .unwrap();
         // SAFETY: the buffers hold `n` rows of `d` values in every form.
@@ -349,7 +350,8 @@ fn the_fused_kernels_by_form() {
             let gate = upload(device, &noise(17, (n * inner) as usize, 5.0));
             let up = upload(device, &noise(19, (n * inner) as usize, 3.0));
             let bytes = |n_in: u32| {
-                quantized_activation_bytes(u64::from(n) * u64::from(n_in))
+                act::Layout::of(u64::from(n) * u64::from(n_in))
+                    .bytes
                     .max(Kernels::activation_bytes(ActivationForm::F16, n_in, n))
             };
             let act = DeviceBuffer::new(device, bytes(n_in.max(inner))).unwrap();
