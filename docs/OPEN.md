@@ -1658,6 +1658,11 @@ the agents' builds):
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- A named `--context` overflows like the model's own (the owner, 2026-11-24: an operator always
+  names it, e.g. 4 sequences of 128k = `--context 524288` for all together). For Flash-Next the
+  indexer's keys and the near pages stay in VRAM and the rest lies in RAM, whether the context
+  was named or not; the 27B's (dense attention) stays all in VRAM. In work on `cleanup2/server`
+  after the loaders.
 - The cleanup comes first (the owner, 2026-11-24): the SSD comparison (item 3, UD-Q4_K_XL and
   UD-Q5_K_XL against the newest Strata) starts after cleanup phases 1 and 2, not beside them.
 - `--parallel` defaults to 4 (the owner, 2026-11-24; was 2). At the owner's settings (27B,
