@@ -1065,6 +1065,9 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       to 256 options a question, a session cache (`--session-cache-gb`), `--batch-invariant`.
       Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
       in 28 s; "up to 9.5 times faster than vLLM and SGLang".
+      Its groundwork in the runtime, kept by the cleanup for it (2026-11-24): the decisions of
+      `ares-sched` (`Want::Score`, `PartKind::Score`, the option rows first in `plan`), the
+      conductor's arms for them, and `Engine::decide`, which answers Unsupported today.
 - [ ] Untested GPU classes go to Vulkan (the owner, 2026-11-23; was "Turing. Later."). CUDA builds
       and opens only the tested classes, Ampere (8.6) and Ada (8.9) (`cuda/tested-archs`); Turing,
       Pascal, Hopper, data-centre Blackwell, Jetson and every other GPU are to run through the
@@ -1454,6 +1457,23 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       `Models::Fixed` (mock engines answer to several names, which a router of one preset does
       not: decide the names first), `plan::default_ram` and `parse_available_ram` (`plan.rs`,
       `load.rs`), one segmenter for the blocks of Messages and the items of Responses.
+      Runtime part done on `cleanup/runtime` (about 1,300 lines fewer): the pass in waves and its
+      docs, the copied give-back of the loans and the RAM tier (`Tier::vacate`), the thinking
+      followed once (`watch::Tracker`), unreached API in the store, sched, state and store
+      crates, the store's small copies, the drafting suites' rig, docs that drifted. Left for
+      after `kv/overflow` (its files): `PinnedRam::machine`, `RamLevel::shed`'s argument, the
+      `on_cache` hook's allowance, `PrefixIndex::lookup` beside `lookup_chain`, the runtime's
+      re-exports nobody outside uses (`lib.rs`), the cache oracle rigs of `ssd.rs`, `ssd_ram.rs`
+      and `ram_cache.rs` (with `prefix.rs`'s), the module docs of `cache.rs` and `ram.rs`.
+      Moved to phase 2: the old expert fill (`fill` / `predicted`) is not the MTP layer's alone:
+      `Session::fill` and `Runtime::fill` (13 sites in the Flash-Next GPU tests, `qwen4exp_run`)
+      fill from a list through it, and the bench's predictors read through `predicted` between
+      steps, where `ahead` does nothing; one way in (a `TierFill` planned from a list) changes
+      what those tests and the bench do. Admission's restore of spilled pages (the conductor
+      always says 0 pages; the model test of admission still simulates it). The rest of the
+      store's small copies (running means, odds, the step clock, the profile and table files,
+      the CPU kernels' test rig, the read submission of `read` and `transit_read`), the expert
+      store's test rig and the fake executor of `tests/images.rs`.
 - [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
       one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
       one place, the conductor split, the two model loaders of the server, shared device helpers.
