@@ -328,7 +328,7 @@ pub const OPTIONS: &[Opt] = &[
          fits one model file with its formats and split, and the directory may be shared by \
          all models. A mixture of experts keeps the usage profile of its experts there, \
          which fills its tiers at the next start [default: none, and nothing is written; \
-         the profiles are then kept in ~/.cache/ares]",
+         the profiles are then kept in $XDG_CACHE_HOME/ares, else in ~/.cache/ares]",
     )
     .heading("Prompt cache on SSD, below the one in RAM."),
     Opt::model(
