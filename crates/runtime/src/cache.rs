@@ -1889,12 +1889,10 @@ mod tests {
 
     // --- the levels in RAM and on SSD, and the allowance of the books ------
 
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use crate::exec::{Clock, ExecError, StepMeta, StepOutput};
-    use crate::ram::{Machine, Rule};
+    use crate::testing::TestMachine;
 
     const PLENTY: u64 = 64 << 30;
     /// A checkpoint, and the share of a page on the one device, which takes
@@ -1911,8 +1909,7 @@ mod tests {
         pool: PagePool,
         hashes: Vec<ChainHash>,
         ram: PinnedRam,
-        machine: Arc<Machine>,
-        available: Arc<AtomicU64>,
+        machine: TestMachine,
         dir: std::path::PathBuf,
     }
 
@@ -1925,14 +1922,8 @@ mod tests {
             let dir = std::env::temp_dir()
                 .join(format!("ares-cache-following-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            let available = Arc::new(AtomicU64::new(PLENTY));
-            let source = available.clone();
-            let machine = Machine::new(
-                Rule::default(),
-                move || Some(source.load(Ordering::SeqCst)),
-                || Duration::ZERO,
-            );
-            let ram = PinnedRam::following(1 << 30, &machine);
+            let machine = TestMachine::new(PLENTY);
+            let ram = PinnedRam::following(1 << 30, machine.machine());
             let durable = Durable {
                 fingerprint: b"cache tests".to_vec(),
                 page_bytes: vec![64],
@@ -1952,7 +1943,7 @@ mod tests {
             assert!(cache.ssd_problem.is_none(), "{:?}", cache.ssd_problem);
             let mut pool = PagePool::new(64, PER_PAGE);
             let hashes = three_pages(&mut cache, &mut pool);
-            Self { cache, pool, hashes, ram, machine, available, dir }
+            Self { cache, pool, hashes, ram, machine, dir }
         }
 
         /// Text `i` of three pages, which the index holds and nobody else.
@@ -1971,13 +1962,6 @@ mod tests {
         fn all_into_ram(&mut self, devices: &mut Devices) {
             self.cache.evict(&mut self.pool, u32::MAX);
             self.cache.settle_leaving(&mut self.pool, devices);
-        }
-
-        /// The machine has `available` bytes from now on, and has been
-        /// looked at.
-        fn machine_has(&self, available: u64) {
-            self.available.store(available, Ordering::SeqCst);
-            self.machine.look().expect("the machine says what it has");
         }
 
         /// Pumps the levels against `devices`, and returns what they were
@@ -2079,7 +2063,7 @@ mod tests {
     fn the_cache_keeps_its_floor_when_the_machine_has_no_room() {
         let f = Following::new("floor");
         assert_eq!(f.ram.cache_allowance(), 4 * STATE + RESERVE * PAGE, "all of the budget");
-        f.machine_has(0);
+        f.machine.has(0);
         assert_eq!(f.ram.cache_allowance(), STATE + RESERVE * PAGE, "a place and the pages");
         let mut f = f;
         // A checkpoint is still taken, in the one place, and the next one
@@ -2121,7 +2105,7 @@ mod tests {
 
         // The machine runs short: the floor is one place. One checkpoint goes,
         // and leaves its place for the drive before the place is called unused.
-        f.machine_has(0);
+        f.machine.has(0);
         assert_eq!(f.trimmed(&mut devices), 1);
         let out = of(&devices.asked, TransferKind::StateOut);
         assert_eq!(out.len(), 1, "{:?}", devices.asked);
@@ -2137,7 +2121,7 @@ mod tests {
         assert!(f.cache.save(0, f.hashes[1], Owner(1), false).taken);
         assert!(f.cache.save(1, f.hashes[2], Owner(2), false).taken);
         written(&mut f.cache);
-        f.machine_has(0);
+        f.machine.has(0);
         assert_eq!(f.trimmed(&mut devices), 1);
         assert!(of(&devices.asked, TransferKind::StateOut).is_empty(), "{:?}", devices.asked);
         assert_eq!(f.cache.index.checkpoint(f.hashes[1]), None, "the one left behind went");
@@ -2154,7 +2138,7 @@ mod tests {
         assert!(f.cache.save(1, f.hashes[2], Owner(1), false).taken);
         // The machine runs short before that record is written: the cache
         // keeps the one place of its floor and gives the other checkpoint up.
-        f.machine_has(0);
+        f.machine.has(0);
         assert_eq!(f.trimmed(&mut devices), 1);
         assert!(of(&devices.asked, TransferKind::StateOut).is_empty(), "nothing to read");
         assert_eq!(f.cache.ssd_counters().states_skipped, 1);
@@ -2228,7 +2212,7 @@ mod tests {
             // level on SSD, and what goes is written before its memory goes;
             // without one it is dropped at once, down to what the one
             // checkpoint place holds while no checkpoint uses it.
-            f.machine_has(0);
+            f.machine.has(0);
             f.trimmed(&mut devices);
             match ssd {
                 true => {

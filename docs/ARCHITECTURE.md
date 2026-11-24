@@ -763,7 +763,7 @@ one array per part, indexed by page number.
     Until 2026-11-23 its save went with it, the restore read what the place
     held before, the first turn's anchor, and Flash-Next failed the step:
     "the rows of slot 0 start at cell 650 and its sequence is at cell 512".
-    `tests/prefix.rs`
+    `tests/cache/prefix.rs`
     `a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state`, and on
     the GPU `qwen4exp_runtime`'s
     `a_turn_read_layer_by_layer_from_an_end_state_saved_with_its_record_answers_as_the_reference`,
@@ -6520,7 +6520,7 @@ wider than the parts' own scratch runs as a **pass**:
   sends a request 5 ms after a prompt of 480 rows: it gets its first token after 16 ms, the long
   prompt after 61 to 78 ms, and both answer as alone, token for token the reference's, in every
   placement. The conductor's side has tests of its own with a host executor that pauses
-  (`tests/prefix.rs`: a paused step runs again until its rows are done; a request runs between
+  (`tests/cache/prefix.rs`: a paused step runs again until its rows are done; a request runs between
   the pieces; a cancelled request gives its paused step up), and the oracle checks that no step
   between reads, saves or restores the paused sequence's state.
 - *The CPU's share* of a pass of up to `cpu_rows` rows (2048): each micro-batch copies its
@@ -6540,7 +6540,7 @@ wider than the parts' own scratch runs as a **pass**:
   block's state goes there once the block has followed the rows up to the position, and what
   the n-gram feed keeps of the sequence there is written at once. The place holds, when the pass
   is done, what a save at the end of a step at that position would hold.
-  (`a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it`, `tests/prefix.rs`
+  (`a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it`, `tests/cache/prefix.rs`
   `checkpoints_inside_a_step_serve_a_later_prompt`.) The tail behind the last checkpoint that
   is too close to the end is a step of its own as before. The places of the saves inside a
   step are locked where a step's saves lock theirs, after the step's copies and before any
@@ -6555,7 +6555,7 @@ wider than the parts' own scratch runs as a **pass**:
   each in order and makes room for it as a save at a step's end does, so that a later one
   pushes an earlier one out as after cuts: taken all at once, a first turn of 9821 rows kept
   the checkpoint at 8192 and lost its anchor, and the next turn replayed 1635 rows instead of
-  99 (`real_cache`'s Flash-Next test asserts fewer than 256; `tests/prefix.rs`
+  99 (`real_cache`'s Flash-Next test asserts fewer than 256; `tests/cache/prefix.rs`
   `a_turn_after_saves_inside_a_step_replays_no_more_than_after_cut_steps`).
 
 *Measured* (2026-11-23, local, the IQ2_XS file through the server, `--ram 8G`, `--context

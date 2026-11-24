@@ -249,7 +249,7 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       all cached was read as if it were not (6832 tokens with 6784 cached: 31.2 s, the same as
       uncached; 622 with 512 cached: 12.0 s); Strata 0.33-0.47 s. Two causes: the anchor of the
       first ask lost its place to its end state where the roots held all places but one (fixed,
-      `flash/prompt` ebe5061, test in `runtime/tests/prefix.rs`), and every small wide step paid
+      `flash/prompt` ebe5061, test in `runtime/tests/cache/prefix.rs`), and every small wide step paid
       a pass of uploads (the CPU's share of wide steps). To measure there.
 - [x] The agent suite on the test machine (main e6d7676, 2026-11-23, UD-Q3_K_XL at 40G on the 4060
       Ti): the second turn failed every time in its first step ("the rows of slot 0 start at cell
@@ -258,7 +258,7 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       that record, and the places for the checkpoints inside its pass, taken before the record
       was written, gave the end state up: its save was dropped and the restore read the first
       turn's anchor (fixed on `fix/turn-cell`: the save stays while a restore of the record reads
-      the place; tests in `runtime/tests/prefix.rs`, `cache.rs` and `qwen4exp_runtime`, the last
+      the place; tests in `runtime/tests/cache/prefix.rs`, `cache.rs` and `qwen4exp_runtime`, the last
       failing as the suite did before the fix). With the fix, two sessions on the test machine
       passed all six turns (first ask 622/1 cached 5.5 and 6.5 s, 6832/648 12.6 and 12.8 s, the
       third turn from the second's end state 1.8 s; asked again 622/512 4.3 and 4.8 s, 6832/6784
@@ -1090,7 +1090,7 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         level on SSD with `--cache` or nowhere without it. A running sequence's far K and V stay
         required. Built (`Cache::trim` takes such pages off the devices while the prompt cache
         holds more than its allowance, `PinnedRam::set_context_cached`; a far piece is unlocked
-        once no page in use lies in it). Tests: `ares-runtime --test prefix
+        once no page in use lies in it). Tests: `ares-runtime --test cache
         far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory`, the
         books' `far_k_and_v_of_finished_requests_counts_as_prompt_cache_and_not_against_the_tier`.
   - [ ] Steps of the parts' own scratch (pieces of a prompt while another request waits) read the

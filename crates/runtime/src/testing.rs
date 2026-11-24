@@ -71,6 +71,7 @@
 //! host needs for a step.
 
 mod faulty;
+mod machine;
 mod slots;
 
 use std::collections::HashMap;
@@ -86,6 +87,7 @@ use crate::synthetic::SyntheticModel;
 use crate::timing::DeviceTimes;
 
 pub use faulty::{Failure, Fault, Faulty};
+pub use machine::TestMachine;
 pub use slots::{HostShareState, HostSlots};
 
 /// A latch a test closes to hold steps back and opens to let them finish.

@@ -1,56 +1,17 @@
-//! The level of the prefix cache that is on SSD, in the conductor, against
-//! the host executor as an oracle.
+//! The level of the prefix cache that is on SSD.
 //!
 //! What is written: what leaves RAM, and what is worth keeping when an engine
 //! ends. The engines here keep little in RAM (their budget is a few
-//! checkpoints), so that what the devices give up reaches the drive soon.
-//!
-//! The executor keeps the cells of every page and the recurrent state of
-//! every slot and checkpoint place ([`ares_runtime::testing`]), and it carries
-//! out the transfers of the level on SSD: a page's cells and a place's state
-//! go to the host as bytes and come back. A row that reads a cell or a state
-//! that is not the one its history made picks another token, so an answer that
-//! equals the answer of an engine without a cache says that what was written
-//! to the store, read back into another engine and restored there was the
-//! right state.
+//! checkpoints), so that what the devices give up reaches the drive soon. An
+//! answer that equals the answer of an engine without a cache says that what
+//! was written to the store, read back into another engine and restored there
+//! was the right state.
 
-mod common;
-
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ares_runtime::testing::{HostExecutor, Problems};
-use ares_runtime::{
-    RequestReport, Runtime, RuntimeConfig, Snapshot, Split, SsdConfig, SyntheticConfig,
-    SyntheticModel,
-};
-use common::*;
+use ares_runtime::{RuntimeConfig, SsdConfig, SyntheticConfig, SyntheticModel};
 
-/// Cells per page, and the bytes one checkpoint takes in the model that
-/// pretends to recurrent state.
-const PAGE: u32 = 16;
-const CHECKPOINT: u64 = 4096;
-/// The settled cells below which nothing of a text is written here.
-const MIN_CELLS: u32 = 48;
-
-/// A fresh directory under the system temp dir, removed when dropped.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("ares-runtime-ssd-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use super::*;
 
 /// A model with recurrent state whose device side moves state to the host;
 /// `weights` stands for its file in the store's fingerprint.
@@ -62,16 +23,6 @@ fn model(weights: u64, configure: impl FnOnce(&mut SyntheticConfig)) -> Arc<Synt
     configure(&mut config);
     Arc::new(SyntheticModel::new(config).unwrap())
 }
-
-fn store(dir: &Path) -> SsdConfig {
-    SsdConfig { min_cells: MIN_CELLS, segment_bytes: 64 << 10, ..SsdConfig::new(dir, 1 << 30) }
-}
-
-/// The bytes of a page in RAM (one block of direct I/O), and the pages that
-/// pass through RAM on their way to the drive and back, which a budget for
-/// the prompt cache's RAM holds besides its checkpoints.
-const PAGE_BYTES: u64 = 4096;
-const FLOOR: u64 = 16 * PAGE_BYTES;
 
 /// Checkpoints at every second page boundary of a prompt and while
 /// generating, `places` of them in RAM, and with a level on SSD the floor of
@@ -91,79 +42,6 @@ fn config(pages: u32, places: u64, ssd: Option<SsdConfig>) -> RuntimeConfig {
     }
 }
 
-struct Rig {
-    rt: Runtime,
-    problems: Problems,
-}
-
-fn engine(model: &Arc<SyntheticModel>, config: RuntimeConfig) -> Rig {
-    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
-        .with_pool(config.pages, config.cells_per_page);
-    let problems = host.problems();
-    Rig { rt: Runtime::start(model.clone(), Box::new(host), config).unwrap(), problems }
-}
-
-struct Answer {
-    text: String,
-    report: RequestReport,
-}
-
-impl Rig {
-    fn ask(&self, prompt: &str, max_tokens: u32) -> Answer {
-        let request = request(prompt, Some(max_tokens));
-        let id = request.id;
-        let run = run_one(&self.rt, request);
-        let report = *snapshot(&self.rt).request(id).expect("the request ended");
-        Answer { text: run.text, report }
-    }
-
-    fn snapshot(&self) -> Snapshot {
-        snapshot(&self.rt)
-    }
-
-    /// Waits until the level on SSD has nothing left to write.
-    fn written(&self) -> Snapshot {
-        let deadline = std::time::Instant::now() + LIMIT;
-        loop {
-            let s = self.snapshot();
-            if s.counters.ssd.pending == 0 {
-                return s;
-            }
-            assert!(std::time::Instant::now() < deadline, "the writer is stuck: {s}");
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-
-    /// The oracle found nothing wrong.
-    fn consistent(&self) {
-        let problems = self.problems.lock().unwrap();
-        assert!(problems.is_empty(), "the oracle found: {problems:#?}");
-    }
-}
-
-/// What an engine without any cache says.
-fn fresh(prompt: &str, max_tokens: u32) -> String {
-    let mut config = SyntheticConfig::small(Split::Single, 1);
-    config.context_length = 2048;
-    let model = Arc::new(SyntheticModel::new(config).unwrap());
-    let rt = Runtime::start(
-        model.clone(),
-        Box::new(HostExecutor::new(model.clone(), model.config().max_rows, 8)),
-        RuntimeConfig { ssd: None, ..self::config(4096, 0, None) },
-    )
-    .unwrap();
-    alone(&rt, prompt, Some(max_tokens)).text
-}
-
-fn text_of(seed: u64, len: usize) -> String {
-    Rng(seed).prompt(len)
-}
-
-/// What the store in `dir` holds, as an engine that opens it sees it.
-fn stored(model: &Arc<SyntheticModel>, dir: &Path) -> ares_runtime::SsdCounters {
-    engine(model, config(256, 8, Some(store(dir)))).snapshot().counters.ssd
-}
-
 #[test]
 fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
     let dir = TempDir::new("restart");
@@ -172,7 +50,7 @@ fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
 
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let a = e.ask(&first, 20);
-    assert_eq!(a.text, fresh(&first, 20));
+    assert_eq!(a.run.text, fresh(&first, 20));
     assert_eq!(a.report.cached_tokens, 0);
     // Nothing is written while the devices hold the text.
     let s = e.written();
@@ -188,11 +66,11 @@ fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
 
     // Another engine, whose devices hold nothing: the second turn of the
     // conversation finds the first on SSD.
-    let second = format!("{first}{}{}", a.text, text_of(2, 40));
+    let second = format!("{first}{}{}", a.run.text, text_of(2, 40));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     assert_eq!(e.snapshot().counters.ssd.store_pages, 13);
     let b = e.ask(&second, 20);
-    assert_eq!(b.text, fresh(&second, 20));
+    assert_eq!(b.run.text, fresh(&second, 20));
     let s = e.snapshot();
     // The run ends at the deepest checkpoint, which is restored; nothing is
     // replayed, and the rest is computed.
@@ -206,7 +84,7 @@ fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
 
     // The same prompt again is in the devices now: nothing is read.
     let c = e.ask(&second, 20);
-    assert_eq!(c.text, b.text);
+    assert_eq!(c.run.text, b.run.text);
     assert_eq!(e.snapshot().counters.ssd.pages_read, s.counters.ssd.pages_read);
     e.consistent();
 }
@@ -233,8 +111,8 @@ fn what_the_devices_gave_up_comes_back_from_ssd() {
     // from the drive (and from RAM, as far as its floor still holds them:
     // that depends on how fast the writer was).
     let again = e.ask(&one, 10);
-    assert_eq!(again.text, a.text);
-    assert_eq!(again.text, fresh(&one, 10));
+    assert_eq!(again.run.text, a.run.text);
+    assert_eq!(again.run.text, fresh(&one, 10));
     let s = e.snapshot();
     assert!(again.report.cached_tokens >= 256, "{:?}", again.report);
     assert!(s.counters.ssd.pages_read > 0, "{s}");
@@ -252,13 +130,13 @@ fn a_short_text_is_not_written() {
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     // 30 cells of prompt and 10 of reply stay below the 48 of the rule.
     let a = e.ask(&text_of(5, 30), 10);
-    assert_eq!(a.text, fresh(&text_of(5, 30), 10));
+    assert_eq!(a.run.text, fresh(&text_of(5, 30), 10));
     drop(e);
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let s = e.snapshot();
     assert_eq!((s.counters.ssd.store_pages, s.counters.ssd.store_states), (0, 0), "{s}");
     // A text that grows past the rule is written from its first page.
-    let long = text_of(5, 30) + &a.text + &text_of(6, 60);
+    let long = text_of(5, 30) + &a.run.text + &text_of(6, 60);
     e.ask(&long, 10);
     e.consistent();
     drop(e);
@@ -281,7 +159,7 @@ fn state_of_another_fingerprint_is_never_used_and_makes_room_first() {
     let other = model(2, |_| {});
     let e = engine(&other, config(256, 8, Some(at(1 << 30))));
     let b = e.ask(&prompt, 10);
-    assert_eq!(b.text, a.text, "the synthetic model's text does not depend on the number");
+    assert_eq!(b.run.text, a.run.text, "the synthetic model's text does not depend on the number");
     assert_eq!(b.report.cached_tokens, 0);
     let s = e.written();
     assert_eq!(s.counters.ssd.pages_read, 0, "{s}");
@@ -294,7 +172,7 @@ fn state_of_another_fingerprint_is_never_used_and_makes_room_first() {
     let e = engine(&other, config(256, 8, Some(at(old_bytes + old_bytes / 2))));
     assert_eq!(stores(), 1);
     let c = e.ask(&prompt, 10);
-    assert_eq!(c.text, a.text);
+    assert_eq!(c.run.text, a.run.text);
     assert!(c.report.cached_tokens > 0);
     e.consistent();
 }
@@ -312,7 +190,7 @@ fn the_size_limit_gives_up_the_texts_used_least_recently() {
     // What the pool gives up goes to RAM, and from there to the drive.
     let mut answers = Vec::new();
     for text in &texts {
-        answers.push(e.ask(text, 8).text);
+        answers.push(e.ask(text, 8).run.text);
         e.written();
     }
     let s = e.written();
@@ -326,10 +204,10 @@ fn the_size_limit_gives_up_the_texts_used_least_recently() {
     // say what they said.
     let newest = e.ask(&texts[7], 8);
     assert!(newest.report.cached_tokens >= 256, "{:?}", newest.report);
-    assert_eq!(newest.text, answers[7]);
+    assert_eq!(newest.run.text, answers[7]);
     let oldest = e.ask(&texts[0], 8);
     assert_eq!(oldest.report.cached_tokens, 0, "{:?}", oldest.report);
-    assert_eq!(oldest.text, answers[0]);
+    assert_eq!(oldest.run.text, answers[0]);
     e.consistent();
 }
 
@@ -366,12 +244,12 @@ fn damaged_and_missing_files_cost_only_time() {
 
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let again = e.ask(&one, 10);
-    assert_eq!(again.text, a.text);
+    assert_eq!(again.run.text, a.run.text);
     // The run was cut at the damaged page: what came before it is used.
     assert!(again.report.cached_tokens < 4 * PAGE, "{:?}", again.report);
     let s = e.snapshot();
     assert_eq!(s.counters.ssd.imports_cut, 1, "{s}");
-    assert_eq!(e.ask(&two, 10).text, b.text);
+    assert_eq!(e.ask(&two, 10).run.text, b.run.text);
     e.consistent();
 
     // The directory vanishes while the engine runs: it keeps serving, and
@@ -379,17 +257,17 @@ fn damaged_and_missing_files_cost_only_time() {
     std::fs::remove_dir_all(&dir.0).unwrap();
     let three = text_of(42, 600);
     let c = e.ask(&three, 10);
-    assert_eq!(c.text, fresh(&three, 10));
+    assert_eq!(c.run.text, fresh(&three, 10));
     let four = text_of(43, 600);
     let d = e.ask(&four, 10);
-    assert_eq!(d.text, fresh(&four, 10));
+    assert_eq!(d.run.text, fresh(&four, 10));
     e.consistent();
     drop(e);
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let s = e.snapshot();
     assert!(s.ssd_problem.is_none() && s.counters.ssd.enabled, "{s}");
     let d2 = e.ask(&four, 10);
-    assert_eq!(d2.text, d.text);
+    assert_eq!(d2.run.text, d.run.text);
     e.consistent();
 }
 
@@ -408,10 +286,10 @@ fn one_place_for_checkpoints_is_enough() {
     assert_eq!(s.counters.ssd.pages_written, 0, "the devices hold the pages: {s}");
     drop(e);
 
-    let second = format!("{first}{}{}", a.text, text_of(51, 20));
+    let second = format!("{first}{}{}", a.run.text, text_of(51, 20));
     let e = engine(&model, config(256, 1, Some(store(&dir.0))));
     let b = e.ask(&second, 20);
-    assert_eq!(b.text, fresh(&second, 20));
+    assert_eq!(b.run.text, fresh(&second, 20));
     assert!(b.report.cached_tokens >= 352, "{:?}", b.report);
     assert_eq!(b.report.replayed_rows, 0);
     e.consistent();
@@ -427,10 +305,10 @@ fn pages_that_settle_late_are_written_in_the_form_they_have() {
     let a = e.ask(&first, 20);
     drop(e);
     assert_eq!(stored(&model, &dir.0).store_pages, 13, "the end writes them all");
-    let second = format!("{first}{}{}", a.text, text_of(61, 40));
+    let second = format!("{first}{}{}", a.run.text, text_of(61, 40));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let b = e.ask(&second, 20);
-    assert_eq!(b.text, fresh(&second, 20));
+    assert_eq!(b.run.text, fresh(&second, 20));
     assert!(b.report.cached_tokens >= 192, "{:?}", b.report);
     e.consistent();
 }
@@ -445,12 +323,12 @@ fn a_second_engine_on_the_same_store_serves_without_it() {
     let s = second.snapshot();
     assert!(!s.counters.ssd.enabled);
     assert!(s.ssd_problem.as_deref().is_some_and(|why| why.contains("in use")), "{s}");
-    assert_eq!(second.ask(&prompt, 10).text, first.ask(&prompt, 10).text);
+    assert_eq!(second.ask(&prompt, 10).run.text, first.ask(&prompt, 10).run.text);
     // A model whose devices move no state says so, too.
     let plain = self::model(1, |c| c.durable = None);
     let third = engine(&plain, config(256, 8, Some(store(&dir.0))));
     assert!(third.snapshot().ssd_problem.is_some());
-    assert_eq!(third.ask(&prompt, 10).text, fresh(&prompt, 10));
+    assert_eq!(third.ask(&prompt, 10).run.text, fresh(&prompt, 10));
 }
 
 #[test]
@@ -464,7 +342,7 @@ fn requests_that_share_a_run_from_ssd_wait_for_it_together() {
 
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let prompts: Vec<String> =
-        (0..4).map(|i| format!("{base}{}{}", a.text, text_of(90 + i, 20))).collect();
+        (0..4).map(|i| format!("{base}{}{}", a.run.text, text_of(90 + i, 20))).collect();
     let handles: Vec<Handle> =
         prompts.iter().map(|p| start(&e.rt, request(p, Some(10))).unwrap()).collect();
     for (handle, prompt) in handles.into_iter().zip(&prompts) {

@@ -1,31 +1,18 @@
-//! The prefix cache in the conductor, against the host executor as an oracle.
-//!
-//! The executor keeps the cells of every page and the recurrent state of every
-//! slot ([`ares_runtime::testing`]), carries out the step record's copies, and
-//! makes a row that reads anything wrong pick another token. So every answer
-//! here that equals the answer of an engine without a cache says that the
-//! pages, tails and checkpoints the conductor shared, restored, replayed and
-//! evicted were the right ones; and the counters and the per-request reports
-//! say how much it computed.
-
-mod common;
+//! The index on the devices: the pages, tails and checkpoints the conductor
+//! shares, restores, replays and evicts, and what the per-request reports say
+//! it computed.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ares_api::Engine;
-use ares_runtime::testing::{Gate, HostExecutor, Problems};
+use ares_runtime::testing::{Gate, HostExecutor};
 use ares_runtime::{
-    FarPages, PinnedRam, RequestReport, Runtime, RuntimeConfig, Snapshot, Split, StateCopyKind,
-    SyntheticConfig, SyntheticModel,
+    FarPages, PinnedRam, RuntimeConfig, Split, StateCopyKind, SyntheticConfig, SyntheticModel,
 };
-use common::*;
 
-/// Cells per page, and the bytes one checkpoint takes in the model that
-/// pretends to recurrent state.
-const PAGE: u32 = 16;
-const CHECKPOINT: u64 = 4096;
+use super::*;
 
 fn model(
     prefix_cache: Option<u64>,
@@ -72,27 +59,6 @@ fn config(pages: u32, checkpoints: u64) -> RuntimeConfig {
     }
 }
 
-struct Rig {
-    rt: Runtime,
-    problems: Problems,
-}
-
-fn engine_with(
-    model: &Arc<SyntheticModel>,
-    config: RuntimeConfig,
-    adjust: impl FnOnce(HostExecutor) -> HostExecutor,
-) -> Rig {
-    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
-        .with_pool(config.pages, config.cells_per_page);
-    let host = adjust(host);
-    let problems = host.problems();
-    Rig { rt: Runtime::start(model.clone(), Box::new(host), config).unwrap(), problems }
-}
-
-fn engine(model: &Arc<SyntheticModel>, config: RuntimeConfig) -> Rig {
-    engine_with(model, config, |host| host)
-}
-
 /// Waits until the conductor has dispatched `n` steps, which an observer
 /// counts in `steps`. It is inside the last of them, or about to be: what is
 /// submitted from here on it takes in after that step.
@@ -102,60 +68,6 @@ fn dispatched(steps: &AtomicU32, n: u32) {
         assert!(Instant::now() < deadline, "the conductor never dispatched step {n}");
         std::thread::sleep(Duration::from_micros(200));
     }
-}
-
-/// What the oracle found wrong, which is nothing when the conductor did right.
-fn assert_consistent(engine: &Rig) {
-    let problems = engine.problems.lock().unwrap();
-    assert!(problems.is_empty(), "the oracle found: {problems:#?}");
-    // The accounting counted the pages a step needs right: none had to be
-    // found after a claim had been granted.
-    let s = engine.snapshot();
-    assert_eq!(s.counters.cache_pages_evicted_late, 0, "{s}");
-}
-
-/// What a request said and what it took from the cache and computed.
-struct Answer {
-    run: Run,
-    report: RequestReport,
-}
-
-impl Rig {
-    fn ask(&self, prompt: &str, max_tokens: u32) -> Answer {
-        let request = request(prompt, Some(max_tokens));
-        let id = request.id;
-        let run = run_one(&self.rt, request);
-        let report = *snapshot(&self.rt).request(id).expect("the request ended");
-        Answer { run, report }
-    }
-
-    fn snapshot(&self) -> Snapshot {
-        snapshot(&self.rt)
-    }
-
-    /// The counters since `before`.
-    fn since(&self, before: &Snapshot) -> std::collections::HashMap<&'static str, u64> {
-        since(&self.snapshot(), before)
-    }
-}
-
-/// The answers of an engine without a cache, which is what the cache must not change.
-fn fresh(model_config: impl Fn(&mut SyntheticConfig), prompt: &str, max_tokens: u32) -> Run {
-    let model = model(None, model_config);
-    let rt = Runtime::start(
-        model.clone(),
-        Box::new(HostExecutor::new(model.clone(), model.config().max_rows, 16)),
-        RuntimeConfig { window_rows: 1, warm_up: false, ..config(4096, 0) },
-    )
-    .unwrap();
-    let mut run = alone(&rt, prompt, Some(max_tokens));
-    // A cold engine cached nothing.
-    run.usage.cached_prompt_tokens = 0;
-    run
-}
-
-fn text_of(rng: &mut Rng, len: usize) -> String {
-    rng.prompt(len)
 }
 
 /// The first `n` tokens of a text: a token is a character here.
@@ -170,7 +82,7 @@ fn tokens_of(text: &str) -> u64 {
 #[test]
 fn the_same_prompt_twice_computes_only_what_the_cache_lacks_the_second_time() {
     let mut rng = Rng(7);
-    let prompt = text_of(&mut rng, 100);
+    let prompt = rng.prompt(100);
     let model = model(Some(CHECKPOINT), |_| {});
     let e = engine(&model, config(256, 16));
     let first = e.ask(&prompt, 40);
@@ -181,7 +93,7 @@ fn the_same_prompt_twice_computes_only_what_the_cache_lacks_the_second_time() {
     let before = e.snapshot();
     let second = e.ask(&prompt, 40);
     assert_eq!(second.run.text, first.run.text, "the same tokens");
-    assert_eq!(second.run.text, fresh(|_| {}, &prompt, 40).text, "and as with no cache at all");
+    assert_eq!(second.run.text, fresh(&prompt, 40), "and as with no cache at all");
     // 99 cells are looked up (the last token is always computed): 6 pages of
     // 16. The checkpoint at the anchor, the last page boundary before the
     // prompt's end, is at 96: nothing is replayed and the last 4 rows run.
@@ -195,20 +107,20 @@ fn the_same_prompt_twice_computes_only_what_the_cache_lacks_the_second_time() {
     assert_eq!(d["tokens"], 40);
     let c = e.snapshot().counters;
     assert_eq!((c.prefix_hits, c.cached_cells, c.checkpoints_restored), (1, 96, 1));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
 fn without_checkpoints_a_hit_replays_every_cached_row_and_writes_none_of_them() {
     let mut rng = Rng(8);
-    let prompt = text_of(&mut rng, 100);
+    let prompt = rng.prompt(100);
     let model = model(Some(CHECKPOINT), |_| {});
     // No budget: nothing to restore, so the 96 cached rows run again.
     let e = engine(&model, config(256, 0));
     let first = e.ask(&prompt, 20);
     let second = e.ask(&prompt, 20);
     assert_eq!(second.run.text, first.run.text);
-    assert_eq!(second.run.text, fresh(|_| {}, &prompt, 20).text);
+    assert_eq!(second.run.text, fresh(&prompt, 20));
     assert_eq!(second.run.usage.cached_prompt_tokens, 96);
     assert_eq!(
         (second.report.cached_tokens, second.report.replayed_rows, second.report.computed_rows),
@@ -216,7 +128,7 @@ fn without_checkpoints_a_hit_replays_every_cached_row_and_writes_none_of_them() 
     );
     let c = e.snapshot().counters;
     assert_eq!((c.checkpoints_saved, c.checkpoints_restored, c.replay_rows), (0, 0, 96));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -224,12 +136,12 @@ fn a_conversation_continued_turn_by_turn_resumes_at_the_tail_checkpoint() {
     let mut rng = Rng(11);
     let model = model(Some(CHECKPOINT), |_| {});
     let e = engine(&model, config(256, 16));
-    let mut text = text_of(&mut rng, 70);
+    let mut text = rng.prompt(70);
     let mut cells_left = 0u64;
     for turn in 0..5 {
         let before = e.snapshot();
         let answer = e.ask(&text, 30);
-        assert_eq!(answer.run.text, fresh(|_| {}, &text, 30).text, "turn {turn}");
+        assert_eq!(answer.run.text, fresh(&text, 30), "turn {turn}");
         let tokens = tokens_of(&text);
         if turn > 0 {
             // The last turn left the cells of its prompt and its answer but
@@ -248,29 +160,29 @@ fn a_conversation_continued_turn_by_turn_resumes_at_the_tail_checkpoint() {
             );
         }
         cells_left = tokens + 30 - 1;
-        text = format!("{text}{}{}", answer.run.text, text_of(&mut rng, 12));
+        text = format!("{text}{}{}", answer.run.text, rng.prompt(12));
     }
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
 fn a_prompt_that_diverges_inside_a_page_resumes_at_the_boundary_before_it() {
     let mut rng = Rng(12);
-    let first = text_of(&mut rng, 100);
+    let first = rng.prompt(100);
     // The same text up to 50, which is inside the fourth page, then another.
-    let other = format!("{}{}", head(&first, 50), text_of(&mut rng, 40));
+    let other = format!("{}{}", head(&first, 50), rng.prompt(40));
     for budget in [16, 0] {
         let model = model(Some(CHECKPOINT), |_| {});
         let e = engine(&model, config(256, budget));
         e.ask(&first, 30);
         let answer = e.ask(&other, 30);
-        assert_eq!(answer.run.text, fresh(|_| {}, &other, 30).text, "budget {budget}");
+        assert_eq!(answer.run.text, fresh(&other, 30), "budget {budget}");
         // Three whole pages are the same text. With checkpoints the one at
         // 48 is restored; without, the three pages are replayed.
         assert_eq!(answer.report.cached_tokens, 48, "budget {budget}");
         assert_eq!(answer.report.replayed_rows, if budget > 0 { 0 } else { 48 }, "budget {budget}");
         assert_eq!(answer.report.computed_rows, 90 - 48, "budget {budget}");
-        assert_consistent(&e);
+        e.consistent();
     }
 }
 
@@ -281,30 +193,30 @@ fn a_prompt_that_continues_into_the_middle_of_a_tail_takes_the_cells_it_shares()
     let e = engine(&model, config(256, 16));
     // 40 tokens and 25 more: the cells end at 64 and the request leaves a
     // full page; 40 and 30 end at 69, a tail of 5 cells.
-    let first = text_of(&mut rng, 40);
+    let first = rng.prompt(40);
     let done = e.ask(&first, 30);
     // 69 cells: 4 pages and a tail of 5 cells. A prompt that follows the
     // answer for 3 of them and then goes its own way shares 4 pages and 3.
-    let own = format!("{first}{}{}", head(&done.run.text, 64 - 40 + 3), text_of(&mut rng, 10));
+    let own = format!("{first}{}{}", head(&done.run.text, 64 - 40 + 3), rng.prompt(10));
     let answer = e.ask(&own, 20);
-    assert_eq!(answer.run.text, fresh(|_| {}, &own, 20).text);
+    assert_eq!(answer.run.text, fresh(&own, 20));
     assert_eq!(answer.report.cached_tokens, 67);
     // The tail's checkpoint is the state after 69 cells, not after 67: the
     // checkpoint at 64 is restored and 3 rows replayed.
     assert_eq!((answer.report.replayed_rows, answer.report.computed_rows), (3, 77 - 67));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
 fn a_model_without_recurrent_state_shares_pages_and_tails_and_replays_nothing() {
     let mut rng = Rng(14);
-    let prompt = text_of(&mut rng, 100);
+    let prompt = rng.prompt(100);
     let model = model(Some(0), |_| {});
     let e = engine(&model, config(256, 0));
     let first = e.ask(&prompt, 40);
     let second = e.ask(&prompt, 40);
     assert_eq!(second.run.text, first.run.text);
-    assert_eq!(second.run.text, fresh(|_| {}, &prompt, 40).text);
+    assert_eq!(second.run.text, fresh(&prompt, 40));
     assert_eq!(
         (second.report.cached_tokens, second.report.replayed_rows, second.report.computed_rows),
         (96, 0, 4)
@@ -312,18 +224,18 @@ fn a_model_without_recurrent_state_shares_pages_and_tails_and_replays_nothing() 
     // A conversation's next turn takes the tail as well.
     let next = format!("{prompt}{}more", first.run.text);
     let third = e.ask(&next, 10);
-    assert_eq!(third.run.text, fresh(|_| {}, &next, 10).text);
+    assert_eq!(third.run.text, fresh(&next, 10));
     assert_eq!(third.report.cached_tokens, 100 + 40 - 1);
     assert_eq!(third.report.replayed_rows, 0);
     let c = e.snapshot().counters;
     assert_eq!((c.checkpoints_saved, c.checkpoints_restored, c.replay_rows), (0, 0, 0));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
 fn a_model_that_does_not_take_part_has_no_cache() {
     let mut rng = Rng(15);
-    let prompt = text_of(&mut rng, 100);
+    let prompt = rng.prompt(100);
     let model = model(None, |_| {});
     let rt = Runtime::start(
         model.clone(),
@@ -343,7 +255,7 @@ fn a_model_that_does_not_take_part_has_no_cache() {
 #[test]
 fn two_equal_prompts_submitted_together_share_from_the_first_full_page_and_one_is_held_back() {
     let mut rng = Rng(16);
-    let prompt = text_of(&mut rng, 100);
+    let prompt = rng.prompt(100);
     let model = model(Some(CHECKPOINT), |_| {});
     let gate = Gate::new();
     let steps = Arc::new(AtomicU32::new(0));
@@ -353,7 +265,7 @@ fn two_equal_prompts_submitted_together_share_from_the_first_full_page_and_one_i
             steps.fetch_add(1, Ordering::SeqCst);
         })
     });
-    let expected = fresh(|_| {}, &prompt, 30);
+    let expected = fresh_run(|_| {}, &prompt, 30);
 
     // Keep the conductor inside a step while both are submitted, so that it
     // takes them in one turn and starts them in one pass.
@@ -380,17 +292,17 @@ fn two_equal_prompts_submitted_together_share_from_the_first_full_page_and_one_i
     assert_eq!((second.cached_tokens, second.replayed_rows, second.computed_rows), (96, 0, 4));
     // The rows of the prompt that ran: "busy", the prompt, and the last 4 rows.
     assert_eq!(s.counters.prefill_rows, 4 + 100 + 4);
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
 fn a_prompt_that_arrives_while_another_computes_its_pages_waits_for_them() {
     let mut rng = Rng(17);
-    let prompt = text_of(&mut rng, 300);
+    let prompt = rng.prompt(300);
     let model = model(Some(CHECKPOINT), |_| {});
     let e =
         engine_with(&model, config(256, 32), |host| host.with_delay(Duration::from_micros(300)));
-    let expected = fresh(|_| {}, &prompt, 20);
+    let expected = fresh_run(|_| {}, &prompt, 20);
     let first = start(&e.rt, request(&prompt, Some(20))).unwrap();
     // The first prompt takes 19 steps of one page each.
     std::thread::sleep(Duration::from_millis(1));
@@ -411,13 +323,13 @@ fn a_prompt_that_arrives_while_another_computes_its_pages_waits_for_them() {
         300 + u64::from(report.replayed_rows)
     );
     assert!(s.counters.prefill_rows < 300 + 300 - 16 + 1, "{s}");
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
 fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
     let mut rng = Rng(18);
-    let prompt = text_of(&mut rng, 300);
+    let prompt = rng.prompt(300);
     let model = model(Some(CHECKPOINT), |_| {});
     let gate = Gate::new();
     // The conductor stops in the second step, which is the first of the
@@ -433,7 +345,7 @@ fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
             steps.fetch_add(1, Ordering::SeqCst);
         })
     });
-    let expected = fresh(|_| {}, &prompt, 20);
+    let expected = fresh_run(|_| {}, &prompt, 20);
     gate.close();
     let busy = start(&e.rt, request("busy", Some(1))).unwrap();
     // The conductor is inside the step of "busy": the two prompts arrive
@@ -456,7 +368,7 @@ fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
     assert_eq!(s.counters.requests_held, 1);
     let report = s.request(held_id).unwrap();
     assert_eq!((report.cached_tokens, report.replayed_rows, report.computed_rows), (16, 0, 284));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -468,10 +380,10 @@ fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_wa
     let mut ended_in_a_window = 0;
     for max_tokens in 20..70u32 {
         let len = 20 + rng.below(40) as usize;
-        let first = text_of(&mut rng, len);
+        let first = rng.prompt(len);
         let before = e.snapshot();
         let said = e.ask(&first, max_tokens);
-        assert_eq!(said.run.text, fresh(repeating, &first, max_tokens).text, "{max_tokens}");
+        assert_eq!(said.run.text, fresh_run(repeating, &first, max_tokens).text, "{max_tokens}");
         let d = e.since(&before);
         // The request ended with its last window: every cell but the last
         // token's, nothing of the drafts that were rejected.
@@ -481,7 +393,7 @@ fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_wa
         // The next turn continues the text and takes all those cells.
         let next = format!("{first}{}and on", said.run.text);
         let answer = e.ask(&next, 12);
-        assert_eq!(answer.run.text, fresh(repeating, &next, 12).text, "{max_tokens}");
+        assert_eq!(answer.run.text, fresh_run(repeating, &next, 12).text, "{max_tokens}");
         assert_eq!(u64::from(answer.run.usage.cached_prompt_tokens), cells, "{max_tokens}");
         assert_eq!(answer.report.replayed_rows, 0, "{max_tokens}");
     }
@@ -493,8 +405,8 @@ fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_wa
     // of the drafts that were accepted: what the request keeps ends there.
     for at in 8..50 {
         let len = 30 + rng.below(30) as usize;
-        let first = text_of(&mut rng, len);
-        let long = fresh(repeating, &first, 80).text;
+        let first = rng.prompt(len);
+        let long = fresh_run(repeating, &first, 80).text;
         let stop: String = long.chars().skip(at).take(2).collect();
         let mut stopped = request(&first, Some(80));
         stopped.stop = vec![stop.clone()];
@@ -507,10 +419,10 @@ fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_wa
         let written = head(&long, produced as usize);
         let next = format!("{first}{written}and on");
         let answer = e.ask(&next, 12);
-        assert_eq!(answer.run.text, fresh(repeating, &next, 12).text, "{at}");
+        assert_eq!(answer.run.text, fresh_run(repeating, &next, 12).text, "{at}");
         assert_eq!(u64::from(answer.run.usage.cached_prompt_tokens), cells, "stop at {at}");
     }
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -520,9 +432,9 @@ fn eviction_under_page_pressure_and_a_small_budget_of_ram_keeps_every_answer_equ
     // 30 pages of 16 cells, and room for 3 checkpoints.
     let e = engine(&model, config(30, 3));
     // 12 prompts of 90 tokens and 20 more: 7 pages each, more than the pool.
-    let prompts: Vec<String> = (0..12).map(|_| text_of(&mut rng, 90)).collect();
+    let prompts: Vec<String> = (0..12).map(|_| rng.prompt(90)).collect();
     let expected: Vec<Run> =
-        prompts.iter().map(|p| fresh(|c| c.context_length = 256, p, 20)).collect();
+        prompts.iter().map(|p| fresh_run(|c| c.context_length = 256, p, 20)).collect();
     for round in 0..3 {
         for (i, prompt) in prompts.iter().enumerate() {
             let answer = e.ask(prompt, 20);
@@ -539,7 +451,7 @@ fn eviction_under_page_pressure_and_a_small_budget_of_ram_keeps_every_answer_equ
     assert!(c.cache_pages_evicted > 20 && c.checkpoints_dropped > 5, "{s}");
     assert!(c.checkpoints_saved > 20 && c.checkpoints_restored > 0, "{s}");
     assert_eq!(s.pages_free + s.cached_pages, s.pages_capacity, "no page is lost");
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -563,7 +475,7 @@ fn a_request_that_gives_way_goes_into_the_cache_and_comes_back_as_a_hit() {
         };
         let e = engine_with(&model, cfg, |host| host.with_delay(Duration::from_micros(100)));
         let jobs: Vec<String> = (0..4).map(|i| format!("writes more than expected {i}")).collect();
-        let expected: Vec<Run> = jobs.iter().map(|p| fresh(shape_of, p, 180)).collect();
+        let expected: Vec<Run> = jobs.iter().map(|p| fresh_run(shape_of, p, 180)).collect();
         // Requests that end at once teach the accounting to expect little.
         for i in 0..60 {
             let mut short = request(&format!("ends early {i}"), Some(200));
@@ -595,7 +507,7 @@ fn a_request_that_gives_way_goes_into_the_cache_and_comes_back_as_a_hit() {
         );
         assert_eq!(s.pages_free + s.cached_pages, s.pages_capacity, "{name}");
         assert_eq!((s.active, s.waiting), (0, 0));
-        assert_consistent(&e);
+        e.consistent();
     }
 }
 
@@ -609,10 +521,10 @@ fn a_window_ends_where_a_checkpoint_is_due_whatever_it_drafts() {
             RuntimeConfig { window_rows: window(speculation), ..config(256, 24) },
             |host| host.with_delay(Duration::from_micros(100)),
         );
-        let prompt = text_of(&mut rng, 20);
+        let prompt = rng.prompt(20);
         let before = e.snapshot();
         let said = e.ask(&prompt, 200);
-        assert_eq!(said.run.text, fresh(repeating, &prompt, 200).text);
+        assert_eq!(said.run.text, fresh_run(repeating, &prompt, 200).text);
         let d = e.snapshot().counters;
         if speculation {
             assert!(d.drafts_accepted - before.counters.drafts_accepted > 50, "{d:?}");
@@ -624,7 +536,7 @@ fn a_window_ends_where_a_checkpoint_is_due_whatever_it_drafts() {
             8,
             "speculation {speculation}: {d:?}"
         );
-        assert_consistent(&e);
+        e.consistent();
     }
 }
 
@@ -668,7 +580,7 @@ fn watched() -> (Arc<Mutex<Vec<Seen>>>, impl FnOnce(HostExecutor) -> HostExecuto
 #[test]
 fn a_prefill_step_ends_where_a_checkpoint_is_due_and_it_is_saved_with_the_next_record() {
     let mut rng = Rng(23);
-    let prompt = text_of(&mut rng, 100);
+    let prompt = rng.prompt(100);
     let model = model(Some(CHECKPOINT), |_| {});
     let (seen, watch) = watched();
     let e = engine_with(&model, config(256, 16), watch);
@@ -715,7 +627,7 @@ fn a_prefill_step_ends_where_a_checkpoint_is_due_and_it_is_saved_with_the_next_r
     assert!(
         kinds.windows(2).all(|w| w[0] == StateCopyKind::Save || w[1] == StateCopyKind::Restore)
     );
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -725,7 +637,7 @@ fn rows_that_rebuild_state_are_marked_replay_and_the_copy_of_a_shared_page_is_in
     let (seen, watch) = watched();
     // No checkpoints: a hit replays from the start.
     let e = engine_with(&model, config(256, 0), watch);
-    let first = text_of(&mut rng, 40);
+    let first = rng.prompt(40);
     let said = e.ask(&first, 30);
     seen.lock().unwrap().clear();
     // 69 cells were left: 4 pages and a tail of 5 cells.
@@ -750,7 +662,7 @@ fn rows_that_rebuild_state_are_marked_replay_and_the_copy_of_a_shared_page_is_in
     assert_eq!(copies.len(), 1, "{copies:?}");
     assert_eq!(copies[0].2, 5);
     assert_ne!(copies[0].0, copies[0].1);
-    assert_consistent(&e);
+    e.consistent();
 }
 
 /// A request and what an engine with no cache says to it.
@@ -775,7 +687,7 @@ fn jobs(shape: Shape, rng: &mut Rng, n: usize, longest: u64) -> Vec<Job> {
     let documents: Vec<String> = (0..4)
         .map(|_| {
             let len = 150 + rng.below(70) as usize;
-            text_of(rng, len)
+            rng.prompt(len)
         })
         .collect();
     let mut jobs: Vec<Job> = Vec::new();
@@ -784,7 +696,7 @@ fn jobs(shape: Shape, rng: &mut Rng, n: usize, longest: u64) -> Vec<Job> {
         let prompt = match kind {
             0 => {
                 let len = 20 + rng.below(100) as usize;
-                text_of(rng, len)
+                rng.prompt(len)
             }
             1 | 2 => {
                 // A slice of a document, edited in a few places, and more.
@@ -797,16 +709,16 @@ fn jobs(shape: Shape, rng: &mut Rng, n: usize, longest: u64) -> Vec<Job> {
                     }
                 }
                 let more = rng.below(20) as usize;
-                format!("{}{}", chars.into_iter().collect::<String>(), text_of(rng, more))
+                format!("{}{}", chars.into_iter().collect::<String>(), rng.prompt(more))
             }
             3 if !jobs.is_empty() => {
                 // The conversation goes on after an answer.
                 let last = &jobs[rng.below(jobs.len() as u64) as usize];
                 let more = 5 + rng.below(15) as usize;
-                format!("{}{}{}", last.prompt, last.expected.text, text_of(rng, more))
+                format!("{}{}{}", last.prompt, last.expected.text, rng.prompt(more))
             }
             _ if !jobs.is_empty() => jobs[rng.below(jobs.len() as u64) as usize].prompt.clone(),
-            _ => text_of(rng, 40),
+            _ => rng.prompt(40),
         };
         if prompt.chars().count() > 300 {
             continue;
@@ -905,7 +817,7 @@ fn many_requests_with_shared_prefixes_edits_and_tight_memory_all_say_what_they_s
                 assert!(s.counters.cache_pages_evicted > 0, "{shape_name}, {name}: {s}");
             }
             gave_way += u32::from(s.counters.requests_suspended > 0);
-            assert_consistent(&e);
+            e.consistent();
         }
     }
     assert!(gave_way >= 3, "requests gave way in {gave_way} of the runs");
@@ -921,13 +833,13 @@ fn the_scenarios_of_an_engine_without_a_cache_run_clean_under_the_oracle() {
             RuntimeConfig { window_rows: window(speculation), max_slots: 64, ..config(4096, 0) };
         let e = engine_with(&model, cfg, |host| host.with_delay(Duration::from_micros(300)));
         output_is_independent_of_the_batch(&e.rt, Duration::from_micros(400));
-        assert_consistent(&e);
+        e.consistent();
     }
     let small = model(None, |c| c.context_length = 256);
     let cfg = RuntimeConfig { window_rows: 8, max_slots: 64, ..config(4096, 0) };
     let e = engine_with(&small, cfg, |host| host.with_delay(Duration::from_micros(500)));
     cancel_frees_pages_and_spares_the_others(&e.rt);
-    assert_consistent(&e);
+    e.consistent();
 
     let looping = model(None, |c| {
         c.context_length = 256;
@@ -936,7 +848,7 @@ fn the_scenarios_of_an_engine_without_a_cache_run_clean_under_the_oracle() {
     let cfg = RuntimeConfig { output_ratio: 0.05, window_rows: 8, ..config(24, 0) };
     let e = engine_with(&looping, cfg, |host| host.with_delay(Duration::from_micros(100)));
     a_request_that_gives_way_comes_back_and_says_the_same(&e.rt);
-    assert_consistent(&e);
+    e.consistent();
 }
 
 /// The pages the records name as freed, and the pages their updates table, as
@@ -980,7 +892,7 @@ fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
     });
     let mut first_batch = std::collections::HashSet::new();
     for n in 0..6 {
-        let prompt = text_of(&mut rng, 20 + 25 * n);
+        let prompt = rng.prompt(20 + 25 * n);
         e.ask(&prompt, 12);
         if n == 4 {
             let mut pages = seen.lock().unwrap();
@@ -1002,7 +914,7 @@ fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
         );
     }
     assert!(pages.freed.iter().all(|p| pages.tabled.contains(p)), "only pages that were used");
-    assert_consistent(&e);
+    e.consistent();
 }
 
 /// A conversation as a request: the synthetic model writes each message as
@@ -1057,9 +969,9 @@ fn boundary_config() -> RuntimeConfig {
 fn a_new_conversation_with_the_same_system_prompt_starts_from_its_root() {
     use ares_api::Role::{System, User};
     let mut rng = Rng(31);
-    let system = text_of(&mut rng, 100);
-    let first = [(System, system.clone()), (User, text_of(&mut rng, 30))];
-    let second = [(System, system.clone()), (User, text_of(&mut rng, 30))];
+    let system = rng.prompt(100);
+    let first = [(System, system.clone()), (User, rng.prompt(30))];
+    let second = [(System, system.clone()), (User, rng.prompt(30))];
     let model = model(Some(CHECKPOINT), |_| {});
     // The system message is `system: ` and 100 characters: it ends at 108,
     // and the first message's text starts at 115 after `\nuser: `. The roots
@@ -1068,16 +980,16 @@ fn a_new_conversation_with_the_same_system_prompt_starts_from_its_root() {
     let a = e.ask_chat(&first, 20);
     assert_eq!(a.report.replayed_rows, 0);
     let b = e.ask_chat(&second, 20);
-    assert_eq!(b.run.text, fresh(|_| {}, &rendered(&second), 20).text);
+    assert_eq!(b.run.text, fresh(&rendered(&second), 20));
     assert_eq!((b.report.cached_tokens, b.report.replayed_rows), (112, 0));
-    assert_consistent(&e);
+    e.consistent();
     // The same texts without boundaries (plain text of the same tokens):
     // nothing is kept at the system prompt's end, every shared row runs again.
     let e = engine(&model, boundary_config());
     e.ask(&rendered(&first), 20);
     let b = e.ask(&rendered(&second), 20);
     assert_eq!((b.report.cached_tokens, b.report.replayed_rows), (112, 112));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -1088,28 +1000,28 @@ fn an_edited_message_replays_only_the_rows_from_the_boundary_before_it() {
     // A conversation of five turns that comes whole (a client that sends a
     // history, a conversation the cache had lost), then again with its
     // second answer changed.
-    let mut messages = vec![(System, text_of(&mut rng, 40))];
+    let mut messages = vec![(System, rng.prompt(40))];
     for turn in 0..5 {
-        messages.push((User, text_of(&mut rng, 25)));
+        messages.push((User, rng.prompt(25)));
         if turn < 4 {
-            messages.push((Assistant, text_of(&mut rng, 30)));
+            messages.push((Assistant, rng.prompt(30)));
         }
     }
     let mut edited = messages.clone();
-    edited[4].1 = text_of(&mut rng, 30);
+    edited[4].1 = rng.prompt(30);
     // The text of the changed answer starts here.
     let shared = (rendered(&messages[..4]).len() as u32) / PAGE * PAGE;
 
     let e = engine(&model, boundary_config());
     let first = e.ask_chat(&messages, 20);
-    assert_eq!(first.run.text, fresh(|_| {}, &rendered(&messages), 20).text);
+    assert_eq!(first.run.text, fresh(&rendered(&messages), 20));
     let answer = e.ask_chat(&edited, 20);
-    assert_eq!(answer.run.text, fresh(|_| {}, &rendered(&edited), 20).text);
+    assert_eq!(answer.run.text, fresh(&rendered(&edited), 20));
     // It takes the pages before the change and replays from a checkpoint
     // less than a piece of prompt (64 rows) before it.
     assert_eq!(answer.report.cached_tokens, shared);
     assert!(answer.report.replayed_rows < 64, "{:?}", answer.report);
-    assert_consistent(&e);
+    e.consistent();
 
     // Without boundaries (the same tokens as plain text) the history has a
     // checkpoint only at its end: the change replays every shared row.
@@ -1117,7 +1029,7 @@ fn an_edited_message_replays_only_the_rows_from_the_boundary_before_it() {
     e.ask(&rendered(&messages), 20);
     let answer = e.ask(&rendered(&edited), 20);
     assert_eq!((answer.report.cached_tokens, answer.report.replayed_rows), (shared, shared));
-    assert_consistent(&e);
+    e.consistent();
 }
 
 #[test]
@@ -1140,24 +1052,24 @@ fn the_same_prompt_asked_again_resumes_at_its_anchor_while_the_roots_keep_their_
             ..config(1024, places)
         };
         let e = engine(&model, config);
-        let mut messages = vec![(System, text_of(&mut rng, 70)), (User, text_of(&mut rng, 20))];
+        let mut messages = vec![(System, rng.prompt(70)), (User, rng.prompt(20))];
         let first = e.ask_chat(&messages, 12);
         messages.push((Assistant, first.run.text.clone()));
-        messages.push((Tool, text_of(&mut rng, 600)));
+        messages.push((Tool, rng.prompt(600)));
         let once = e.ask_chat(&messages, 12);
         let again = e.ask_chat(&messages, 12);
         assert_eq!(again.run.text, once.run.text, "{places} places");
-        assert_eq!(again.run.text, fresh(long, &rendered(&messages), 12).text);
+        assert_eq!(again.run.text, fresh_run(long, &rendered(&messages), 12).text);
         // 747 cells are looked up: 46 pages of 16, and the anchor at 736.
         let report = &again.report;
         assert_eq!((report.cached_tokens, report.replayed_rows), (736, 0), "{places} places");
         // The next turn continues the second ask's reply from its end state.
         messages.push((Assistant, again.run.text.clone()));
-        messages.push((User, text_of(&mut rng, 20)));
+        messages.push((User, rng.prompt(20)));
         let next = e.ask_chat(&messages, 12);
-        assert_eq!(next.run.text, fresh(long, &rendered(&messages), 12).text);
+        assert_eq!(next.run.text, fresh_run(long, &rendered(&messages), 12).text);
         assert_eq!(next.report.replayed_rows, 0, "{places} places: {:?}", next.report);
-        assert_consistent(&e);
+        e.consistent();
     }
 }
 
@@ -1173,17 +1085,17 @@ fn paused_config() -> RuntimeConfig {
 #[test]
 fn a_paused_step_runs_again_until_its_rows_are_done() {
     let mut rng = Rng(11);
-    let prompt = text_of(&mut rng, 200);
+    let prompt = rng.prompt(200);
     let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
     let model = model(Some(CHECKPOINT), shape);
     let e = engine_with(&model, paused_config(), |host| host.with_pauses(16, 4));
     let first = e.ask(&prompt, 40);
-    assert_eq!(first.run.text, fresh(shape, &prompt, 40).text, "as without pauses");
+    assert_eq!(first.run.text, fresh_run(shape, &prompt, 40).text, "as without pauses");
     let paused = e.snapshot().counters.steps_paused;
     assert!(paused >= 3, "{paused} steps paused");
     let second = e.ask(&prompt, 40);
     assert_eq!(second.run.text, first.run.text, "from the cache, as the first time");
-    assert_consistent(&e);
+    e.consistent();
 }
 
 /// A request that comes while a step of another prompt is paused runs before that step
@@ -1192,8 +1104,8 @@ fn a_paused_step_runs_again_until_its_rows_are_done() {
 #[test]
 fn a_request_runs_between_the_pieces_of_a_paused_step() {
     let mut rng = Rng(12);
-    let long = text_of(&mut rng, 240);
-    let short = text_of(&mut rng, 10);
+    let long = rng.prompt(240);
+    let short = rng.prompt(10);
     let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
     let model = model(Some(CHECKPOINT), shape);
     let pieces = 40;
@@ -1217,9 +1129,9 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
     let paused = e.snapshot().counters.steps_paused - at_start;
     let long_done = long_run.finish();
     assert!(paused < u64::from(pieces) / 2, "{paused} pauses while the short request ran");
-    assert_eq!(short_done.text, fresh(shape, &short, 5).text);
-    assert_eq!(long_done.text, fresh(shape, &long, 20).text);
-    assert_consistent(&e);
+    assert_eq!(short_done.text, fresh_run(shape, &short, 5).text);
+    assert_eq!(long_done.text, fresh_run(shape, &long, 20).text);
+    e.consistent();
 }
 
 /// A model that pauses its wide steps reads a long prompt that comes while another
@@ -1229,8 +1141,8 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
 #[test]
 fn a_long_prompt_beside_generation_is_read_in_wide_steps_that_pause() {
     let mut rng = Rng(14);
-    let first = text_of(&mut rng, 10);
-    let long = text_of(&mut rng, 240);
+    let first = rng.prompt(10);
+    let long = rng.prompt(240);
     let shape = |c: &mut SyntheticConfig| {
         c.own_rows = 16;
         c.pauses_wide_steps = true;
@@ -1259,9 +1171,9 @@ fn a_long_prompt_beside_generation_is_read_in_wide_steps_that_pause() {
         wide.windows(2).any(|pair| pair[1] > pair[0] + 1),
         "rounds ran between the pieces: {steps:?}"
     );
-    assert_eq!(long_done.text, fresh(shape, &long, 20).text);
-    assert_eq!(format!("{head}{}", generated.text), fresh(shape, &first, 400).text);
-    assert_consistent(&e);
+    assert_eq!(long_done.text, fresh_run(shape, &long, 20).text);
+    assert_eq!(format!("{head}{}", generated.text), fresh_run(shape, &first, 400).text);
+    e.consistent();
 }
 
 /// A request whose step is paused can be cancelled: what it computed is not kept, the
@@ -1269,7 +1181,7 @@ fn a_long_prompt_beside_generation_is_read_in_wide_steps_that_pause() {
 #[test]
 fn a_cancelled_request_gives_its_paused_step_up() {
     let mut rng = Rng(13);
-    let long = text_of(&mut rng, 240);
+    let long = rng.prompt(240);
     let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
     let model = model(Some(CHECKPOINT), shape);
     let e = engine_with(&model, paused_config(), |host| {
@@ -1287,8 +1199,8 @@ fn a_cancelled_request_gives_its_paused_step_up() {
     // The same prompt again: nothing of the cancelled one is cached past what it had
     // before its paused step.
     let again = e.ask(&long, 20);
-    assert_eq!(again.run.text, fresh(shape, &long, 20).text);
-    assert_consistent(&e);
+    assert_eq!(again.run.text, fresh_run(shape, &long, 20).text);
+    e.consistent();
 }
 
 /// Two turns of a conversation: a prompt of 220 rows, then the prompt with the start of the
@@ -1297,7 +1209,7 @@ fn a_cancelled_request_gives_its_paused_step_up() {
 /// Returns the rows the second turn replayed, its answer and the engine.
 fn two_turns(inside: bool, checkpoints: u64) -> (u64, Rig, String, Run) {
     let mut rng = Rng(29);
-    let prompt = text_of(&mut rng, 220);
+    let prompt = rng.prompt(220);
     let model = model(Some(CHECKPOINT), move |c: &mut SyntheticConfig| {
         c.max_rows = 256;
         c.own_rows = 16;
@@ -1308,7 +1220,7 @@ fn two_turns(inside: bool, checkpoints: u64) -> (u64, Rig, String, Run) {
     let first = e.ask(&prompt, 6);
     let saved = e.snapshot().counters;
     let reply: String = first.run.text.chars().take(4).collect();
-    let second = format!("{prompt}{reply}{}", text_of(&mut rng, 10));
+    let second = format!("{prompt}{reply}{}", rng.prompt(10));
     let again = e.ask(&second, 6);
     let after = e.snapshot().counters;
     assert_eq!(after.checkpoints_restored - saved.checkpoints_restored, 1);
@@ -1331,12 +1243,12 @@ fn a_turn_after_saves_inside_a_step_replays_no_more_than_after_cut_steps() {
             c.own_rows = 16;
             c.inner_saves = true;
         };
-        assert_eq!(run.text, fresh(shape, &second, 6).text, "{checkpoints} checkpoints");
+        assert_eq!(run.text, fresh_run(shape, &second, 6).text, "{checkpoints} checkpoints");
         assert!(
             inside <= cut,
             "{checkpoints} checkpoints: {inside} rows replayed after saves inside, {cut} after cuts"
         );
-        assert_consistent(&e);
+        e.consistent();
     }
 }
 
@@ -1347,8 +1259,8 @@ fn a_turn_after_saves_inside_a_step_replays_no_more_than_after_cut_steps() {
 #[test]
 fn checkpoints_inside_a_step_serve_a_later_prompt() {
     let mut rng = Rng(21);
-    let prompt = text_of(&mut rng, 200);
-    let later = format!("{}{}", head(&prompt, 150), text_of(&mut rng, 30));
+    let prompt = rng.prompt(200);
+    let later = format!("{}{}", head(&prompt, 150), rng.prompt(30));
     let shape = |c: &mut SyntheticConfig| {
         c.own_rows = 16;
         c.inner_saves = true;
@@ -1357,15 +1269,15 @@ fn checkpoints_inside_a_step_serve_a_later_prompt() {
         let model = model(Some(CHECKPOINT), shape);
         let e = engine_with(&model, config(256, 16), |host| host.with_pauses(16, pieces));
         let first = e.ask(&prompt, 20);
-        assert_eq!(first.run.text, fresh(shape, &prompt, 20).text, "pieces {pieces}");
+        assert_eq!(first.run.text, fresh_run(shape, &prompt, 20).text, "pieces {pieces}");
         let c = e.snapshot().counters;
         // Steps of 64 rows with a checkpoint every 16 cells: three inside each.
         assert!(c.checkpoints_saved >= 9, "pieces {pieces}: {} checkpoints", c.checkpoints_saved);
         assert!(c.prefill_rows <= 200, "pieces {pieces}: {} rows", c.prefill_rows);
         let second = e.ask(&later, 20);
-        assert_eq!(second.run.text, fresh(shape, &later, 20).text, "pieces {pieces}");
+        assert_eq!(second.run.text, fresh_run(shape, &later, 20).text, "pieces {pieces}");
         assert!(second.report.cached_tokens >= 128, "{:?}", second.report);
-        assert_consistent(&e);
+        e.consistent();
     }
 }
 
@@ -1387,18 +1299,18 @@ fn a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state
     let model = model(Some(CHECKPOINT), shape);
     let e = engine(&model, config(256, 1));
     // Less than a page with the reply: no checkpoint but the end state's.
-    let first = text_of(&mut rng, 10);
+    let first = rng.prompt(10);
     let done = e.ask(&first, 6);
-    assert_eq!(done.run.text, fresh(shape, &first, 6).text);
+    assert_eq!(done.run.text, fresh_run(shape, &first, 6).text);
     let saved = e.snapshot().counters;
     assert_eq!(saved.checkpoints_saved, 1, "the end state is the one checkpoint");
-    let second = format!("{first}{}{}", done.run.text, text_of(&mut rng, 150));
+    let second = format!("{first}{}{}", done.run.text, rng.prompt(150));
     let again = e.ask(&second, 6);
     let after = e.snapshot().counters;
     assert_eq!(after.checkpoints_restored - saved.checkpoints_restored, 1);
     assert_eq!(again.report.replayed_rows, 0, "{:?}", again.report);
-    assert_eq!(again.run.text, fresh(shape, &second, 6).text);
-    assert_consistent(&e);
+    assert_eq!(again.run.text, fresh_run(shape, &second, 6).text);
+    e.consistent();
 }
 
 /// Pages a model keeps in host memory (from page 4 on, [`FarPages`]: the K and V of a context
@@ -1411,7 +1323,7 @@ fn a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state
 #[test]
 fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory() {
     let mut rng = Rng(31);
-    let prompt = text_of(&mut rng, 10 * PAGE as usize + 3);
+    let prompt = rng.prompt(10 * PAGE as usize + 3);
     let mut texts = Vec::new();
     for hungry in [true, false] {
         let model = model(Some(CHECKPOINT), |c| {
@@ -1436,7 +1348,7 @@ fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_m
         }
         assert_eq!(again.run.text, first.run.text, "hungry {hungry}");
         texts.push(first.run.text);
-        assert_consistent(&e);
+        e.consistent();
     }
     assert_eq!(texts[0], texts[1]);
 }

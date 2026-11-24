@@ -1,6 +1,5 @@
 //! Where the host memory that follows the machine meets the level of the
-//! prefix cache on SSD, in the conductor, against the host executor as an
-//! oracle.
+//! prefix cache on SSD.
 //!
 //! The executor is given the books of page-locked RAM
 //! ([`HostExecutor::with_ram`]) and plays the strictest device they allow: a
@@ -11,48 +10,20 @@
 //! The books follow a machine whose available memory and clock are the
 //! test's, so "the machine has no room for checkpoints" is a line of a test.
 
-mod common;
-
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ares_runtime::testing::{HostExecutor, Problems};
+use ares_runtime::testing::TestMachine;
 use ares_runtime::{
-    Machine, PinnedRam, RecordView, RequestReport, Rule, Runtime, RuntimeConfig, Snapshot, Split,
-    SsdConfig, StateCopyKind, SyntheticConfig, SyntheticModel,
+    Machine, PinnedRam, RecordView, Rule, RuntimeConfig, SsdConfig, StateCopyKind, SyntheticConfig,
+    SyntheticModel,
 };
-use common::*;
 
-/// Cells per page, and the bytes one checkpoint takes in the model that
-/// pretends to recurrent state.
-const PAGE: u32 = 16;
-const CHECKPOINT: u64 = 4096;
-/// The settled cells below which nothing of a text is written here.
-const MIN_CELLS: u32 = 48;
-/// A machine with memory to spare, and the limit of the engine's books.
-const PLENTY: u64 = 64 << 30;
+use super::*;
+
+/// The limit of the engine's books.
 const RAM_LIMIT: u64 = 1 << 20;
-
-/// A fresh directory under the system temp dir, removed when dropped.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("ares-runtime-ssd-ram-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// A model with recurrent state whose device side moves state to the host.
 fn model() -> Arc<SyntheticModel> {
@@ -62,16 +33,6 @@ fn model() -> Arc<SyntheticModel> {
     config.durable = Some(1);
     Arc::new(SyntheticModel::new(config).unwrap())
 }
-
-fn store(dir: &Path) -> SsdConfig {
-    SsdConfig { min_cells: MIN_CELLS, segment_bytes: 64 << 10, ..SsdConfig::new(dir, 1 << 30) }
-}
-
-/// The bytes of a page in RAM (one block of direct I/O), and the pages that
-/// pass through RAM on their way to the drive and back, which the budget of
-/// the prompt cache's RAM holds besides its checkpoints.
-const PAGE_BYTES: u64 = 4096;
-const FLOOR: u64 = 16 * PAGE_BYTES;
 
 /// Checkpoints at every second page boundary of a prompt and while
 /// generating, a budget of eight of them in RAM, and with a level on SSD the
@@ -91,134 +52,44 @@ fn config(ssd: Option<SsdConfig>) -> RuntimeConfig {
     }
 }
 
-/// The machine the engines of a test follow: what it has available and its
-/// clock are set by the test, and it is looked at when the test says so.
-struct Memory {
-    available: Arc<AtomicU64>,
-    ms: Arc<AtomicU64>,
-    machine: Arc<Machine>,
-}
-
-impl Memory {
-    fn new(available: u64) -> Arc<Self> {
-        Self::with_rule(available, Rule::default())
-    }
-
-    fn with_rule(available: u64, rule: Rule) -> Arc<Self> {
-        let (bytes, ms) = (Arc::new(AtomicU64::new(available)), Arc::new(AtomicU64::new(0)));
-        let (source, clock) = (bytes.clone(), ms.clone());
-        let machine = Machine::new(
-            rule,
-            move || Some(source.load(Ordering::SeqCst)),
-            move || Duration::from_millis(clock.load(Ordering::SeqCst)),
-        );
-        Arc::new(Self { available: bytes, ms, machine })
-    }
-
-    /// The machine has `available` bytes from now on, and has been looked at:
-    /// the engines' allowances are what that leaves them.
-    fn has(&self, available: u64) {
-        self.available.store(available, Ordering::SeqCst);
-        self.ms.fetch_add(50, Ordering::SeqCst);
-        self.machine.look().expect("the machine says what it has");
-    }
-}
-
-struct Rig {
-    rt: Runtime,
-    problems: Problems,
+/// An engine of the rig, the books it follows, and the most bytes the
+/// checkpoint places held at the start of a step.
+struct Following {
+    rig: Rig,
     ram: PinnedRam,
-    /// The most bytes the checkpoint places held at the start of a step.
     peak: Arc<AtomicU64>,
+}
+
+impl std::ops::Deref for Following {
+    type Target = Rig;
+    fn deref(&self) -> &Rig {
+        &self.rig
+    }
 }
 
 type Observer = Box<dyn FnMut(&RecordView<'_>) + Send>;
 
-/// An engine whose checkpoint places lie in books that follow `memory`.
+/// An engine whose checkpoint places lie in books that follow `machine`.
 /// `observer` sees the record of every step before it runs, on the
 /// conductor's thread.
 fn engine(
     model: &Arc<SyntheticModel>,
     config: RuntimeConfig,
-    memory: &Memory,
+    machine: &Arc<Machine>,
     mut observer: Option<Observer>,
-) -> Rig {
-    let ram = PinnedRam::following(RAM_LIMIT, &memory.machine);
+) -> Following {
+    let ram = PinnedRam::following(RAM_LIMIT, machine);
     let peak = Arc::new(AtomicU64::new(0));
     let (books, most) = (ram.clone(), peak.clone());
-    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
-        .with_pool(config.pages, config.cells_per_page)
-        .with_ram(ram.clone())
-        .with_observer(move |record| {
+    let rig = engine_with(model, config, |host| {
+        host.with_ram(ram.clone()).with_observer(move |record| {
             most.fetch_max(books.checkpoints(), Ordering::SeqCst);
             if let Some(observer) = &mut observer {
                 observer(record);
             }
-        });
-    let problems = host.problems();
-    Rig { rt: Runtime::start(model.clone(), Box::new(host), config).unwrap(), problems, ram, peak }
-}
-
-struct Answer {
-    text: String,
-    report: RequestReport,
-}
-
-impl Rig {
-    fn ask(&self, prompt: &str, max_tokens: u32) -> Answer {
-        let request = request(prompt, Some(max_tokens));
-        let id = request.id;
-        let run = run_one(&self.rt, request);
-        let report = *snapshot(&self.rt).request(id).expect("the request ended");
-        Answer { text: run.text, report }
-    }
-
-    fn snapshot(&self) -> Snapshot {
-        snapshot(&self.rt)
-    }
-
-    /// Waits until the level on SSD has nothing left to write.
-    fn written(&self) -> Snapshot {
-        let deadline = std::time::Instant::now() + LIMIT;
-        loop {
-            let s = self.snapshot();
-            if s.counters.ssd.pending == 0 {
-                return s;
-            }
-            assert!(std::time::Instant::now() < deadline, "the writer is stuck: {s}");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// The oracle found nothing wrong.
-    fn consistent(&self) {
-        let problems = self.problems.lock().unwrap();
-        assert!(problems.is_empty(), "the oracle found: {problems:#?}");
-    }
-}
-
-/// What an engine without any cache says.
-fn fresh(prompt: &str, max_tokens: u32) -> String {
-    let mut config = SyntheticConfig::small(Split::Single, 1);
-    config.context_length = 2048;
-    let model = Arc::new(SyntheticModel::new(config).unwrap());
-    let rt = Runtime::start(
-        model.clone(),
-        Box::new(HostExecutor::new(model.clone(), model.config().max_rows, 8)),
-        RuntimeConfig { pages: 4096, cache_ram: 0, ..self::config(None) },
-    )
-    .unwrap();
-    alone(&rt, prompt, Some(max_tokens)).text
-}
-
-fn text_of(seed: u64, len: usize) -> String {
-    Rng(seed).prompt(len)
-}
-
-/// What the store in `dir` holds, as an engine that opens it sees it.
-fn stored(model: &Arc<SyntheticModel>, dir: &Path) -> ares_runtime::SsdCounters {
-    let memory = Memory::new(PLENTY);
-    engine(model, config(Some(store(dir))), &memory, None).snapshot().counters.ssd
+        })
+    });
+    Following { rig, ram, peak }
 }
 
 /// Whether the record carries the save of a checkpoint.
@@ -234,8 +105,8 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
     // What the level on SSD holds of this text while memory is free: nothing
     // while the engine runs, and what is worth keeping once it ends.
     let free = TempDir::new("free");
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&free.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&free.0))), memory.machine(), None);
     let a = e.ask(&first, 20);
     let unhurried = e.written();
     assert_eq!(unhurried.counters.ssd.states_written, 0, "{unhurried}");
@@ -248,12 +119,12 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
     // with the third save is under way: the allowance of the prompt cache
     // falls to its floor, one place, and the conductor is told to trim.
     let dir = TempDir::new("short");
-    let memory = Memory::new(PLENTY);
+    let memory = Arc::new(TestMachine::new(PLENTY));
     let (seen, short) = (Arc::new(AtomicUsize::new(0)), memory.clone());
     let e = engine(
         &model,
         config(Some(store(&dir.0))),
-        &memory,
+        memory.machine(),
         Some(Box::new(move |record| {
             if saves(record) && seen.fetch_add(1, Ordering::SeqCst) == 2 {
                 short.has(0);
@@ -262,8 +133,8 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
     );
     assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT + FLOOR);
     let b = e.ask(&first, 20);
-    assert_eq!(b.text, a.text);
-    assert_eq!(b.text, fresh(&first, 20));
+    assert_eq!(b.run.text, a.run.text);
+    assert_eq!(b.run.text, fresh(&first, 20));
     assert_eq!(e.ram.cache_allowance(), CHECKPOINT + FLOOR, "the floor: one place and pages");
     let s = e.written();
     // The checkpoints that were in RAM went, the coldest first, and their
@@ -279,11 +150,11 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
     assert_eq!(stored(&model, &dir.0).store_pages, 13);
 
     // What was written is the right state: another engine resumes from it.
-    let second = format!("{first}{}{}", b.text, text_of(2, 40));
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let second = format!("{first}{}{}", b.run.text, text_of(2, 40));
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let c = e.ask(&second, 20);
-    assert_eq!(c.text, fresh(&second, 20));
+    assert_eq!(c.run.text, fresh(&second, 20));
     assert!(c.report.cached_tokens >= 192, "{:?}", c.report);
     assert_eq!(c.report.replayed_rows, 0, "{:?}", c.report);
     e.consistent();
@@ -294,18 +165,18 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     let dir = TempDir::new("resume");
     let model = model();
     let first = text_of(11, 200);
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let a = e.ask(&first, 20);
     drop(e);
 
     // Another engine on a machine that has nothing to spare from the start.
-    let memory = Memory::new(0);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(0));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     assert_eq!(e.ram.cache_allowance(), CHECKPOINT + FLOOR, "nothing but the floor");
-    let second = format!("{first}{}{}", a.text, text_of(12, 40));
+    let second = format!("{first}{}{}", a.run.text, text_of(12, 40));
     let b = e.ask(&second, 20);
-    assert_eq!(b.text, fresh(&second, 20));
+    assert_eq!(b.run.text, fresh(&second, 20));
     let s = e.snapshot();
     // The checkpoint came back from the drive into the one place, was
     // restored from it, and nothing was replayed.
@@ -326,10 +197,10 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
     drop(e);
     assert_eq!(stored(&model, &dir.0).store_pages, 17);
-    let third = format!("{second}{}{}", b.text, text_of(13, 40));
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let third = format!("{second}{}{}", b.run.text, text_of(13, 40));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let c = e.ask(&third, 20);
-    assert_eq!(c.text, fresh(&third, 20));
+    assert_eq!(c.run.text, fresh(&third, 20));
     assert!(c.report.cached_tokens > b.report.cached_tokens, "{:?}", c.report);
     assert_eq!(c.report.replayed_rows, 0, "{:?}", c.report);
     e.consistent();
@@ -338,9 +209,9 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     // Without a level on SSD the same machine leaves the cache its one
     // checkpoint place and no pages: checkpoints are still taken, one at a
     // time in that place.
-    let e = engine(&model, config(None), &memory, None);
+    let e = engine(&model, config(None), memory.machine(), None);
     assert_eq!(e.ram.cache_allowance(), CHECKPOINT);
-    assert_eq!(e.ask(&first, 20).text, a.text);
+    assert_eq!(e.ask(&first, 20).run.text, a.run.text);
     let s = e.snapshot();
     assert!(s.counters.checkpoints_saved > 0, "{s}");
     assert!(e.peak.load(Ordering::SeqCst) <= CHECKPOINT, "{}", e.peak.load(Ordering::SeqCst));
@@ -351,8 +222,8 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
 fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
     let dir = TempDir::new("back");
     let model = model();
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let first = text_of(21, 200);
     let a = e.ask(&first, 20);
     let held = e.snapshot().counters.checkpoints_saved;
@@ -375,16 +246,16 @@ fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
     // The second turn finds its pages in the devices and its checkpoints
     // gone from RAM but for one; it says the same as an engine that kept
     // everything. Then memory is free again, long enough to be taken.
-    let second = format!("{first}{}{}", a.text, text_of(22, 40));
+    let second = format!("{first}{}{}", a.run.text, text_of(22, 40));
     let b = e.ask(&second, 20);
-    assert_eq!(b.text, fresh(&second, 20));
+    assert_eq!(b.run.text, fresh(&second, 20));
     for _ in 0..100 {
         memory.has(PLENTY);
     }
     assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT + FLOOR, "all of the budget again");
-    let third = format!("{second}{}{}", b.text, text_of(23, 40));
+    let third = format!("{second}{}{}", b.run.text, text_of(23, 40));
     let c = e.ask(&third, 20);
-    assert_eq!(c.text, fresh(&third, 20));
+    assert_eq!(c.run.text, fresh(&third, 20));
     let s = e.written();
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
     e.consistent();
@@ -409,10 +280,10 @@ fn a_save_that_never_ran_is_never_read_for_the_drive() {
     // waits a second before it takes, and four pass here)...
     let rule =
         Rule { calm: Duration::from_secs(1), calm_max: Duration::from_secs(1), ..Rule::default() };
-    let memory = Memory::with_rule(PLENTY, rule);
+    let memory = Arc::new(TestMachine::with_rule(PLENTY, rule));
     let spare = memory.clone();
     let observer: Observer = Box::new(move |_| (0..80).for_each(|_| spare.has(PLENTY)));
-    let e = engine(&model, small.clone(), &memory, Some(observer));
+    let e = engine(&model, small.clone(), memory.machine(), Some(observer));
     // ...and none whenever a text gets a token: after the saves of that step
     // were queued and before the record that carries them is written. The
     // cache then keeps the one place of its floor, and of two saves that
@@ -445,12 +316,12 @@ fn a_save_that_never_ran_is_never_read_for_the_drive() {
 
     // What did reach the drive is the right state: an engine with memory to
     // spare resumes every text from it.
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, small, &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, small, memory.machine(), None);
     for (prompt, said) in prompts.iter().zip(&expected) {
         let longer = format!("{prompt}{said}{}", text_of(120, 10));
         let again = e.ask(&longer, 10);
-        assert_eq!(again.text, fresh(&longer, 10));
+        assert_eq!(again.run.text, fresh(&longer, 10));
         assert!(again.report.cached_tokens >= 48, "{:?}", again.report);
     }
     e.consistent();
@@ -461,19 +332,19 @@ fn saves_and_checkpoints_from_ssd_pass_through_the_one_place_together() {
     let dir = TempDir::new("together");
     let model = model();
     let base = text_of(31, 600);
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let a = e.ask(&base, 10);
     drop(e);
 
     // A machine without room: one place. Prompts that resume from SSD (a
     // checkpoint from the drive takes the place) run next to texts that
     // are new (their saves take it, and leave for the drive from it).
-    let memory = Memory::new(0);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(0));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let mut prompts: Vec<String> = Vec::new();
     for i in 0..3 {
-        prompts.push(format!("{base}{}{}", a.text, text_of(40 + i, 20 + 16 * i as usize)));
+        prompts.push(format!("{base}{}{}", a.run.text, text_of(40 + i, 20 + 16 * i as usize)));
         prompts.push(text_of(50 + i, 150 + 40 * i as usize));
     }
     let expected: Vec<String> = prompts.iter().map(|p| fresh(p, 40)).collect();
@@ -493,11 +364,11 @@ fn saves_and_checkpoints_from_ssd_pass_through_the_one_place_together() {
 
     // Whatever reached the drive under these conditions is the right state:
     // an engine with memory to spare resumes every text from it.
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     for (prompt, said) in prompts.iter().zip(&expected) {
         let longer = format!("{prompt}{said}{}", text_of(60, 20));
-        assert_eq!(e.ask(&longer, 10).text, fresh(&longer, 10));
+        assert_eq!(e.ask(&longer, 10).run.text, fresh(&longer, 10));
     }
     assert!(e.snapshot().counters.ssd.states_read >= 1, "{s}");
     e.consistent();
@@ -508,8 +379,8 @@ fn memory_that_comes_and_goes_while_state_moves_stops_nothing() {
     let dir = TempDir::new("flicker");
     let model = model();
     let base = text_of(71, 400);
-    let memory = Memory::new(PLENTY);
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let memory = Arc::new(TestMachine::new(PLENTY));
+    let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let a = e.ask(&base, 10);
     drop(e);
 
@@ -536,12 +407,10 @@ fn memory_that_comes_and_goes_while_state_moves_stops_nothing() {
         move || started.elapsed(),
     );
     machine.watch();
-    let memory =
-        Memory { available: Arc::new(AtomicU64::new(0)), ms: Arc::new(AtomicU64::new(0)), machine };
-    let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
+    let e = engine(&model, config(Some(store(&dir.0))), &machine, None);
     let mut prompts: Vec<String> = Vec::new();
     for i in 0..3 {
-        prompts.push(format!("{base}{}{}", a.text, text_of(80 + i, 30 + 16 * i as usize)));
+        prompts.push(format!("{base}{}{}", a.run.text, text_of(80 + i, 30 + 16 * i as usize)));
         prompts.push(text_of(90 + i, 200 + 40 * i as usize));
     }
     let expected: Vec<String> = prompts.iter().map(|p| fresh(p, 60)).collect();
