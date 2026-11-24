@@ -777,7 +777,7 @@ Read by a delegated reader.
   (`managers/scheduler_pp_mixin.py`,
   `managers/scheduler_components/dynamic_chunk_sizer.py:37-110`). A comment
   says the pipeline does not work with the overlapped loop. Ares: **take**
-  the fit (a context term for `StepTimeModel`) and the rule of as many groups
+  the fit (the context term of the step price, `ContextFit`) and the rule of as many groups
   of sequences in flight as devices in a layer chain.
 - **The sampler** falls back to `torch.topk` or a full sort unless FlashInfer
   is used; penalties are dense rows of the vocabulary
@@ -1728,7 +1728,7 @@ Ares' own measurements; none is measured.
    waits for at that layer, and a request in restore is skipped, not waited
    for (SGLang). A context term in the step-time model (SGLang's quadratic
    fit). A budget of draft rows across requests by survival probability
-   (vLLM). Changes: `ares-runtime`, `ares-sched` (`StepTimeModel`, `plan`),
+   (vLLM). Changes: `ares-runtime`, `ares-sched` (`ContextFit`, `plan`),
    `ares-state::PagePool`. Expected: small on one device (the conductor
    already costs microseconds); real for the layer split with several
    sequences, for the time to the first token on a cache hit, and at eight
