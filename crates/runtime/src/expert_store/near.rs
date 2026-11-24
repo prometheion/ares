@@ -17,13 +17,9 @@
 //! checksum (16 bytes): ChainHash::root of everything before it
 //! ```
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use ares_state::ChainHash;
-
-use super::profile::{Ignored, ProfileKey};
+use super::profile::{Ignored, ProfileKey, read_file, sealed, write_atomically};
 
 /// The first bytes of every table.
 const MAGIC: &[u8; 8] = b"ARESNEAR";
@@ -31,8 +27,8 @@ const MAGIC: &[u8; 8] = b"ARESNEAR";
 /// The format this engine writes and reads.
 pub const NEAR_FORMAT: u32 = 1;
 
+/// Bytes before the entries.
 const HEADER: usize = 8 + 4 + 4 + 4 + 4 + 16;
-const CHECKSUM: usize = 16;
 const ENTRY: usize = 2 + 4 + 4;
 
 /// One expert that is like another.
@@ -85,8 +81,7 @@ impl ExpertNeighbours {
 
     /// The name of the table's file.
     pub fn file_name(key: &ProfileKey) -> String {
-        let hex: String = key.fingerprint.iter().map(|b| format!("{b:02x}")).collect();
-        format!("{hex}.near")
+        key.named("near")
     }
 
     /// Where the table of `key` lives in `dir`.
@@ -96,21 +91,13 @@ impl ExpertNeighbours {
 
     /// The bytes of the file.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER + ENTRY * self.entries.len() + CHECKSUM);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&NEAR_FORMAT.to_le_bytes());
-        out.extend_from_slice(&self.key.layers.to_le_bytes());
-        out.extend_from_slice(&self.key.experts.to_le_bytes());
-        out.extend_from_slice(&(self.count as u32).to_le_bytes());
-        out.extend_from_slice(&self.key.fingerprint);
+        let mut out = self.key.header(MAGIC, NEAR_FORMAT, &[self.count as u32]);
         for near in &self.entries {
             out.extend_from_slice(&near.expert.to_le_bytes());
             out.extend_from_slice(&near.closeness.to_le_bytes());
             out.extend_from_slice(&near.scale.to_le_bytes());
         }
-        let checksum = ChainHash::root(&out).to_bytes();
-        out.extend_from_slice(&checksum);
-        out
+        sealed(out)
     }
 
     /// The table in `bytes`, if it is one made for `key`.
@@ -119,35 +106,9 @@ impl ExpertNeighbours {
     ///
     /// Why it is not: see [`Ignored`].
     pub fn from_bytes(bytes: &[u8], key: &ProfileKey) -> Result<Self, Ignored> {
-        if bytes.len() < HEADER + CHECKSUM || &bytes[..8] != MAGIC {
-            return Err(Ignored::NotAProfile);
-        }
-        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
-        let format = word(8);
-        if format < NEAR_FORMAT {
-            return Err(Ignored::OlderFormat { found: format });
-        }
-        if format > NEAR_FORMAT {
-            return Err(Ignored::UnknownFormat { found: format });
-        }
-        let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM);
-        if ChainHash::root(body).to_bytes() != checksum {
-            return Err(Ignored::Damaged("its checksum does not match"));
-        }
-        if bytes[24..40] != key.fingerprint {
-            return Err(Ignored::AnotherFile);
-        }
-        let (layers, experts, count) = (word(12), word(16), word(20) as usize);
-        if (layers, experts) != (key.layers, key.experts) {
-            return Err(Ignored::Shape {
-                layers,
-                experts,
-                want_layers: key.layers,
-                want_experts: key.experts,
-            });
-        }
-        let values = &body[HEADER..];
-        if values.len() != ENTRY * layers as usize * experts as usize * count {
+        let (values, words) = key.open(bytes, MAGIC, NEAR_FORMAT, HEADER)?;
+        let (experts, count) = (key.experts, words[2] as usize);
+        if values.len() != ENTRY * key.layers as usize * experts as usize * count {
             return Err(Ignored::Damaged("its length does not fit its shape"));
         }
         let entries: Vec<Near> = values
@@ -176,11 +137,7 @@ impl ExpertNeighbours {
     ///
     /// A file that is there and is not taken, and why.
     pub fn read(dir: &Path, key: &ProfileKey) -> Result<Option<Self>, Ignored> {
-        match std::fs::read(Self::path(key, dir)) {
-            Ok(bytes) => Self::from_bytes(&bytes, key).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Ignored::Unreadable(error)),
-        }
+        read_file(&Self::path(key, dir))?.map(|bytes| Self::from_bytes(&bytes, key)).transpose()
     }
 
     /// Writes the table into `dir` (made if it is missing), atomically: a
@@ -191,29 +148,7 @@ impl ExpertNeighbours {
     ///
     /// What the file system said; the table that was there stays.
     pub fn write(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::fs::create_dir_all(dir)?;
-        let name = Self::file_name(&self.key);
-        let path = dir.join(&name);
-        let temporary = dir.join(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = (|| {
-            let mut file = std::fs::File::create_new(&temporary)?;
-            file.write_all(&self.to_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &path)
-        })();
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
-        }
-        if let Ok(directory) = std::fs::File::open(dir) {
-            let _ = directory.sync_all();
-        }
-        Ok(path)
+        write_atomically(dir, &Self::file_name(&self.key), &self.to_bytes())
     }
 }
 
@@ -251,7 +186,7 @@ mod tests {
         let read = ExpertNeighbours::read(&dir, &key()).unwrap().expect("it is there");
         assert_eq!(read, written);
         assert_eq!(read.of(1, 5)[0], Near { expert: 0, closeness: 0.9, scale: 1.25 });
-        assert_eq!(std::fs::read(&path).unwrap().len(), HEADER + ENTRY * 2 * 6 * 3 + CHECKSUM);
+        assert_eq!(std::fs::read(&path).unwrap().len(), HEADER + ENTRY * 2 * 6 * 3 + 16);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

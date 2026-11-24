@@ -64,14 +64,131 @@ impl ProfileKey {
 
     /// The name of the profile's file.
     pub fn file_name(&self) -> String {
-        let hex: String = self.fingerprint.iter().map(|b| format!("{b:02x}")).collect();
-        format!("{hex}.experts")
+        self.named("experts")
     }
 
     /// Where the profile lives in `dir`.
     pub fn path(&self, dir: &Path) -> PathBuf {
         dir.join(self.file_name())
     }
+
+    /// The name of a file of this key with `extension`: the fingerprint in
+    /// hex.
+    pub(super) fn named(&self, extension: &str) -> String {
+        let hex: String = self.fingerprint.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{hex}.{extension}")
+    }
+
+    /// The start of a file of this key: `magic`, the `format`, the shape,
+    /// `more` words of the file's own, then the fingerprint.
+    pub(super) fn header(&self, magic: &[u8; 8], format: u32, more: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(magic);
+        for word in [format, self.layers, self.experts].iter().chain(more) {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&self.fingerprint);
+        out
+    }
+
+    /// The values of a file of this key in `bytes` (after a header of
+    /// `header` bytes that [`ProfileKey::header`] wrote with `magic` and
+    /// `format`, before the checksum), and the words of the header from
+    /// offset 12 on, if the file is one made for this key.
+    ///
+    /// # Errors
+    ///
+    /// Why it is not: see [`Ignored`].
+    pub(super) fn open<'a>(
+        &self,
+        bytes: &'a [u8],
+        magic: &[u8; 8],
+        format: u32,
+        header: usize,
+    ) -> Result<(&'a [u8], Vec<u32>), Ignored> {
+        if bytes.len() < header + CHECKSUM || &bytes[..8] != magic {
+            return Err(Ignored::NotAProfile);
+        }
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+        let found = word(8);
+        if found < format {
+            return Err(Ignored::OlderFormat { found });
+        }
+        if found > format {
+            return Err(Ignored::UnknownFormat { found });
+        }
+        let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM);
+        if ChainHash::root(body).to_bytes() != checksum {
+            return Err(Ignored::Damaged("its checksum does not match"));
+        }
+        if bytes[header - 16..header] != self.fingerprint {
+            return Err(Ignored::AnotherFile);
+        }
+        let (layers, experts) = (word(12), word(16));
+        if (layers, experts) != (self.layers, self.experts) {
+            return Err(Ignored::Shape {
+                layers,
+                experts,
+                want_layers: self.layers,
+                want_experts: self.experts,
+            });
+        }
+        let words = (12..header - 16).step_by(4).map(word).collect();
+        Ok((&body[header..], words))
+    }
+}
+
+/// `bytes` with their checksum after them: what a file of a key holds.
+pub(super) fn sealed(mut bytes: Vec<u8>) -> Vec<u8> {
+    let checksum = ChainHash::root(&bytes).to_bytes();
+    bytes.extend_from_slice(&checksum);
+    bytes
+}
+
+/// The bytes of the file at `path`: `Ok(None)` when there is none.
+///
+/// # Errors
+///
+/// A file that is there and cannot be read.
+pub(super) fn read_file(path: &Path) -> Result<Option<Vec<u8>>, Ignored> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Ignored::Unreadable(error)),
+    }
+}
+
+/// Writes `bytes` into `dir` (made if it is missing) as the file `name`,
+/// atomically: a reader finds the file that was there or this one, whole.
+/// Returns the path.
+///
+/// # Errors
+///
+/// What the file system said; the file that was there stays.
+pub(super) fn write_atomically(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(name);
+    let temporary = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = std::fs::File::create_new(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    // The rename is durable with the directory.
+    if let Ok(directory) = std::fs::File::open(dir) {
+        let _ = directory.sync_all();
+    }
+    Ok(path)
 }
 
 /// Why a file that is there was not taken as the profile.
@@ -130,18 +247,11 @@ impl ExpertProfile {
 
     /// The bytes of the file.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER + 4 * self.heat.len() + CHECKSUM);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&PROFILE_FORMAT.to_le_bytes());
-        out.extend_from_slice(&self.key.layers.to_le_bytes());
-        out.extend_from_slice(&self.key.experts.to_le_bytes());
-        out.extend_from_slice(&self.key.fingerprint);
+        let mut out = self.key.header(MAGIC, PROFILE_FORMAT, &[]);
         for heat in &self.heat {
             out.extend_from_slice(&heat.to_le_bytes());
         }
-        let checksum = ChainHash::root(&out).to_bytes();
-        out.extend_from_slice(&checksum);
-        out
+        sealed(out)
     }
 
     /// The profile in `bytes`, if it is one made for `key`.
@@ -150,35 +260,8 @@ impl ExpertProfile {
     ///
     /// Why it is not: see [`Ignored`].
     pub fn from_bytes(bytes: &[u8], key: &ProfileKey) -> Result<Self, Ignored> {
-        if bytes.len() < HEADER + CHECKSUM || &bytes[..8] != MAGIC {
-            return Err(Ignored::NotAProfile);
-        }
-        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
-        let format = word(8);
-        if format < PROFILE_FORMAT {
-            return Err(Ignored::OlderFormat { found: format });
-        }
-        if format > PROFILE_FORMAT {
-            return Err(Ignored::UnknownFormat { found: format });
-        }
-        let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM);
-        if ChainHash::root(body).to_bytes() != checksum {
-            return Err(Ignored::Damaged("its checksum does not match"));
-        }
-        if bytes[20..36] != key.fingerprint {
-            return Err(Ignored::AnotherFile);
-        }
-        let (layers, experts) = (word(12), word(16));
-        if (layers, experts) != (key.layers, key.experts) {
-            return Err(Ignored::Shape {
-                layers,
-                experts,
-                want_layers: key.layers,
-                want_experts: key.experts,
-            });
-        }
-        let values = &body[HEADER..];
-        if values.len() != 4 * layers as usize * experts as usize {
+        let (values, _) = key.open(bytes, MAGIC, PROFILE_FORMAT, HEADER)?;
+        if values.len() != 4 * key.layers as usize * key.experts as usize {
             return Err(Ignored::Damaged("its length does not fit its shape"));
         }
         let heat: Vec<f32> =
@@ -195,11 +278,7 @@ impl ExpertProfile {
     ///
     /// A file that is there and is not taken, and why.
     pub fn read(dir: &Path, key: &ProfileKey) -> Result<Option<Self>, Ignored> {
-        match std::fs::read(key.path(dir)) {
-            Ok(bytes) => Self::from_bytes(&bytes, key).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Ignored::Unreadable(error)),
-        }
+        read_file(&key.path(dir))?.map(|bytes| Self::from_bytes(&bytes, key)).transpose()
     }
 
     /// Writes the profile into `dir` (made if it is missing) under its key's
@@ -210,30 +289,7 @@ impl ExpertProfile {
     ///
     /// What the file system said; the profile that was there stays.
     pub fn write(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::fs::create_dir_all(dir)?;
-        let name = self.key.file_name();
-        let path = dir.join(&name);
-        let temporary = dir.join(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = (|| {
-            let mut file = std::fs::File::create_new(&temporary)?;
-            file.write_all(&self.to_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &path)
-        })();
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
-        }
-        // The rename is durable with the directory.
-        if let Ok(directory) = std::fs::File::open(dir) {
-            let _ = directory.sync_all();
-        }
-        Ok(path)
+        write_atomically(dir, &self.key.file_name(), &self.to_bytes())
     }
 }
 
