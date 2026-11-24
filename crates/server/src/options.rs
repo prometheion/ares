@@ -250,8 +250,8 @@ pub const OPTIONS: &[Opt] = &[
         "--cors-origins",
         "<LIST>",
         "Origins whose web pages may call the server from a browser and read its answers \
-         (CORS), such as https://chat.example.org, separated by commas, or * for any. Without keys a \
-         request from a page of any other site is refused, unless the page is local \
+         (CORS), such as https://chat.example.org, separated by commas, or * for any. Without \
+         keys a request from a page of any other site is refused, unless the page is local \
          (localhost, an address) [default: none]",
     ),
     Opt::model(
