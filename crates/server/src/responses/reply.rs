@@ -16,6 +16,7 @@ use serde::{Serialize, Serializer};
 
 use super::request::Echo;
 use crate::answer::Written;
+use crate::answer::{Kind, Segment, Segments};
 use crate::bridge::Timings;
 use crate::error::ApiError;
 use crate::openai::reply::TimingsBody;
@@ -161,21 +162,19 @@ pub(crate) enum Change {
     Done(usize),
 }
 
-/// The output of a reply: its items so far.
+/// The output of a reply: its items so far, an item for each segment of the
+/// reply ([`Segments`]).
 #[derive(Debug)]
 pub(crate) struct Output {
     /// The id of the request, which the ids of the items carry.
     request: String,
     items: Vec<Item>,
-    /// Whether the last item is open.
-    open: bool,
-    /// The item of each call of the reply.
-    calls: Vec<usize>,
+    segments: Segments,
 }
 
 impl Output {
     pub fn new(request: String) -> Self {
-        Self { request, items: Vec::new(), open: false, calls: Vec::new() }
+        Self { request, items: Vec::new(), segments: Segments::default() }
     }
 
     pub fn items(&self) -> &[Item] {
@@ -184,21 +183,47 @@ impl Output {
 
     /// Takes the next pieces of the reply.
     pub fn push(&mut self, pieces: Vec<Piece>) -> Vec<Change> {
+        let segments = self.segments.push(pieces);
+        self.changes(segments, Status::Completed)
+    }
+
+    /// Takes the end of the reply: the open item closes, as incomplete when
+    /// the limit of tokens `cut` the reply.
+    pub fn finish(&mut self, cut: bool) -> Vec<Change> {
+        let segments = self.segments.finish();
+        self.changes(segments, if cut { Status::Incomplete } else { Status::Completed })
+    }
+
+    /// The changes of `segments`; an item that closes gets `closed`.
+    fn changes(&mut self, segments: Vec<Segment>, closed: Status) -> Vec<Change> {
         let mut changes = Vec::new();
-        for piece in pieces {
-            match piece {
-                Piece::Text(split) => {
-                    if !split.reasoning.is_empty() {
-                        self.text(true, split.reasoning, &mut changes);
-                    }
-                    if !split.content.is_empty() {
-                        self.text(false, split.content, &mut changes);
-                    }
+        for segment in segments {
+            match segment {
+                Segment::Open { index, kind } => {
+                    let status = Status::InProgress;
+                    self.items.push(if kind == Kind::Reasoning {
+                        Item::Reasoning {
+                            id: format!("rs_{}_{index}", self.request),
+                            summary: Nothing,
+                            content: vec![Part::ReasoningText { text: String::new() }],
+                            status,
+                        }
+                    } else {
+                        let part = Part::OutputText {
+                            text: String::new(),
+                            annotations: Nothing,
+                            logprobs: Nothing,
+                        };
+                        Item::Message {
+                            id: format!("msg_{}_{index}", self.request),
+                            role: "assistant",
+                            status,
+                            content: vec![part],
+                        }
+                    });
+                    changes.push(Change::Added(index));
                 }
-                Piece::Call { id, name, .. } => {
-                    self.close(Status::Completed, &mut changes);
-                    let index = self.items.len();
-                    self.calls.push(index);
+                Segment::Call { index, id, name } => {
                     self.items.push(Item::FunctionCall {
                         id: format!("fc_{}_{index}", self.request),
                         status: Status::InProgress,
@@ -206,87 +231,31 @@ impl Output {
                         name,
                         arguments: String::new(),
                     });
-                    self.open = true;
                     changes.push(Change::Added(index));
                 }
-                Piece::Arguments { index, json } => {
-                    // The arguments of a call come before the next item opens.
-                    if let Some(&index) = self.calls.get(index)
-                        && self.open
-                        && index + 1 == self.items.len()
-                        && !json.is_empty()
-                        && let Item::FunctionCall { arguments, .. } = &mut self.items[index]
+                Segment::Text { index, text, .. } => {
+                    if let Item::Reasoning { content, .. } | Item::Message { content, .. } =
+                        &mut self.items[index]
                     {
-                        arguments.push_str(&json);
-                        changes.push(Change::Arguments { index, delta: json });
+                        content[0].text_mut().push_str(&text);
                     }
+                    changes.push(Change::Text { index, delta: text });
+                }
+                Segment::Arguments { index, json } => {
+                    if let Item::FunctionCall { arguments, .. } = &mut self.items[index] {
+                        arguments.push_str(&json);
+                    }
+                    changes.push(Change::Arguments { index, delta: json });
+                }
+                Segment::Close { index, .. } => {
+                    // Only the end of a reply that was cut leaves an item
+                    // incomplete: one that the next closed is complete.
+                    *self.items[index].status_mut() = closed;
+                    changes.push(Change::Done(index));
                 }
             }
         }
         changes
-    }
-
-    /// Takes the end of the reply: the open item closes, as incomplete when
-    /// the limit of tokens `cut` the reply.
-    pub fn finish(&mut self, cut: bool) -> Vec<Change> {
-        let mut changes = Vec::new();
-        self.close(if cut { Status::Incomplete } else { Status::Completed }, &mut changes);
-        changes
-    }
-
-    /// Appends text to the open reasoning item (or message), which is
-    /// opened if an item of another kind, or none, is open.
-    fn text(&mut self, reasoning: bool, delta: String, changes: &mut Vec<Change>) {
-        let continues = self.open
-            && match self.items.last() {
-                Some(Item::Reasoning { .. }) => reasoning,
-                Some(Item::Message { .. }) => !reasoning,
-                _ => false,
-            };
-        if !continues {
-            self.close(Status::Completed, changes);
-            let index = self.items.len();
-            let status = Status::InProgress;
-            self.items.push(if reasoning {
-                Item::Reasoning {
-                    id: format!("rs_{}_{index}", self.request),
-                    summary: Nothing,
-                    content: vec![Part::ReasoningText { text: String::new() }],
-                    status,
-                }
-            } else {
-                let part = Part::OutputText {
-                    text: String::new(),
-                    annotations: Nothing,
-                    logprobs: Nothing,
-                };
-                Item::Message {
-                    id: format!("msg_{}_{index}", self.request),
-                    role: "assistant",
-                    status,
-                    content: vec![part],
-                }
-            });
-            self.open = true;
-            changes.push(Change::Added(index));
-        }
-        let index = self.items.len() - 1;
-        if let Item::Reasoning { content, .. } | Item::Message { content, .. } =
-            &mut self.items[index]
-        {
-            content[0].text_mut().push_str(&delta);
-        }
-        changes.push(Change::Text { index, delta });
-    }
-
-    fn close(&mut self, status: Status, changes: &mut Vec<Change>) {
-        if !self.open {
-            return;
-        }
-        self.open = false;
-        let index = self.items.len() - 1;
-        *self.items[index].status_mut() = status;
-        changes.push(Change::Done(index));
     }
 }
 

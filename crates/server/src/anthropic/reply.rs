@@ -11,7 +11,7 @@
 use ares_api::Usage;
 use serde::Serialize;
 
-use crate::answer::Written;
+use crate::answer::{Kind, Segment, Segments, Written};
 use crate::sorter::Piece;
 
 /// What every thinking block of a reply carries as its signature, unless the
@@ -77,22 +77,11 @@ pub(crate) enum BlockEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Thinking,
-    Text,
-    ToolUse,
-}
-
-/// Turns the pieces of a reply into the events of its blocks.
+/// Turns the pieces of a reply into the events of its blocks: a block for
+/// each segment of the reply ([`Segments`]).
 #[derive(Debug, Default)]
 pub(crate) struct Blocks {
-    /// The block that is open.
-    open: Option<Kind>,
-    /// How many blocks have begun.
-    begun: usize,
-    /// The block of each call of the reply.
-    calls: Vec<usize>,
+    segments: Segments,
     /// The thinking is omitted: its blocks have no text, and their signature
     /// carries it ([`carried`]).
     omit: bool,
@@ -109,87 +98,58 @@ impl Blocks {
 
     /// The events of the next pieces.
     pub fn push(&mut self, pieces: Vec<Piece>) -> Vec<BlockEvent> {
-        let mut events = Vec::new();
-        for piece in pieces {
-            match piece {
-                Piece::Text(split) => {
-                    if !split.reasoning.is_empty() {
-                        let index = self.open(Kind::Thinking, &mut events);
-                        if self.omit {
-                            self.held.push_str(&split.reasoning);
-                        } else {
-                            events.push(BlockEvent::ThinkingDelta { index, text: split.reasoning });
-                        }
-                    }
-                    if !split.content.is_empty() {
-                        let index = self.open(Kind::Text, &mut events);
-                        events.push(BlockEvent::TextDelta { index, text: split.content });
-                    }
-                }
-                Piece::Call { id, name, .. } => {
-                    self.close(&mut events);
-                    let index = self.begin(Kind::ToolUse);
-                    self.calls.push(index);
-                    events.push(BlockEvent::ToolUse { index, id, name });
-                }
-                Piece::Arguments { index, json } => {
-                    if let Some(&index) = self.calls.get(index)
-                        && !json.is_empty()
-                    {
-                        events.push(BlockEvent::InputDelta { index, json });
-                    }
-                }
-            }
-        }
-        events
+        let segments = self.segments.push(pieces);
+        self.events(segments)
     }
 
     /// The events of the end of the reply: the open block closes.
     pub fn finish(&mut self) -> Vec<BlockEvent> {
-        let mut events = Vec::new();
-        self.close(&mut events);
-        events
+        let segments = self.segments.finish();
+        self.events(segments)
     }
 
     /// How many calls the reply has begun.
     pub fn calls(&self) -> usize {
-        self.calls.len()
+        self.segments.calls()
     }
 
-    /// The index of the open block of `kind`, which is opened if another
-    /// kind, or none, is open.
-    fn open(&mut self, kind: Kind, events: &mut Vec<BlockEvent>) -> usize {
-        if self.open != Some(kind) {
-            self.close(events);
-            let index = self.begin(kind);
-            events.push(match kind {
-                Kind::Thinking => BlockEvent::Thinking { index },
-                _ => BlockEvent::Text { index },
-            });
+    fn events(&mut self, segments: Vec<Segment>) -> Vec<BlockEvent> {
+        let mut events = Vec::new();
+        for segment in segments {
+            match segment {
+                Segment::Open { index, kind: Kind::Reasoning } => {
+                    events.push(BlockEvent::Thinking { index });
+                }
+                Segment::Open { index, .. } => events.push(BlockEvent::Text { index }),
+                Segment::Call { index, id, name } => {
+                    events.push(BlockEvent::ToolUse { index, id, name });
+                }
+                Segment::Text { kind: Kind::Reasoning, text, .. } if self.omit => {
+                    self.held.push_str(&text);
+                }
+                Segment::Text { index, kind: Kind::Reasoning, text } => {
+                    events.push(BlockEvent::ThinkingDelta { index, text });
+                }
+                Segment::Text { index, text, .. } => {
+                    events.push(BlockEvent::TextDelta { index, text });
+                }
+                Segment::Arguments { index, json } => {
+                    events.push(BlockEvent::InputDelta { index, json });
+                }
+                Segment::Close { index, kind } => {
+                    if kind == Kind::Reasoning {
+                        let signature = if self.omit {
+                            carried(&std::mem::take(&mut self.held))
+                        } else {
+                            SIGNATURE.to_owned()
+                        };
+                        events.push(BlockEvent::Signature { index, signature });
+                    }
+                    events.push(BlockEvent::Stop { index });
+                }
+            }
         }
-        self.begun - 1
-    }
-
-    fn begin(&mut self, kind: Kind) -> usize {
-        self.open = Some(kind);
-        self.begun += 1;
-        self.begun - 1
-    }
-
-    fn close(&mut self, events: &mut Vec<BlockEvent>) {
-        let Some(kind) = self.open.take() else {
-            return;
-        };
-        let index = self.begun - 1;
-        if kind == Kind::Thinking {
-            let signature = if self.omit {
-                carried(&std::mem::take(&mut self.held))
-            } else {
-                SIGNATURE.to_owned()
-            };
-            events.push(BlockEvent::Signature { index, signature });
-        }
-        events.push(BlockEvent::Stop { index });
+        events
     }
 }
 
