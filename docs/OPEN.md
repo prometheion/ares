@@ -427,6 +427,23 @@ owed a measurement. Found:
       for random experts at 2 to 64 in flight with any queue depth from 4 to 64 and whole
       demand reads (pieces of 256 or 128 KiB are slower); file order does not matter.
 
+Reference (2026-11-24, the owner's link): Strata-HotRod, https://github.com/sangharshadhyeta/Strata-HotRod,
+MIT, a fork of Strata 0.1.45 for Flash-Next IQ3_S on an RTX 3060 12 GB with 30 GB RAM and NVMe on
+PCIe 3.0; one request at a time; the author's own measurements, many single runs. Claims 17 ->
+50-70 tokens/s decode on short answers (38-54 after a 45k prompt), UD-Q4_K_XL 15-25. Where it
+comes from: (1) stand-in experts, the big lever: a missing expert is replaced by the best expert
+on the card when router weight x logit gap is within a self-tuned budget (maths 47/50 against
+48/50, code 30/30 both; aggressive settings broke words and JSON and are off). A candidate for
+the owner's dynamic pruning (item 6), measured for quality against the reference (the owner's
+rule: differ for speed, never wrong). (2) A learned correction on the routers' look-ahead: of the
+needed experts not on the card, the plain router held 77-79 / 66-69 / 55-58 % at 1 / 2 / 4
+layers, the learned one 85-88 / 76-79 / 66-71 %; but read ahead only 29 % of the guesses were
+used (95 % unused as read-ahead rows): precision is the problem, as Ares measured (3-8 % in
+decode). (3) K/V from RAM past 64k with 32k on the card (as Ares's far pages); two I/O threads,
+next layer first; a pinned RAM tier with PCIe balance (+9 %); swaps across layers (one run). For
+Inkling 2 Mini it points to another fork, UnbiasedStrata (not read). To be read in its code
+before stand-ins are built; measure in the SSD comparison (item 3).
+
 Reference now in the open (2026-11-17): Run My AI's engine TokenWing, MIT, built on llama.cpp,
 https://github.com/runmyai/tokenwing (`docs/how-it-works.md`, `docs/architecture.md`,
 `docs/settings.md`); it runs Qwen3.8 Flash-Next (IQ3_S and UD-Q4_K_XL). Its README: expert reads
