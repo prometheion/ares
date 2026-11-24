@@ -5430,6 +5430,13 @@ model, as Strata's `expert_profile_save` and Run My AI's table of usage do
   machine's memory can shrink the tier meanwhile. Without a profile the start reads
   the warm-up text as before, writes the profile at once and fills the tiers from
   the heat the warm-up left in the same way (`Qwen4Exp::fill_from_heat`).
+  The same fill takes a list instead of the heat (`ExpertStore::plan_listed_fill`:
+  the MTP block's experts before the first chains, a session's or a test's recorded
+  routing or every expert), with the same rules but no member giving way. A fill that
+  finds an expert on its way into RAM for someone else (a read ahead of a router)
+  takes what that read brings, and reads the expert itself when it was cancelled.
+  (Until 2026-11-24 a list went through an older way in, `ExpertStore::fill` and
+  `predicted`, as guesses; it is gone.)
 - *While nothing runs* (no step for a second): the same thread fills what is empty
   or colder, VRAM's free slots and members colder than an expert outside, and the
   RAM tier's room, from the heat, those for VRAM first and

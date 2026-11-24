@@ -114,8 +114,11 @@ pub struct FillStats {
 #[derive(Debug, Default)]
 pub struct TierFill {
     todo: VecDeque<Item>,
-    /// Experts whose read into the RAM tier has started.
+    /// Experts whose read into the RAM tier has started, and those whose read
+    /// someone else started (a read ahead of a router), which the fill takes:
+    /// when that one is cancelled, the fill reads the expert itself.
     reading: Vec<Item>,
+    adopted: Vec<Item>,
     /// Experts meant for VRAM whose bytes are in RAM, waiting for an upload.
     ready: VecDeque<Item>,
     stats: FillStats,
@@ -124,12 +127,15 @@ pub struct TierFill {
 impl TierFill {
     /// Whether nothing is left to do and nothing of the fill is on its way.
     pub fn is_done(&self) -> bool {
-        self.todo.is_empty() && self.reading.is_empty() && self.ready.is_empty()
+        self.todo.is_empty()
+            && self.reading.is_empty()
+            && self.adopted.is_empty()
+            && self.ready.is_empty()
     }
 
     /// The experts the fill has not finished with.
     pub fn left(&self) -> usize {
-        self.todo.len() + self.reading.len() + self.ready.len()
+        self.todo.len() + self.reading.len() + self.adopted.len() + self.ready.len()
     }
 
     /// The experts the fill has not started on, in the order it brings them:
@@ -153,6 +159,16 @@ impl<D: SlotDevice> ExpertStore<D> {
     pub fn set_heat(&mut self, layer: usize, heat: &[f32]) {
         self.heat.layer_mut(layer).copy_from_slice(heat);
         self.worth_stale[layer] = true;
+    }
+
+    /// The slots of `layer` that stay free in VRAM for the misses of a step,
+    /// where the store keeps them free between steps: none in a layer that
+    /// holds all its experts.
+    fn kept_free(&self, layer: usize) -> usize {
+        match self.serve() == Serve::Stream && !self.layers[layer].resident {
+            true => self.config.vram_reserve,
+            false => 0,
+        }
     }
 
     /// The store's count of steps: it moves at the end of every step and at
@@ -181,25 +197,62 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// a copy of an expert that VRAM holds); nothing without heat is brought.
     /// Nothing starts before [`ExpertStore::advance_fill`].
     pub fn plan_fill(&mut self, layers: &[usize], order: FillOrder) -> TierFill {
-        // Slots that stay free in VRAM for the misses of a step, where the
-        // store keeps them free between steps.
-        let keep = if self.serve() == Serve::Stream { self.config.vram_reserve } else { 0 };
+        let lists: Vec<(usize, Vec<u32>)> = layers
+            .iter()
+            .map(|&layer| {
+                let heat = self.heat.layer(layer);
+                let mut experts: Vec<u32> =
+                    (0..heat.len() as u32).filter(|e| heat[*e as usize] > 0.0).collect();
+                experts
+                    .sort_by(|a, b| heat[*b as usize].total_cmp(&heat[*a as usize]).then(a.cmp(b)));
+                (layer, experts)
+            })
+            .collect();
+        self.plan_fill_of(&lists, true, order)
+    }
+
+    /// What a fill of the experts `lists` names for each layer would bring
+    /// now, in `order`, each list the most wanted first: those VRAM does not
+    /// hold into its free slots, and the next that RAM does not hold, as far
+    /// as RAM has room as in [`ExpertStore::plan_fill`]. No member makes room
+    /// for them: a list says what is wanted, not what it is worth against
+    /// the heat. For a fill from a recorded routing, or of every expert.
+    pub fn plan_listed_fill(&mut self, lists: &[(usize, Vec<u32>)], order: FillOrder) -> TierFill {
+        self.plan_fill_of(lists, false, order)
+    }
+
+    /// [`ExpertStore::plan_fill`] for the experts `lists` names per layer,
+    /// the most wanted first; with `by_heat` an expert takes the place of a
+    /// member colder than it.
+    fn plan_fill_of(
+        &mut self,
+        lists: &[(usize, Vec<u32>)],
+        by_heat: bool,
+        order: FillOrder,
+    ) -> TierFill {
         let mut items: Vec<(Item, f32)> = Vec::new();
-        for &layer in layers {
+        for (layer, listed) in lists {
+            let layer = *layer;
+            let keep = self.kept_free(layer);
             self.refresh_worth(layer);
             let heat = self.heat.layer(layer);
             let worth = self.ram_worth.layer(layer);
             let (vram, ram) = (&self.vram.sets[layer], &self.ram.sets[layer]);
-            let mut outsiders: Vec<u32> = (0..heat.len() as u32)
-                .filter(|e| heat[*e as usize] > 0.0 && !vram.contains(*e) && !vram.is_loading(*e))
+            let outsiders: Vec<u32> = listed
+                .iter()
+                .copied()
+                .filter(|e| !vram.contains(*e) && !vram.is_loading(*e))
                 .collect();
-            outsiders
-                .sort_by(|a, b| heat[*b as usize].total_cmp(&heat[*a as usize]).then(a.cmp(b)));
+            // How much an outsider is wanted: its heat, or its place in the list.
+            let wanted = |rank: usize, expert: u32| match by_heat {
+                true => heat[expert as usize],
+                false => (outsiders.len() - rank) as f32,
+            };
             // Room in VRAM: free slots (less those kept free), and then the
             // members, the coldest first, each for an outsider hotter than it
             // (the hottest outsider first), such as what the steps that
             // measured the price of a step brought.
-            let members = vram.room_worths(self.step, heat);
+            let members = if by_heat { vram.room_worths(self.step, heat) } else { Vec::new() };
             let free = vram.n_free().saturating_sub(keep);
             let to_vram = outsiders
                 .iter()
@@ -221,13 +274,13 @@ impl<D: SlotDevice> ExpertStore<D> {
             for (rank, expert) in outsiders.iter().enumerate() {
                 let tier = if rank < to_vram {
                     FillTier::Vram
-                } else if room > 0 && !ram.contains(*expert) && !ram.is_loading(*expert) {
+                } else if room > 0 && !ram.contains(*expert) {
                     room -= 1;
                     FillTier::Ram
                 } else {
                     continue;
                 };
-                items.push((Item { layer, expert: *expert, tier }, heat[*expert as usize]));
+                items.push((Item { layer, expert: *expert, tier }, wanted(rank, *expert)));
             }
         }
         match order {
@@ -272,6 +325,23 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         self.poll()?;
 
+        // Reads of others that have landed: what they brought is the fill's
+        // own read's, and what they did not bring the fill reads itself.
+        let mut at = 0;
+        while at < fill.adopted.len() {
+            let item = fill.adopted[at];
+            let ram = &self.ram.sets[item.layer];
+            if ram.is_loading(item.expert) {
+                at += 1;
+                continue;
+            }
+            fill.adopted.swap_remove(at);
+            match ram.contains(item.expert) {
+                true => fill.reading.push(item),
+                false => fill.todo.push_front(item),
+            }
+        }
+
         // Reads that have landed.
         let mut at = 0;
         while at < fill.reading.len() {
@@ -294,10 +364,10 @@ impl<D: SlotDevice> ExpertStore<D> {
 
         // Uploads into VRAM: a free slot, or the slot of a member colder than
         // the expert.
-        let keep = if self.serve() == Serve::Stream { self.config.vram_reserve } else { 0 };
         let mut waiting = VecDeque::new();
         while let Some(item) = fill.ready.pop_front() {
             let (layer, expert) = (item.layer, item.expert);
+            let keep = self.kept_free(layer);
             let device = self.layers[layer].device;
             if self.vram.sets[layer].contains(expert) || self.vram.sets[layer].is_loading(expert) {
                 continue;
@@ -348,7 +418,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             if ram.is_loading(expert) {
                 // Someone else's read: the fill takes what it brings.
                 fill.todo.pop_front();
-                fill.reading.push(item);
+                fill.adopted.push(item);
                 continue;
             }
             if ram.contains(expert) {

@@ -13,7 +13,8 @@ use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_io::{Config, ExpertMap, Reader};
 use ares_runtime::expert_store::{
-    ExpertStore, HostRegion, LayerSpec, Locker, ScratchLoan, StoreConfig, StoreError, StorePlan,
+    ExpertStore, FillOrder, FillPace, HostRegion, LayerSpec, Locker, ScratchLoan, StoreConfig,
+    StoreError, StorePlan,
 };
 use ares_runtime::testing::HostSlots;
 
@@ -223,7 +224,7 @@ fn a_missing_pick_comes_from_the_file_into_a_slot() {
     rig.settle();
     let stats = rig.store.take_stats();
     assert_eq!((stats.picks, stats.hits, stats.miss_from_disk), (2, 0, 2));
-    assert_eq!((stats.demand_reads, stats.uploads, stats.early_uploads), (2, 2, 0));
+    assert_eq!((stats.demand_reads, stats.uploads), (2, 2));
     assert_eq!(stats.miss_ms.len(), 2);
     assert_eq!(stats.upload_bytes, 2 * 352);
 
@@ -276,8 +277,7 @@ fn a_resident_layer_holds_all_its_experts_outside_the_tiers_and_never_misses() {
     assert!(rig.store.is_resident(0) && !rig.store.is_resident(1));
     // Filled once, through the few RAM slots the layer passes its experts
     // through.
-    rig.store.fill(0, &(0..EXPERTS).collect::<Vec<_>>()).unwrap();
-    rig.settle();
+    rig.fill(0, &(0..EXPERTS).collect::<Vec<_>>());
     for expert in 0..EXPERTS {
         rig.assert_usable(0, expert);
     }
@@ -369,72 +369,6 @@ fn what_vram_evicts_and_ram_has_lost_is_copied_down() {
     rig.step(&[&[back, other][..]]);
     let stats = rig.store.take_stats();
     assert_eq!((stats.miss_from_ram, stats.demand_reads), (1, 0));
-}
-
-#[test]
-fn a_guess_arrives_before_its_layer_and_takes_only_free_slots() {
-    let mut rig = rig(4, 8, |config| config.vram_reserve = 2);
-    // Fill layer 1: two slots hold experts, two are kept free.
-    rig.step(&[&[][..], &[0, 1][..]]);
-    rig.store.take_stats();
-
-    rig.store.begin_step();
-    rig.store.routed(0, &[6, 7]).unwrap();
-    // While layer 0 runs, layer 1's picks are predicted: three experts, of
-    // which two can have the free slots.
-    rig.store.predicted(1, &[10, 11, 12], usize::MAX).unwrap();
-    rig.settle_guesses(|store| {
-        [10, 11, 12].into_iter().filter(|e| store.in_vram(1, *e)).count() >= 2
-    });
-    let early: Vec<u32> = [10, 11, 12].into_iter().filter(|e| rig.store.in_vram(1, *e)).collect();
-    assert_eq!(early.len(), 2, "two free slots");
-    for expert in &early {
-        rig.assert_usable(1, *expert);
-    }
-    // Nothing of layer 1 was removed: the step may still pick it.
-    rig.assert_usable(1, 0);
-    rig.assert_usable(1, 1);
-
-    // The router of layer 1 picks a predicted expert and one that was there.
-    assert_eq!(rig.store.routed(1, &[early[0], 0]).unwrap(), 0);
-    rig.store.end_step().unwrap();
-    rig.settle();
-    let stats = rig.store.take_stats();
-    assert_eq!(stats.early_uploads, 2);
-    assert_eq!(stats.guess_reads, 3);
-    assert_eq!((stats.picks, stats.hits), (4, 2));
-}
-
-#[test]
-fn an_unsure_guess_is_uploaded_from_ram_but_not_read_from_the_file() {
-    let mut rig = rig(4, 8, |config| {
-        recent_first(config);
-        config.vram_reserve = 2;
-    });
-    // Expert 4 gets into RAM and out of VRAM again; expert 13 is only in the file.
-    rig.step(&[&[][..], &[4, 5][..]]);
-    rig.step(&[&[][..], &[6, 7][..]]);
-    rig.step(&[&[][..], &[8, 9][..]]);
-    assert!(!rig.store.in_vram(1, 4) && rig.store.in_ram(1, 4));
-    rig.store.take_stats();
-
-    rig.store.begin_step();
-    rig.store.routed(0, &[1, 2]).unwrap();
-    // Nothing of what is named may be read: both are unsure.
-    rig.store.predicted(1, &[4, 13], 0).unwrap();
-    rig.settle_guesses(|store| store.in_vram(1, 4));
-    assert!(rig.store.in_vram(1, 4), "what RAM has is uploaded early");
-    assert!(!rig.store.in_ram(1, 13) && !rig.store.in_vram(1, 13));
-    rig.store.routed(1, &[4, 13]).unwrap();
-    rig.settle();
-    rig.store.end_step().unwrap();
-    rig.settle();
-    let stats = rig.store.take_stats();
-    assert_eq!((stats.guess_reads, stats.early_uploads), (0, 1));
-    assert_eq!(
-        stats.demand_reads, 3,
-        "experts 1 and 2 of layer 0, and expert 13 when it was picked"
-    );
 }
 
 /// `n` experts of `layer` that no tier holds, the lowest numbers first.
@@ -602,8 +536,7 @@ fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
         // The record picks another expert: the read ahead is cancelled on its way.
         rig.store.routed(1, &named[1..]).unwrap();
         rig.store.end_step().unwrap();
-        rig.store.fill(1, &named[..1]).unwrap();
-        rig.settle();
+        rig.fill(1, &named[..1]);
         if !rig.store.in_vram(1, named[0]) && !rig.store.in_ram(1, named[0]) {
             lost.push(run);
         }
@@ -659,6 +592,21 @@ fn slots_follow_the_heat_between_layers() {
 }
 
 impl Rig {
+    /// Brings `experts` of `layer` into the tiers as a model's fill from a
+    /// list does ([`ExpertStore::plan_listed_fill`]), and lets the store
+    /// settle.
+    fn fill(&mut self, layer: usize, experts: &[u32]) {
+        let mut fill = self.store.plan_listed_fill(&[(layer, experts.to_vec())], FillOrder::File);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fill.is_done() {
+            self.store.advance_fill(&mut fill, FillPace::START).unwrap();
+            self.store.device_mut(0).run(usize::MAX);
+            assert!(Instant::now() < deadline, "the fill does not end: {:?}", self.store);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        self.settle();
+    }
+
     /// Lets guesses be read and uploaded until `there` says that what the
     /// test expects has arrived, however long the reader's thread takes for
     /// it, and for a few rounds more, in which what should not follow would
@@ -1538,20 +1486,16 @@ mod device {
         // take what fits (the first reads to arrive get the VRAM slots), and
         // the fill is over when nothing has moved for a while.
         let all: Vec<u32> = (0..EXPERTS).collect();
-        for layer in 0..LAYERS {
-            store.fill(layer, &all).unwrap();
-        }
+        let lists: Vec<(usize, Vec<u32>)> = (0..LAYERS).map(|layer| (layer, all.clone())).collect();
+        let mut fill = store.plan_listed_fill(&lists, FillOrder::File);
         let patience = Duration::from_secs(30);
-        let progress = |store: &ExpertStore<CudaSlots>| {
-            let stats = store.stats();
-            (stats.uploads, stats.demand_reads, stats.guess_reads)
-        };
-        let mut last = (progress(&store), Instant::now());
-        while !store.is_settled() && last.1.elapsed() < Duration::from_millis(300) {
-            store.poll().unwrap();
-            let now = progress(&store);
-            if now != last.0 {
-                last = (now, Instant::now());
+        let mut last = (fill.left(), Instant::now());
+        while !(fill.is_done() && store.is_settled())
+            && last.1.elapsed() < Duration::from_millis(300)
+        {
+            store.advance_fill(&mut fill, FillPace::START).unwrap();
+            if fill.left() != last.0 {
+                last = (fill.left(), Instant::now());
             }
         }
         assert_eq!(store.stats().uploads, vram_slots * LAYERS as u64, "every slot was filled");

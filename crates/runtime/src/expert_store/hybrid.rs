@@ -497,7 +497,6 @@ impl<D: SlotDevice> ExpertStore<D> {
                     self.wants.push(Wanted {
                         layer,
                         expert,
-                        demand: true,
                         since: now,
                         source: Source::OnItsWay,
                         cpu: false,
@@ -648,7 +647,6 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.wants.push(Wanted {
                     layer,
                     expert: group.expert,
-                    demand: true,
                     since: now,
                     source: *source,
                     cpu: false,
@@ -669,7 +667,6 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.wants.push(Wanted {
                     layer,
                     expert: group.expert,
-                    demand: true,
                     since: now,
                     source: *source,
                     cpu: true,

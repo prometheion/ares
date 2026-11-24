@@ -23,10 +23,11 @@
 //! - how long a missing expert took (median and 99th percentile), by where
 //!   it came from.
 //!
-//! Predictors are emulated with a given recall, since there is no hidden
+//! A predictor is emulated with a given recall, since there is no hidden
 //! state to apply a router to: `lookahead=<d>` names the picks of layer
-//! `l + d` when layer `l` has been routed, `table=<layers>` names the picks
-//! of the first layers before a step starts. Their kernels' cost is real.
+//! `l + d` when layer `l` has been routed, and the store reads ahead what it
+//! names as a model's predictions are read ahead ([`ExpertStore::ahead`]).
+//! Its kernels' cost is real.
 //!
 //! ```sh
 //! cargo run --release -p ares-runtime --example expert_pipe_bench -- \
@@ -53,7 +54,8 @@ use ares_runtime::expert_store::cpu::{
     CpuExpert, CpuPool, Decode, Features, LayerJob, Placement, Topology, quantize_activations,
 };
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertStore, HostRegion, LayerSpec, Serve, StoreConfig, StorePlan, StoreStats,
+    CudaSlots, ExpertStore, FillOrder, FillPace, HostRegion, LayerSpec, Serve, StoreConfig,
+    StorePlan, StoreStats,
 };
 use ares_weights::{ExpertHeat, SlotSet, Start, TableBuilder, TableConfig, Want};
 
@@ -393,37 +395,29 @@ fn predict(picks: &[u16], recall_by_rank: &[f64], experts: usize, rng: &mut Rng)
 }
 
 /// What an emulated predictor names for `layer` of the step whose rows start
-/// at `token`: the experts of all rows, the surest rank first, and how many
-/// of them are of the first `read_ranks` ranks (those may be read from the
-/// file).
+/// at `token`: the experts of the first `name_ranks` ranks of all rows, the
+/// surest rank first.
 fn named_by(
     trace: &Trace,
     token: usize,
     rows: usize,
     layer: usize,
     recall_by_rank: &[f64],
-    (name_ranks, read_ranks): (usize, usize),
+    name_ranks: usize,
     rng: &mut Rng,
-) -> (Vec<u32>, usize) {
+) -> Vec<u32> {
     let per_row: Vec<Vec<u32>> = (0..rows)
         .map(|row| predict(trace.picks(token + row, layer), recall_by_rank, 512, rng))
         .collect();
     let mut named: Vec<u32> = Vec::with_capacity(rows * trace.k);
-    let mut sure = 0;
     for rank in 0..name_ranks.min(trace.k) {
         for row in &per_row {
             if !named.contains(&row[rank]) {
                 named.push(row[rank]);
             }
         }
-        if rank + 1 == read_ranks {
-            sure = named.len();
-        }
     }
-    if read_ranks >= name_ranks.min(trace.k) {
-        sure = named.len();
-    }
-    (named, sure)
+    named
 }
 
 /// The recall per rank of a router applied one layer early, as Strata's
@@ -445,15 +439,12 @@ struct Options {
     warm: usize,
     steps: usize,
     lookahead: usize,
-    table: usize,
-    table_recall: f64,
     dense_mb: u64,
     reserve: usize,
     lanes: usize,
     profile: usize,
-    read_ranks: usize,
     name_ranks: usize,
-    sweep: Vec<(usize, usize)>,
+    sweep: Vec<usize>,
     share: f64,
     group: usize,
     skew: f64,
@@ -500,13 +491,10 @@ impl Options {
             warm: 200,
             steps: 300,
             lookahead: 0,
-            table: 0,
-            table_recall: 0.6,
             dense_mb: 0,
             reserve: 8,
             lanes: 8,
             profile: 0,
-            read_ranks: 2,
             name_ranks: 10,
             sweep: Vec::new(),
             share: 0.55,
@@ -544,20 +532,15 @@ impl Options {
                 "warm" => options.warm = value.parse()?,
                 "steps" => options.steps = value.parse()?,
                 "lookahead" => options.lookahead = value.parse()?,
-                "table" => options.table = value.parse()?,
-                "table-recall" => options.table_recall = value.parse()?,
                 "dense-mb" => options.dense_mb = value.parse()?,
                 "reserve" => options.reserve = value.parse()?,
                 "lanes" => options.lanes = value.parse()?,
                 "profile" => options.profile = value.parse()?,
-                "read-ranks" => options.read_ranks = value.parse()?,
                 "name-ranks" => options.name_ranks = value.parse()?,
-                // More warm phases after the first, each "<lookahead>:<table layers>".
+                // More warm phases after the first, each with its lookahead.
                 "sweep" => {
-                    for phase in value.split(',') {
-                        let (ahead, table) =
-                            phase.split_once(':').ok_or("sweep=<lookahead>:<table>,...")?;
-                        options.sweep.push((ahead.parse()?, table.parse()?));
+                    for ahead in value.split(',') {
+                        options.sweep.push(ahead.parse()?);
                     }
                 }
                 "share" => options.share = value.parse()?,
@@ -1179,27 +1162,19 @@ fn main() -> Result<(), AnyError> {
             load_average()
         );
     }
-    if let Some(heat) = &profile {
-        // Fill the tiers with the hottest experts of every layer.
+    if profile.is_some() {
+        // Fill the tiers with the hottest experts of every layer from the
+        // heat of the profile, as a model fills them from its own.
         let started = Instant::now();
         let before = store.reader().stats();
-        for layer in 0..LAYERS {
-            let mut order: Vec<u32> = (0..EXPERTS as u32).collect();
-            order.sort_by(|a, b| {
-                heat.layer(layer)[*b as usize].total_cmp(&heat.layer(layer)[*a as usize])
-            });
-            let (vram, ram) = store.slots(layer);
-            order.truncate((vram + ram - options.reserve.min(vram)).min(EXPERTS));
-            order.retain(|e| heat.layer(layer)[*e as usize] > 0.0);
-            store.fill(layer, &order)?;
-        }
+        let layers: Vec<usize> = (0..LAYERS).collect();
+        let mut fill = store.plan_fill(&layers, FillOrder::File);
         // Until nothing moves any more (what does not fit stays in the file).
-        let mut last = (store.stats().uploads, store.stats().demand_reads, Instant::now());
-        while !store.is_settled() && last.2.elapsed() < Duration::from_secs(2) {
-            store.poll()?;
-            let now = (store.stats().uploads, store.stats().demand_reads);
-            if now != (last.0, last.1) {
-                last = (now.0, now.1, Instant::now());
+        let mut last = (fill.left(), Instant::now());
+        while !(fill.is_done() && store.is_quiet()) && last.1.elapsed() < Duration::from_secs(2) {
+            store.advance_fill(&mut fill, FillPace::START)?;
+            if fill.left() != last.0 {
+                last = (fill.left(), Instant::now());
             }
         }
         let after = store.reader().stats();
@@ -1293,17 +1268,16 @@ fn main() -> Result<(), AnyError> {
     }
 
     let lookahead: Vec<Vec<f64>> = (0..=5).map(lookahead_recall).collect();
-    let table_recall = vec![options.table_recall];
     let mut predictions: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
 
-    // The phases: name, steps, and the predictors that run in it.
+    // The phases: name, steps, and the lookahead of the predictor in it.
     let mut phases = vec![
-        ("cold".to_owned(), options.cold, options.lookahead, options.table),
-        ("warm-up".to_owned(), options.warm, options.lookahead, options.table),
-        ("warm".to_owned(), options.steps, options.lookahead, options.table),
+        ("cold".to_owned(), options.cold, options.lookahead),
+        ("warm-up".to_owned(), options.warm, options.lookahead),
+        ("warm".to_owned(), options.steps, options.lookahead),
     ];
-    for (ahead, table) in &options.sweep {
-        phases.push((format!("la{ahead} t{table}"), options.steps, (*ahead).min(5), *table));
+    for ahead in &options.sweep {
+        phases.push((format!("la{ahead}"), options.steps, (*ahead).min(5)));
     }
     let mut token = options.profile;
     let mut step_number = 0u32;
@@ -1326,7 +1300,7 @@ fn main() -> Result<(), AnyError> {
         unsafe { lane.stream.fill(lane.out.ptr(), 0, out_bytes.len())? };
         lane.stream.synchronize()?;
     }
-    for (phase, steps, phase_lookahead, phase_table) in phases {
+    for (phase, steps, phase_lookahead) in phases {
         if steps == 0 {
             continue;
         }
@@ -1450,16 +1424,16 @@ fn main() -> Result<(), AnyError> {
                     // What the routers of later layers say about them, as of now.
                     let ahead = *layer + phase_lookahead;
                     if phase_lookahead > 0 && ahead < LAYERS {
-                        let (guess, sure) = named_by(
+                        let guess = named_by(
                             &trace,
                             token,
                             rows,
                             ahead,
                             &lookahead[phase_lookahead],
-                            (options.name_ranks, options.read_ranks),
+                            options.name_ranks,
                             &mut rng,
                         );
-                        store.predicted(ahead, &guess, sure)?;
+                        store.ahead(ahead, &guess, phase_lookahead, rows);
                         predictions.insert((step_number as usize, ahead), guess);
                     }
                 }
@@ -1470,27 +1444,6 @@ fn main() -> Result<(), AnyError> {
             store.end_step()?;
             token += rows;
 
-            // Before the next step: what the token table says about its first layers.
-            for layer in 0..phase_table.min(LAYERS) {
-                let (guess, sure) = named_by(
-                    &trace,
-                    token,
-                    rows,
-                    layer,
-                    &table_recall,
-                    (options.name_ranks, options.read_ranks),
-                    &mut rng,
-                );
-                store.predicted(layer, &guess, sure)?;
-                predictions.insert((step_number as usize + 1, layer), guess);
-            }
-            if phase_table > 0 {
-                // The time a token's sampling and the rest of a step's start leave.
-                let until = Instant::now() + Duration::from_micros(300);
-                while Instant::now() < until {
-                    store.poll()?;
-                }
-            }
             step_ms.push(step_started.elapsed().as_secs_f32() * 1e3);
             if alternating {
                 let turn = step_in_phase / options.alternate % turns.len();
@@ -1774,13 +1727,12 @@ fn report(
         per_step(stats.miss_on_its_way),
     );
     println!(
-        "          read from the file per step: {:.2} MB ({:.2} demand reads, {:.2} guesses); uploaded {:.2} MB ({:.2} experts, {:.2} early), copied down {:.2}",
+        "          read from the file per step: {:.2} MB ({:.2} demand reads, {:.2} guesses); uploaded {:.2} MB ({:.2} experts), copied down {:.2}",
         (io_after - io_before) as f64 / 1e6 / steps as f64,
         per_step(stats.demand_reads),
         per_step(stats.guess_reads),
         stats.upload_bytes as f64 / 1e6 / steps as f64,
         per_step(stats.uploads),
-        per_step(stats.early_uploads),
         per_step(stats.demotions),
     );
     println!(

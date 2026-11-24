@@ -47,9 +47,10 @@
 //! step wait. The routers of later layers applied on the device name the
 //! experts of a layer before it runs ([`ExpertStore::ahead`]): only what no
 //! tier holds is read, within bounds that keep the drive for the reads a step
-//! waits for (`ahead.rs`). [`ExpertStore::predicted`] is the older way in,
-//! which also uploads what RAM holds: the tests' and the bench's predictors
-//! and a fill from a list ([`ExpertStore::fill`]) use it.
+//! waits for (`ahead.rs`). The tiers are filled between steps by a
+//! [`TierFill`], from the heat ([`ExpertStore::plan_fill`]) or from a list
+//! ([`ExpertStore::plan_listed_fill`]: a recorded routing, every expert, the
+//! MTP block's).
 //!
 //! What keeps this safe without a lock or a host wait is the order of the
 //! table: an entry appears on the device after the expert's bytes, and an
@@ -340,8 +341,6 @@ enum Source {
 struct Wanted {
     layer: usize,
     expert: u32,
-    /// A step waits for it; otherwise it is a guess.
-    demand: bool,
     since: Instant,
     source: Source,
     /// The CPU computes it once its bytes are in RAM; otherwise it is
@@ -406,10 +405,8 @@ pub struct StoreStats {
     pub demand_read_bytes: u64,
     pub guess_read_bytes: u64,
     pub failed_reads: u64,
-    /// Experts copied into VRAM slots; `early_uploads` of them before a
-    /// step asked.
+    /// Experts copied into VRAM slots.
     pub uploads: u64,
-    pub early_uploads: u64,
     pub upload_bytes: u64,
     /// Experts copied from a VRAM slot back to RAM when they were evicted.
     pub demotions: u64,
@@ -543,7 +540,6 @@ pub struct ExpertStore<D: SlotDevice> {
     step: u64,
     in_step: bool,
     /// The tiers are being filled and no step has begun since.
-    filling: bool,
     phase: Vec<Phase>,
     reads: HashMap<u64, ReadOp>,
     next_read: u64,
@@ -943,7 +939,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             ram_skip,
             step: 0,
             in_step: false,
-            filling: false,
             phase: vec![Phase::Passed; layers.len()],
             reads: HashMap::new(),
             next_read: 0,
@@ -1059,7 +1054,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// Experts a step waits for that are not in their slot yet.
     pub fn waiting(&self) -> usize {
-        self.wants.iter().filter(|w| w.demand).count() + self.cpu_waiting()
+        self.wants.len() + self.cpu_waiting()
     }
 
     /// Whether nothing is on its way: no read, no copy, nothing wanted.
@@ -1076,7 +1071,6 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// enqueued, and make the step's streams wait for what the store has
     /// enqueued so far (`CudaSlots::fence`).
     pub fn begin_step(&mut self) {
-        self.filling = false;
         self.in_step = true;
         self.phase.fill(Phase::Ahead);
         self.windows.set(&[], None);
@@ -1127,7 +1121,6 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.heat.record(layer, picks);
         self.guesses.forget_layer(layer);
         self.ahead_routed(layer, picks);
-        self.wants.retain(|w| w.layer != layer || w.demand);
         self.worth_stale[layer] = true;
         self.vram.sets[layer].routed(picks, self.step);
         self.ram.sets[layer].routed(picks, self.step);
@@ -1161,7 +1154,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             self.wants.push(Wanted {
                 layer,
                 expert: *expert,
-                demand: true,
                 since: now,
                 source,
                 cpu: false,
@@ -1183,64 +1175,6 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.worth_stale[layer] = true;
     }
 
-    /// Something names `experts` for `layer` before the layer's router has
-    /// run, most likely first: during a step, for a layer the step has not
-    /// reached; between steps, for the next step. The store protects those
-    /// that are in a slot and starts to bring the others, without taking
-    /// anything a running step may need.
-    ///
-    /// Only the first `read` of them are read from the file when they are in
-    /// no tier; the others are uploaded if RAM has them and left alone if
-    /// not. An upload from RAM is cheap when it was for nothing; a read from
-    /// the file takes the drive from the reads a step waits for, so it is
-    /// for the guesses that are nearly sure.
-    pub fn predicted(
-        &mut self,
-        layer: usize,
-        experts: &[u32],
-        read: usize,
-    ) -> Result<(), StoreError> {
-        if self.in_step && self.phase[layer] != Phase::Ahead {
-            return Ok(());
-        }
-        self.vram.sets[layer].predicted(experts, self.step);
-        self.ram.sets[layer].predicted(experts, self.step);
-        let now = Instant::now();
-        let mut to_read = Vec::new();
-        for (rank, expert) in experts.iter().enumerate() {
-            let vram = &self.vram.sets[layer];
-            if vram.contains(*expert) || vram.is_loading(*expert) {
-                continue;
-            }
-            if !self.wants.iter().any(|w| w.layer == layer && w.expert == *expert) {
-                self.wants.push(Wanted {
-                    layer,
-                    expert: *expert,
-                    demand: false,
-                    since: now,
-                    source: Source::OnItsWay,
-                    cpu: false,
-                    loan: false,
-                });
-            }
-            let ram = &self.ram.sets[layer];
-            if rank < read && !ram.contains(*expert) && !ram.is_loading(*expert) {
-                to_read.push(*expert);
-            }
-        }
-        self.guesses.guess(&mut self.ram.sets, layer, &to_read, self.step);
-        Ok(())
-    }
-
-    /// Brings `experts` of `layer` into the tiers, the first ones first, as
-    /// far as they fit: at load, from a routing profile. It is
-    /// [`ExpertStore::predicted`] for a time when nothing waits: the reads go
-    /// at the full depth of the drive until the first step begins.
-    pub fn fill(&mut self, layer: usize, experts: &[u32]) -> Result<(), StoreError> {
-        self.filling = true;
-        self.predicted(layer, experts, usize::MAX)
-    }
-
     /// The running step has ended on the devices. Guesses for it are over,
     /// heat ages, and every layer gets its free slots back.
     pub fn end_step(&mut self) -> Result<(), StoreError> {
@@ -1250,7 +1184,6 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.ahead_end_step();
         self.step += 1;
         self.stats.steps += 1;
-        self.wants.retain(|w| w.demand);
         // Memory the machine wants back goes before anything new is started,
         // and memory the tier may take again comes a piece a step: a lock
         // takes tens of milliseconds, and the next step waits for it.
@@ -1303,16 +1236,10 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.ahead_read_done(read_of(done.key), op.layer, op.expert, op.failed);
             }
             if op.failed {
-                // A read ahead that the layer's record did not need was cancelled.
+                // A read ahead that the layer's record did not need was cancelled. A
+                // want of the expert reads it again by itself below.
                 self.stats.failed_reads += u64::from(!op.ahead || op.demand);
                 self.ram.sets[op.layer].abort(&op.swap);
-                // Whoever wanted the expert while the read was on its way (a fill, a
-                // prediction of a step) counted on it and started no read of its own: it
-                // is read again. A demand's want reads it again by itself below.
-                let wanted = |w: &Wanted| !w.demand && w.layer == op.layer && w.expert == op.expert;
-                if op.ahead && self.wants.iter().any(wanted) {
-                    self.guesses.guess(&mut self.ram.sets, op.layer, &[op.expert], self.step);
-                }
             } else {
                 self.ram.sets[op.layer].commit(&op.swap);
                 if op.demand {
@@ -1369,35 +1296,31 @@ impl<D: SlotDevice> ExpertStore<D> {
                 continue;
             }
             if self.vram.sets[layer].contains(expert) {
-                if want.demand {
-                    let ms = want.since.elapsed().as_secs_f32() * 1e3;
-                    self.stats.miss_ms.push(ms);
-                    match want.source {
-                        Source::Disk => self.stats.disk_miss_ms.push(ms),
-                        Source::Ram => self.stats.ram_miss_ms.push(ms),
-                        Source::OnItsWay => {}
-                    }
+                let ms = want.since.elapsed().as_secs_f32() * 1e3;
+                self.stats.miss_ms.push(ms);
+                match want.source {
+                    Source::Disk => self.stats.disk_miss_ms.push(ms),
+                    Source::Ram => self.stats.ram_miss_ms.push(ms),
+                    Source::OnItsWay => {}
                 }
                 self.wants.swap_remove(at);
                 continue;
             }
             if !self.vram.sets[layer].is_loading(expert) {
                 if self.ram.sets[layer].contains(expert) {
-                    self.promote(layer, expert, want.demand, want.loan)?;
+                    self.promote(layer, expert, want.loan)?;
                 } else if self.ram.sets[layer].is_loading(expert) {
-                    if want.demand {
-                        self.hurry(layer, expert);
-                    }
-                } else if want.demand {
+                    self.hurry(layer, expert);
+                } else {
                     self.read_demanded(layer, expert)?;
                 }
             }
             at += 1;
         }
 
-        // Guesses, while lanes are free. A fill has the drive to itself. Reads ahead of a
-        // router keep within bounds of their own (`ahead.rs`).
-        let lanes = if self.filling { 4 * self.config.read_lanes } else { self.config.read_lanes };
+        // Guesses, while lanes are free. Reads ahead of a router keep within bounds of their
+        // own (`ahead.rs`).
+        let lanes = self.config.read_lanes;
         while self.reads.len() < lanes && !self.guesses.is_empty() && !self.pieces.shrinking {
             for layer in 0..self.layers.len() {
                 self.refresh_worth(layer);
@@ -1411,7 +1334,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             ) else {
                 break;
             };
-            self.read(started.layer, started.swap, self.filling)?;
+            self.read(started.layer, started.swap, false)?;
         }
 
         self.poll_cpu()?;
@@ -1421,7 +1344,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let mut at = 0;
         while at < self.waits.len() {
             let (layer, since) = self.waits[at];
-            if self.wants.iter().any(|w| w.demand && w.layer == layer) || self.cpu_is_open(layer) {
+            if self.wants.iter().any(|w| w.layer == layer) || self.cpu_is_open(layer) {
                 at += 1;
             } else {
                 self.stats.wait_ms += since.elapsed().as_secs_f64() * 1e3;
@@ -1574,20 +1497,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
     }
 
-    /// Starts the upload of an expert that is in RAM into a VRAM slot, if a
-    /// slot can be had now, with its table entry behind it.
-    fn promote(
-        &mut self,
-        layer: usize,
-        expert: u32,
-        demand: bool,
-        loan: bool,
-    ) -> Result<(), StoreError> {
-        let want = if demand { Want::Demand } else { Want::Guess };
-        let started = self.upload(layer, expert, want, true)?;
-        if started && !demand {
-            self.stats.early_uploads += 1;
-        }
+    /// Starts the upload of an expert that a step waits for and that is in
+    /// RAM into a VRAM slot, if a slot can be had now, with its table entry
+    /// behind it.
+    fn promote(&mut self, layer: usize, expert: u32, loan: bool) -> Result<(), StoreError> {
+        let started = self.upload(layer, expert, Want::Demand, true)?;
         if started && loan {
             self.vram.sets[layer].lend(expert);
             self.stats.loans += 1;

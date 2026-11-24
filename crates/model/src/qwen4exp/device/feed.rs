@@ -16,7 +16,8 @@ use ares_gguf::Gguf;
 use ares_io::{ExpertMap, ExpertSpan, FileId, Reader};
 use ares_runtime::expert_store::cpu::{CpuPool, Placement as CpuPlacement, Topology};
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertStore, HostRegion, LayerSpec, Serve, StoreConfig, StorePlan,
+    CudaSlots, ExpertStore, FillOrder, FillPace, HostRegion, LayerSpec, Serve, StoreConfig,
+    StorePlan,
 };
 use ares_weights::{Lookahead, LookaheadRule};
 
@@ -603,12 +604,13 @@ impl Feed {
         self.store.take_stats();
         let before = self.store.reader().stats();
         let shared = self.layout.per_layer > 1;
+        let mut lists = Vec::new();
         if self.mtp {
             // The MTP block is asked as the layer behind the model's last.
             let mut order = experts_of(n_layer);
             let (vram, ram) = self.store.slots(0);
             order.truncate((vram + ram).min(n_experts));
-            self.store.fill(0, &order)?;
+            lists.push((0, order));
         }
         for layer in 0..n_layer {
             let wanted = experts_of(layer);
@@ -621,10 +623,10 @@ impl Feed {
                     .filter(|expert| !shared || owner(layer, *expert) == part)
                     .collect();
                 order.truncate((vram + ram).min(n_experts));
-                self.store.fill(at, &order)?;
+                lists.push((at, order));
             }
         }
-        self.settle()?;
+        self.fill_lists(&lists)?;
         let after = self.store.reader().stats();
         let stats = self.store.take_stats();
         Ok(Fill {
@@ -636,16 +638,18 @@ impl Feed {
         })
     }
 
-    /// Lets the store work until nothing moves any more.
-    fn settle(&mut self) -> Result<(), Error> {
-        let progress =
-            |store: &ExpertStore<CudaSlots>| (store.stats().uploads, store.stats().demand_reads);
-        let mut last = (progress(&self.store), Instant::now());
-        while !self.store.is_settled() && last.1.elapsed() < Duration::from_secs(2) {
-            self.store.poll()?;
-            let now = progress(&self.store);
-            if now != last.0 {
-                last = (now, Instant::now());
+    /// Brings the experts `lists` names for each store layer into the tiers
+    /// at the pace of a start ([`ExpertStore::plan_listed_fill`]), and lets
+    /// the store work until nothing moves any more.
+    fn fill_lists(&mut self, lists: &[(usize, Vec<u32>)]) -> Result<(), Error> {
+        let mut fill = self.store.plan_listed_fill(lists, FillOrder::File);
+        let mut last = (fill.left(), Instant::now());
+        while !(fill.is_done() && self.store.is_settled())
+            && last.1.elapsed() < Duration::from_secs(2)
+        {
+            self.store.advance_fill(&mut fill, FillPace::START)?;
+            if fill.left() != last.0 {
+                last = (fill.left(), Instant::now());
             }
         }
         Ok(())
@@ -661,8 +665,7 @@ impl Feed {
         }
         let (vram, ram) = self.store.slots(0);
         let order: Vec<u32> = (0..(vram + ram).min(n_experts) as u32).collect();
-        self.store.fill(0, &order)?;
-        self.settle()?;
+        self.fill_lists(&[(0, order)])?;
         self.store.take_stats();
         Ok(())
     }
