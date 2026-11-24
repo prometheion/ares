@@ -10,6 +10,9 @@
 //!   device found faster for the rows the model runs ([`Layouts`]).
 //! - [`Qwen35`] is the model as the runtime drives it: it opens a part on
 //!   every device's thread and hands each step to it.
+//! - [`Estimate`] (`plan.rs`) is what the server asks before it opens the
+//!   model: the placement of a spread and what each device would take
+//!   ([`Footprint`]), without a device.
 //! - [`Harness`] drives one part on one device step by step, for tests and
 //!   measurements; [`Session`] drives a whole model, on one device or
 //!   several, through the runtime's executor.
@@ -22,6 +25,7 @@ mod harness;
 mod load;
 mod part;
 pub mod placement;
+mod plan;
 mod runtime;
 mod session;
 
@@ -34,5 +38,6 @@ pub use part::{
     checkpoint_bytes, exact_bytes, page_bytes, partial_state_bytes, state_slot_bytes,
 };
 pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
+pub use plan::{Estimate, Footprint, Whole, attention_by_room, fit_shares, heads_for_context};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};
 pub use session::{Rows, Session, StepTime, Wanted};

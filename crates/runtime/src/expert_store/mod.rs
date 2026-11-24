@@ -198,6 +198,10 @@ pub struct StoreConfig {
 }
 
 impl StoreConfig {
+    /// The free slots kept per layer in VRAM unless a store is told otherwise
+    /// ([`StoreConfig::vram_reserve`]).
+    pub const VRAM_RESERVE: usize = 8;
+
     /// The rules the engine uses, for steps of up to `max_rows` rows of
     /// `top_k` experts and the given budgets.
     pub fn new(max_rows: u32, top_k: u32, vram_bytes: Vec<u64>, ram_bytes: u64) -> Self {
@@ -206,7 +210,7 @@ impl StoreConfig {
             top_k,
             vram_bytes,
             ram_bytes,
-            vram_reserve: 8,
+            vram_reserve: Self::VRAM_RESERVE,
             read_lanes: 8,
             heat_decay: 0.9,
             decay_every: 32,

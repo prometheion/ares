@@ -68,8 +68,8 @@ pub use placement::{
 pub use prune::{PruneMask, PruneSetup, PruneStats};
 pub use roles::{RoleTime, RoleTrial};
 pub use runtime::{
-    ExpertCosts, OpenError, Qwen4Exp, batch_rows, page_parts, place, reads_layer_by_layer,
-    step_rows,
+    ExpertCosts, OpenError, Qwen4Exp, batch_rows, drafter_bytes, page_parts, place,
+    reads_layer_by_layer, slot_floors, step_rows,
 };
 pub use session::{LayerOut, Probe, Rows, Session, SessionOptions, StepTime, StoreRef, Wanted};
 pub use usage::{IDLE_AFTER, Log, ProfileFound, ProfileReport, UsageStats, profile_key};

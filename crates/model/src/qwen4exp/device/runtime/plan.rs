@@ -1,9 +1,11 @@
 //! What the server asks of the model before it opens it: the rows of a step,
-//! where the layers go and what a page takes on each device, and the widest
-//! step the expert slots can lend for.
+//! where the layers go and what a page takes on each device, the expert slots
+//! each device cannot do without, and the widest step the expert slots can
+//! lend for.
 
 use ares_cuda::{Device, MAX_BATCH};
 use ares_gguf::Gguf;
+use ares_runtime::expert_store::StoreConfig;
 
 use super::super::feed::Layout;
 use super::super::options::ModelOptions;
@@ -11,7 +13,7 @@ use super::super::part::{Frame, Options, PartShape};
 use super::super::placement::{Chosen, PartPlan, Placement, choose};
 use super::OpenError;
 use crate::qwen4exp::Config;
-use crate::qwen4exp::weights::Weights;
+use crate::qwen4exp::weights::{MtpWeights, Weights};
 
 /// The rows of a step to open the model with on `devices`: as many as the scratch of a step
 /// may take of the smaller device's memory (a thirty-second; the rest is slots for experts and
@@ -51,6 +53,37 @@ pub fn reads_layer_by_layer(opts: &Options, dflash: bool) -> bool {
     opts.own_rows() >= 2 * MAX_BATCH
         && crate::blocks::kv::Group::window_limit(opts.kv.0, opts.kv.1).is_none()
         && !dflash
+}
+
+/// What the drafters take of the bytes for expert slots on the device with
+/// the head, for the plan of the context: the tensors of the MTP block in
+/// `mtp` (its experts stay resident there) and the weights of the DFlash
+/// drafter `dflash`, each with a margin of 128 MiB for its pools and buffers.
+pub fn drafter_bytes(mtp: Option<&Gguf>, dflash: Option<&crate::dflash::File>) -> u64 {
+    const MARGIN: u64 = 128 << 20;
+    mtp.map_or(0, |file| MtpWeights::file_bytes(file) + MARGIN)
+        + dflash.map_or(0, |file| file.bytes() + MARGIN)
+}
+
+/// The bytes of expert slots each device of `placement` cannot do without: a
+/// row's picks and the free slots of every layer it holds slots for (what the
+/// store gives a layer when the CPU serves what VRAM cannot take), a tenth
+/// more for the rounding of slots, and on the device with the head `drafter`
+/// bytes for the drafters ([`drafter_bytes`]).
+pub fn slot_floors(config: &Config, placement: &Placement, drafter: u64) -> Vec<u64> {
+    let all: u64 = placement.devices.iter().map(|d| d.experts).sum();
+    let reserve = StoreConfig::VRAM_RESERVE as u64;
+    let per_slot = (config.experts.used as u64 + reserve) * 11 / 10;
+    placement
+        .devices
+        .iter()
+        .map(|d| {
+            // One expert of every layer the device holds slots for.
+            let round = if placement.tensor.is_some() { all } else { d.experts };
+            let round = round / config.experts.count.max(1) as u64;
+            per_slot * round + if d.head { drafter } else { 0 }
+        })
+        .collect()
 }
 
 /// The most rows of a step the model is opened with.

@@ -23,6 +23,7 @@ use super::part::{
     TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
+use super::plan::Estimate;
 use crate::blocks::rows::{self, EmbeddingReport, HostTable, Stage};
 use crate::blocks::slots::{self, Declared};
 use crate::blocks::step::{self, DrafterIds, StepInputs};
@@ -157,32 +158,12 @@ impl Qwen35 {
         options: Options,
         context: u32,
     ) -> Result<Self, OpenError> {
-        let config = Config::from_gguf(&gguf)?;
-        let (placement, table) = {
-            let weights = Weights::load(&gguf, &config)?;
-            let weights = match &options.mtp_file {
-                Some(file) => weights.with_mtp_file(file, &config)?,
-                None => weights,
-            };
-            let table = table_shape(&weights.token_embd);
-            let placement = spread.place(&config, &weights)?;
-            (placement, table)
-        };
-        // A model with an MTP block (in its file or a file of its own) drafts
-        // with it when it is asked to and windows may carry drafts, on the
-        // device with the first rows of the head: the one that embeds, or
-        // the last one of a layer split. A DFlash drafter reads taps of the
-        // model's layers on the device that embeds, which a layer split does
-        // not give it.
-        let drafts = options.window_rows > 1;
-        let mtp = (config.n_nextn == 1 || options.mtp_file.is_some()) && options.mtp;
-        let vocabulary = options.draft_vocabulary.as_deref();
-        let placement = if drafts && mtp {
-            placement.with_mtp(&config, vocabulary)?
-        } else if drafts && options.dflash.is_some() && placement.split != Split::Layer {
-            placement.with_head_view(&config, vocabulary, false)?
-        } else {
-            placement
+        // Where the weights and the drafter go: the placement the server's
+        // estimate was made for.
+        let (config, placement, table) = {
+            let estimate = Estimate::for_options(&gguf, &options)?;
+            let table = table_shape(&estimate.weights().token_embd);
+            (estimate.config().clone(), estimate.place(spread, &options)?, table)
         };
         if let Some(file) = &options.dflash {
             file.config

@@ -66,7 +66,9 @@ mod plan;
 use meeting::Meeting;
 use parts::Build;
 pub(super) use pass::{PassKey, PassLoan};
-pub use plan::{batch_rows, page_parts, place, reads_layer_by_layer, step_rows};
+pub use plan::{
+    batch_rows, drafter_bytes, page_parts, place, reads_layer_by_layer, slot_floors, step_rows,
+};
 use plan::{place_in, widest_rows};
 
 /// What the expert store measured of serving a miss on this machine

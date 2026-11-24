@@ -167,17 +167,18 @@ fn check_shares(shares: &[f64]) -> Result<Vec<f64>, PlacementError> {
         .collect())
 }
 
-fn matrix_bytes(m: &Matrix<'_>) -> u64 {
+pub(super) fn matrix_bytes(m: &Matrix<'_>) -> u64 {
     m.bytes().len() as u64
 }
 
-/// The stored bytes of block `layer`.
-fn block_bytes(w: &Weights<'_>, layer: usize) -> u64 {
+/// The stored bytes of block `layer`: of its mixer and of its feed-forward
+/// part.
+pub(super) fn block_parts(w: &Weights<'_>, layer: usize) -> (u64, u64) {
     let l = &w.layers[layer];
     let ffn = matrix_bytes(&l.block.ffn_gate)
         + matrix_bytes(&l.block.ffn_up)
         + matrix_bytes(&l.block.ffn_down);
-    ffn + match &l.mixer {
+    let mixer = match &l.mixer {
         Mixer::Recurrent(r) => {
             matrix_bytes(&r.qkv)
                 + matrix_bytes(&r.gate)
@@ -188,7 +189,14 @@ fn block_bytes(w: &Weights<'_>, layer: usize) -> u64 {
         Mixer::Attention(a) => {
             matrix_bytes(&a.q) + matrix_bytes(&a.k) + matrix_bytes(&a.v) + matrix_bytes(&a.out)
         }
-    }
+    };
+    (mixer, ffn)
+}
+
+/// The stored bytes of block `layer`.
+fn block_bytes(w: &Weights<'_>, layer: usize) -> u64 {
+    let (mixer, ffn) = block_parts(w, layer);
+    ffn + mixer
 }
 
 impl Placement {

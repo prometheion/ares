@@ -364,6 +364,21 @@ pub const MTP_ARCHITECTURE: &str = "qwen4exp-mtp";
 /// in a model file that carries it.
 const MTP_PREFIX: &str = "mtp.";
 
+impl MtpWeights<'_> {
+    /// Whether the model file `gguf` carries the MTP block among its tensors.
+    pub fn in_model_file(gguf: &Gguf) -> bool {
+        gguf.tensor("mtp.fc_embedding.weight").is_some()
+    }
+
+    /// The bytes of the block's tensors in `gguf`: a file of the architecture
+    /// [`MTP_ARCHITECTURE`], or a model file that carries the block.
+    pub fn file_bytes(gguf: &Gguf) -> u64 {
+        let in_model = gguf.architecture() == Some(super::config::ARCHITECTURE);
+        let tensors = gguf.tensors().iter();
+        tensors.filter(|t| !in_model || t.name.starts_with(MTP_PREFIX)).map(|t| t.size).sum()
+    }
+}
+
 impl<'g> MtpWeights<'g> {
     /// Builds the table from the tensors of `gguf`, a file of the architecture
     /// [`MTP_ARCHITECTURE`] or a model file that carries its block (the same
