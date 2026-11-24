@@ -767,7 +767,8 @@ impl PinnedRam {
     /// part, where they are not locked: the places the copies of a step or a
     /// transfer use, locked before it runs (page-locked memory does not change
     /// inside a step, see [`ares_cuda::gate`]). The conductor has made room in
-    /// the limit for them.
+    /// the limit for them. Every place is tried; the first that could not be
+    /// locked is the error.
     pub(crate) fn hold_places(&self, places: &[u32]) -> Result<(), ModelError> {
         if places.is_empty() {
             return Ok(());
@@ -776,12 +777,15 @@ impl PinnedRam {
             let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
             all.iter().filter_map(Weak::upgrade).collect()
         };
+        let mut first = Ok(());
         for table in &tables {
             for place in places.iter().filter(|place| **place < table.capacity) {
-                table.pointer(*place)?;
+                if let (Err(error), Ok(())) = (table.pointer(*place), &first) {
+                    first = Err(error);
+                }
             }
         }
-        Ok(())
+        first
     }
 
     /// Releases chunks of checkpoint places in which the conductor has no

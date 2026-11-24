@@ -580,17 +580,14 @@ impl Executor for GpuExecutor {
             return Ok(());
         }
         // The places checkpoints come into are locked first, as a step's are.
+        // A place the limit has no room for fails its own transfer on the
+        // devices (inside the job nothing is locked) and not the others.
         let places: Vec<u32> = batch
             .iter()
             .filter(|transfer| transfer.kind == TransferKind::StateIn)
             .map(|transfer| transfer.object)
             .collect();
-        if let Err(error) = self.ram.hold_places(&places) {
-            return Err(ExecError::Device {
-                device: 0,
-                message: format!("the checkpoint places of a transfer: {error}"),
-            });
-        }
+        let _ = self.ram.hold_places(&places);
         let steps = ares_cuda::gate::Steps::begin();
         self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
         for (device, handle) in self.handles.iter().enumerate() {
