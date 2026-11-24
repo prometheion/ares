@@ -272,10 +272,11 @@ fn included(value: &str) -> Result<(), ApiError> {
             "the probabilities of tokens are not served on this route: the reply's tokens are not \
              told apart into those of the answer, of the reasoning and of calls"
         }
-        "message.input_image.image_url" | "computer_call_output.output.image_url" => {
-            "images cannot be read: input other than text is not built"
+        "message.input_image.image_url" => {
+            "a response holds what the model wrote, not the images of the input"
         }
-        "file_search_call.results"
+        "computer_call_output.output.image_url"
+        | "file_search_call.results"
         | "web_search_call.results"
         | "web_search_call.action.sources"
         | "code_interpreter_call.outputs" => "the server runs no tools of its own",

@@ -435,6 +435,11 @@ fn what_is_not_served_is_refused_by_its_name() {
             "include",
             "runs no tools",
         ),
+        (
+            with(json!({"include": ["message.input_image.image_url"]})),
+            "include",
+            "not the images of the input",
+        ),
         (with(json!({"include": ["everything"]})), "include", "everything"),
         (with(json!({"include": "reasoning.encrypted_content"})), "include", "an array"),
         (with(json!({"top_logprobs": 3})), "top_logprobs", "probabilities"),
