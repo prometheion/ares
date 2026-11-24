@@ -215,6 +215,20 @@ impl StoreConfig {
             cpu_serves: false,
         }
     }
+
+    /// The slots a layer needs in VRAM for steps of `rows` rows: what they
+    /// can pick there and the free slots for experts that arrive before the
+    /// layer runs.
+    pub fn slots_for(&self, rows: u32) -> usize {
+        (rows * self.top_k) as usize + self.vram_reserve
+    }
+
+    /// The fewest slots a layer keeps in VRAM: a decode step's, or where the
+    /// CPU computes what VRAM cannot take ([`StoreConfig::cpu_serves`]) a
+    /// row's.
+    pub fn vram_floor(&self) -> usize {
+        self.slots_for(if self.cpu_serves { 1 } else { self.max_rows })
+    }
 }
 
 /// Where a layer's matrices are in a slot of each tier.
@@ -564,6 +578,16 @@ impl<D: SlotDevice> std::fmt::Debug for ExpertStore<D> {
     }
 }
 
+/// The bytes of VRAM the experts that stay resident on `device` take: all
+/// `n_experts` of each such layer.
+fn resident_bytes(layers: &[LayerSpec], device: usize, n_experts: usize) -> u64 {
+    layers
+        .iter()
+        .filter(|s| s.resident && s.device == device)
+        .map(|s| s.slot_bytes * n_experts as u64)
+        .sum()
+}
+
 /// The fewest slots each layer has in each tier.
 ///
 /// A decode step of `max_rows` rows can pick `max_rows * top_k` experts of a layer, and the
@@ -585,8 +609,8 @@ struct Floors {
 
 impl Floors {
     fn new(config: &StoreConfig, layers: &[LayerSpec], budget: &[u64], n_experts: usize) -> Self {
-        let step = (config.max_rows * config.top_k) as usize + config.vram_reserve;
-        let least = (config.top_k as usize + config.vram_reserve).min(step);
+        let step = config.slots_for(config.max_rows);
+        let least = config.slots_for(1).min(step);
         let device_floor: Vec<usize> = (0..budget.len())
             .map(|device| {
                 let fit = Self::fit(layers, budget, device, n_experts);
@@ -601,12 +625,11 @@ impl Floors {
     /// The slots each layer of `device` can have: the bytes of its budget beside the experts
     /// that stay resident, over the bytes a slot of each of its other layers takes.
     fn fit(layers: &[LayerSpec], budget: &[u64], device: usize, n_experts: usize) -> usize {
-        let on = || layers.iter().filter(|s| s.device == device);
-        let resident: u64 =
-            on().filter(|s| s.resident).map(|s| s.slot_bytes * n_experts as u64).sum();
-        let round: u64 = on().filter(|s| !s.resident).map(|s| s.slot_bytes).sum();
+        let round: u64 =
+            layers.iter().filter(|s| s.device == device && !s.resident).map(|s| s.slot_bytes).sum();
+        let resident = resident_bytes(layers, device, n_experts);
         let left = budget.get(device).copied().unwrap_or(0).saturating_sub(resident);
-        (left / round.max(1)).min(n_experts as u64) as usize
+        tier::rounds(left, round, n_experts)
     }
 
     /// Why the VRAM tier cannot be planned: the first device whose bytes for slots (what is
@@ -776,11 +799,7 @@ impl StorePlan {
         let ram_fixed: Vec<Option<usize>> =
             layers.iter().map(|s| s.resident.then_some(RESIDENT_PASSAGE)).collect();
         for (device, budget) in config.vram_bytes.iter().enumerate() {
-            let resident: u64 = layers
-                .iter()
-                .filter(|s| s.resident && s.device == device)
-                .map(|s| s.slot_bytes * n_experts as u64)
-                .sum();
+            let resident = resident_bytes(layers, device, n_experts);
             if resident > *budget {
                 return Err(plan_error(format!(
                     "the VRAM budget of device {device} ({} MiB) does not hold the experts that \

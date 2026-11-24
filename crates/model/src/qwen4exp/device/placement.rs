@@ -523,15 +523,11 @@ impl Placement {
 }
 
 /// The bytes of page-locked RAM for the experts' tier in host memory: `want`
-/// when given, otherwise half of what the system reports available (the
-/// default of the engine's RAM limit), and never more than `wanted`, what the
-/// experts that VRAM has no slot for take.
+/// when given, otherwise half of what the system reports available (a tool's
+/// guess: the engine follows the machine instead), and never more than
+/// `wanted`, what the experts that VRAM has no slot for take.
 pub fn ram_tier_bytes(want: Option<u64>, wanted: u64) -> u64 {
-    let available = || {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
-        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kib * 1024)
-    };
+    use ares_runtime::MemorySource;
+    let available = || ares_runtime::Meminfo.available();
     want.unwrap_or_else(|| available().map_or(1 << 30, |bytes| bytes / 2)).min(wanted)
 }

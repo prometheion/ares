@@ -58,6 +58,13 @@ pub(crate) struct Vacated {
     pub moves: Option<Vec<Move>>,
 }
 
+/// The slots every layer of a place gets from `bytes`, where one slot for
+/// each of them takes `per_round` bytes: as many rounds as fit, at most one
+/// slot per expert.
+pub(super) fn rounds(bytes: u64, per_round: u64, n_experts: usize) -> usize {
+    (bytes / per_round.max(1)).min(n_experts as u64) as usize
+}
+
 impl Tier {
     /// A tier for layers of `n_experts` experts: `layers[l]` is the place and
     /// the slot size of layer `l`, `budget[place]` the bytes the tier may
@@ -125,8 +132,8 @@ impl Tier {
                 .filter(|(layer, (place, _))| *place == pool.place && fixed_of(*layer).is_none())
                 .map(|(_, (_, s))| *s)
                 .sum();
-            let rounds = budget.get(pool.place).copied().unwrap_or(0) / per_round.max(1);
-            let slots = (rounds as usize).min(n_experts) * members.len();
+            let rounds = rounds(budget.get(pool.place).copied().unwrap_or(0), per_round, n_experts);
+            let slots = rounds * members.len();
             let floors: Vec<usize> = members.iter().map(|l| floor[*l]).collect();
             if slots < floors.iter().sum() {
                 return None;

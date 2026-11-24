@@ -160,7 +160,7 @@ impl Default for Rule {
             // docs/ARCHITECTURE.md for the measurement.
             speed: 2 * GIB,
             latency: Duration::from_millis(100),
-            piece: 64 * MIB,
+            piece: crate::expert_store::PIECE as u64,
             calm: Duration::from_secs(3),
             calm_max: Duration::from_secs(300),
             settle: Duration::from_secs(60),

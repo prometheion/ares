@@ -243,9 +243,8 @@ pub(super) fn plan_transit(
     let stride = layout.specs.iter().map(|s| s.slot_bytes).max().unwrap_or(1).max(1);
     let floor = 2 * config.top_k;
     // What the tiers must keep: the slots a decode step needs in every layer, or where the
-    // CPU computes what VRAM cannot take, a row's (`StoreConfig::cpu_serves`).
-    let rows = if config.cpu_serves { 1 } else { config.max_rows };
-    let tier_floor = u64::from(rows * config.top_k) + config.vram_reserve as u64;
+    // CPU computes what VRAM cannot take, a row's.
+    let tier_floor = config.vram_floor() as u64;
     config.transit_slots = config
         .vram_bytes
         .iter()
