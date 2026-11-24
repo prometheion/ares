@@ -33,9 +33,11 @@
 //!   spilled, returns the victims that turned out not to be needed, and hands
 //!   back one [`Outcome`]. Everything the outcome grants fits.
 //! - **When the pool is short, the sequence with the fewest generated tokens
-//!   gives way** (SGLang's order; ties: the longest prompt). Here it is
-//!   spilled, not recomputed: its pages go to RAM and it waits at the front of
-//!   the line to come back.
+//!   gives way** (SGLang's order; ties: the longest prompt). It is spilled:
+//!   it waits at the front of the line to come back, and the runtime says
+//!   what it then needs (the rows it computes again from what the prefix
+//!   cache kept, [`Admission::set_recompute`], and the cached pages it takes
+//!   again, [`Admission::set_restore`]).
 //! - **A request has a priority, a lower number first** (vLLM's numbers).
 //!   Everything above holds among the requests of one priority; the line is
 //!   taken by priority first, so a request never waits for one of a worse

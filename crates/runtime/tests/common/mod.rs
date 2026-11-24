@@ -1,5 +1,5 @@
-//! What the conductor tests and the GPU tests share: the ways to drive a
-//! runtime, and the scenarios that must hold whatever executes the steps.
+//! What the runtime's test suites share: the ways to drive a runtime, and the
+//! scenarios that must hold whatever executes the steps.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

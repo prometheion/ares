@@ -183,7 +183,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking and tool calls, `count_tokens`, `tokenize`, `pieces`, `failure`; the `Structure` of a reply and the `Json` value of requests) | Done, unit tested |
 | `ares-tokenizer` | Text to token ids and back for the byte-level BPE vocabularies of GGUF models, as llama.cpp does; the chat templates (the Jinja dialect of the supported models) and what a template declares about thinking and tool calls | Done; tests against `llama-tokenize` and `llama-server --jinja` |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); unit tests in `src` and route suites against a scripted engine without a GPU, suites that start the real binary (some need the 27B or the files of Flash-Next) and suites that run the engine in the test's process (the suites of the routes on the 0.8B, or on any file the server loads with `ARES_TEST_API_MODEL`: they pass on Flash-Next); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader, and `tests/real_router.rs` on real devices); images through a projector (`--mmproj`, see [Images in a prompt](#images-in-a-prompt)), `/v1/systemone` answers 501 |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, the prefix cache with its levels in RAM and on SSD, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` and `qwen4exp` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by both models on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`; pages that leave the devices go to RAM and, with `--cache`, to the SSD), and a request that gives way is not spilled with its pages: what it computed stays in the prefix cache, and it computes again what the cache no longer holds; the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's MTP block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) feeds both models' image cells (see [Images in a prompt](#images-in-a-prompt)) |
 
 Both test architectures are specified under [reference/](reference/):
@@ -477,7 +477,8 @@ end of its step.
 A model whose device side carries out the step record's copies and replay
 segments says so (`Model::prefix_cache`, with the bytes of one checkpoint on
 each device) and takes part in the prefix cache; one that does not has none.
-Until a real model exists a synthetic one drives the real kernels: 64 layers
+Beside the real models, a synthetic one drives the real kernels for the
+runtime's own tests and bench: 64 layers
 of two q4_K matrices of 5120 x 17408 each, with sums between devices for the
 tensor split and a hand-over per group of rows for the layer split. Its next
 token is a pure function of a sequence's own tokens, so the tests can check
@@ -7311,15 +7312,17 @@ look by look. The users:
   most (`SsdConfig::transit_ram`) off the limit before it hands the rest to
   the books.
 
-Inside one engine there is nobody else today: a mixture of experts has no
-prefix cache and a dense model has no experts, so the two elastic users never
-meet in one set of books, and a prompt's working memory, staging and
+Both elastic users meet in the books of a Flash-Next engine: the tier of
+experts, and the prompt cache of its recurrent state (`Model::prefix_cache`,
+and with `--cache` its level on SSD), whose floor of one checkpoint place the
+server books before the tier (`qwen4exp.rs`); the ranks above decide between
+them. A dense model has no tier. A prompt's working memory, staging and
 checkpoints do not borrow from each other at run time (staging is a fixed
-part of the tier, sized at load for the tier as it starts). The ranks decide
-between the engines of a server (see "Several models"). What does meet inside
-a dense model's engine is the checkpoints, the pages in RAM and the level of
-the prompt cache on SSD, which reads checkpoints out of the places and writes
-them back in; the rules for that are under "In RAM" and "On SSD".
+part of the tier, sized at load for the tier as it starts). The ranks also
+decide between the engines of a server (see "Several models"). What meets
+inside the prompt cache is the checkpoints, the pages in RAM and the level on
+SSD, which reads checkpoints out of the places and writes them back in; the
+rules for that are under "In RAM" and "On SSD".
 
 The limit is `GpuConfig::ram_limit`, which the server sets from `--ram`
 (default: all the machine has; the log states it, what the machine has
