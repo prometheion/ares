@@ -1139,21 +1139,33 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         `hybrid/wide.rs`, `cpu/mod.rs` and `transit.rs` found no cause; a diagnostic that prints the
         first tokens' log-probabilities per run (`zz_dbg_lent_gaps`, with the serve mode and a log
         line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`).
-  - [ ] **Defect, seen in the merge check (2026-11-23, `integrate2`)**: on the two local cards with
-        IQ2_XS, `--ram 8G`, no `--context`, a prompt of 80 507 tokens (483 far pages) and then an
-        unrelated short request: the short request hung in its first step until the watchdog took
-        the model down (600 s; both cards at 100 %, the device threads asleep, so the experts' kernels
-        waited for a store nobody served) in 2 of 2 runs of the rebased branch with the bench's flow
-        (`/var/tmp/ares-integrate2/bench.py prompt 64000`), and was slow in two more (its prompt of 5
-        rows 5 to 6 s, 2 to 3 tokens/s, almost no uploads; the conductor did not answer `/metrics`
-        for 30 s right after the long request). Main never (2 runs); the branch's own head before the
-        rebase (ea94d5f, lent steps) once: no hang, the short request's first token after 4.5 s; a
-        prompt of 31 000 tokens (100 far pages): no stall; the same 80 507 tokens without the bench's
-        `/metrics` calls and the short request before: no stall. Suspected: the finished request's far
-        pages, which rank as prompt cache, leaving through a RAM level that has no room at `--ram 8G`
-        (page by page to the drive, the conductor waiting) while the next request runs. Not found yet;
-        notes, logs and a gdb harness (`hangdbg.sh`, the server under gdb because ptrace_scope is 1) in
-        `/var/tmp/ares-integrate2/`.
+  - [x] **A request after a long far request stalls or hangs** (merge check 2026-11-23,
+        `integrate2`; `kvfix` 2026-11-24, two local cards, IQ2_XS, `--ram 8G`, the model's own
+        context, the bench's flow: a short request, a prompt of 80 507 tokens, an unrelated short
+        request, `/metrics` around each). The stall is explained and fixed: when the long request
+        ends its far pages (490) rank as prompt cache and the next trim takes them all off the
+        devices; the RAM level had no room at `--ram 8G`, and each page of a text long enough for
+        the drive waited for the writer to free a buffer (up to 250 ms) while the conductor ran no
+        step and answered no command. Counted with an instrumented build: that trim took 827 ms with
+        490 far pages, 463 waits for the writer and 468 transfer calls (the writer kept up that
+        time; at the merge check's load it was half a minute without an answer to `/metrics`). Far
+        pages now go into RAM when it has room and are dropped otherwise (`cache.rs`,
+        `far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive`). The hang
+        did not come back in 10 runs of the flow (on 852cc02 under gdb: this branch, an instrumented
+        build and the merge check's very binary; without gdb: before and after the fix; rebased on
+        main e86dcc8f: five with the fix; loads 3 to 56): its cause is not found, and the engine's
+        step watchdog (600 s) stays the guard. Seen on the way, neither of them the far pages': the
+        decode right after the long prompt is slow when the machine is busy (3.0 to 15.9 tokens/s
+        with the load; the pass's loan gives its slots back empty and the CPU computes the misses
+        beside other programs; main e86dcc8f 7.5 after its own 80k prompt, this branch 7.5 and 7.8
+        at like loads); and "a step stood still for 30s while rows of the n-gram table were read"
+        (one of the five runs with the fix, at load 27 to 34), which main e86dcc8f gives as well
+        (its 80k prompt at load 9 to 23; its warm-up at load 56 stood still on a pass's experts):
+        the 30-s checks count from the start of a wait, not from the last progress. Main against
+        this branch on the same cards: 10 752 VRAM slots (43.8 %) against 13 056 (53.1 %), the 80k
+        prompt in 105.5 s against 104.6 s (load 9 to 27); with the fix at load 5 to 8 102.6 s
+        (97.0 s before the rebase, 202.4 s without the pass's copy).
+
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
 Every tensor of both models takes every weight type the shape allows (the audit of every place
