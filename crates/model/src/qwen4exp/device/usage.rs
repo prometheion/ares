@@ -39,8 +39,8 @@ use ares_runtime::expert_store::{
 };
 
 use super::feed::Layout;
+use super::flow::Flow;
 use super::placement::Placement;
-use super::runtime::Flow;
 use crate::qwen4exp::Config;
 
 /// How long no step must have run before the empty slots are filled.

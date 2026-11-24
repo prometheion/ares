@@ -11,7 +11,7 @@
 //! the routers leave and serving the expert store.
 //!
 //! - A device thread enqueues its part layer by layer and stays at most
-//!   [`LEAD_LAYERS`] ahead of the layers whose records the store has handled:
+//!   [`LEAD_LAYERS`](super::flow::LEAD_LAYERS) ahead of the layers whose records the store has handled:
 //!   the driver's queue of commands is finite, and a thread that blocks in a
 //!   launch can no longer bring the expert its device waits for.
 //! - The store has one owner at a time. It sits behind a lock that no thread
@@ -27,13 +27,11 @@
 //!   model.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use ares_api::{ChatFormat, EngineError, ExpertStats, ModelCard, Prompt};
 use ares_core::Ledger;
-use ares_core::units::Bytes;
 use ares_cuda::{Device, DevicePtr, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepRecord, Stream};
 use ares_gguf::Gguf;
 use ares_io::Reader;
@@ -43,8 +41,8 @@ use ares_runtime::expert_store::{
 };
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    FarPages, LinkSpec, Logits, Model, ModelDrafts, ModelError, Pick, PinnedRam, PrefixCache,
-    Split, StepContext, TowerJob, TransferContext, Vision,
+    FarPages, LinkSpec, Logits, Model, ModelDrafts, ModelError, Pick, PrefixCache, Split,
+    StepContext, TowerJob, TransferContext, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -54,7 +52,9 @@ use super::feed::{
     Feed, Layout, MtpExperts, build_store, cpu_pool, device_slots, expert_map, places,
     plan_transit, reader,
 };
-use super::misses::{Misses, Progress, SpanPicks, WideStats};
+use super::flow::{Flow, Routing, Turn, wide_layer};
+use super::invalid;
+use super::misses::{SpanPicks, WideStats};
 use super::mtp::{MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
 use super::options::ModelOptions;
@@ -80,30 +80,13 @@ use crate::qwen4exp::{Config, Error as FileError};
 
 mod pass;
 
-use pass::{PassKey, PassLoan, PassRun};
-
-/// How many layers a device thread enqueues ahead of the last layer of its
-/// part whose route record the store has handled.
-///
-/// A step is not enqueued blind to its end: a layer that misses an expert
-/// makes the device wait for the host, and the driver's queue of commands for
-/// a device is finite. A host that goes on enqueuing the rest of the step (a
-/// layer is about 30 launches, a step of 48 layers 1 300) fills that queue,
-/// blocks inside a launch, and can then no longer bring the expert the device
-/// waits for. Seen as a step that never ends, on one device from the first
-/// prompt step on, on two devices with a few hundred timed events more per
-/// step. The host enqueues much faster than a device computes, so staying
-/// this far ahead never leaves a device without work.
-pub(super) const LEAD_LAYERS: usize = 6;
+use pass::PassRun;
+pub(super) use pass::{PassKey, PassLoan};
 
 /// How long a part waits for the others to arrive while they open: the
 /// longest thing between two meetings is the upload of a device's weights
 /// from a cold drive.
 const MEET_LIMIT: Duration = Duration::from_secs(1800);
-
-/// How long a failed step serves the store so that the kernels that wait for
-/// an expert can end, before the device threads leave it.
-const DRAIN: Duration = Duration::from_secs(5);
 
 /// What the expert store measured of serving a miss on this machine
 /// ([`Qwen4Exp::expert_costs`]).
@@ -128,17 +111,6 @@ pub enum OpenError {
     /// A choice that a model on the runtime cannot carry out.
     #[error("{0}")]
     Choice(String),
-}
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
-}
-
-fn model_error(error: super::Error) -> ModelError {
-    match error {
-        super::Error::Model(e) => e,
-        other => invalid(other.to_string()),
-    }
 }
 
 // --- the parts that open together -------------------------------------------
@@ -277,418 +249,6 @@ struct PlanBox {
     /// The bytes of the RAM tier that are locked at the start.
     ram_start: u64,
 }
-
-/// How long the tier of experts locks pieces at a time when it may hold
-/// more and no step runs: the thread that watches the machine's memory does
-/// it, it must look again soon, and a step that begins waits for it.
-const GROW_SLICE: Duration = Duration::from_millis(40);
-
-/// How long the start of a step tries to make room in the RAM limit for the
-/// K and V beyond VRAM that it names, and how long each try waits for what
-/// is on its way into the tier of experts before the tier gives pieces up.
-const FAR_WAIT: Duration = Duration::from_secs(10);
-const FAR_SHRINK_WAIT: Duration = Duration::from_millis(200);
-
-// --- what the device threads share in a step --------------------------------
-
-/// The expert store, the rows of the n-gram table, and the counters that tell
-/// the threads how far each part's step has got.
-pub(super) struct Flow {
-    feed: Mutex<Feed>,
-    ngram: Mutex<NgramFeed>,
-    /// Per part: the layers of the running step that it has enqueued, and the
-    /// layers whose route records the store has handled.
-    enqueued: Vec<AtomicUsize>,
-    followed: Vec<AtomicUsize>,
-    /// The step the store has begun, and how many parts have ended it.
-    begun: AtomicU64,
-    finished: AtomicUsize,
-    /// Set by a part whose step failed, so that the others give up.
-    failed: AtomicBool,
-    /// Uploads and reads the store had finished the last time anyone looked.
-    uploads_seen: AtomicU64,
-    stall: Duration,
-    /// What the store counted, summed over the times it was read.
-    totals: Mutex<ExpertStats>,
-    /// What the wide steps found and waited for, since the engine started.
-    wide: Mutex<WideStats>,
-    /// The most rows of a step on the parts' own scratch; a wider step runs on
-    /// VRAM the expert slots lend: per part its bytes and where they lie.
-    own_rows: u32,
-    lent: Vec<Vec<u64>>,
-    lent_at: Vec<Option<Pieces>>,
-    /// Whether the running step runs on the loan.
-    on_loan: AtomicBool,
-    /// Prompts read layer by layer (`runtime/pass.rs`): the most rows of one (0: none), what
-    /// each part keeps of a row, the picks of a row, the loan of the pass that runs or ran
-    /// last, and whether the step being run is a pass.
-    pass_rows: u32,
-    pass_sizes: Vec<PassSizes>,
-    top_k: u32,
-    pass: Mutex<Option<PassLoan>>,
-    pass_completed: AtomicBool,
-    /// In a step of a pass: a part paused it; and by layers, the residuals of micro-batches
-    /// the device before has handed over and the next has released.
-    pass_paused: AtomicBool,
-    pass_sent: AtomicUsize,
-    pass_released: AtomicUsize,
-    /// Both devices on every layer: the pieces of the pass the mixer has let run, and the
-    /// picks its router made, which the worker takes.
-    pass_go: AtomicU64,
-    pass_picks: Mutex<Option<(u64, Arc<SpanPicks>)>>,
-    /// The passes that took a loan so far: each is numbered by it.
-    pass_count: AtomicU64,
-    /// The far pools of the parts (`blocks/far.rs`), the far slots their
-    /// pieces cover now, and the engine's RAM, which books them.
-    far: Vec<Arc<Mutex<FarPool>>>,
-    far_live: Mutex<Vec<bool>>,
-    ram: PinnedRam,
-}
-
-impl Flow {
-    fn parts(&self) -> usize {
-        self.enqueued.len()
-    }
-
-    /// Adds what the wide steps found since the last call to the totals. The experts of a
-    /// layer that a wide step found in a slot are hits and the others are picks the store
-    /// counts when it brings them (as misses, never as hits).
-    fn fold_wide(&self) {
-        let wide = self.lock_feed().take_wide();
-        let found = wide.picked - wide.missing;
-        let mut totals = self.totals.lock().unwrap_or_else(|e| e.into_inner());
-        totals.picks += found;
-        totals.hits += found;
-        totals.wait_us +=
-            (wide.compute_wait + wide.bring_wait + wide.round_wait).as_micros() as u64;
-        drop(totals);
-        self.wide.lock().unwrap_or_else(|e| e.into_inner()).add(&wide);
-    }
-
-    fn fail(&self) {
-        self.failed.store(true, Ordering::SeqCst);
-    }
-
-    pub(super) fn lock_feed(&self) -> MutexGuard<'_, Feed> {
-        self.feed.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The tier of experts in RAM follows `allowance`, the bytes it may hold.
-    /// Called by the thread that watches the machine's memory. A running
-    /// step gives pieces up, and takes one, when it ends
-    /// ([`Flow::finish`]); when no step runs, this gives them up and locks
-    /// pieces for a while, and no step begins meanwhile: the driver's unlock
-    /// waits for the device, and a step's kernels can wait for the store.
-    fn follow_ram(&self, ram: &PinnedRam, allowance: u64) {
-        let mut feed = self.lock_feed();
-        feed.store.set_ram_target(allowance);
-        if feed.store.waiting() > 0 {
-            return;
-        }
-        if feed.store.shrink_ram(Duration::ZERO).is_err() {
-            self.fail();
-        }
-        drop(feed.store.take_released());
-        if feed.store.ram_at_floor() {
-            ram.experts_floor(feed.store.ram_bytes().0);
-        }
-        let begun = Instant::now();
-        while begun.elapsed() < GROW_SLICE && !feed.store.in_step() {
-            if !matches!(feed.store.grow_ram(1), Ok(1)) {
-                break;
-            }
-        }
-    }
-
-    pub(super) fn lock_ngram(&self) -> MutexGuard<'_, NgramFeed> {
-        self.ngram.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// A step begins on part `index` (device `index`, whose stream is
-    /// `stream`): the first part to arrive begins it for the store, every
-    /// part makes its stream wait for what the store removed from the tables
-    /// since the step before.
-    /// `windows` are the step's windows that verify drafts, as (first row,
-    /// rows), with what each row of the step is worth (the record's row
-    /// worth): their rows past the first wait for the file only while they
-    /// are worth it. A step that
-    /// only drafts (`windows` is `None`) is no step of the store: its routing
-    /// is the MTP block's, whose experts are resident, and the work between
-    /// two steps of the store (the heat's decay, the slots that move, the RAM
-    /// tier that grows) is counted in the model's steps.
-    #[allow(clippy::too_many_arguments)]
-    fn begin(
-        &self,
-        step: u64,
-        rows: u32,
-        windows: Option<StepWindows<'_>>,
-        far_live: &[bool],
-        index: usize,
-        stream: &Stream,
-        pass: Option<&PassKey>,
-    ) -> Result<(), ModelError> {
-        let mut feed = self.lock_feed();
-        if self.begun.load(Ordering::Acquire) != step {
-            // The K and V beyond VRAM that the step names are locked before
-            // the store begins it: the tier of experts gives up what they take
-            // while no step runs.
-            self.lock_far(&mut feed, far_live)?;
-            for counter in self.enqueued.iter().chain(&self.followed) {
-                counter.store(0, Ordering::Release);
-            }
-            self.finished.store(0, Ordering::Release);
-            // A prompt read layer by layer keeps its rows on a loan of its own; the loan of
-            // one before goes back first, or serves it.
-            if windows.is_some() {
-                let far_reach = far_live.iter().rposition(|l| *l).map_or(0, |s| s as u32 + 1);
-                self.lend_pass(&mut feed, pass, far_reach)?;
-            }
-            self.pass_completed.store(false, Ordering::Release);
-            self.pass_paused.store(false, Ordering::Release);
-            let wide = rows > self.own_rows && windows.is_some() && pass.is_none();
-            if wide {
-                self.lend(&mut feed)?;
-            }
-            self.on_loan.store(wide, Ordering::Release);
-            if let Some((windows, worth)) = windows {
-                feed.begin_step(rows).map_err(model_error)?;
-                feed.store.set_windows(windows, worth);
-            }
-            self.begun.store(step, Ordering::Release);
-        }
-        feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
-    }
-
-    /// Locks the pieces of every far pool that hold far pages in use (`live`,
-    /// a flag per far slot) and gives back the others, between steps, with
-    /// the store not in a step. The tier of experts gives up what the RAM
-    /// limit has no room for: a running sequence's K and V rank above it
-    /// (see "Host memory" in `docs/ARCHITECTURE.md`).
-    fn lock_far(&self, feed: &mut Feed, live: &[bool]) -> Result<(), ModelError> {
-        if self.far.is_empty() {
-            return Ok(());
-        }
-        let mut last = self.far_live.lock().unwrap_or_else(|e| e.into_inner());
-        if last.as_slice() == live {
-            return Ok(());
-        }
-        let mut pools: Vec<_> =
-            self.far.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner())).collect();
-        let wanted: Vec<Vec<bool>> = pools.iter().map(|p| p.wanted(live)).collect();
-        // What holds no page in use goes back first; what the pages need is
-        // locked in every pool.
-        for (pool, wanted) in pools.iter_mut().zip(&wanted) {
-            pool.release_unwanted(wanted);
-        }
-        let bytes: u64 = pools.iter().zip(&wanted).map(|(p, w)| p.bytes_of(w)).sum();
-        let locked: u64 = pools.iter().map(|p| p.locked()).sum();
-        self.ram.set_context_target(bytes.max(locked));
-        let started = Instant::now();
-        loop {
-            let short = pools
-                .iter_mut()
-                .zip(&wanted)
-                .find_map(|(pool, wanted)| pool.lock_wanted(wanted).err());
-            match short {
-                None => break,
-                Some(Err(error)) => return Err(error),
-                Some(Ok(short)) => {
-                    if started.elapsed() > FAR_WAIT {
-                        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
-                        return Err(invalid(format!(
-                            "the RAM limit has no room for {} more of K and V beyond VRAM: the \
-                             tier of experts is at its floor and the prompt cache holds the rest",
-                            Bytes(short.0)
-                        )));
-                    }
-                    // The tier gives up what its allowance no longer has room for.
-                    feed.store.set_ram_target(self.ram.experts_allowance());
-                    feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
-                    drop(feed.store.take_released());
-                    if feed.store.ram_at_floor() {
-                        self.ram.experts_floor(feed.store.ram_bytes().0);
-                    }
-                    self.ram.sweep_checkpoints();
-                }
-            }
-        }
-        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
-        last.clear();
-        last.extend_from_slice(live);
-        Ok(())
-    }
-
-    /// Lends every device the VRAM of a step wider than the parts' own
-    /// scratch, if it has not yet, and waits until the memory is free: the
-    /// slots' experts moved out and copied down. Between steps.
-    fn lend(&self, feed: &mut Feed) -> Result<(), ModelError> {
-        let started = Instant::now();
-        for (device, pieces) in self.lent.iter().enumerate().filter(|(_, p)| !p.is_empty()) {
-            while feed
-                .store
-                .lend_pieces(device, pieces)
-                .map_err(|e| invalid(e.to_string()))?
-                .is_none()
-            {
-                self.check(started, "the expert slots lent VRAM")?;
-                feed.store.poll().map_err(|e| invalid(e.to_string()))?;
-                std::hint::spin_loop();
-            }
-            while !feed.store.scratch_ready(device).map_err(|e| invalid(e.to_string()))? {
-                self.check(started, "the expert slots lent VRAM")?;
-                feed.store.poll().map_err(|e| invalid(e.to_string()))?;
-                std::hint::spin_loop();
-            }
-        }
-        Ok(())
-    }
-
-    /// Where the VRAM lent to part `index` lies while the expert slots lend it.
-    fn lent(&self, index: usize) -> Option<Pieces> {
-        let lent = self.lent_at.get(index).cloned().flatten()?;
-        self.lock_feed().store.has_scratch(index).then_some(lent)
-    }
-
-    fn enqueued_layers(&self) -> Vec<usize> {
-        self.enqueued.iter().map(|n| n.load(Ordering::Acquire)).collect()
-    }
-
-    /// Hands the route records that have arrived to the store and lets it and
-    /// the reads of table rows work, if no other thread is doing that now.
-    /// Never waits.
-    pub(super) fn pump(&self) -> Result<(), ModelError> {
-        match self.feed.try_lock() {
-            Ok(mut feed) => {
-                let enqueued = self.enqueued_layers();
-                feed.pump(&enqueued).map_err(model_error)?;
-                for (counter, followed) in self.followed.iter().zip(feed.followed()) {
-                    counter.store(*followed, Ordering::Release);
-                }
-            }
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(invalid("the expert store was left broken by a failed step"));
-            }
-        }
-        if let Ok(mut ngram) = self.ngram.try_lock() {
-            ngram.poll();
-        }
-        Ok(())
-    }
-
-    /// A number that changes whenever a layer is enqueued or followed or the store finishes
-    /// an upload or a read. A wide step that waits for the other part's layers makes no
-    /// progress of its own, and has stood still only when this does not change either.
-    fn progress(&self) -> u64 {
-        if let Ok(feed) = self.feed.try_lock() {
-            let stats = feed.store.stats();
-            let moved = stats.uploads
-                + stats.demand_reads
-                + stats.transit_uploads
-                + stats.transit_reads
-                + stats.transit_ahead_reads;
-            self.uploads_seen.store(moved, Ordering::Relaxed);
-        }
-        let layers: usize =
-            self.enqueued.iter().chain(&self.followed).map(|n| n.load(Ordering::Acquire)).sum();
-        layers as u64 + self.uploads_seen.load(Ordering::Relaxed)
-    }
-
-    /// An error when another part failed, or when the step has stood still
-    /// since `started` for longer than a step may.
-    pub(super) fn check(&self, started: Instant, what: &str) -> Result<(), ModelError> {
-        if self.failed.load(Ordering::Acquire) {
-            return Err(ModelError::Aborted);
-        }
-        if started.elapsed() < self.stall {
-            return Ok(());
-        }
-        self.fail();
-        let enqueued = self.enqueued_layers();
-        let state = match self.feed.try_lock() {
-            Ok(feed) => feed.standing_still(&enqueued),
-            Err(_) => "the expert store is busy".to_owned(),
-        };
-        Err(invalid(format!("a step stood still for {:.0?} while {what}: {state}", self.stall)))
-    }
-
-    /// Serves the store until `part` has no layer enqueued more than the lead
-    /// ahead of the records it has handled.
-    fn throttle(&self, part: usize) -> Result<(), ModelError> {
-        let started = Instant::now();
-        while self.enqueued[part].load(Ordering::Acquire)
-            >= self.followed[part].load(Ordering::Acquire) + LEAD_LAYERS
-        {
-            self.check(started, "the host held back the next layer")?;
-            self.pump()?;
-            std::hint::spin_loop();
-        }
-        Ok(())
-    }
-
-    /// Waits for the rows of the n-gram table of the step, serving the store
-    /// meanwhile, and returns them.
-    fn await_rows(&self) -> Result<Vec<u8>, ModelError> {
-        let started = Instant::now();
-        loop {
-            {
-                let mut ngram = self.lock_ngram();
-                ngram.poll();
-                if ngram.is_done() {
-                    return Ok(ngram.rows().map_err(model_error)?.to_vec());
-                }
-            }
-            self.check(started, "rows of the n-gram table were read")?;
-            self.pump()?;
-            std::hint::spin_loop();
-        }
-    }
-
-    /// Serves the store for a while so that kernels that wait for an expert
-    /// can end: after a step failed, before its buffers are freed.
-    fn drain(&self, idle: impl Fn() -> bool) {
-        let started = Instant::now();
-        while !idle() && started.elapsed() < DRAIN {
-            if self.pump().is_err() {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-    }
-
-    /// A part has ended its step on the device: the last of them ends it for
-    /// the store, unless it only drafted (`store` false).
-    fn finish(&self, store: bool) -> Result<(), ModelError> {
-        if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() {
-            let mut feed = self.lock_feed();
-            if store {
-                feed.end_step().map_err(model_error)?;
-                // What the tier gave up at the end of this step is unlocked
-                // here, where every device has ended the step and none has
-                // begun the next.
-                drop(feed.store.take_released());
-            }
-            // A pass that ended in this step has read its rows; its loan stays until the
-            // next step begins.
-            if self.pass_completed.load(Ordering::Acquire) {
-                self.pass_done();
-            }
-            // VRAM lent for wide steps goes back after the first step that did
-            // not run on it: that step's start still read what the last one
-            // left there (the MTP block follows its rows).
-            if !self.on_loan.load(Ordering::Acquire) && !self.has_pass_loan() {
-                for device in 0..self.lent.len() {
-                    feed.store.return_scratch(device).map_err(|e| invalid(e.to_string()))?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The windows of a step that verify drafts, as (first row, rows), and what
-/// every row of the step is worth in milliseconds (the record's row worth).
-type StepWindows<'a> = (&'a [(u32, u32)], Option<&'a [f32]>);
 
 // --- the model --------------------------------------------------------------
 
@@ -1464,7 +1024,7 @@ impl Qwen4Exp {
                     &|layer, expert| placement.owner(layer, expert),
                     experts_of,
                 )
-                .map_err(model_error),
+                .map_err(ModelError::from),
         )
     }
 
@@ -1604,7 +1164,7 @@ impl Qwen4Exp {
                             .min(self.opts.slot_bytes.unwrap_or(u64::MAX))
                     })
                     .collect();
-                let reader = reader(&self.gguf, self.mtp.as_deref()).map_err(model_error)?;
+                let reader = reader(&self.gguf, self.mtp.as_deref())?;
                 let head = self
                     .mtp
                     .as_ref()
@@ -1615,7 +1175,7 @@ impl Qwen4Exp {
                     MtpExperts { gguf, weights, device: self.head_device() }
                 });
                 let map = expert_map(&self.gguf, c, layout.per_layer, mtp_experts.as_ref())
-                    .map_err(model_error)?;
+                    ?;
                 // The tier is planned for all it can ever hold, what the limit
                 // leaves and the experts without a slot in VRAM can use, and
                 // starts with what it may hold now. Staging is sized for the
@@ -1680,8 +1240,7 @@ impl Qwen4Exp {
             layout,
             serve,
             o.max_rows.min(MAX_BATCH),
-        )
-        .map_err(model_error)?;
+        )?;
         self.meeting.meet(
             n,
             |build| {
@@ -1707,11 +1266,8 @@ impl Qwen4Exp {
                 // one for each device.
                 let cpu = (serve != Serve::Stream)
                     .then(|| cpu_pool(self.opts.cpu_workers, 1 + n).map(|pool| (pool, serve)))
-                    .transpose()
-                    .map_err(model_error)?;
-                let store = build_store(plan, layout, map, reader, slots, tier, cpu)
-                    .map_err(model_error)?;
-                let ram_bytes = store.ram_bytes().0;
+                    .transpose()?;
+                let store = build_store(plan, layout, map, reader, slots, tier, cpu)?;
                 let ram_fixed = store.ram_fixed_bytes();
                 // The widest step a prompt read alone takes: the rows the
                 // parts were opened for, or the most below them, in multiples
@@ -1843,43 +1399,24 @@ impl Qwen4Exp {
                 }
                 if build.mtp {
                     feed.set_mtp();
-                    feed.fill_mtp(c.experts.count).map_err(model_error)?;
+                    feed.fill_mtp(c.experts.count)?;
                 }
-                let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)
-                    .map_err(model_error)?;
+                let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)?;
                 let flow = Arc::new(Flow {
-                    feed: Mutex::new(feed),
-                    ngram: Mutex::new(ngram),
-                    enqueued: (0..n).map(|_| AtomicUsize::new(0)).collect(),
-                    followed: (0..n).map(|_| AtomicUsize::new(0)).collect(),
-                    begun: AtomicU64::new(0),
-                    finished: AtomicUsize::new(0),
-                    failed: AtomicBool::new(false),
-                    uploads_seen: AtomicU64::new(0),
-                    stall: self.opts.stall,
-                    wide: Mutex::new(WideStats::default()),
-                    own_rows: o.own_rows(),
                     lent: build.lent_pieces.clone(),
                     lent_at: build.lent_at.clone(),
-                    on_loan: AtomicBool::new(false),
                     pass_rows: build.pass_rows,
                     pass_sizes,
-                    top_k: c.experts.used as u32,
-                    pass: Mutex::new(None),
-                    pass_completed: AtomicBool::new(false),
-                    pass_paused: AtomicBool::new(false),
-                    pass_sent: AtomicUsize::new(0),
-                    pass_released: AtomicUsize::new(0),
-                    pass_go: AtomicU64::new(0),
-                    pass_picks: Mutex::new(None),
-                    pass_count: AtomicU64::new(0),
                     far: build.far.iter().flatten().cloned().collect(),
-                    far_live: Mutex::new(Vec::new()),
-                    ram: ram.clone(),
-                    totals: Mutex::new(ExpertStats {
-                        ram_tier_bytes: ram_bytes,
-                        ..Default::default()
-                    }),
+                    ..Flow::new(
+                        feed,
+                        ngram,
+                        n,
+                        self.opts.stall,
+                        o.own_rows(),
+                        c.experts.used as u32,
+                        ram.clone(),
+                    )
                 });
                 let _ = self.flow.set(flow.clone());
                 self.usage.attach(&flow, layout, &self.placement);
@@ -1991,18 +1528,7 @@ impl Qwen4Exp {
             chains: Vec::new(),
             only_drafts: false,
             drives_ngram: part.ngram_layer().is_some(),
-            routing: Routing {
-                mixer: self.placement.tensor.as_ref().map(|t| t.mixer).filter(|m| *m != index),
-                owned: self.placement.tensor.as_ref().map(|_| {
-                    (0..c.n_layer)
-                        .map(|layer| {
-                            (0..c.experts.count as u32)
-                                .map(|e| self.placement.owner(layer, e) == index)
-                                .collect()
-                        })
-                        .collect()
-                }),
-            },
+            routing: Routing::of(&self.placement, c, index),
             part,
             flow,
             segments: Vec::new(),
@@ -2361,53 +1887,6 @@ impl std::fmt::Debug for Qwen4ExpDevice {
     }
 }
 
-/// The experts of layer `layer` of `part` (the `index`-th) in a step of more than eight
-/// rows: the first round is enqueued with the experts that have a slot, then the store is
-/// served until the misses are brought and computed (`Misses`).
-fn wide_layer(
-    part: &mut Part,
-    flow: &Flow,
-    index: usize,
-    env: &StepEnv<'_>,
-    layer: usize,
-    routing: &Routing,
-) -> Result<(), ModelError> {
-    let owned = |expert: u32| routing.owned.as_ref().is_none_or(|o| o[layer][expert as usize]);
-    let (mut started, mut seen) = (Instant::now(), flow.progress());
-    let source = routing.mixer.map(|mixer| flow.lock_feed().board(mixer));
-    let mut misses = {
-        let feed = flow.lock_feed();
-        Misses::begin(part, env, &feed, index, layer, source, &owned).map_err(model_error)?
-    };
-    loop {
-        let routed =
-            routing.mixer.is_none_or(|mixer| flow.enqueued[mixer].load(Ordering::Acquire) > layer);
-        let progress = {
-            let mut feed = flow.lock_feed();
-            misses.advance(part, env, &mut feed, routed, &owned).map_err(model_error)?
-        };
-        if progress == Progress::Done {
-            return Ok(());
-        }
-        let progress = flow.progress();
-        if progress != seen {
-            (started, seen) = (Instant::now(), progress);
-        }
-        flow.check(started, "the experts of a wide step were brought")?;
-        flow.pump()?;
-        std::hint::spin_loop();
-    }
-}
-
-/// Who routes for a part and which experts it computes, when both devices work on every
-/// layer.
-struct Routing {
-    /// The device that routes, for a part that does not.
-    mixer: Option<usize>,
-    /// Per layer and expert, whether this part computes the expert; `None` for all.
-    owned: Option<Vec<Vec<bool>>>,
-}
-
 impl Qwen4ExpDevice {
     /// The stream is idle: nothing of a failed step waits for the host any
     /// more.
@@ -2558,7 +2037,7 @@ impl Qwen4ExpDevice {
             }
             self.part.enqueue_commit(stream, &self.accepted)?;
             if self.drives_ngram {
-                self.flow.lock_ngram().settle(&self.accepted).map_err(model_error)?;
+                self.flow.lock_ngram().settle(&self.accepted)?;
             }
         }
 
@@ -2664,11 +2143,11 @@ impl Qwen4ExpDevice {
             let mut ngram = self.flow.lock_ngram();
             let mut parts = Vec::with_capacity(self.segments.len());
             for s in &self.segments {
-                ngram.begin_sequence(s.slot, s.pos0 as u32).map_err(model_error)?;
+                ngram.begin_sequence(s.slot, s.pos0 as u32)?;
                 let rows = s.row0 as usize..(s.row0 + s.n_rows) as usize;
                 parts.push((s.slot, &self.tokens[rows]));
             }
-            ngram.ask(&parts).map_err(model_error)?;
+            ngram.ask(&parts)?;
             for (slot, tokens) in parts {
                 let direct = self.segments.iter().any(|s| s.slot == slot && s.direct);
                 if direct {
@@ -2735,13 +2214,13 @@ impl Qwen4ExpDevice {
             if ngram_at == Some(i) && fetched.is_none() {
                 fetched = Some(self.flow.await_rows()?);
             }
-            self.flow.throttle(self.index)?;
-            self.part.enqueue_layer(&env!(fetched.as_deref(), None), i)?;
-            // The other part of a shared layer may read this one's record from now on.
-            self.flow.enqueued[self.index].store(i + 1, Ordering::Release);
+            let env = env!(fetched.as_deref(), None);
+            self.flow.enqueue_layer(&mut self.part, self.index, &env, i)?;
             if rows > MAX_BATCH {
-                let env = env!(fetched.as_deref(), None);
-                wide_layer(&mut self.part, &self.flow, self.index, &env, i, &self.routing)?;
+                let part = &mut self.part;
+                let (index, routing) = (self.index, &self.routing);
+                let turn = Turn { part, index, env: &env, routing, pass: false };
+                wide_layer(&self.flow, i, &mut [turn])?;
             }
             self.flow.pump()?;
         }
@@ -2762,28 +2241,9 @@ impl Qwen4ExpDevice {
 
     fn wait_step(&mut self, end: &Event) -> Result<(), ModelError> {
         let flow = &self.flow;
-        // A wide step's last layers may take long: it stands still only when
-        // no layer's route record reaches the store.
-        let followed = || flow.followed.iter().map(|n| n.load(Ordering::Acquire)).sum::<usize>();
-        let (mut started, mut seen) = (Instant::now(), followed());
-        while !end.is_done()? {
-            let now = followed();
-            if now != seen {
-                (started, seen) = (Instant::now(), now);
-            }
-            flow.check(started, "a device ran the step")?;
-            flow.pump()?;
-            std::hint::spin_loop();
-        }
+        flow.wait_for(end, "a device ran the step")?;
         // Every route record of this part is with the store.
-        let started = Instant::now();
-        while flow.followed[self.index].load(Ordering::Acquire)
-            < flow.enqueued[self.index].load(Ordering::Acquire)
-        {
-            flow.check(started, "route records were on their way")?;
-            flow.pump()?;
-            std::hint::spin_loop();
-        }
+        flow.follow(self.index)?;
         // The MTP block's chains of a step that only drafts made their drafts
         // on the device; the round after it verifies them, or the first of
         // them, and the rows of the n-gram table its rows need are read now,

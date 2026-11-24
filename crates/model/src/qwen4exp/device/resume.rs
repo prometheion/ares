@@ -27,9 +27,9 @@
 use ares_cuda::{Device, DevicePtr, Stream};
 use ares_runtime::{DeviceTransfer, ModelError, PinnedRam, RecordView, TransferKind};
 
+use super::flow::Flow;
 use super::mtp::MtpBlock;
 use super::part::Part;
-use super::runtime::Flow;
 use crate::blocks::slots::{self, Checkpoint, Copies, Pages, Places};
 
 fn model_error(error: super::Error) -> ModelError {

@@ -27,18 +27,21 @@ use std::time::Instant;
 use ares_cuda::{Segment, StepRecord};
 use ares_runtime::{Logits, ModelError, StepContext};
 
-use super::super::misses::{Misses, Progress, SpanPicks};
+use super::super::feed::Feed;
+use super::super::flow::{Flow, Routing, Turn};
+use super::super::invalid;
+use super::super::misses::{Misses, SpanPicks};
 use super::super::part::{
     MicroPlan, Part, PassAt, PassLayout, PassSizes, StepEnv, chunk_rows, chunks_of,
     micro_batches_at,
 };
-use super::{Feed, Flow, Qwen4ExpDevice, Routing, invalid, model_error};
+use super::Qwen4ExpDevice;
 use crate::blocks::rows;
 
 /// The prompt rows a pass reads: its sequence's slot, its first position and its rows, and
 /// the rows (from its first) at which it saves the state for checkpoints inside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PassKey {
+pub(in super::super) struct PassKey {
     pub slot: u32,
     pub pos0: i32,
     pub rows: u32,
@@ -54,7 +57,7 @@ impl PassKey {
 }
 
 /// The loan of a pass on every device.
-pub(super) struct PassLoan {
+pub(in super::super) struct PassLoan {
     key: PassKey,
     /// A number that is new for every pass that takes a loan: two passes of the same rows
     /// one after the other are two passes.
@@ -124,7 +127,7 @@ impl Flow {
     /// devices lend anew; a step that is no pass gives a done pass's loan back. A new pass's
     /// loan holds a copy of `far_slots` far slots of a layer (the far slots the pages in use
     /// reach) where a part keeps K and V in host memory.
-    pub(super) fn lend_pass(
+    pub(in super::super) fn lend_pass(
         &self,
         feed: &mut Feed,
         pass: Option<&PassKey>,
@@ -273,7 +276,7 @@ impl Flow {
             return Ok(());
         }
         let n = feed.layout().shapes[at].n_experts;
-        let owned = |e: &u32| routing.owned.as_ref().is_none_or(|o| o[layer][*e as usize]);
+        let owned = |e: &u32| routing.owns(layer, *e);
         let experts: Vec<u32> = (0..n).filter(owned).collect();
         let each = (u64::from(rows) * u64::from(self.top_k) / u64::from(n.max(1))).max(1);
         let named = vec![u32::try_from(each).unwrap_or(u32::MAX); experts.len()];
@@ -358,14 +361,14 @@ impl Flow {
     }
 
     /// The pass of the step has read its rows (by the last part to end the step).
-    pub(super) fn pass_done(&self) {
+    pub(in super::super) fn pass_done(&self) {
         if let Some(loan) = self.pass.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             loan.done = true;
         }
     }
 
     /// Whether a pass holds a loan.
-    pub(super) fn has_pass_loan(&self) -> bool {
+    pub(in super::super) fn has_pass_loan(&self) -> bool {
         self.pass.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 }
@@ -548,7 +551,7 @@ impl Qwen4ExpDevice {
         // the pieces in the order they run, a block of eight each (the output of a layer's
         // experts crosses in the next layer's piece of the same micro-batch, first), and the
         // mixer decides for both whether a piece runs.
-        let shared = self.routing.owned.is_some();
+        let shared = self.routing.shared();
         let follows = self.routing.mixer.is_some();
         let micro_n = run.micro.len() as u64;
         let base = token.wrapping_mul(self.per_step).wrapping_add(1);
@@ -624,7 +627,7 @@ impl Qwen4ExpDevice {
                 unsafe { self.part.pass_record_to_host(i, host, copied)? };
                 run.picks.mark(i);
             }
-            self.flow.enqueued[self.index].store(i + 1, Ordering::Release);
+            self.flow.mark_enqueued(self.index, i + 1);
             let env = StepEnv {
                 stream,
                 record: &run.span,
@@ -811,9 +814,7 @@ impl Qwen4ExpDevice {
             None => {
                 let picks = match self.picks.take() {
                     Some(picks) if picks.holds(key.rows, top_k) => picks,
-                    _ => Arc::new(
-                        SpanPicks::new(self.part.device(), key.rows, top_k).map_err(model_error)?,
-                    ),
+                    _ => Arc::new(SpanPicks::new(self.part.device(), key.rows, top_k)?),
                 };
                 self.picks = Some(picks.clone());
                 picks.reset();
@@ -873,31 +874,15 @@ fn pass_experts(
     routing: &Routing,
     picks: &Arc<SpanPicks>,
 ) -> Result<(), ModelError> {
-    let owned = |expert: u32| routing.owned.as_ref().is_none_or(|o| o[layer][expert as usize]);
-    let (mut started, mut seen) = (Instant::now(), flow.progress());
     // A worker computes its experts of the picks the mixer's router made.
     let relay = routing.mixer.is_some();
-    let mut misses = {
+    let misses = {
         let feed = flow.lock_feed();
-        Misses::begin_pass(part, env, &feed, index, layer, picks.clone(), relay, &owned)
-            .map_err(model_error)?
+        let owned = |expert: u32| routing.owns(layer, expert);
+        Misses::begin_pass(part, env, &feed, index, layer, picks.clone(), relay, &owned)?
     };
-    loop {
-        let progress = {
-            let mut feed = flow.lock_feed();
-            misses.advance(part, env, &mut feed, true, &owned).map_err(model_error)?
-        };
-        if progress == Progress::Done {
-            return Ok(());
-        }
-        let progress = flow.progress();
-        if progress != seen {
-            (started, seen) = (Instant::now(), progress);
-        }
-        flow.check(started, "the experts of a layer of a pass were brought")?;
-        flow.pump()?;
-        std::hint::spin_loop();
-    }
+    let mut turns = [Turn { part, index, env, routing, pass: true }];
+    flow.complete(layer, &mut turns, &mut [misses], "the experts of a layer of a pass were brought")
 }
 
 #[cfg(test)]

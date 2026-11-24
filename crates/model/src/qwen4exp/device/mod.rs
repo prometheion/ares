@@ -31,6 +31,7 @@
 
 mod board;
 mod feed;
+mod flow;
 mod load;
 mod misses;
 mod mtp;
@@ -92,4 +93,20 @@ pub enum Error {
     /// The request cannot be served as it is.
     #[error("{0}")]
     Invalid(String),
+}
+
+/// A request the model cannot serve as it is, as the runtime hears of it.
+fn invalid(message: impl Into<String>) -> ares_runtime::ModelError {
+    ares_runtime::ModelError::Invalid(message.into())
+}
+
+/// What the runtime hears of an error of the model on its devices: the part's
+/// own error as it is, anything else as its message.
+impl From<Error> for ares_runtime::ModelError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Model(e) => e,
+            other => invalid(other.to_string()),
+        }
+    }
 }
