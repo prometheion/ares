@@ -210,7 +210,7 @@ pub const OPTIONS: &[Opt] = &[
         "<FILE>",
         "Serve several models from a preset file: an INI file with one section for each \
          model, named by the id requests use, and a section [*] for all of them. A section \
-         holds the options below under their names (context = 32768), and aliases, \
+         holds the options of a model below under their names (context = 32768), and aliases, \
          load-on-startup and idle-unload. A model is loaded when a request names it and \
          unloaded when another needs its room or when it was idle for its idle-unload. An \
          option given here on the command line holds for every model",
@@ -251,9 +251,9 @@ pub const OPTIONS: &[Opt] = &[
         "<LIST>",
         "Origins whose web pages may call the server from a browser and read its answers \
          (CORS), such as https://chat.example.org, separated by commas, or * for any. Without \
-         keys a request from a page of any other site is refused, unless the page is local \
-         (localhost, an address) or of the server's own name or an allowed host [default: \
-         none]",
+         keys a request from a page of any other site is refused, unless the page is of this \
+         machine (localhost, a loopback address), of the server's own name or of an allowed \
+         host [default: none]",
     ),
     Opt::model(
         "--devices",
