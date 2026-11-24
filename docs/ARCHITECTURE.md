@@ -7686,7 +7686,8 @@ engine does the same with a rule of the request (`TokenFilter`, around the
 request's own grammar if it has one): every reply gets a `Guard`, which reads
 the reply token by token as text, finds where its thinking opens and closes
 (the tags the template declares; a call the model opens inside its thinking
-ends it too), and counts the thinking's tokens. Once the thinking has taken
+ends it too) with the same tracker as the usage's count (`watch::Tracker`,
+below), and counts the thinking's tokens. Once the thinking has taken
 the budget's tokens, after the character a token cut in two is whole, the
 next rows carry a mask of one token each: the tokens of the message and of the
 end of the thinking as the template writes it (`\n</think>\n\n`), which
@@ -8423,8 +8424,8 @@ text of the template in effect, from `Engine::chat_template`),
 **The stop string and the thinking of a reply** (`crates/runtime/src/watch.rs`).
 The conductor matches stop strings where it turns tokens into text. It carries
 a `Watch` for every request, built where the request is taken
-(`Runtime::start_request`), and tells it every token it accepts and every
-character of their text; the watch is the stop strings' matcher and says which
+(`Runtime::start_request`), and tells it every token it accepts with its bytes
+and every character of their text; the watch is the stop strings' matcher and says which
 of them matched (`FinishReason::StopString`, its place in the request's list),
 counts the tokens of the thinking, and notes when the request left the line.
 The server names the string: `stop_reason` and `stop_sequence` on
@@ -8438,9 +8439,11 @@ message stands inside it), the reply begins inside it; otherwise the reply may
 open it with its first text, and an answer that begins with anything else has
 none. The thinking ends at the closing tag, whose tokens are the thinking's,
 or at the marker of a call that the model opens inside its thinking (the
-request's rule says it), whose tokens are not. Tokens are counted as the
-conductor accepts them, drafts or not, so the count is exact: every character
-carries the number of the token it came with. The usage has it as
+request's rule says it), whose tokens are not. One `watch::Tracker` follows
+that over the bytes of the tokens, for this count and for the guard's budget
+(which does not count the tags). Tokens are counted as the conductor accepts
+them, drafts or not, so the count is exact: every byte carries the number of
+the token it came with, also where a token cuts a tag. The usage has it as
 `completion_tokens_details.reasoning_tokens` (and `output_tokens_details` on
 `/v1/responses`) for a model that thinks; Anthropic's usage has no such field.
 
