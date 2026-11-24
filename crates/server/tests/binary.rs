@@ -1,18 +1,30 @@
 //! The `ares` binary as an operator runs it, as far as that needs no GPU:
-//! flags, and the refusals of a start that cannot work. `tests/real.rs`
-//! serves a model.
+//! flags, the refusals of a start that cannot work, and a preset file served
+//! before any model is loaded. `tests/real.rs` serves a model.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Output, Stdio};
+use std::process::Output;
+use std::time::Duration;
 
 use ares_gguf::GgufBuilder;
+use common::process::Server;
+use serde_json::json;
 
 mod common;
 
+/// How long a server may take for anything before a test fails.
+const LIMIT: Duration = Duration::from_secs(60);
+
 fn ares(args: &[&str]) -> Output {
     common::process::ares().args(args).output().unwrap()
+}
+
+/// `ares` with `args`, on a port of its own, once it listens.
+fn serve(args: &[&str]) -> Server {
+    let mut command = common::process::ares();
+    command.args(["--port", "0"]).args(args);
+    Server::start(command, LIMIT)
 }
 
 fn stderr(output: &Output) -> String {
@@ -20,10 +32,7 @@ fn stderr(output: &Output) -> String {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("binary-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch(&format!("binary-{name}"))
 }
 
 /// A model file of an architecture nobody implements.
@@ -221,36 +230,10 @@ fn a_preset_file_is_served_with_its_defaults_in_the_log_and_in_the_model_list() 
         model.display()
     );
     std::fs::write(&preset, text).unwrap();
-    let mut child = common::process::ares()
-        .args(["--port", "0", "--models-preset", preset.to_str().unwrap()])
-        .args(["--max-tokens", "500"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // The log up to the line that says the server listens, which has the port.
-    let mut log = Vec::new();
-    for line in BufReader::new(child.stderr.take().unwrap()).lines() {
-        let line = line.unwrap();
-        let listening = line.contains("listening");
-        log.push(line);
-        if listening {
-            break;
-        }
-    }
-    let said = log.join("\n");
-    let listed = log.last().and_then(|line| {
-        let address = line.split("address=").nth(1)?.split_whitespace().next()?;
-        let mut stream = TcpStream::connect(address).ok()?;
-        stream
-            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .ok()?;
-        let mut answer = String::new();
-        stream.read_to_string(&mut answer).ok()?;
-        Some(answer)
-    });
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let mut server = serve(&["--models-preset", preset.to_str().unwrap(), "--max-tokens", "500"]);
+    let list = server.get("/v1/models");
+    let said = server.logged().join("\n");
+    server.stop();
 
     // The command line's option holds over the file's for every model.
     for line in [
@@ -262,11 +245,8 @@ fn a_preset_file_is_served_with_its_defaults_in_the_log_and_in_the_model_list() 
         assert!(said.contains(line), "{line}:\n{said}");
     }
     assert_eq!(said.matches("a field a request leaves out").count(), 3, "once a model:\n{said}");
-    let listed = listed.unwrap_or_else(|| panic!("the server did not answer:\n{said}"));
-    assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
-    let body = listed.split_once("\r\n\r\n").expect("a body").1;
-    let list: serde_json::Value = serde_json::from_str(body).expect("JSON");
-    let json = serde_json::json!([
+    assert_eq!(list.status, 200, "{}", list.body);
+    let expected = json!([
         {
             "id": "toy", "object": "model", "owned_by": "ares", "aliases": [],
             "status": {"value": "unloaded"},
@@ -285,5 +265,64 @@ fn a_preset_file_is_served_with_its_defaults_in_the_log_and_in_the_model_list() 
             "defaults": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "max_tokens": 500}
         }
     ]);
-    assert_eq!(list["data"], json, "{body}");
+    assert_eq!(list.json()["data"], expected, "{}", list.body);
+}
+
+#[test]
+fn a_preset_file_that_cannot_be_served_is_refused_with_its_line() {
+    let dir = scratch("refused");
+    let model = dir.join("m.gguf");
+    std::fs::write(&model, b"not a model").unwrap();
+    let ini = dir.join("models.ini");
+    let run = |text: &str, flags: &[&str]| {
+        std::fs::write(&ini, text.replace("MODEL", model.to_str().unwrap())).unwrap();
+        let mut args = vec!["--port", "0", "--models-preset", ini.to_str().unwrap()];
+        args.extend(flags);
+        let output = ares(&args);
+        (output.status.code(), stderr(&output))
+    };
+    let (code, said) = run("[m]\nmodel = MODEL\nctx-size = 4096\n", &[]);
+    assert_eq!(code, Some(2), "{said}");
+    let wanted =
+        format!("error: {}:3: Ares has no option 'ctx-size': the context is", ini.display());
+    assert!(said.starts_with(&wanted), "{said}");
+    assert!(!said.contains("listening"), "nothing is served: {said}");
+
+    let (code, said) = run("[m]\nmodel = /nowhere/m.gguf\n", &[]);
+    assert_eq!(code, Some(2));
+    assert!(
+        said.contains("models.ini:2: the model file '/nowhere/m.gguf' does not exist"),
+        "{said}"
+    );
+    // A model on the command line and a preset file exclude each other.
+    let (code, said) = run("[m]\nmodel = MODEL\n", &["--model", "x.gguf"]);
+    assert_eq!(code, Some(2));
+    assert!(said.contains("--model and --models-preset are both given"), "{said}");
+    let (code, said) = run("[m]\nmodel = MODEL\n", &["--context", "none"]);
+    assert_eq!(code, Some(2));
+    assert!(said.contains("option '--context': 'none' is not a number of tokens"), "{said}");
+}
+
+/// A model of a preset file that fails to load is listed with its reason and
+/// leaves the server serving; nothing loaded, the server stops in order.
+#[test]
+fn a_preset_file_is_served_with_a_failed_load_listed_and_stops_in_order() {
+    let dir = scratch("served");
+    let model = dir.join("garbage.gguf");
+    std::fs::write(&model, b"this is not a model file at all").unwrap();
+    let ini = dir.join("models.ini");
+    let text =
+        format!("[*]\nidle-unload = 10m\n[broken]\nmodel = {}\naliases = b\n", model.display());
+    std::fs::write(&ini, text).unwrap();
+    // The server listens at once: nothing is loaded before a request.
+    let server = serve(&["--models-preset", ini.to_str().unwrap()]);
+    let list = server.get("/v1/models").body;
+    assert!(list.contains(r#""status":{"value":"unloaded"}"#), "{list}");
+    let answer = server.post("/v1/completions", &json!({"model": "b", "prompt": "hi"}));
+    assert_eq!(answer.status, 503, "{}", answer.body);
+    let error = &answer.body;
+    assert!(error.contains("model_load_failed") && error.contains("not a GGUF file"), "{error}");
+    let list = server.get("/v1/models").body;
+    assert!(list.contains(r#""value":"failed""#) && list.contains("not a GGUF file"), "{list}");
+    server.stop();
 }

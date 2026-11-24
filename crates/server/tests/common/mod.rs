@@ -1,6 +1,7 @@
 //! Test support: a scripted engine and helpers to drive the router.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use serde_json::json;
 use tower::ServiceExt;
 
 pub mod process;
+pub mod socket;
 
 /// How long an engine thread or a test waits for the other side before it
 /// fails, so that a broken test ends instead of hanging.
@@ -628,6 +630,19 @@ pub fn parse_sse(body: &str) -> Stream {
         .map(|p| serde_json::from_str(p).unwrap_or_else(|e| panic!("chunk is not JSON ({e}): {p}")))
         .collect();
     Stream { chunks, done }
+}
+
+/// A fresh directory of the build's for the files of a test: `name` must be
+/// unique among the tests of every suite.
+pub fn scratch(name: &str) -> PathBuf {
+    fresh(PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name))
+}
+
+/// `dir`, emptied of what an earlier run left.
+pub fn fresh(dir: PathBuf) -> PathBuf {
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// Polls until `condition` holds; fails the test after a few seconds.

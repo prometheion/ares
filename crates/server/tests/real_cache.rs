@@ -26,15 +26,13 @@
 //! that came back is the state that was computed, not how two ways of
 //! rounding break a near tie.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use common::fresh;
+use common::process::{Client, Server, ares};
+use serde_json::json;
 
 mod common;
 
@@ -54,8 +52,7 @@ fn file(variable: &str, what: &str) -> Option<PathBuf> {
 }
 
 fn port(offset: u16) -> u16 {
-    let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(18970);
-    base + offset
+    common::process::port(18970, offset)
 }
 
 fn test_device() -> u32 {
@@ -66,42 +63,14 @@ fn test_device() -> u32 {
 fn scratch(name: &str) -> PathBuf {
     let base = std::env::var_os("ARES_TEST_CACHE_DIR")
         .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
-    let dir = base.join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    fresh(base.join(name))
 }
 
-struct Server {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    log: Vec<String>,
-    address: String,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        // A failing test leaves nothing on the devices.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn dechunk(mut raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    while let Some(end) = raw.windows(2).position(|w| w == b"\r\n") {
-        let size = std::str::from_utf8(&raw[..end])
-            .ok()
-            .and_then(|hex| usize::from_str_radix(hex.trim(), 16).ok())
-            .unwrap_or(0);
-        let start = end + 2;
-        if size == 0 || raw.len() < start + size {
-            break;
-        }
-        out.extend_from_slice(&raw[start..start + size]);
-        raw = &raw[(start + size + 2).min(raw.len())..];
-    }
-    out
+/// `ares` with `args`, started on `port`.
+fn serve(args: &[String], port: u16) -> Server {
+    let mut command = ares();
+    command.args(args).args(["--port", &port.to_string()]);
+    Server::start(command, LIMIT)
 }
 
 /// What a completion said, how much of its prompt came from the cache, and
@@ -114,134 +83,37 @@ struct Said {
     first_ms: f64,
 }
 
-impl Server {
-    /// Starts `ares` with `args` on `port` and waits until it listens.
-    fn start(args: &[String], port: u16) -> Self {
-        let mut child = common::process::ares()
-            .args(args)
-            .args(["--port", &port.to_string()])
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        // The reader keeps draining, so that the child never blocks on a full pipe.
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut server =
-            Self { child, lines, log: Vec::new(), address: format!("127.0.0.1:{port}") };
-        server.wait_for_log("listening");
-        server
+/// The most probable continuation of `prompt` by `model`, `max_tokens` long
+/// at most.
+fn complete(server: &Client, model: &str, prompt: &str, max_tokens: u32) -> Said {
+    let body = json!({
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stop": ["\n"],
+    });
+    let reply = server.post("/v1/completions", &body);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let reply = reply.json();
+    let usage = &reply["usage"];
+    Said {
+        text: reply["choices"][0]["text"].as_str().expect("a text").to_owned(),
+        prompt_tokens: usage["prompt_tokens"].as_u64().expect("prompt tokens"),
+        cached_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+        first_ms: reply["timings"]["prompt_ms"].as_f64().unwrap_or(f64::NAN),
     }
+}
 
-    fn wait_for_log(&mut self, needle: &str) -> String {
-        loop {
-            let line = self
-                .lines
-                .recv_timeout(LIMIT)
-                .unwrap_or_else(|e| panic!("no log line with {needle:?} ({e}): {:#?}", self.log));
-            self.log.push(line.clone());
-            if line.contains(needle) {
-                return line;
-            }
+/// Waits until nothing waits for the writer. Returns the pages written.
+fn settled(server: &Client) -> u64 {
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        if server.metric("cache_ssd_pending") == 0 {
+            return server.metric("cache_ssd_pages_written_total");
         }
-    }
-
-    fn logged(&mut self) -> &[String] {
-        while let Ok(line) = self.lines.try_recv() {
-            self.log.push(line);
-        }
-        &self.log
-    }
-
-    fn request(&self, method: &str, path: &str, body: &str) -> (u16, String) {
-        let mut stream = TcpStream::connect(&self.address).expect("the server accepts");
-        stream.set_read_timeout(Some(LIMIT)).unwrap();
-        write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("an answer");
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a complete header");
-        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
-        let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("a status line");
-        let body = &raw[split + 4..];
-        let body =
-            if head.contains("transfer-encoding: chunked") { dechunk(body) } else { body.to_vec() };
-        (status, String::from_utf8(body).expect("the body is valid UTF-8"))
-    }
-
-    /// The most probable continuation of `prompt` by `model`, `max_tokens`
-    /// long at most.
-    fn complete(&self, model: &str, prompt: &str, max_tokens: u32) -> Said {
-        let body = json!({
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "stop": ["\n"],
-        });
-        let (status, body) = self.request("POST", "/v1/completions", &body.to_string());
-        assert_eq!(status, 200, "{body}");
-        let reply: Value = serde_json::from_str(&body).expect("JSON");
-        let usage = &reply["usage"];
-        Said {
-            text: reply["choices"][0]["text"].as_str().expect("a text").to_owned(),
-            prompt_tokens: usage["prompt_tokens"].as_u64().expect("prompt tokens"),
-            cached_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-            first_ms: reply["timings"]["prompt_ms"].as_f64().unwrap_or(f64::NAN),
-        }
-    }
-
-    /// The value of a line of `GET /metrics`, for a server of one model.
-    fn metric(&self, name: &str) -> u64 {
-        let (status, body) = self.request("GET", "/metrics", "");
-        assert_eq!(status, 200, "{body}");
-        body.lines()
-            .filter(|line| !line.starts_with('#'))
-            .find_map(|line| {
-                let (key, value) = line.rsplit_once(' ')?;
-                key.ends_with(name).then(|| value.trim().parse::<f64>().ok())?
-            })
-            .unwrap_or_else(|| panic!("no metric {name} in:\n{body}")) as u64
-    }
-
-    /// Waits until nothing waits for the writer. Returns the pages written.
-    fn settled(&self) -> u64 {
-        let deadline = Instant::now() + LIMIT;
-        loop {
-            if self.metric("cache_ssd_pending") == 0 {
-                return self.metric("cache_ssd_pages_written_total");
-            }
-            assert!(Instant::now() < deadline, "the store never came to rest");
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// Stops the server with one signal and checks that it left in order.
-    fn stop(mut self) -> Vec<String> {
-        let pid = self.child.id().to_string();
-        assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
-        let deadline = Instant::now() + LIMIT;
-        let status = loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "the process did not exit: {:#?}", self.logged());
-            thread::sleep(Duration::from_millis(10));
-        };
-        let log = self.logged().to_vec();
-        assert!(status.success(), "a clean stop: {status:?}\n{log:#?}");
-        log
+        assert!(Instant::now() < deadline, "the store never came to rest");
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -274,12 +146,12 @@ fn args(model: &Path, rest: &[&str]) -> Vec<String> {
 
 /// The two turns of a conversation over `seed`'s facts: the first prompt,
 /// and the second, which goes on from the first reply.
-fn turns(server: &Server, model: &str, seed: u64, lines: u32) -> (String, Said, String, Said) {
+fn turns(server: &Client, model: &str, seed: u64, lines: u32) -> (String, Said, String, Said) {
     let first = format!("{}{}", facts(seed, lines), question(7));
-    let one = server.complete(model, &first, 12);
+    let one = complete(server, model, &first, 12);
     assert!(one.text.contains(&code_of(seed, 7).to_string()), "{one:?}");
     let second = format!("{first}{}\n{}", one.text, question(lines - 3));
-    let two = server.complete(model, &second, 12);
+    let two = complete(server, model, &second, 12);
     assert!(two.text.contains(&code_of(seed, lines - 3).to_string()), "{two:?}");
     (first, one, second, two)
 }
@@ -301,18 +173,18 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
     let with_cache: Vec<&str> = flags.iter().copied().chain(["--cache", &cache]).collect();
 
     // What a server without the store says: the reference for every reply.
-    let plain = Server::start(&args(model, flags), port(at));
+    let plain = serve(&args(model, flags), port(at));
     let (_, _, second, reference) = turns(&plain, &name, 1, lines);
     assert_eq!(plain.metric("cache_ssd_pages_written_total"), 0);
     plain.stop();
 
-    let server = Server::start(&args(model, &with_cache), port(at));
+    let server = serve(&args(model, &with_cache), port(at));
     let (_, one, _, two) = turns(&server, &name, 1, lines);
     assert_eq!(one.cached_tokens, 0);
     assert!(two.cached_tokens > 2048, "the second turn starts from the first: {two:?}");
     assert_eq!(two.text, reference.text);
     // Nothing is written while the devices and RAM hold the conversation.
-    assert_eq!(server.settled(), 0);
+    assert_eq!(settled(&server), 0);
     assert_eq!(server.metric("cache_ssd_written_bytes_total"), 0);
     assert_eq!(server.metric("cache_ssd_pages_read_total"), 0);
     let log = server.stop();
@@ -320,12 +192,12 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
 
     // A new process: the devices hold nothing of the conversation, and the
     // drive what the last one wrote when it stopped.
-    let mut server = Server::start(&args(model, &with_cache), port(at));
+    let mut server = serve(&args(model, &with_cache), port(at));
     let stored = server.metric("cache_ssd_bytes");
     assert!(stored >= u64::from(lines) * 8 / 128 * 4096, "{stored} bytes on the drive");
     eprintln!("{tag}: {} prompt tokens, {stored} bytes written at the stop", two.prompt_tokens);
     let began = Instant::now();
-    let again = server.complete(&name, &second, 12);
+    let again = complete(&server, &name, &second, 12);
     let took = began.elapsed();
     assert_eq!(again.text, reference.text, "the reply after a restart");
     assert!(again.cached_tokens > 2048, "{again:?}");
@@ -345,13 +217,13 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
         turns(&server, &name, seed, lines);
     }
     let before = server.metric("cache_ram_pages_read_total");
-    let back = server.complete(&name, &second, 12);
+    let back = complete(&server, &name, &second, 12);
     assert_eq!(back.text, reference.text, "the reply after eviction");
     assert!(back.cached_tokens > 2048, "{back:?}");
     let read = server.metric("cache_ram_pages_read_total") - before;
     assert!(read > 0, "the pages came back from RAM: {:#?}", server.logged());
     assert!(server.metric("cache_ram_pages_in_total") > 0);
-    assert_eq!(server.settled(), 0, "nothing was written while RAM held it");
+    assert_eq!(settled(&server), 0, "nothing was written while RAM held it");
     eprintln!("{tag}: after eviction {read} pages came back from RAM");
     server.stop();
 }
@@ -399,24 +271,15 @@ fn a_model_that_was_unloaded_resumes_from_ssd_when_it_is_loaded_again() {
     );
     std::fs::write(&ini, text).unwrap();
     let preset = ["--models-preset".to_owned(), ini.display().to_string()];
-    let mut server = Server::start(&preset, port(2));
+    let mut server = serve(&preset, port(2));
     let (_, _, second, two) = turns(&server, "talker", 1, 330);
     assert!(two.cached_tokens > 2048, "{two:?}");
 
     // Idle for its time, the model is unloaded, and its caches with it.
-    let state = |server: &Server| {
-        let (_, body) = server.request("GET", "/v1/models", "");
-        let list: Value = serde_json::from_str(&body).expect("JSON");
-        list["data"][0]["status"]["value"].as_str().expect("a state").to_owned()
-    };
-    let deadline = Instant::now() + LIMIT;
-    while state(&server) != "unloaded" {
-        assert!(Instant::now() < deadline, "the model was never unloaded: {:#?}", server.logged());
-        thread::sleep(Duration::from_millis(100));
-    }
+    server.until("talker", "unloaded");
 
     // The next request loads it again; the conversation comes from the drive.
-    let again = server.complete("talker", &second, 12);
+    let again = complete(&server, "talker", &second, 12);
     assert_eq!(again.text, two.text, "the reply after an unload and a reload");
     assert!(again.cached_tokens > 2048, "{again:?}");
     let log = server.stop();
@@ -455,25 +318,25 @@ fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
 
     // A server that never saw the conversation: the second turn computed
     // from nothing is the reference.
-    let plain = Server::start(&args(&model, &flags), port(3));
-    let one = plain.complete(&name, &first, 12);
+    let plain = serve(&args(&model, &flags), port(3));
+    let one = complete(&plain, &name, &first, 12);
     assert!(one.text.contains(&code_of(1, 7).to_string()), "{one:?}");
     plain.stop();
     let second = format!("{first}{}\n{}", one.text, question(lines - 3));
-    let plain = Server::start(&args(&model, &flags), port(3));
-    let cold = plain.complete(&name, &second, 12);
+    let plain = serve(&args(&model, &flags), port(3));
+    let cold = complete(&plain, &name, &second, 12);
     assert!(cold.text.contains(&code_of(1, lines - 3).to_string()), "{cold:?}");
     assert_eq!(cold.cached_tokens, 0);
     report("cold", &cold);
     plain.stop();
 
-    let mut server = Server::start(&args(&model, &with_cache), port(3));
+    let mut server = serve(&args(&model, &with_cache), port(3));
     let plan = server.logged().iter().find(|line| line.contains("plan: RAM")).cloned();
     eprintln!("{plan:?}");
-    let again = server.complete(&name, &first, 12);
+    let again = complete(&server, &name, &first, 12);
     assert_eq!(again.text, one.text, "the first turn");
     let replayed = server.metric("replayed_rows_total");
-    let cards = server.complete(&name, &second, 12);
+    let cards = complete(&server, &name, &second, 12);
     let replayed = server.metric("replayed_rows_total") - replayed;
     report(&format!("from the cards ({replayed} rows replayed)"), &cards);
     assert_eq!(cards.text, cold.text, "the second turn from the cards");
@@ -486,12 +349,12 @@ fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
     // Two other conversations take the pool.
     for seed in 2..4 {
         let other = format!("{}{}", facts(seed, lines), question(5));
-        let said = server.complete(&name, &other, 12);
+        let said = complete(&server, &name, &other, 12);
         assert!(said.text.contains(&code_of(seed, 5).to_string()), "{said:?}");
     }
     let (ram_before, ssd_before) =
         (server.metric("cache_ram_pages_read_total"), server.metric("cache_ssd_pages_read_total"));
-    let back = server.complete(&name, &second, 12);
+    let back = complete(&server, &name, &second, 12);
     let from_ram = server.metric("cache_ram_pages_read_total") - ram_before;
     let from_ssd = server.metric("cache_ssd_pages_read_total") - ssd_before;
     report(&format!("after eviction ({from_ram} pages from RAM, {from_ssd} from SSD)"), &back);
@@ -505,8 +368,8 @@ fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
     server.stop();
 
     // A new process: the drive has what the last one wrote when it stopped.
-    let server = Server::start(&args(&model, &with_cache), port(3));
-    let restart = server.complete(&name, &second, 12);
+    let server = serve(&args(&model, &with_cache), port(3));
+    let restart = complete(&server, &name, &second, 12);
     report("after a restart", &restart);
     assert_eq!(restart.text, cold.text, "the second turn after a restart");
     assert!(restart.cached_tokens > 4096, "{restart:?}");

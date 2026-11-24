@@ -22,16 +22,14 @@
 //! idle time is a few seconds and the tests wait for a state, not for a
 //! duration (`tests/models.rs` has the state machine on a clock it sets).
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ares_cuda::{Device, Wait};
-use serde_json::{Value, json};
+use common::process::{Server, ares};
+use common::scratch;
+use common::socket::Reply;
+use serde_json::json;
 
 mod common;
 
@@ -56,8 +54,7 @@ fn file(variable: &str, what: &str) -> Option<PathBuf> {
 }
 
 fn port(offset: u16) -> u16 {
-    let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(18980);
-    base + offset
+    common::process::port(18980, offset)
 }
 
 fn test_device() -> u32 {
@@ -69,175 +66,17 @@ fn free(device: &Device) -> u64 {
     device.mem_info().expect("the device reports its memory").free
 }
 
-struct Server {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    log: Vec<String>,
-    address: String,
+/// `ares` over the preset file `ini`, started on `port`.
+fn serve(ini: &Path, port: u16) -> Server {
+    let mut command = ares();
+    command.arg("--models-preset").arg(ini).args(["--port", &port.to_string()]);
+    Server::start(command, LIMIT)
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        // A failing test leaves nothing on the devices.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-struct Reply {
-    status: u16,
-    body: String,
-}
-
-impl Reply {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("not JSON ({e}): {}", self.body))
-    }
-}
-
-fn dechunk(mut raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    while let Some(end) = raw.windows(2).position(|w| w == b"\r\n") {
-        let size = std::str::from_utf8(&raw[..end])
-            .ok()
-            .and_then(|hex| usize::from_str_radix(hex.trim(), 16).ok())
-            .unwrap_or(0);
-        let start = end + 2;
-        if size == 0 || raw.len() < start + size {
-            break;
-        }
-        out.extend_from_slice(&raw[start..start + size]);
-        raw = &raw[(start + size + 2).min(raw.len())..];
-    }
-    out
-}
-
-impl Server {
-    /// Starts `ares` over the preset file `ini` and waits until it listens.
-    fn start(ini: &Path, port: u16) -> Self {
-        let mut child = common::process::ares()
-            .arg("--models-preset")
-            .arg(ini)
-            .args(["--port", &port.to_string()])
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        // The reader keeps draining, so that the child never blocks on a full pipe.
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut server =
-            Self { child, lines, log: Vec::new(), address: format!("127.0.0.1:{port}") };
-        server.wait_for_log("listening");
-        server
-    }
-
-    fn wait_for_log(&mut self, needle: &str) -> String {
-        loop {
-            let line = self
-                .lines
-                .recv_timeout(LIMIT)
-                .unwrap_or_else(|e| panic!("no log line with {needle:?} ({e}): {:#?}", self.log));
-            self.log.push(line.clone());
-            if line.contains(needle) {
-                return line;
-            }
-        }
-    }
-
-    fn logged(&mut self) -> &[String] {
-        while let Ok(line) = self.lines.try_recv() {
-            self.log.push(line);
-        }
-        &self.log
-    }
-
-    fn request(&self, method: &str, path: &str, body: &str) -> Reply {
-        let mut stream = TcpStream::connect(&self.address).expect("the server accepts");
-        stream.set_read_timeout(Some(LIMIT)).unwrap();
-        write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("an answer");
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a complete header");
-        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
-        let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("a status line");
-        let body = &raw[split + 4..];
-        let body =
-            if head.contains("transfer-encoding: chunked") { dechunk(body) } else { body.to_vec() };
-        Reply { status, body: String::from_utf8(body).expect("the body is valid UTF-8") }
-    }
-
-    /// A short completion by `model`, which is loaded for it if it is not.
-    fn complete(&self, model: &str) -> Reply {
-        let body = json!({ "model": model, "prompt": "The capital of France is", "max_tokens": 8 });
-        self.request("POST", "/v1/completions", &body.to_string())
-    }
-
-    /// The state of every model, by id.
-    fn states(&self) -> Vec<(String, String)> {
-        let list = self.request("GET", "/v1/models", "").json();
-        let data = list["data"].as_array().expect("a list").iter();
-        data.map(|m| {
-            let text = |v: &Value| v.as_str().expect("a string").to_owned();
-            (text(&m["id"]), text(&m["status"]["value"]))
-        })
-        .collect()
-    }
-
-    fn state(&self, model: &str) -> String {
-        let states = self.states();
-        states.into_iter().find(|(id, _)| id == model).expect("the model is listed").1
-    }
-
-    /// Waits until `model` is in `state`.
-    fn until(&mut self, model: &str, state: &str) {
-        let deadline = Instant::now() + LIMIT;
-        while self.state(model) != state {
-            assert!(
-                Instant::now() < deadline,
-                "{model} did not become {state}: {:#?}",
-                self.logged()
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// The bytes of the server's process that are in RAM.
-    fn resident(&self) -> u64 {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap();
-        let line = status.lines().find_map(|line| line.strip_prefix("VmRSS:")).expect("VmRSS");
-        line.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap() * 1024
-    }
-
-    /// Stops the server with one signal and checks that it left in order.
-    fn stop(mut self) -> Vec<String> {
-        let pid = self.child.id().to_string();
-        assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
-        let deadline = Instant::now() + LIMIT;
-        let status = loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "the process did not exit: {:#?}", self.logged());
-            thread::sleep(Duration::from_millis(10));
-        };
-        let log = self.logged().to_vec();
-        assert!(status.success(), "a clean stop: {status:?}\n{log:#?}");
-        assert!(log.last().is_some_and(|line| line.trim_end().ends_with("stopped")), "{log:#?}");
-        log
-    }
+/// A short completion by `model`, which is loaded for it if it is not.
+fn complete(server: &Server, model: &str) -> Reply {
+    let body = json!({ "model": model, "prompt": "The capital of France is", "max_tokens": 8 });
+    server.post("/v1/completions", &body)
 }
 
 /// Prints the lines of the log that say how long loads and unloads took.
@@ -248,12 +87,6 @@ fn print_times(what: &str, log: &[String]) {
             eprintln!("{what}: {}", line.split("INFO").last().unwrap_or(line).trim());
         }
     }
-}
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 #[test]
@@ -276,7 +109,7 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
 
     let device = Device::open(ordinal, Wait::Block).expect("the test device opens");
     let before = free(&device);
-    let mut server = Server::start(&ini, port(0));
+    let mut server = serve(&ini, port(0));
     let all = |state: &str| -> Vec<(String, String)> {
         ["stays", "idles", "broken"].iter().map(|id| ((*id).to_owned(), state.to_owned())).collect()
     };
@@ -284,7 +117,7 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
     assert!(free(&device) + SLACK > before, "a server that has loaded nothing holds no device");
 
     // The first request loads its model, by an alias.
-    let reply = server.complete("first");
+    let reply = complete(&server, "first");
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.json()["model"], "stays");
     assert_eq!(server.state("stays"), "loaded");
@@ -293,7 +126,7 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
     assert!(with_one + SLACK < before, "the model is on the device");
 
     // The second model fits next to it: both are loaded, on one card.
-    let reply = server.complete("idles");
+    let reply = complete(&server, "idles");
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(server.state("stays"), "loaded", "nothing made way: there was room");
     assert_eq!(server.state("idles"), "loaded");
@@ -302,15 +135,15 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
     let resident_two = server.resident();
 
     // A model whose file is not one fails, says why, and leaves the others serving.
-    let reply = server.complete("broken");
+    let reply = complete(&server, "broken");
     assert_eq!(reply.status, 503, "{}", reply.body);
     let error = reply.json();
     assert_eq!(error["error"]["code"], "model_load_failed");
     assert!(error["error"]["message"].as_str().unwrap().contains("not a GGUF file"), "{error}");
-    let list = server.request("GET", "/v1/models", "").json();
+    let list = server.get("/v1/models").json();
     assert_eq!(list["data"][2]["status"]["value"], "failed");
     assert!(list["data"][2]["status"]["reason"].as_str().unwrap().contains("not a GGUF file"));
-    assert_eq!(server.complete("stays").status, 200);
+    assert_eq!(complete(&server, "stays").status, 200);
 
     // The idle one is unloaded after its time, and what it held is back.
     server.until("idles", "unloaded");
@@ -331,15 +164,15 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
     assert!(!log.contains("did not come back"), "{log}");
 
     // The next request loads it again.
-    let reply = server.complete("idles");
+    let reply = complete(&server, "idles");
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(server.state("idles"), "loaded");
 
     // The endpoint unloads the other one, which says so in the events' words.
-    let reply = server.request("POST", "/models/unload", r#"{"model": "stays"}"#);
+    let reply = server.post("/models/unload", &json!({"model": "stays"}));
     assert_eq!((reply.status, reply.body.as_str()), (200, r#"{"success":true}"#));
     server.until("stays", "unloaded");
-    let reply = server.request("POST", "/models/load", r#"{"model": "stays"}"#);
+    let reply = server.post("/models/load", &json!({"model": "stays"}));
     assert_eq!(reply.status, 200);
     server.until("stays", "loaded");
 
@@ -376,9 +209,9 @@ fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
     std::fs::write(&ini, text).unwrap();
     let devices = [0, 1].map(|ordinal| Device::open(ordinal, Wait::Block).expect("a device"));
     let before = devices.each_ref().map(free);
-    let mut server = Server::start(&ini, port(1));
+    let mut server = serve(&ini, port(1));
 
-    let reply = server.complete("one-card");
+    let reply = complete(&server, "one-card");
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(server.state("one-card"), "loaded");
     let with_one = devices.each_ref().map(free);
@@ -386,7 +219,7 @@ fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
     assert!(with_one[1] + SLACK > before[1], "and not on device 1");
 
     // The second does not fit next to it, and the first is idle: it makes way.
-    let reply = server.complete("both-cards");
+    let reply = complete(&server, "both-cards");
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(server.state("one-card"), "unloaded");
     assert_eq!(server.state("both-cards"), "loaded");
@@ -397,7 +230,7 @@ fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
     assert!(!log.contains("did not come back"), "{log}");
 
     // And the other way round: the first comes back when a request names it.
-    let reply = server.complete("one-card");
+    let reply = complete(&server, "one-card");
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(server.state("one-card"), "loaded");
     assert_eq!(server.state("both-cards"), "unloaded");
@@ -441,17 +274,17 @@ fn flash_next_is_loaded_again_after_an_unload_and_after_the_27b() {
         large.display()
     );
     std::fs::write(&ini, text).unwrap();
-    let mut server = Server::start(&ini, port(2));
+    let mut server = serve(&ini, port(2));
     let resident_before = server.resident();
     let answer = |server: &Server, model: &str| {
-        let reply = server.complete(model);
+        let reply = complete(server, model);
         assert_eq!(reply.status, 200, "{model}: {}", reply.body);
         assert_eq!(server.state(model), "loaded");
     };
 
     answer(&server, "flash");
     let resident_loaded = server.resident();
-    let reply = server.request("POST", "/models/unload", r#"{"model": "flash"}"#);
+    let reply = server.post("/models/unload", &json!({"model": "flash"}));
     assert_eq!(reply.status, 200, "{}", reply.body);
     server.until("flash", "unloaded");
     let resident_unloaded = server.resident();

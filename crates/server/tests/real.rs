@@ -17,14 +17,15 @@
 //! The servers run with exact products, so that a text does not depend on
 //! what else is in a step and texts can be compared.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::process::ExitStatus;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::process::{Client, Server, ares};
+use common::socket::Reply;
 use serde_json::{Value, json};
 
 mod common;
@@ -48,72 +49,7 @@ fn model() -> Option<PathBuf> {
 }
 
 fn port(offset: u16) -> u16 {
-    let base = std::env::var("ARES_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(18951);
-    base + offset
-}
-
-/// A running server process. Killed when dropped, so that a failing test
-/// leaves nothing on the device.
-struct Server {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    log: Vec<String>,
-    client: Client,
-}
-
-/// Where a server listens and what it serves: all a request needs, and
-/// something threads can share.
-struct Client {
-    address: String,
-    /// The name the model is served under.
-    model: String,
-    /// How long the server may take for anything before a test fails.
-    limit: Duration,
-}
-
-impl std::ops::Deref for Server {
-    type Target = Client;
-
-    fn deref(&self) -> &Client {
-        &self.client
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// One answer of the server.
-struct Reply {
-    status: u16,
-    body: String,
-}
-
-impl Reply {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("not JSON ({e}): {}", self.body))
-    }
-
-    /// The `data:` payloads of a streamed answer and whether `[DONE]` ended it.
-    fn events(&self) -> (Vec<Value>, bool) {
-        events(&self.body)
-    }
-}
-
-fn events(body: &str) -> (Vec<Value>, bool) {
-    let mut payloads: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("data: ")).collect();
-    let done = payloads.last() == Some(&"[DONE]");
-    if done {
-        payloads.pop();
-    }
-    let chunks = payloads
-        .iter()
-        .map(|p| serde_json::from_str(p).unwrap_or_else(|e| panic!("not JSON ({e}): {p}")))
-        .collect();
-    (chunks, done)
+    common::process::port(18951, offset)
 }
 
 /// The text of a streamed answer: its deltas put together, the reasoning of a
@@ -138,203 +74,38 @@ fn streamed_text(chunks: &[Value]) -> String {
         .collect()
 }
 
-/// Removes the chunked transfer coding.
-fn dechunk(mut raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    while let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") {
-        let size = std::str::from_utf8(&raw[..line_end])
-            .ok()
-            .and_then(|s| usize::from_str_radix(s.trim(), 16).ok());
-        let Some(size) = size else { break };
-        let start = line_end + 2;
-        if size == 0 || raw.len() < start + size {
-            break;
-        }
-        out.extend_from_slice(&raw[start..start + size]);
-        raw = &raw[(start + size + 2).min(raw.len())..];
+/// `ares` with the model on one device and `flags`, started on `port`. The
+/// test device (`ARES_TEST_DEVICE`) serves it unless `flags` name
+/// `--devices`.
+fn serve(model: &PathBuf, port: u16, flags: &[&str]) -> Server {
+    let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
+    // The test device, exact products and a context of 8192 unless the test
+    // says otherwise.
+    let mut base: Vec<&str> = Vec::new();
+    if !flags.contains(&"--devices") {
+        base.extend(["--devices", device.as_str()]);
     }
-    out
+    if !flags.contains(&"--precision") {
+        base.extend(["--precision", "exact"]);
+    }
+    if !flags.contains(&"--context") {
+        base.extend(["--context", "8192"]);
+    }
+    serve_with(model, port, &base, flags, LIMIT)
 }
 
-fn parse(raw: &[u8]) -> Reply {
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a complete header");
-    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
-    let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("a status line");
-    let body = &raw[split + 4..];
-    let body =
-        if head.contains("transfer-encoding: chunked") { dechunk(body) } else { body.to_vec() };
-    Reply { status, body: String::from_utf8(body).expect("the body is valid UTF-8") }
-}
-
-impl Server {
-    /// Starts `ares` with the model on one device and `flags`, and waits
-    /// until it listens. The test device (`ARES_TEST_DEVICE`) serves it unless
-    /// `flags` name `--devices`.
-    fn start(model: &PathBuf, port: u16, flags: &[&str]) -> Self {
-        let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
-        // The test device, exact products and a context of 8192 unless the test
-        // says otherwise.
-        let mut base: Vec<&str> = Vec::new();
-        if !flags.contains(&"--devices") {
-            base.extend(["--devices", device.as_str()]);
-        }
-        if !flags.contains(&"--precision") {
-            base.extend(["--precision", "exact"]);
-        }
-        if !flags.contains(&"--context") {
-            base.extend(["--context", "8192"]);
-        }
-        Self::start_with(model, port, &base, flags, LIMIT)
-    }
-
-    /// Starts `ares` with the model and exactly the flags given, and waits
-    /// until it listens; nothing it does takes longer than `limit`.
-    fn start_with(
-        model: &PathBuf,
-        port: u16,
-        base: &[&str],
-        flags: &[&str],
-        limit: Duration,
-    ) -> Self {
-        let mut child = common::process::ares()
-            .arg("--model")
-            .arg(model)
-            .args(["--port", &port.to_string()])
-            .args(base)
-            .args(flags)
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        // The reader keeps draining after the start, so that the child can
-        // never block on a full pipe.
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let client = Client { address: format!("127.0.0.1:{port}"), model: String::new(), limit };
-        let mut server = Self { child, lines, log: Vec::new(), client };
-        server.wait_for_log("listening");
-        let models = server.get("/v1/models").json();
-        server.client.model =
-            models["data"][0]["id"].as_str().expect("a model is served").to_owned();
-        server
-    }
-
-    /// Reads log lines until one contains `needle`.
-    fn wait_for_log(&mut self, needle: &str) -> String {
-        loop {
-            let line = self
-                .lines
-                .recv_timeout(self.limit)
-                .unwrap_or_else(|e| panic!("no log line with {needle:?} ({e}): {:#?}", self.log));
-            self.log.push(line.clone());
-            if line.contains(needle) {
-                return line;
-            }
-        }
-    }
-
-    /// Everything the server has logged so far.
-    fn logged(&mut self) -> &[String] {
-        while let Ok(line) = self.lines.try_recv() {
-            self.log.push(line);
-        }
-        &self.log
-    }
-
-    fn signal(&self, name: &str) {
-        let status = Command::new("kill")
-            .args([&format!("-{name}"), &self.child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    fn wait_exit(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + self.limit;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(Instant::now() < deadline, "the process did not exit: {:#?}", self.logged());
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Stops the server with one signal and checks that it left in order.
-    fn stop(mut self) {
-        self.signal("TERM");
-        let status = self.wait_exit();
-        let log = self.logged().join("\n");
-        assert!(status.success(), "a clean stop: {status:?}\n{log}");
-        assert!(log.contains("threads joined, devices released"), "{log}");
-    }
-}
-
-impl Client {
-    fn connect(&self) -> std::io::Result<TcpStream> {
-        let stream = TcpStream::connect(&self.address)?;
-        stream.set_read_timeout(Some(self.limit))?;
-        Ok(stream)
-    }
-
-    /// Sends a request and leaves the answer unread.
-    fn send(&self, method: &str, path: &str, body: &str) -> TcpStream {
-        let mut stream = self.connect().expect("the server accepts connections");
-        write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        stream
-    }
-
-    fn request(&self, method: &str, path: &str, body: &str) -> Reply {
-        let mut raw = Vec::new();
-        self.send(method, path, body).read_to_end(&mut raw).unwrap();
-        parse(&raw)
-    }
-
-    fn get(&self, path: &str) -> Reply {
-        self.request("GET", path, "")
-    }
-
-    fn post(&self, path: &str, body: &Value) -> Reply {
-        self.request("POST", path, &body.to_string())
-    }
-
-    /// A chat request body for this server's model: `extra` on top of one
-    /// user message.
-    fn chat(&self, question: &str, extra: Value) -> Value {
-        let mut body = json!({
-            "model": self.model,
-            "messages": [{"role": "user", "content": question}],
-        });
-        for (key, value) in extra.as_object().expect("an object") {
-            body[key] = value.clone();
-        }
-        body
-    }
-
-    /// One value of `GET /metrics`.
-    fn metric(&self, name: &str) -> u64 {
-        let reply = self.get("/metrics");
-        assert_eq!(reply.status, 200, "{}", reply.body);
-        reply
-            .body
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("ares_{name} ")))
-            .unwrap_or_else(|| panic!("no metric {name}: {}", reply.body))
-            .parse()
-            .unwrap()
-    }
+/// `ares` with the model and exactly the flags given, started on `port`;
+/// nothing it does takes longer than `limit`.
+fn serve_with(
+    model: &PathBuf,
+    port: u16,
+    base: &[&str],
+    flags: &[&str],
+    limit: Duration,
+) -> Server {
+    let mut command = ares();
+    command.arg("--model").arg(model).args(["--port", &port.to_string()]).args(base).args(flags);
+    Server::start(command, limit)
 }
 
 /// Polls until `condition` holds.
@@ -366,7 +137,7 @@ const ENGLISH: &str = "Explain in three sentences why the sky is blue.";
 #[test]
 fn the_basics_of_a_server_work_with_a_real_model() {
     let Some(model) = model() else { return };
-    let server = Server::start(&model, port(5), &[]);
+    let server = serve(&model, port(5), &[]);
     let props = server.get("/props").json();
     assert!(props["chat_template"].as_str().unwrap().contains("<|im_start|>"), "{props}");
     assert_eq!(props["chat_template_caps"]["supports_reasoning"], true, "{props}");
@@ -446,7 +217,7 @@ fn the_basics_of_a_server_work_with_a_real_model() {
 #[test]
 fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
     let Some(model) = model() else { return };
-    let server = Server::start(&model, port(0), &["--chat-var", "enable_thinking=false"]);
+    let server = serve(&model, port(0), &["--chat-var", "enable_thinking=false"]);
 
     assert_eq!(server.get("/health").body, r#"{"status":"ok"}"#);
     let models = server.get("/v1/models").json();
@@ -520,7 +291,7 @@ fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
 #[test]
 fn completions_stop_strings_and_token_limits_end_a_text_where_they_should() {
     let Some(model) = model() else { return };
-    let server = Server::start(&model, port(1), &[]);
+    let server = serve(&model, port(1), &[]);
     let complete = |extra: Value| {
         let mut body = json!({
             "model": server.model,
@@ -576,7 +347,7 @@ fn completions_stop_strings_and_token_limits_end_a_text_where_they_should() {
 #[test]
 fn a_client_that_leaves_frees_its_sequence() {
     let Some(model) = model() else { return };
-    let server = Server::start(&model, port(2), &[]);
+    let server = serve(&model, port(2), &[]);
     let pages = server.metric("pages");
     // A page is free, or the prefix cache holds what was computed on it.
     let unused = || server.metric("pages_free") + server.metric("cached_pages");
@@ -619,7 +390,7 @@ fn a_client_that_leaves_frees_its_sequence() {
 #[test]
 fn two_requests_run_at_once_and_each_gets_its_own_text() {
     let Some(model) = model() else { return };
-    let process = Server::start(&model, port(3), &["--parallel", "2"]);
+    let process = serve(&model, port(3), &["--parallel", "2"]);
     let server: &Client = &process;
     let ask = |question: &str, seed: u64| {
         let extra = json!({"max_tokens": 160, "temperature": 0.7, "seed": seed, "stream": true});
@@ -663,7 +434,7 @@ fn two_requests_run_at_once_and_each_gets_its_own_text() {
 #[test]
 fn what_the_engine_cannot_do_is_refused_by_name() {
     let Some(model) = model() else { return };
-    let server = Server::start(&model, port(4), &[]);
+    let server = serve(&model, port(4), &[]);
     let refused = |path: &str, body: Value, status: u16, words: &[&str]| {
         let reply = server.post(path, &body);
         let error = reply.json()["error"].clone();
@@ -803,7 +574,7 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
 #[test]
 fn a_signal_lets_a_running_request_finish_and_then_stops_in_order() {
     let Some(model) = model() else { return };
-    let mut server = Server::start(&model, port(5), &[]);
+    let mut server = serve(&model, port(5), &[]);
     let body = server.chat(ENGLISH, json!({"stream": true, "max_tokens": 400, "temperature": 0}));
     let mut stream = server.send("POST", "/v1/chat/completions", &body.to_string());
     let mut raw = read_events(&mut stream, 5);
@@ -813,7 +584,7 @@ fn a_signal_lets_a_running_request_finish_and_then_stops_in_order() {
     // The listener is closed; the request that runs is not disturbed.
     eventually("the listener to close", || server.connect().is_err());
     stream.read_to_end(&mut raw).unwrap();
-    let (chunks, done) = parse(&raw).events();
+    let (chunks, done) = Reply::parse(&raw).events();
     assert!(done, "the request ran to its end");
     let finish = chunks.last().unwrap();
     assert_eq!(finish["choices"][0]["finish_reason"], "length");
@@ -831,7 +602,7 @@ fn a_signal_lets_a_running_request_finish_and_then_stops_in_order() {
 #[test]
 fn a_second_signal_ends_a_running_request_and_still_stops_in_order() {
     let Some(model) = model() else { return };
-    let mut server = Server::start(&model, port(6), &[]);
+    let mut server = serve(&model, port(6), &[]);
     // No token limit: this request does not end by itself in time.
     let body = server.chat("Write a very long story about a river.", json!({"stream": true}));
     let mut stream = server.send("POST", "/v1/chat/completions", &body.to_string());
@@ -840,12 +611,12 @@ fn a_second_signal_ends_a_running_request_and_still_stops_in_order() {
     server.signal("INT");
     server.wait_for_log("no new connections");
     thread::sleep(Duration::from_millis(300));
-    assert!(server.child.try_wait().unwrap().is_none(), "the first signal waits for the request");
+    assert!(server.exited().is_none(), "the first signal waits for the request");
     server.signal("INT");
 
     // The client is told, and the stream does not look complete.
     stream.read_to_end(&mut raw).unwrap();
-    let (chunks, done) = parse(&raw).events();
+    let (chunks, done) = Reply::parse(&raw).events();
     assert!(!done, "no [DONE] after a cut");
     assert_eq!(chunks.last().unwrap()["error"]["code"], "cancelled");
     assert!(streamed_text(&chunks).len() > 10, "the text up to the cut arrived");
@@ -922,7 +693,7 @@ fn two_turns(server: &Client) -> [(Value, Value, String); 2] {
 #[test]
 fn a_second_turn_starts_from_what_the_first_turn_computed_and_says_so() {
     let Some(model) = model() else { return };
-    let mut server = Server::start(&model, port(7), &["--chat-var", "enable_thinking=false"]);
+    let mut server = serve(&model, port(7), &["--chat-var", "enable_thinking=false"]);
     let [(usage, timings, answer), (usage2, timings2, answer2)] = two_turns(&server);
 
     // The first turn computes its whole prompt.
@@ -958,40 +729,22 @@ fn a_second_turn_starts_from_what_the_first_turn_computed_and_says_so() {
     server.stop();
 }
 
-/// The server started as [`Server::start`] starts it, with `ram` as its RAM
-/// limit, which it refuses: its exit status and what it said. The port is
-/// named so that a server that starts after all takes no other, and such a
-/// server is killed.
+/// The server started as [`serve`] starts it, with `ram` as its RAM limit,
+/// which it refuses: its exit status and what it said. The port is named so
+/// that a server that starts after all takes no other, and such a server is
+/// killed.
 fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitStatus, String) {
     let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
-    let mut child = common::process::ares()
+    let mut command = ares();
+    command
         .arg("--model")
         .arg(model)
         .args(["--port", &port.to_string(), "--devices", &device])
         .args(["--precision", "exact", "--context", "8192", "--ram", ram])
-        .args(flags)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let said = thread::spawn(move || {
-        let mut said = String::new();
-        stderr.read_to_string(&mut said).unwrap();
-        said
-    });
-    let deadline = Instant::now() + LIMIT;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("--ram {ram} was not refused: {}", said.join().unwrap());
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    (status, said.join().unwrap())
+        .args(flags);
+    let mut server = Server::spawn(command, LIMIT);
+    let status = server.wait_exit();
+    (status, server.logged().join("\n"))
 }
 
 /// A server whose `--ram` is exactly what the engine needs: the step buffers,
@@ -1007,7 +760,7 @@ fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitSt
 fn a_server_with_no_ram_to_spare_keeps_one_checkpoint_and_answers_as_one_with() {
     let Some(model) = model() else { return };
     let flags = ["--chat-var", "enable_thinking=false"];
-    let with = Server::start(&model, port(7), &flags);
+    let with = serve(&model, port(7), &flags);
     let [_, with_second] = two_turns(&with);
     with.stop();
 
@@ -1040,7 +793,7 @@ fn a_server_with_no_ram_to_spare_keeps_one_checkpoint_and_answers_as_one_with() 
     let required = required.to_string();
     let mut few = Vec::from(flags);
     few.extend(["--ram", &required]);
-    let mut without = Server::start(&model, port(8), &few);
+    let mut without = serve(&model, port(8), &few);
     assert!(
         without.logged().iter().any(|l| l.contains("plan: RAM")
             && l.contains("as asked")
@@ -1070,7 +823,7 @@ fn a_server_with_no_ram_to_spare_keeps_one_checkpoint_and_answers_as_one_with() 
 /// The server run with `flags` on the small model, which is refused before
 /// any device is touched: its exit status and what it said.
 fn refused(model: &PathBuf, flags: &[&str]) -> (ExitStatus, String) {
-    let output = common::process::ares().arg("--model").arg(model).args(flags).output().unwrap();
+    let output = ares().arg("--model").arg(model).args(flags).output().unwrap();
     (output.status, String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
@@ -1166,7 +919,7 @@ fn reply_tokens_as(
 #[test]
 fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
     let Some(model) = draft_model() else { return };
-    let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
+    let server = serve(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
     let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
     assert!(drafted.unwrap_or(0) > 0, "the MTP block and the n-gram drafter: {drafted:?}");
     let (_, _, none) = reply_tokens(&server, ENGLISH, false);
@@ -1220,7 +973,7 @@ fn with_exact_products_the_reply_with_drafts_is_the_reply_without() {
     let Some(model) = two_card_model() else { return };
     let flags =
         ["--devices", "0,1", "--split", "tensor", "--parallel", "1", "--precision", "exact"];
-    let server = Server::start(&model, port(9), &flags);
+    let server = serve(&model, port(9), &flags);
     for (question, parted) in replies_with_and_without_drafts(&server) {
         assert_eq!(parted, None, "{question}: the replies part after this many characters");
     }
@@ -1241,7 +994,7 @@ fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
     let greedy = json!({"max_tokens": 300, "temperature": 0});
     let sampled =
         json!({"max_tokens": 300, "temperature": 0.8, "top_k": 20, "top_p": 0.95, "seed": 4711});
-    let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
+    let server = serve(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
     for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
         for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
             assert_eq!(
@@ -1253,7 +1006,7 @@ fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
     server.stop();
     let Some(model) = two_card_model() else { return };
     let flags = ["--devices", "0,1", "--split", "tensor", "--parallel", "1", "--precision", "fast"];
-    let server = Server::start(&model, port(9), &flags);
+    let server = serve(&model, port(9), &flags);
     for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
         for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
             assert_eq!(parted, None, "both cards, {how}, {question}: the replies part");
@@ -1290,7 +1043,7 @@ fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
             "--drafters",
             drafters.as_str(),
         ];
-        let server = Server::start(&model, port(9), &flags);
+        let server = serve(&model, port(9), &flags);
         for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
             for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
                 assert_eq!(parted, None, "--drafters {drafters}, {how}, {question}: they part");
@@ -1311,7 +1064,7 @@ fn a_server_with_no_drafters_never_drafts_and_one_with_the_mtp_block_does() {
     let flags = ["--parallel", "1", "--precision", "fast"];
     let mut none = Vec::from(flags);
     none.extend(["--drafters", "none"]);
-    let mut server = Server::start(&model, port(9), &none);
+    let mut server = serve(&model, port(9), &none);
     assert!(
         server.logged().iter().any(|l| l.contains("no drafters") && l.contains("no speculation")),
         "{:#?}",
@@ -1324,7 +1077,7 @@ fn a_server_with_no_drafters_never_drafts_and_one_with_the_mtp_block_does() {
     }
     assert_eq!(server.metric("drafts_proposed_total"), 0, "the counters say the same");
     server.stop();
-    let server = Server::start(&model, port(9), &flags);
+    let server = serve(&model, port(9), &flags);
     let (_, _, drafted) = reply_tokens(&server, repeat, true);
     assert!(drafted.unwrap_or(0) > 0, "the same request drafts with the model's MTP block");
     server.stop();
@@ -1336,7 +1089,7 @@ fn a_server_with_no_drafters_never_drafts_and_one_with_the_mtp_block_does() {
 fn a_model_with_no_mtp_block_is_served_with_no_speculation_at_all() {
     let Some(model) = model() else { return };
     let repeat = "Write the sentence 'The quick brown fox jumps over the lazy dog.' ten times.";
-    let mut server = Server::start(&model, port(9), &["--parallel", "1"]);
+    let mut server = serve(&model, port(9), &["--parallel", "1"]);
     assert!(
         server
             .logged()
@@ -1389,7 +1142,7 @@ fn flash_server(model: &PathBuf, port: u16, split: &str) -> Server {
     let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
     let ram = flash_ram();
     let chat = "enable_thinking=false";
-    Server::start_with(
+    serve_with(
         model,
         port,
         &["--devices", &devices, "--split", split, "--ram", &ram, "--chat-var", chat],
@@ -1531,7 +1284,7 @@ fn flash_next_drafts_with_its_mtp_block() {
     let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
     let ram = flash_ram();
     let chat = "enable_thinking=false";
-    let mut server = Server::start_with(
+    let mut server = serve_with(
         &model,
         port(3),
         &["--devices", &devices, "--ram", &ram, "--chat-var", chat, "--drafters", &block],
@@ -1588,7 +1341,7 @@ fn flash_next_answers_on_one_card() {
     let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".to_owned());
     let device = devices.split(',').next().unwrap_or("0").to_owned();
     let ram = flash_ram();
-    let mut server = Server::start_with(
+    let mut server = serve_with(
         &model,
         port(2),
         &["--devices", &device, "--ram", &ram, "--chat-var", "enable_thinking=false"],
@@ -1665,7 +1418,7 @@ fn flash_next_starts_from_the_usage_profile_of_its_experts() {
             dir.to_str().expect("a path in UTF-8"),
         ];
         let begun = Instant::now();
-        let mut server = Server::start_with(&model, port(4), &flags, &[], SLOW);
+        let mut server = serve_with(&model, port(4), &flags, &[], SLOW);
         let line = server
             .logged()
             .iter()
@@ -1744,7 +1497,7 @@ fn first_choice(reply: &Reply) -> (String, Vec<Value>) {
 fn the_sampler_serves_what_a_request_sets_and_reports_the_probabilities() {
     let Some(model) = model() else { return };
     // The 0.8B thinks first unless told not to: the answers are the reply.
-    let server = Server::start(&model, port(9), &["--chat-var", "enable_thinking=false"]);
+    let server = serve(&model, port(9), &["--chat-var", "enable_thinking=false"]);
     let chat_path = "/v1/chat/completions";
     let question = "Name three colours.";
     let greedy = |extra: Value| {
