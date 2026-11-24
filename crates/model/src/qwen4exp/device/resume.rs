@@ -32,13 +32,6 @@ use super::mtp::MtpBlock;
 use super::part::Part;
 use crate::blocks::slots::{self, Checkpoint, Copies, Pages, Places};
 
-fn model_error(error: super::Error) -> ModelError {
-    match error {
-        super::Error::Model(e) => e,
-        other => ModelError::Invalid(other.to_string()),
-    }
-}
-
 /// A device's checkpoints: what one keeps, and the places for them.
 pub(super) struct Resume {
     places: Places,
@@ -182,7 +175,7 @@ impl Copies for Holder<'_> {
         self.part.check_slot(slot)?;
         let host = match self.resume.checkpoint.host {
             0 => Vec::new(),
-            _ => self.flow.lock_ngram().save(slot).map_err(model_error)?,
+            _ => self.flow.lock_ngram().save(slot)?,
         };
         self.resume.places.save(stream, &self.resume.checkpoint, slot, place, &host)
     }
@@ -192,7 +185,7 @@ impl Copies for Holder<'_> {
         let mut host = vec![0u8; self.resume.checkpoint.host as usize];
         self.resume.places.restore(stream, &self.resume.checkpoint, slot, place, &mut host)?;
         if !host.is_empty() {
-            self.flow.lock_ngram().restore(slot, &host).map_err(model_error)?;
+            self.flow.lock_ngram().restore(slot, &host)?;
         }
         Ok(())
     }

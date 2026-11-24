@@ -37,10 +37,7 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 
 use super::config::{Config, Matrix, Vector, Weights};
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
-}
+use crate::blocks::invalid;
 
 /// A matrix in the drafter's arena, as the file stores it.
 #[derive(Clone, Copy, Debug)]

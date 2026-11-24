@@ -41,6 +41,7 @@ mod resume;
 mod tensor;
 
 use crate::blocks::forms::Reach;
+use crate::blocks::invalid;
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::slots::{Arena, Checkpoint, Extent, Places, SlotLayout};
@@ -52,15 +53,7 @@ pub use resume::{checkpoint_bytes, state_slot_bytes};
 
 pub use crate::blocks::PAGE_ENTRY;
 
-/// The formats of K and of V of the MTP block: 4 bits, whatever the model's.
-/// The block's keys and values are read to propose a token that the model then
-/// verifies, and they cost the same VRAM per cell as any layer's. With them in
-/// `q4` against `q8` the share of drafts the model accepts is the same: the
-/// first draft 67.1 % against 67.4 % and 70.3 % against 70.3 % (greedy and
-/// sampled), the second 65.8 % against 64.7 % and 66.6 % against 64.5 %, over
-/// 11 000 drafts each (Qwen3.8-27B, German, English and code); the differences
-/// are inside the noise (`z` below 1.3).
-pub const MTP_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
+pub use crate::blocks::mtp::MTP_KV;
 
 /// The partly used pages (tails) per sequence slot that the prefix cache may
 /// hold. A tail keeps an exact entry for as long as it exists, so the exact
@@ -599,10 +592,6 @@ impl std::fmt::Debug for Part {
             .field("weights", &self.w.bytes())
             .finish_non_exhaustive()
     }
-}
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
 }
 
 /// The bytes one page (128 cells) takes on a device under `placement`, for K

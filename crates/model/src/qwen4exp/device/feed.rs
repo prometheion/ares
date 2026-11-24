@@ -30,10 +30,6 @@ use super::prune::{PruneMask, PruneStats};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{Moe, MtpWeights, Weights};
 
-fn invalid(message: impl Into<String>) -> Error {
-    Error::Invalid(message.into())
-}
-
 /// Where the experts' tensors are in the file, for a store with `per_layer`
 /// entries for each layer of the model. With `draft`, the experts of the
 /// model's MTP block are the store's layer 0, in a file of their own that
@@ -59,7 +55,7 @@ pub(super) fn expert_map(
         let places = mtp
             .weights
             .expert_places(mtp.gguf)
-            .ok_or_else(|| invalid("the mtp block's experts are not in its file"))?;
+            .ok_or_else(|| Error::invalid("the mtp block's experts are not in its file"))?;
         let spans = places.map(|p| ExpertSpan {
             file: FileId(gguf.n_parts() as u16 + p.part),
             base: p.base,
@@ -143,7 +139,7 @@ impl Layout {
             down_ty: moe.down.ty(),
         };
         let spec_of = |shape: &ExpertShape, device: usize, what: &str, resident: bool| {
-            let geometry = || invalid(format!("{what}: the experts do not fit a slot"));
+            let geometry = || Error::invalid(format!("{what}: the experts do not fit a slot"));
             Ok::<_, Error>(LayerSpec {
                 device,
                 offsets: [
@@ -174,7 +170,7 @@ impl Layout {
             } else {
                 placement
                     .device_of(layer)
-                    .ok_or_else(|| invalid(format!("layer {layer} is on no device")))?
+                    .ok_or_else(|| Error::invalid(format!("layer {layer} is on no device")))?
             };
             let spec = spec_of(&shape, device, &format!("layer {layer}"), false)?;
             expert_bytes += spec.slot_bytes * c.experts.count as u64 / per_layer as u64;
@@ -349,7 +345,7 @@ pub(super) fn cpu_pool(workers: Option<usize>, reserved: usize) -> Result<CpuPoo
         None => CpuPlacement::for_machine(&Topology::read(), reserved),
     };
     CpuPool::new(&placement, Duration::from_millis(20))
-        .map_err(|e| invalid(format!("the CPU workers of the expert store: {e}")))
+        .map_err(|e| Error::invalid(format!("the CPU workers of the expert store: {e}")))
 }
 
 /// What filling the tiers took.
@@ -720,7 +716,7 @@ impl Feed {
                     break;
                 }
                 let record = RouteRecord::parse(board.record(i), self.used, self.rows)
-                    .ok_or_else(|| invalid("a route record that is none"))?;
+                    .ok_or_else(|| Error::invalid("a route record that is none"))?;
                 let at = self.layout.store_layer(index, self.firsts[index] + i);
                 self.groups.clear();
                 self.groups.extend(record.groups());

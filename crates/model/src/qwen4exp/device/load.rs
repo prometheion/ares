@@ -24,6 +24,7 @@ use ares_runtime::ModelError;
 
 use crate::blocks::arena::{self, ALIGN, Ranges, Reader, Source, columns_in, gather};
 use crate::blocks::head::runs_of;
+use crate::blocks::invalid;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{
     Layer, Matrix, Mixer, MtpWeights, RecurrentWeights, StreamMixer, Weights,
@@ -225,10 +226,6 @@ struct Layout<'g> {
     /// uploaded, not for the ones that only measure sizes (a pass over the bytes of every
     /// float matrix).
     ranges: Option<Ranges>,
-}
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
 }
 
 impl<'g> Layout<'g> {

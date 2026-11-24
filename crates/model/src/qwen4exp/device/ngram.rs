@@ -14,10 +14,6 @@ use crate::qwen4exp::Config;
 use crate::qwen4exp::config::Ngram;
 use crate::qwen4exp::reference::pieces;
 
-fn invalid(message: impl Into<String>) -> Error {
-    Error::Invalid(message.into())
-}
-
 /// The bytes a checkpoint keeps of what the feed knows of a sequence, for a
 /// model with the n-gram block `ngram` ([`NgramFeed::save`]).
 pub(super) fn saved_bytes(ngram: Option<&Ngram>) -> u64 {
@@ -67,7 +63,7 @@ impl NgramFeed {
             Some(_) => {
                 let info = gguf
                     .tensor("per_layer_token_embd.weight")
-                    .ok_or_else(|| invalid("the model has no n-gram table"))?;
+                    .ok_or_else(|| Error::invalid("the model has no n-gram table"))?;
                 let reader = Reader::open_gguf(gguf, ares_io::Config::default())?;
                 let table = RowTable::for_reader(&reader, info)?;
                 let row_reader = RowReader::new(&reader, table, cache);
@@ -98,7 +94,7 @@ impl NgramFeed {
         let sequence = self
             .sequences
             .get_mut(slot as usize)
-            .ok_or_else(|| invalid(format!("slot {slot} of the session")))?;
+            .ok_or_else(|| Error::invalid(format!("slot {slot} of the session")))?;
         sequence.position = 0;
         sequence.recent.clear();
         Ok(())
@@ -112,11 +108,11 @@ impl NgramFeed {
         }
         match self.sequences.get(slot as usize) {
             Some(sequence) if sequence.position == position => Ok(()),
-            Some(sequence) => Err(invalid(format!(
+            Some(sequence) => Err(Error::invalid(format!(
                 "the rows of slot {slot} start at cell {position} and its sequence is at cell {}",
                 sequence.position
             ))),
-            None => Err(invalid(format!("slot {slot} of the session"))),
+            None => Err(Error::invalid(format!("slot {slot} of the session"))),
         }
     }
 
@@ -134,7 +130,7 @@ impl NgramFeed {
         let sequence = self
             .sequences
             .get(slot as usize)
-            .ok_or_else(|| invalid(format!("slot {slot} of the session")))?;
+            .ok_or_else(|| Error::invalid(format!("slot {slot} of the session")))?;
         let mut out = vec![0u8; self.saved_bytes() as usize];
         if out.is_empty() {
             return Ok(out);
@@ -169,7 +165,7 @@ impl NgramFeed {
     /// where that sequence was, after the same tokens.
     pub(super) fn restore(&mut self, slot: u32, saved: &[u8]) -> Result<(), Error> {
         if saved.len() as u64 != self.saved_bytes() {
-            return Err(invalid(format!(
+            return Err(Error::invalid(format!(
                 "{} bytes of an n-gram sequence; the feed keeps {}",
                 saved.len(),
                 self.saved_bytes()
@@ -183,12 +179,12 @@ impl NgramFeed {
         };
         let count = word(4) as usize;
         if 8 + 4 * count > saved.len() {
-            return Err(invalid(format!("{count} tokens of an n-gram sequence")));
+            return Err(Error::invalid(format!("{count} tokens of an n-gram sequence")));
         }
         let sequence = self
             .sequences
             .get_mut(slot as usize)
-            .ok_or_else(|| invalid(format!("slot {slot} of the session")))?;
+            .ok_or_else(|| Error::invalid(format!("slot {slot} of the session")))?;
         sequence.position = word(0);
         sequence.recent = (0..count).map(|i| word(8 + 4 * i)).collect();
         Ok(())
@@ -206,7 +202,7 @@ impl NgramFeed {
         let sequence = self
             .sequences
             .get(slot as usize)
-            .ok_or_else(|| invalid(format!("slot {slot} of the session")))?;
+            .ok_or_else(|| Error::invalid(format!("slot {slot} of the session")))?;
         let mut before = sequence.recent.clone();
         for &token in tokens {
             out.extend(pieces::ngram_rows(ngram, token, &before));
@@ -309,7 +305,7 @@ impl NgramFeed {
     pub(super) fn rows(&self) -> Result<&[u8], Error> {
         match self.gather.result() {
             Ok(()) => Ok(self.gather.rows()),
-            Err(error) => Err(invalid(format!("reading rows of the n-gram table: {error}"))),
+            Err(error) => Err(Error::invalid(format!("reading rows of the n-gram table: {error}"))),
         }
     }
 
@@ -332,7 +328,7 @@ impl NgramFeed {
     /// Settles the draft windows held: `accepted[i]` rows of the `i`-th count.
     pub(super) fn settle(&mut self, accepted: &[u32]) -> Result<(), Error> {
         if accepted.len() != self.windows.len() {
-            return Err(invalid(format!(
+            return Err(Error::invalid(format!(
                 "{} outcomes for {} draft windows",
                 accepted.len(),
                 self.windows.len()
@@ -340,7 +336,7 @@ impl NgramFeed {
         }
         for (window, count) in self.windows.iter().zip(accepted) {
             if *count as usize > window.tokens.len() {
-                return Err(invalid(format!(
+                return Err(Error::invalid(format!(
                     "{count} accepted rows of a window of {}",
                     window.tokens.len()
                 )));

@@ -67,6 +67,18 @@ use ares_sampler::{SamplePick, SampleRow};
 use super::invalid;
 use super::rows::{HostTable, TableShape, source};
 
+/// The formats of K and of V of the MTP block: 4 bits, whatever the model's.
+/// The block's keys and values are read to propose a token that the model then
+/// verifies, and they cost the same VRAM per cell as any layer's. With them in
+/// `q4` against `q8` the share of drafts the model accepts is the same: the
+/// first draft 67.1 % against 67.4 % and 70.3 % against 70.3 % (greedy and
+/// sampled), the second 65.8 % against 64.7 % and 66.6 % against 64.5 %, over
+/// 11 000 drafts each (Qwen3.8-27B, German, English and code); the differences
+/// are inside the noise (`z` below 1.3). Flash-Next's block takes the same
+/// (not measured there).
+pub const MTP_KV: (ares_cuda::CacheFormat, ares_cuda::CacheFormat) =
+    (ares_cuda::CacheFormat::Q4, ares_cuda::CacheFormat::Q4);
+
 /// A sequence that drafts with the block in the coming step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MtpChain {

@@ -10,10 +10,10 @@
 //! in the slot of the key pool that bears the page's number, one array per
 //! layer.
 
-use ares_cuda::{DevicePtr, ENTRY_CELLS};
+use ares_cuda::DevicePtr;
 use ares_runtime::ModelError;
 
-use super::{Frame, Options, PAGE_ENTRY, Part, invalid};
+use super::{Frame, Options, Part, invalid};
 use crate::blocks::slots::{Declared, Extent, GroupDecl, PageArray, PageGroup};
 
 impl Frame {
@@ -94,11 +94,6 @@ impl Part {
     /// past it or the pool needed room. Such a tile is not written again: its
     /// other cells exist only in the converted entry.
     pub(crate) fn writes_converted(&self, slot: u32, cell: u32) -> bool {
-        let Some(kv) = self.kv.as_ref().filter(|kv| kv.has_exact()) else { return false };
-        if cell.is_multiple_of(ENTRY_CELLS) || slot >= self.opts.max_slots {
-            return false;
-        }
-        let at = (slot * self.opts.table_stride() + cell / ENTRY_CELLS) as usize;
-        self.entries.get(at).is_some_and(|entry| kv.exact_slot(entry & !PAGE_ENTRY).is_none())
+        self.kv.as_ref().is_some_and(|kv| kv.writes_converted(slot, cell, &self.entries))
     }
 }

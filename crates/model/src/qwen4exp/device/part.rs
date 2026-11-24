@@ -75,6 +75,7 @@ use super::load::{
 };
 use super::prune::{PartPrune, PruneMask, PruneSetup};
 use crate::blocks::far::FarPool;
+use crate::blocks::invalid;
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::rows::{self, HostTable};
@@ -84,11 +85,7 @@ use crate::qwen4exp::weights::Weights;
 
 pub use crate::blocks::PAGE_ENTRY;
 
-/// The formats of K and of V of the MTP block: 4 bits, whatever the model's,
-/// as on the 27B (`qwen35::device::MTP_KV`, measured there: the share of
-/// drafts the model accepts is the same as with `q8`). Not measured on this
-/// model.
-pub const MTP_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
+pub use crate::blocks::mtp::MTP_KV;
 
 /// The most pieces a row's device-made list is cut into.
 const MAX_PIECES: u32 = 16;
@@ -660,10 +657,6 @@ pub(crate) struct Frame {
     /// reads and the sums it gives back, for steps of up to [`Options::cpu_rows`] rows; 0
     /// without wide steps.
     wide_cpu_host: u64,
-}
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
 }
 
 /// The bytes of the quantized form of `rows` rows of `n_in` activations.

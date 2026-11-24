@@ -96,9 +96,13 @@ pub enum Error {
     Invalid(String),
 }
 
-/// A request the model cannot serve as it is, as the runtime hears of it.
-fn invalid(message: impl Into<String>) -> ares_runtime::ModelError {
-    ares_runtime::ModelError::Invalid(message.into())
+use crate::blocks::invalid;
+
+impl Error {
+    /// A request the device part cannot serve as it is.
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
 }
 
 /// What the runtime hears of an error of the model on its devices: the part's

@@ -173,15 +173,8 @@ fn the_text_with_the_models_own_drafts_is_the_text_without() {
         eprintln!("skipped: the 27B needs two devices");
         return;
     }
-    let vocabulary: Option<Arc<[u32]>> = std::env::var_os("ARES_TEST_DRAFT_VOCAB").map(|path| {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.parse().unwrap())
-            .collect()
-    });
+    let vocabulary: Option<Arc<[u32]>> = std::env::var_os("ARES_TEST_DRAFT_VOCAB")
+        .map(|path| ares_model::files::read_draft_vocabulary(path.as_ref()).unwrap().into());
     let questions = [
         "Erkl\u{e4}re in drei S\u{e4}tzen, warum der Himmel blau ist.",
         "Write a Python function that returns the n-th Fibonacci number.",
@@ -226,15 +219,8 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
         return;
     }
     let file = Arc::new(ares_model::dflash::File::open(&file).unwrap());
-    let vocabulary: Option<Arc<[u32]>> = std::env::var_os("ARES_TEST_DRAFT_VOCAB").map(|path| {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.parse().unwrap())
-            .collect()
-    });
+    let vocabulary: Option<Arc<[u32]>> = std::env::var_os("ARES_TEST_DRAFT_VOCAB")
+        .map(|path| ares_model::files::read_draft_vocabulary(path.as_ref()).unwrap().into());
     let questions = [
         "Explain in three sentences why the sky is blue.",
         "Write a Python function that returns the n-th Fibonacci number.",

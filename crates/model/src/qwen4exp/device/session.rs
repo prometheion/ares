@@ -183,7 +183,7 @@ fn picks_of(record: &[u8], used: usize, rows: u32) -> Result<Vec<Vec<u32>>, Erro
     if rows > MAX_BATCH {
         let ids = record
             .get(16..16 + 4 * used * rows as usize)
-            .ok_or_else(|| invalid("a route record that is none"))?;
+            .ok_or_else(|| Error::invalid("a route record that is none"))?;
         return Ok(ids
             .as_chunks::<4>()
             .0
@@ -192,7 +192,7 @@ fn picks_of(record: &[u8], used: usize, rows: u32) -> Result<Vec<Vec<u32>>, Erro
             .collect());
     }
     let route = RouteRecord::parse(record, used as u32, rows)
-        .ok_or_else(|| invalid("a route record that is none"))?;
+        .ok_or_else(|| Error::invalid("a route record that is none"))?;
     Ok((0..rows as usize).map(|row| route.ids(row).collect()).collect())
 }
 
@@ -270,10 +270,6 @@ impl std::fmt::Debug for Session<'_> {
     }
 }
 
-fn invalid(message: impl Into<String>) -> Error {
-    Error::Invalid(message.into())
-}
-
 impl<'g> Session<'g> {
     /// Opens the model of `gguf` on `devices`: places the layers, uploads
     /// the dense weights, and builds the expert store with empty tiers
@@ -286,7 +282,7 @@ impl<'g> Session<'g> {
         opts: SessionOptions,
     ) -> Result<Self, Error> {
         if devices.is_empty() {
-            return Err(invalid("a session needs a device"));
+            return Err(Error::invalid("a session needs a device"));
         }
         let model = &opts.model;
         let Chosen { mut placement, speeds, memory } = choose(gguf, c, w, &devices, model)?;
@@ -297,7 +293,7 @@ impl<'g> Session<'g> {
             .collect();
         // The embedding table where the file is mapped: the part that embeds
         // stages a step's rows from it.
-        let mapped = Gguf::open(gguf.path(0)).map_err(|e| invalid(e.to_string()))?;
+        let mapped = Gguf::open(gguf.path(0)).map_err(|e| Error::invalid(e.to_string()))?;
         let table = Arc::new(HostTable::mapped(Arc::new(mapped), TOKEN_EMBD)?);
         let mut parts = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter().enumerate() {
@@ -325,8 +321,10 @@ impl<'g> Session<'g> {
             pools.push(DeviceBuffer::new(&devices[index], part.pool_bytes())?);
             if let Some(mut pool) = part.open_far(&ram)? {
                 pool.lock_all().map_err(|short| match short {
-                    Ok(short) => invalid(format!("{} bytes of K and V beyond VRAM", short.0)),
-                    Err(error) => invalid(error.to_string()),
+                    Ok(short) => {
+                        Error::invalid(format!("{} bytes of K and V beyond VRAM", short.0))
+                    }
+                    Err(error) => Error::invalid(error.to_string()),
                 })?;
                 far.push(pool);
             }
@@ -578,7 +576,7 @@ impl<'g> Session<'g> {
 
     fn run(&mut self, rows: &[Rows<'_>], probe: Option<&mut dyn Probe>) -> Result<(), Error> {
         if self.flow.lock_ngram().has_windows() {
-            return Err(invalid("the draft windows of the last step were not settled"));
+            return Err(Error::invalid("the draft windows of the last step were not settled"));
         }
         let started = Instant::now();
         // The record and the rows of the n-gram table; the part that embeds
@@ -588,13 +586,13 @@ impl<'g> Session<'g> {
         let mut out_rows = Vec::new();
         for part in rows {
             if part.slot >= self.opts.model.part.max_slots {
-                return Err(invalid(format!("slot {} of the session", part.slot)));
+                return Err(Error::invalid(format!("slot {} of the session", part.slot)));
             }
             if part.tokens.is_empty() {
-                return Err(invalid("a sequence without rows in a step"));
+                return Err(Error::invalid("a sequence without rows in a step"));
             }
             if segments.iter().any(|s: &Segment| s.slot == part.slot) {
-                return Err(invalid(format!("slot {} twice in a step", part.slot)));
+                return Err(Error::invalid(format!("slot {} twice in a step", part.slot)));
             }
             let row0 = tokens.len() as u32;
             let count = part.tokens.len() as u32;
@@ -613,7 +611,10 @@ impl<'g> Session<'g> {
             tokens.extend_from_slice(part.tokens);
         }
         if let Some(&token) = tokens.iter().find(|&&t| t as usize >= self.c.n_vocab) {
-            return Err(invalid(format!("token {token} of a vocabulary of {}", self.c.n_vocab)));
+            return Err(Error::invalid(format!(
+                "token {token} of a vocabulary of {}",
+                self.c.n_vocab
+            )));
         }
         let record = StepRecord::new(&segments, &tokens, None, &out_rows)?;
         let dims = record.dims();

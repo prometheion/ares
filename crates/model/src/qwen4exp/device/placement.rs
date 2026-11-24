@@ -43,6 +43,7 @@ use super::load::{LayerShare, Role, head_bytes, key_head_unit, layer_bytes};
 use super::options::{ModelOptions, Spread};
 use super::part::{Frame, Options, PartShape};
 use super::roles::{self, RoleTrial};
+use crate::blocks::invalid;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{Mixer, Weights};
 
@@ -149,10 +150,6 @@ pub struct Placement {
 /// driver rounds every allocation up, and the expert store has tables and
 /// staging of its own.
 pub(super) const MARGIN: u64 = 32 << 20;
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
-}
 
 /// Bytes of the dense weights of every layer held whole.
 fn whole_layers(c: &Config, w: &Weights<'_>) -> Result<Vec<u64>, ModelError> {

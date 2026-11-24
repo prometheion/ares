@@ -185,7 +185,8 @@ fn time_choice(
     wide_rows: u32,
 ) -> Result<RoleTime, Error> {
     let started = Instant::now();
-    let tensor = placement.tensor.as_ref().ok_or_else(|| invalid("a trial of no tensor split"))?;
+    let tensor =
+        placement.tensor.as_ref().ok_or_else(|| Error::invalid("a trial of no tensor split"))?;
     let mixer = tensor.mixer;
     let mut ledgers: Vec<Ledger> = devices
         .iter()
@@ -368,7 +369,9 @@ impl Runner<'_> {
                 let waiting = Instant::now();
                 while !board.arrived(i)? {
                     if waiting.elapsed() > Duration::from_secs(30) {
-                        return Err(invalid(format!("the picks of layer {i} did not arrive")));
+                        return Err(Error::invalid(format!(
+                            "the picks of layer {i} did not arrive"
+                        )));
                     }
                     std::hint::spin_loop();
                 }
@@ -389,10 +392,6 @@ impl Runner<'_> {
         }
         Ok(started.elapsed())
     }
-}
-
-fn invalid(message: impl Into<String>) -> Error {
-    Error::Invalid(message.into())
 }
 
 #[cfg(test)]

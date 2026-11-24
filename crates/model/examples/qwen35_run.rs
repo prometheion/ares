@@ -1008,12 +1008,8 @@ fn ask(
 fn engine(args: &Args, spread: &Spread, window: u32) {
     use ares_runtime::{DevicePhase, GpuConfig, Model, Phase, Runtime, RuntimeConfig};
     let vocabulary: Option<Arc<[u32]>> = args.draft_vocab.as_ref().map(|path| {
-        let text = std::fs::read_to_string(path).expect("the draft vocabulary");
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.parse().expect("a token id"))
-            .collect()
+        let path = std::path::Path::new(path);
+        ares_model::files::read_draft_vocabulary(path).expect("the draft vocabulary").into()
     });
     let profile = Arc::new(Profile::new());
     let options = Options {

@@ -51,6 +51,7 @@ use ares_runtime::ModelError;
 
 use super::part::{ExpertAt, Options, Part, StepEnv};
 use crate::blocks::head::HeadView;
+use crate::blocks::invalid;
 use crate::blocks::mtp::{Driver, DriverSetup, LinkLogits, MtpLayer, Rows};
 pub use crate::blocks::mtp::{MtpStep, MtpTimes};
 use crate::blocks::rows::HostTable;
@@ -59,10 +60,6 @@ use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::Mat;
 use crate::qwen4exp::reference::mtp_config;
 use crate::qwen4exp::weights::MtpWeights;
-
-fn invalid(message: impl Into<String>) -> ModelError {
-    ModelError::Invalid(message.into())
-}
 
 /// What the block took, for reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

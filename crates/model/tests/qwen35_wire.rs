@@ -226,15 +226,8 @@ fn requests() -> Vec<(&'static str, String, u32)> {
 }
 
 fn draft_vocabulary() -> Option<Arc<[u32]>> {
-    std::env::var_os("ARES_TEST_DRAFT_VOCAB").map(|path| {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.parse().unwrap())
-            .collect()
-    })
+    std::env::var_os("ARES_TEST_DRAFT_VOCAB")
+        .map(|path| ares_model::files::read_draft_vocabulary(path.as_ref()).unwrap().into())
 }
 
 /// Tokens per second of a request that writes from nothing and of one that

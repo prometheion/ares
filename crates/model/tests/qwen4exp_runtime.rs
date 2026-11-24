@@ -2305,10 +2305,8 @@ const FLASH_CONTINUATION: [u32; 4] = [248068, 198, 760, 1156];
 /// The draft vocabulary of `ARES_TEST_DRAFT_VOCAB` (a token id per line), when
 /// it is set.
 fn draft_vocabulary() -> Option<Vec<u32>> {
-    let text = std::fs::read_to_string(std::env::var_os("ARES_TEST_DRAFT_VOCAB")?)
-        .expect("the draft vocabulary is readable");
-    let ids = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
-    Some(ids.map(|l| l.parse().expect("a token id per line")).collect())
+    let path = std::env::var_os("ARES_TEST_DRAFT_VOCAB")?;
+    Some(ares_model::files::read_draft_vocabulary(path.as_ref()).expect("a draft vocabulary"))
 }
 
 /// The runtime over the real model on both cards (or the one there is), with

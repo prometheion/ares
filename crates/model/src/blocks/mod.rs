@@ -51,6 +51,7 @@ use ares_runtime::ModelError;
 /// only pool the formats without a tile mean use).
 pub const PAGE_ENTRY: u32 = 1 << 31;
 
-fn invalid(message: impl Into<String>) -> ModelError {
+/// A request the model cannot serve as it is, as the runtime hears of it.
+pub(crate) fn invalid(message: impl Into<String>) -> ModelError {
     ModelError::Invalid(message.into())
 }

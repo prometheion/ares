@@ -52,12 +52,8 @@ fn read_ids(path: &Path) -> Vec<u32> {
 }
 
 fn read_vocabulary(path: &Path) -> Vec<u32> {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.parse().unwrap())
-        .collect()
+    ares_model::files::read_draft_vocabulary(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 fn rel(a: &[f32], b: &[f32]) -> f64 {

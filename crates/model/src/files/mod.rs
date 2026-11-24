@@ -6,7 +6,8 @@
 //! key or tensor, and what a file is for the fingerprints of what is kept of
 //! it on disk (`identity`: the prompt cache's state, the usage profile of the
 //! experts). Each model keeps its own list of keys and tensors and its own
-//! checks of how the values fit together.
+//! checks of how the values fit together. Besides the GGUF files, a draft
+//! vocabulary ([`read_draft_vocabulary`]).
 
 mod error;
 mod keys;
@@ -18,6 +19,23 @@ pub use error::FileError;
 pub(crate) use keys::Keys;
 pub use table::Matrix;
 pub(crate) use table::{Table, vocabulary};
+
+/// The token ids of a draft vocabulary file: one per line, blank lines and
+/// lines that start with `#` left out. Why not, with the line, when a line is
+/// no token id.
+pub fn read_draft_vocabulary(path: &Path) -> Result<Vec<u32>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read it: {e}"))?;
+    let mut tokens = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let token = line.parse::<u32>();
+        tokens.push(token.map_err(|_| format!("line {}: '{line}' is not a token id", number + 1))?);
+    }
+    Ok(tokens)
+}
 
 /// What of a model file goes into a fingerprint: its size, its first bytes
 /// (the header, with the model's settings) and samples spread over the rest
