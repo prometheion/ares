@@ -84,6 +84,34 @@ impl GgufBuilder {
         self
     }
 
+    pub fn u32_array(mut self, key: &str, values: &[u32]) -> Self {
+        self.key(key, 9);
+        self.meta.extend_from_slice(&4u32.to_le_bytes());
+        self.meta.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            self.meta.extend_from_slice(&value.to_le_bytes());
+        }
+        self
+    }
+
+    pub fn u64_array(mut self, key: &str, values: &[u64]) -> Self {
+        self.key(key, 9);
+        self.meta.extend_from_slice(&10u32.to_le_bytes());
+        self.meta.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            self.meta.extend_from_slice(&value.to_le_bytes());
+        }
+        self
+    }
+
+    pub fn bool_array(mut self, key: &str, values: &[bool]) -> Self {
+        self.key(key, 9);
+        self.meta.extend_from_slice(&7u32.to_le_bytes());
+        self.meta.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        self.meta.extend(values.iter().map(|&b| u8::from(b)));
+        self
+    }
+
     pub fn i32_array(mut self, key: &str, values: &[i32]) -> Self {
         self.key(key, 9);
         self.meta.extend_from_slice(&5u32.to_le_bytes());

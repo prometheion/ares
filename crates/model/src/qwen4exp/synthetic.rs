@@ -18,6 +18,7 @@
 use std::path::Path;
 
 use ares_core::GgmlType;
+use ares_gguf::GgufBuilder;
 
 /// The n-gram embedding of a made-up model.
 #[derive(Clone, Debug, PartialEq)]
@@ -289,8 +290,8 @@ impl Synthetic {
     /// Panics when a type cannot hold the rows of this shape.
     pub fn draft_bytes(&self, experts: Option<(GgmlType, GgmlType)>) -> Vec<u8> {
         let mut file = File::default();
-        file.string("general.architecture", "qwen4exp-mtp");
-        file.string("general.name", "ares synthetic qwen4exp MTP block");
+        file.put(|f| f.str("general.architecture", "qwen4exp-mtp"));
+        file.put(|f| f.str("general.name", "ares synthetic qwen4exp MTP block"));
         self.mtp_tensors(&mut file, experts);
         file.build()
     }
@@ -387,10 +388,10 @@ impl Synthetic {
 
     fn metadata(&self, file: &mut File) {
         let s = &self.shape;
-        file.string("general.architecture", "qwen4exp");
-        file.string("general.name", "ares synthetic qwen4exp");
+        file.put(|f| f.str("general.architecture", "qwen4exp"));
+        file.put(|f| f.str("general.name", "ares synthetic qwen4exp"));
         let u = |file: &mut File, key: &str, value: usize| {
-            file.u32(&format!("qwen4exp.{key}"), value as u32);
+            file.put(|f| f.u32(&format!("qwen4exp.{key}"), value as u32));
         };
         u(file, "block_count", s.n_layer);
         u(file, "context_length", s.n_ctx);
@@ -399,20 +400,17 @@ impl Synthetic {
         u(file, "attention.head_count_kv", s.n_head_kv);
         u(file, "attention.key_length", s.head_dim);
         u(file, "attention.value_length", s.head_dim);
-        file.f32("qwen4exp.attention.layer_norm_rms_epsilon", 1e-6);
+        file.put(|f| f.f32("qwen4exp.attention.layer_norm_rms_epsilon", 1e-6));
         u(file, "rope.dimension_count", s.rope_dim);
-        file.u32_array("qwen4exp.rope.dimension_sections", &s.rope_sections);
-        file.f32("qwen4exp.rope.freq_base", s.rope_base);
+        file.put(|f| f.u32_array("qwen4exp.rope.dimension_sections", &s.rope_sections));
+        file.put(|f| f.f32("qwen4exp.rope.freq_base", s.rope_base));
         u(file, "full_attention_interval", s.interval);
         let attention: Vec<bool> = (0..s.n_layer).map(|l| s.is_attention(l)).collect();
-        file.bool_array(
-            "qwen4exp.attention.recurrent_layers",
-            &attention.iter().map(|a| !a).collect::<Vec<_>>(),
-        );
-        file.u32_array(
-            "qwen4exp.attention.compress_ratios",
-            &attention.iter().map(|&a| if a { s.block as u32 } else { 0 }).collect::<Vec<_>>(),
-        );
+        let recurrent: Vec<bool> = attention.iter().map(|a| !a).collect();
+        file.put(|f| f.bool_array("qwen4exp.attention.recurrent_layers", &recurrent));
+        let ratios: Vec<u32> =
+            attention.iter().map(|&a| if a { s.block as u32 } else { 0 }).collect();
+        file.put(|f| f.u32_array("qwen4exp.attention.compress_ratios", &ratios));
         u(file, "attention.indexer.head_count", s.indexer_heads);
         u(file, "attention.indexer.key_length", s.indexer_dim);
         u(file, "attention.indexer.top_k", s.top_k);
@@ -429,15 +427,17 @@ impl Synthetic {
         u(file, "expert_shared_feed_forward_length", s.shared_ff);
         if let Some(g) = &s.ngram {
             let heads = (g.ngram_size - 1) * g.heads_per_ngram;
-            file.u32_array("qwen4exp.ple.layers", &[g.layer as u32]);
+            file.put(|f| f.u32_array("qwen4exp.ple.layers", &[g.layer as u32]));
             u(file, "ple.ngram_size", g.ngram_size);
             u(file, "ple.heads_per_ngram", g.heads_per_ngram);
             u(file, "ple.conv_kernel", g.conv_kernel);
-            file.u32("qwen4exp.ple.eos_token_id", g.eos_token);
-            file.u32("qwen4exp.ple.image_token_id", g.image_token);
+            file.put(|f| f.u32("qwen4exp.ple.eos_token_id", g.eos_token));
+            file.put(|f| f.u32("qwen4exp.ple.image_token_id", g.image_token));
             u(file, "embedding_length_per_layer_input", s.n_embd / heads);
-            file.u64_array("qwen4exp.ple.layer_multipliers", &MULTIPLIERS[..g.ngram_size]);
-            file.u64_array("qwen4exp.ple.head_vocab_sizes", &g.head_vocab);
+            file.put(|f| {
+                f.u64_array("qwen4exp.ple.layer_multipliers", &MULTIPLIERS[..g.ngram_size])
+            });
+            file.put(|f| f.u64_array("qwen4exp.ple.head_vocab_sizes", &g.head_vocab));
             let mut at = 0;
             let offsets: Vec<u64> = g
                 .head_vocab
@@ -447,13 +447,13 @@ impl Synthetic {
                     at - size
                 })
                 .collect();
-            file.u64_array("qwen4exp.ple.head_offsets", &offsets);
+            file.put(|f| f.u64_array("qwen4exp.ple.head_offsets", &offsets));
         }
         let tokens: Vec<String> = (0..s.n_vocab).map(|i| format!("t{i}")).collect();
-        file.string("tokenizer.ggml.model", "gpt2");
-        file.string_array("tokenizer.ggml.tokens", &tokens);
-        file.i32_array("tokenizer.ggml.token_type", &vec![1; s.n_vocab]);
-        file.string_array("tokenizer.ggml.merges", &[]);
+        file.put(|f| f.str("tokenizer.ggml.model", "gpt2"));
+        file.put(|f| f.str_array("tokenizer.ggml.tokens", &tokens));
+        file.put(|f| f.i32_array("tokenizer.ggml.token_type", &vec![1; s.n_vocab]));
+        file.put(|f| f.str_array::<&str>("tokenizer.ggml.merges", &[]));
     }
 
     fn tensors(
@@ -724,82 +724,14 @@ fn set_scale(ty: GgmlType, blk: &mut [u8], scale: f32) {
 /// The hash multipliers of Qwen3.8-Flash-Next.
 const MULTIPLIERS: [u64; 3] = [23703573157769, 20109073645365, 8052911324071];
 
-const ALIGNMENT: usize = 32;
-
-/// A GGUF version 3 file under construction. (`ares_gguf::GgufBuilder` has no
-/// arrays of 64-bit integers or booleans, which this architecture's metadata
-/// needs.)
+/// The file being written: a builder of `ares_gguf` that the writes below
+/// change in place.
 #[derive(Default)]
-struct File {
-    meta: Vec<u8>,
-    n_meta: u64,
-    tensors: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)>,
-}
+struct File(GgufBuilder);
 
 impl File {
-    fn put_str(out: &mut Vec<u8>, text: &[u8]) {
-        out.extend_from_slice(&(text.len() as u64).to_le_bytes());
-        out.extend_from_slice(text);
-    }
-
-    fn key(&mut self, key: &str, type_id: u32) {
-        Self::put_str(&mut self.meta, key.as_bytes());
-        self.meta.extend_from_slice(&type_id.to_le_bytes());
-        self.n_meta += 1;
-    }
-
-    fn array(&mut self, key: &str, elem_type: u32, len: usize) {
-        self.key(key, 9);
-        self.meta.extend_from_slice(&elem_type.to_le_bytes());
-        self.meta.extend_from_slice(&(len as u64).to_le_bytes());
-    }
-
-    fn u32(&mut self, key: &str, value: u32) {
-        self.key(key, 4);
-        self.meta.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn f32(&mut self, key: &str, value: f32) {
-        self.key(key, 6);
-        self.meta.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn string(&mut self, key: &str, value: &str) {
-        self.key(key, 8);
-        Self::put_str(&mut self.meta, value.as_bytes());
-    }
-
-    fn u32_array(&mut self, key: &str, values: &[u32]) {
-        self.array(key, 4, values.len());
-        for value in values {
-            self.meta.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-
-    fn i32_array(&mut self, key: &str, values: &[i32]) {
-        self.array(key, 5, values.len());
-        for value in values {
-            self.meta.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-
-    fn u64_array(&mut self, key: &str, values: &[u64]) {
-        self.array(key, 10, values.len());
-        for value in values {
-            self.meta.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-
-    fn bool_array(&mut self, key: &str, values: &[bool]) {
-        self.array(key, 7, values.len());
-        self.meta.extend(values.iter().map(|&b| u8::from(b)));
-    }
-
-    fn string_array(&mut self, key: &str, values: &[String]) {
-        self.array(key, 8, values.len());
-        for value in values {
-            Self::put_str(&mut self.meta, value.as_bytes());
-        }
+    fn put(&mut self, write: impl FnOnce(GgufBuilder) -> GgufBuilder) {
+        self.0 = write(std::mem::take(&mut self.0));
     }
 
     /// Adds a tensor of `values` in GGUF dimension order, encoded as `ty`.
@@ -828,41 +760,17 @@ impl File {
                 data
             }
         };
-        let dims = dims.iter().map(|&d| d as u64).collect();
-        self.tensors.push((name.to_owned(), dims, ty, data));
+        self.raw_tensor(name, dims, ty, data);
     }
 
     /// Adds a tensor whose stored bytes are `data`.
     fn raw_tensor(&mut self, name: &str, dims: &[usize], ty: GgmlType, data: Vec<u8>) {
-        let dims = dims.iter().map(|&d| d as u64).collect();
-        self.tensors.push((name.to_owned(), dims, ty, data));
+        let dims: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
+        self.put(|file| file.tensor(name, &dims, ty, data));
     }
 
     fn build(&self) -> Vec<u8> {
-        let pad = |out: &mut Vec<u8>| out.resize(out.len().next_multiple_of(ALIGNMENT), 0);
-        let mut out = Vec::new();
-        out.extend_from_slice(b"GGUF");
-        out.extend_from_slice(&3u32.to_le_bytes());
-        out.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
-        out.extend_from_slice(&self.n_meta.to_le_bytes());
-        out.extend_from_slice(&self.meta);
-        let mut offset = 0usize;
-        for (name, dims, ty, data) in &self.tensors {
-            Self::put_str(&mut out, name.as_bytes());
-            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
-            for dim in dims {
-                out.extend_from_slice(&dim.to_le_bytes());
-            }
-            out.extend_from_slice(&ty.id().to_le_bytes());
-            out.extend_from_slice(&(offset as u64).to_le_bytes());
-            offset = (offset + data.len()).next_multiple_of(ALIGNMENT);
-        }
-        pad(&mut out);
-        for (_, _, _, data) in &self.tensors {
-            out.extend_from_slice(data);
-            pad(&mut out);
-        }
-        out
+        self.0.build()
     }
 }
 
