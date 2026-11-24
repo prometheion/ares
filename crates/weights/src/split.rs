@@ -72,7 +72,7 @@ fn gains(heat: &[f32]) -> Vec<f64> {
 ///
 /// # Not moving slots back and forth
 ///
-/// The profile moves slowly and the budget changes at the broker's will, and
+/// The profile moves slowly and the budget changes as the books of host memory say, and
 /// every slot that changes layers costs an eviction and a read. So the
 /// split is not computed again from scratch, but changed from `current`:
 ///

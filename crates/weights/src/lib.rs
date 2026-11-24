@@ -15,7 +15,7 @@
 //!   reads like a cache in front of the SSD, with swaps that only take effect
 //!   once their data has arrived. A tier fed by reads protects the experts the
 //!   current step needs, counts a guess nobody used as worth nothing, and gives
-//!   slots back to the memory broker and takes them again.
+//!   slots back to the books of host memory and takes them again.
 //! - [`GuessQueue`] holds the experts that a prediction or the token table
 //!   named, until an I/O lane is free; a guess takes its slot only then.
 //! - [`split_slots`] divides a tier's memory over the layers by what the next
@@ -59,7 +59,7 @@
 //!   [`SlotSet::abort`]. Its time goes to [`Lookahead::observe_read`].
 //! - **Between steps, every few tokens.** [`ExpertHeat::decay`], and for the
 //!   tiers that are elected, [`SlotSet::elect`].
-//! - **The memory broker asks for RAM back, or gives it,** and every few hundred
+//! - **The books of host memory ask for RAM back, or give it,** and every few hundred
 //!   tokens as the profile moves: [`split_slots`] with the split in force,
 //!   then [`SlotSet::give_back`] or [`SlotSet::take`] in each layer by the
 //!   difference. The memory of a slot given back is freed by the caller, who then

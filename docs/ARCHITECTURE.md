@@ -2822,7 +2822,7 @@ pages) and comes with the runtime.
     well as elections: a demand read gets a slot at once, a guessed read
     (`GuessQueue`) gets one only when it is started, experts routed or
     predicted for the current token are protected, and slots can be given
-    back to the memory broker and taken again. Against a tier that is only
+    back to the memory books and taken again. Against a tier that is only
     re-elected, the model starts 34 % fewer reads per token and waits 20 %
     less with 4 reads in flight (58 % and 44 % with 8). Nearly all of that
     is reading guesses at all; protection removes the evictions of experts in
@@ -5159,7 +5159,7 @@ so nothing idle in VRAM needs lending.
   sequences reach them, and given back when no page in use lies in a piece any more,
   keeping one piece spare. They are booked in `--ram` as required memory ("K/V
   of the context beyond VRAM"), above the tier of experts: a running sequence
-  cannot do without its cells, and the broker's own rule says so. Far pages
+  cannot do without its cells. Far pages
   that only the prompt cache holds rank as prompt cache, the lowest (the
   owner's answer of 2026-11-22; see "Host memory"): they leave the devices first
   when it must give memory back, into RAM where it has room and otherwise
@@ -7184,9 +7184,9 @@ without a limit that was named.
 | Prompt cache in RAM (checkpoints of recurrent state, the pages that left the devices, and the K and V beyond VRAM of pages that only the prompt cache holds on the devices) | Elastic, the lowest | Goes first: the far pages only it holds leave the devices first (into RAM when its allowance has room, otherwise nowhere: they never wait for the drive); what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
 
 Nothing is reserved for the K and V beyond VRAM: they take their memory when
-a sequence reaches them, from the elastic users, as the broker's own rule for
-required memory says ("a running request must never fail to offload its K/V
-pages because a cache is sitting on memory it could do without"). The pages a
+a sequence reaches them, from the elastic users, as the rank of required
+memory says (a running request must never fail to offload its K/V pages
+because a cache is sitting on memory it could do without). The pages a
 finished request leaves in the device pool as prompt cache rank as prompt
 cache with their far K and V (the owner's answer of 2026-11-22): the books
 count those bytes in the prompt cache's share and not against the tier
@@ -7200,11 +7200,20 @@ size of its experts), a long conversation's far pages therefore leave the
 devices when its request ends, and its next turn reads them from the drive or
 computes them again; its pages in VRAM stay.
 
-A broker in `ares-core` keeps the books of the limit: a user asks to grow, a
-grant beyond the limit is refused, and the refusal names who holds what. Below
-the limit every elastic user keeps to an **allowance**, the bytes it may hold
-now, and that is what moves. VRAM is handled the same way in spirit but is
-planned ahead (ledgers), because moving things there is costly.
+The books of the limit count what each user holds: a user asks to grow, a
+booking beyond the limit is refused, and the refusal names who holds what.
+Below the limit every elastic user keeps to an **allowance**, the bytes it may
+hold now, and that is what moves. The rank sets it, in one place
+(`Books::allowances` in `crates/runtime/src/ram.rs`): the tier of experts may
+hold all the room the required users leave but the prompt cache's floor, the
+prompt cache what the tier does not want, at least its floor; an engine that
+follows the machine holds each to the share the machine gives it above its
+floor as well (the machine shares out by the same rank, see *Dividing*
+below). VRAM is handled the same way in spirit but is planned ahead (ledgers),
+because moving things there is costly. (Until 2026-11-24 a general broker in
+`ares-core`, with priorities, floors and reclaim plans, sat under these books;
+the runtime turned every plan into a refusal and kept its own policy on top,
+so the broker went.)
 
 **The rule** (`crates/runtime/src/ram/machine.rs`: `Rule`, `Follow`,
 `Machine`). One watch per process reads `MemAvailable` every 50 ms, and every
