@@ -203,6 +203,19 @@ marks a line that only a GPU run can settle or check.
 | Server, API, cache | 5 | 1 |
 | Model, runtime, kernels | 15 | 11 |
 
+### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
+- [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
+      Flash-Next's layer pass refuses ("a step wider than 512 rows reads one prompt",
+      `qwen4exp/device/runtime/pass.rs` `pass_of`): both requests get 500 and the model is unloaded.
+      In work: `fix/flash-crashes`.
+- [ ] Far K/V finds no RAM room ("the tier of experts is at its floor and the prompt cache holds the
+      rest", `qwen4exp/device/flow.rs` `FAR_WAIT`) at `--ram 40G` beside a 39,810-token request and at
+      `--ram 52G` repeating a 50k prompt: the prompt cache (lowest rank) does not give way, the tier's
+      floor latches for good (`runtime/src/ram.rs` `experts_floor`), and the engine takes the model
+      down instead of ending one request. In work: `fix/flash-crashes`.
+- [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
+      hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
+
 ### Server, API, cache
 - [ ] Chat and completion bodies pass over unknown members nested in a message, a tool or
       `stream_options`, where Messages and Responses refuse them; the server's rule is that
