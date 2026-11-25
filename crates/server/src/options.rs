@@ -468,6 +468,13 @@ pub const OPTIONS: &[Opt] = &[
          once (a request that generates then gets a token per step of prompt) [default: 20]",
     ),
     Opt::model(
+        "--watchdog",
+        "<SECONDS>",
+        "The longest one step may take, the warm-up's too, before the engine is taken for \
+         stuck: its requests end with the reason and the model is taken down; 0 watches \
+         nothing [default: 600]",
+    ),
+    Opt::model(
         "--reasoning",
         "<on|off|auto>",
         "Whether the model thinks before it answers: auto leaves it to the chat template \
@@ -1110,6 +1117,10 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
                 return Err(invalid("--generation-floor", value, expected));
             }
             load.generation_floor = Some(floor);
+        }
+        "--watchdog" => {
+            let expected = "a number of seconds, 0 or more (0 watches nothing)";
+            load.watchdog = Some(number("--watchdog", value, expected)?);
         }
         "--expert-prune" => load.expert_prune = expert_prune(value)?,
         "--chat-var" => {

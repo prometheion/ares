@@ -361,7 +361,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 8 |
+| Server, API, cache | 7 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -396,10 +396,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 - [ ] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
       TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`. Files:
       `crates/server/src/openai/request.rs`, `crates/server/src/generate.rs`, the docs.
-- [ ] Left of the watchdog (S23, done 2026-11-22): no option for the limit (a field of
-      `RuntimeConfig`, 600 s); the steps of the warm-up are not watched (the watch starts after
-      it); the memory a stuck device holds stays taken until the process ends. Files:
-      `crates/server/src/options.rs`, `crates/server/src/plan.rs`, `crates/runtime/src/engine.rs`.
 - [ ] Router: "no room" for Flash-Next is recognised by the message's text ("does not fit",
       "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
       `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
@@ -554,7 +550,11 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
       VRAM, quality.
 
 ## Questions to the owner
-- None open (the seven of the triage answered 2026-11-25, under "Decided by the owner").
+- [ ] An engine whose device never ends a step (the watchdog, `--watchdog`) fails its requests and
+      is taken down, but its device threads and the memory they hold stay with the process until it
+      ends (a context whose kernel never ends cannot be torn down). Should the server then exit with
+      an error, so that its unit or llama-swap starts it again, or keep serving its other models?
+      (Asked 2026-11-25 by `fix/server-sweep`.)
 
 ## Features
 Pieces of real work, days each, in the order of work where the owner placed them.

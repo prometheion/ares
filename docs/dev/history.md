@@ -398,6 +398,13 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-server: /metrics of a model that is not loaded says so with a 200": `ares_model_loaded 0` alone (and `1` before the counters of a loaded one), so a scraper does not take the server for down; the counters of an engine start again at its load. Tests in `tests/models.rs` and `tests/http.rs`.
 
+- [x] Left of the watchdog (S23, done 2026-11-22): no option for the limit (a field of
+      `RuntimeConfig`, 600 s); the steps of the warm-up are not watched (the watch starts after
+      it); the memory a stuck device holds stays taken until the process ends. Files:
+      `crates/server/src/options.rs`, `crates/server/src/plan.rs`, `crates/runtime/src/engine.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: the watchdog watches the warm-up, and --watchdog names its limit": `--watchdog <SECONDS>` (0: none, default 600), and the watch begins before the warm-up, whose stuck step now fails the load instead of holding it for ever (tests in `tests/conductor.rs` and `cli.rs`). The memory a stuck device holds is not a defect the process can fix: a context whose kernel never ends cannot be torn down, and the failure says so; whether the server should then exit so that its unit restarts it is a question to the owner (`OPEN.md`).
+
 ## 2026-11-24
 
 ### From "In work now"

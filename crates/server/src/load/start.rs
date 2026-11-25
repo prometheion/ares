@@ -64,6 +64,11 @@ pub(crate) fn start<M: Model + 'static>(
         generation_floor: options
             .generation_floor
             .unwrap_or(RuntimeConfig::default().generation_floor),
+        watchdog: match options.watchdog {
+            None => RuntimeConfig::default().watchdog,
+            Some(0) => None,
+            Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+        },
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {

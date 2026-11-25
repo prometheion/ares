@@ -166,9 +166,27 @@ impl Runtime {
                 }
             })
             .map_err(|e| RuntimeError::Thread(format!("cannot start the conductor: {e}")))?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        // The watch begins with the warm-up's steps: a device that never ends
+        // one would hold the start for ever.
+        if let Some(limit) = watchdog {
+            watch(heartbeat, limit, running.clone(), failure.clone(), stuck.clone())?;
+        }
+        let ready = loop {
+            match ready_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ready) => break Some(ready),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(mpsc::RecvTimeoutError::Timeout) if stuck.load(Ordering::Acquire) => {
+                    // The conductor waits for the step and is left behind with
+                    // its devices, as after a step that hangs later.
+                    let why = failure.get().cloned().unwrap_or_default();
+                    return Err(RuntimeError::Thread(format!("the warm-up stopped: {why}")));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        };
+        match ready {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
                 let _ = thread.join();
                 return Err(match error {
                     ExecError::Device { device, message } => {
@@ -177,13 +195,10 @@ impl Runtime {
                     other => RuntimeError::Thread(other.to_string()),
                 });
             }
-            Err(_) => {
+            None => {
                 let _ = thread.join();
                 return Err(RuntimeError::Thread("the conductor ended while starting".into()));
             }
-        }
-        if let Some(limit) = watchdog {
-            watch(heartbeat, limit, running.clone(), failure.clone(), stuck.clone())?;
         }
         Ok(Self {
             model,
