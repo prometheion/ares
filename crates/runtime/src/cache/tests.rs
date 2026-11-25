@@ -616,6 +616,32 @@ fn far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive(
 }
 
 #[test]
+fn the_floor_keeps_the_far_pages_of_one_request_until_running_sequences_need_them() {
+    // As above, but one request holds at most six far pages: the floor keeps that many
+    // of them on the devices (the tier of experts does not take them, so a conversation's
+    // next turn finds them), the others leave at the next trim. A running sequence's K and
+    // V outrank them: when the cache gives way, they leave too, with the pages in RAM.
+    let mut f = Following::with("keep", true, STATE + RESERVE * PAGE);
+    f.cache.far = Some(FarPages { first: 3, page_bytes: PAGE });
+    f.cache.far_keep = 6 * PAGE;
+    f.ram.keep_context_cached(6 * PAGE);
+    let mut devices = Devices::default();
+    for i in 0..12 {
+        f.text(i);
+    }
+    f.trimmed(&mut devices);
+    // The floor's place, which no checkpoint uses here, keeps a few more.
+    let kept = f.ram.context_cached();
+    assert!((6 * PAGE..36 * PAGE).contains(&kept), "the far pages of one request stay: {kept}");
+    assert!(f.cache.held() <= f.cache.allowance());
+    let (_, gone) = f.cache.give_way(&mut f.pool, &mut devices);
+    assert!(gone);
+    assert_eq!(f.ram.context_cached(), 0, "they made room for running sequences");
+    assert_eq!(f.cache.ram_counters().pages, 0, "and so did the pages in RAM");
+    assert_eq!(f.written().pages_written, 0, "nothing waited for the drive");
+}
+
+#[test]
 fn the_coldest_of_a_full_ram_is_written_ahead_and_the_rest_waits() {
     // Room for the floor and four pages more: RAM writes what is beyond
     // room for its reserve of sixteen pages.

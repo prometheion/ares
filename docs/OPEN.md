@@ -193,7 +193,7 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 15 | 11 |
+| Model, runtime, kernels | 16 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
 - [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
@@ -239,6 +239,13 @@ marks a line that only a GPU run can settle or check.
       `cache/ssd/mod.rs`, `cache/ssd/pump.rs`.
 
 ### Model, runtime, kernels
+- [ ] The step price the server measures at load is not monotonic in the rows (Flash-Next on
+      the local cards, 2026-11-25: 1 row 22.9 ms, 2 rows 118.7, 3 rows 166.4, 8 rows 80.9; the
+      report on an RTX 4080: 1 row 17.4, 2 rows 126.9, 8 rows 55.5). It is measured before the
+      warm-up fills the tiers, so the steps of few rows wait for experts from the drive; the
+      share and the piece size price steps by it until real steps teach the prices. Seen by
+      `fix/flash-crashes`, not the cause of its defects. Files: `crates/server/src/load/start.rs`,
+      `crates/runtime/src/conductor/measure.rs`.
 Tests that fail:
 - [ ] GPU. `qwen4exp_runtime`'s `flash_next_writes_with_drafts_what_it_writes_without` fails on
       the two local cards in some runs (2026-11-23, IQ2_XS with the MTP block): the greedy reply
@@ -571,7 +578,14 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
       VRAM, quality.
 
 ## Questions to the owner
-- None open (the seven of the triage answered 2026-11-25, under "Decided by the owner").
+- The far pages a finished request leaves (`fix/flash-crashes`, 2026-11-25): the prompt cache's
+  floor now keeps as many as one request can hold beyond VRAM from the tier of experts, so that
+  the same long prompt sent again comes from the cache (asked by the coordinator after the
+  report of 2026-11-25; the decision of 2026-11-22 above had them give way before the tier).
+  They still give way to running sequences' K and V first. Open: whether the machine's memory
+  pressure (another program growing) should take them before the tier too; today it does not
+  (they are in the floor). Files: `crates/runtime/src/ram.rs` (`Books::cache_floor`,
+  `keep_context_cached`), `crates/runtime/src/cache/moves.rs` (`trim`).
 
 ## Features
 Pieces of real work, days each, in the order of work where the owner placed them.

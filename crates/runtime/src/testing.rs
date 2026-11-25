@@ -504,6 +504,31 @@ impl Executor for HostExecutor {
         let mut rows_run = true;
         let mut inner: Vec<crate::InnerSave> =
             (0..view.inner_saves()).map(|i| view.inner_save(i)).collect();
+        // A step wider than the model's own rows borrows memory for its time, which only
+        // a prompt read alone gets (a model that reads it layer by layer refuses any
+        // other); and a model keeps one paused step, so no other wide step runs while
+        // one is paused.
+        let own = self.model.own_rows();
+        if !view.drafts_only() && view.rows() > own {
+            if view.segments() > 1 {
+                note(
+                    &self.problems,
+                    format!("a step of {} rows in {} segments", view.rows(), view.segments()),
+                );
+            }
+            let paused = self.pauses.as_ref().and_then(Pauses::paused_slot);
+            if let Some(slot) = paused
+                && (0..view.segments()).any(|i| view.segment(i).slot != slot)
+            {
+                note(
+                    &self.problems,
+                    format!(
+                        "a step of {} rows while the step of slot {slot} is paused",
+                        view.rows()
+                    ),
+                );
+            }
+        }
         if let Some(pauses) = &mut self.pauses
             && let Some(done) = pauses.step(&view)
         {

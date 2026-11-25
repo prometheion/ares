@@ -337,12 +337,12 @@ impl Cache {
         }
         self.settle_leaving(pool, exec);
         self.settle();
-        let target = self.allowance();
         // Far pages that only the index holds are the prompt cache's lowest:
         // those beyond what its floor keeps leave the devices first, and their
         // memory goes back to the system once the pages of a piece are all free.
-        // The ones the floor keeps go last, when nothing else is left to give.
+        // The ones the floor keeps go only to running sequences ([`Cache::give_way`]).
         self.count_far(pool);
+        let target = self.allowance();
         while self.held() > target && self.far_held > self.far_keep && self.evict_far(pool) {}
         self.settle_leaving(pool, exec);
         let mut dropped = 0;
@@ -359,11 +359,10 @@ impl Cache {
                 Some((_, Item::Checkpoint, hash)) => {
                     dropped += self.ram_give_up(Item::Checkpoint, hash);
                 }
-                None if self.give_up_index_checkpoint(false) => dropped += 1,
+                None if self.give_up_toward_floor() => dropped += 1,
                 None => break,
             }
         }
-        while self.held() > target && self.far_held > 0 && self.evict_far(pool) {}
         self.release_places(pool, exec);
         dropped
     }
@@ -411,8 +410,12 @@ impl Cache {
         }
         self.settle_leaving(pool, exec);
         self.giving_way = false;
-        while let Some((_, item, hash)) = self.in_ram.as_ref().and_then(RamLevel::first) {
-            dropped += self.ram_give_up(item, hash);
+        // What is in a transfer or with the writer goes when it is back.
+        let ready: Vec<ChainHash> = self.in_ram.as_ref().map_or_else(Vec::new, |ram| {
+            ram.in_order().into_iter().filter(|hash| ram.ready(*hash)).collect()
+        });
+        for hash in ready {
+            dropped += self.ram_give_up(Item::Page, hash);
             gone = true;
         }
         if let Some(ram) = &mut self.in_ram
@@ -423,7 +426,7 @@ impl Cache {
             gone = true;
         }
         let in_use = |cache: &Self| u64::from(cache.next_place) - cache.free_places.len() as u64;
-        while in_use(self) > 1 && self.give_up_index_checkpoint(false) {
+        while in_use(self) > 1 && self.give_up_toward_floor() {
             dropped += 1;
             gone = true;
         }

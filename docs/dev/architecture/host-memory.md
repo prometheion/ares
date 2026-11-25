@@ -12,10 +12,10 @@ without a limit that was named.
 | User | Kind | When memory is short |
 | --- | --- | --- |
 | What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; the floor of the prompt cache for a model with recurrent state (one checkpoint place, and with `--cache` 16 pages); with `--cache` the buffers that checkpoints pass through on their way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
-| K and V of running sequences beyond VRAM (Flash-Next: the pages from the plan's `near` on, `blocks/far.rs`) | Required, as it is used | Never gives way. It grows in pieces (about 64 MiB over all attention layers) as the sequences reach far pages and shrinks when no page in use lies in a piece; the step that needs a piece makes the tier of experts give it up first (see "K and V beyond VRAM") |
+| K and V of running sequences beyond VRAM (Flash-Next: the pages from the plan's `near` on, `blocks/far.rs`) | Required, as it is used | Never gives way. It grows in pieces (about 64 MiB over all attention layers) as the sequences reach far pages and shrinks when no page in use lies in a piece; before a step that needs a piece the tier of experts gives what its allowance no longer holds, then the prompt cache all it holds but one checkpoint place, and when that is not enough one request ends with an error (507) and the model serves on (see "K and V beyond VRAM") |
 | RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
 | Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
-| Prompt cache in RAM (checkpoints of recurrent state, the pages that left the devices, and the K and V beyond VRAM of pages that only the prompt cache holds on the devices) | Elastic, the lowest | Goes first: the far pages only it holds leave the devices first (into RAM when its allowance has room, otherwise nowhere: they never wait for the drive); what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
+| Prompt cache in RAM (checkpoints of recurrent state, the pages that left the devices, and the K and V beyond VRAM of pages that only the prompt cache holds on the devices) | Elastic, the lowest | Goes first: the far pages only it holds beyond what one request can hold leave the devices first (into RAM when its allowance has room, otherwise nowhere: they never wait for the drive); what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place. The floor keeps the far pages one request can hold from the tier of experts (since 2026-11-25), so that a conversation's next turn finds what its last turn computed beyond VRAM; K and V of running sequences take them |
 
 Nothing is reserved for the K and V beyond VRAM: they take their memory when
 a sequence reaches them, from the elastic users, as the rank of required
@@ -28,11 +28,43 @@ count those bytes in the prompt cache's share and not against the tier
 its allowance the conductor takes such pages off the devices first
 (`Cache::trim`, `PrefixIndex::evict_where`): into RAM when the allowance has
 room, on to the drive with `--cache`, or nowhere. The far pool unlocks a piece
-once no page in use lies in it, and the memory goes back to the tier. With a
-tier that wants more than the limit leaves (Flash-Next at any `--ram` below the
-size of its experts), a long conversation's far pages therefore leave the
-devices when its request ends, and its next turn reads them from the drive or
-computes them again; its pages in VRAM stay.
+once no page in use lies in it, and the memory goes back to the tier. Until
+2026-11-25 a tier that wants more than the limit leaves (Flash-Next at any
+`--ram` below the size of its experts) left the prompt cache only its one
+place, so a long conversation's far pages left the devices when its request
+ended, the checkpoint that hung on them went too, and the same prompt sent
+again was read again from its last checkpoint in VRAM or from its start
+(reported with a prompt of 49 965 tokens at `--ram 52G`; on the local cards a
+prompt of 32 034 tokens came back with 17 920 from the cache, all of them
+replayed). The prompt cache's floor therefore holds the far pages that one
+request can hold (`PinnedRam::keep_context_cached`: the pages of the model's
+context beyond `near`, 1.29 GiB at most for 131 072 cells in the report), and
+of its checkpoints the one used last goes last (`give_up_index_checkpoint`):
+the tier of experts does not take them, a running sequence's K and V do.
+
+**Room before a step** (`conductor/room.rs`, `Model::make_room`,
+`Flow::make_room`; 2026-11-25). Before the conductor writes a step it hands
+the model the pool pages in use (held by a sequence or by the prompt cache),
+and the model locks the pieces of the far pools they lie in and gives back the
+others; the tier of experts gives what its allowance no longer holds (down to
+its floor). What the limit still lacks comes back as a number. The prompt
+cache then gives up what it holds, at once and without a write (its far pages,
+its pages in RAM, its checkpoints but one place: `Cache::give_way`), and the
+model is asked again; when nothing more can go, the request that holds the most
+pages beyond VRAM ends (the step's prompts first) with an error that says what
+was short (`EngineError::NoMemory`, HTTP 507 `insufficient_memory`), and the
+step runs without it. `Flow::before_step` still locks what a record names, for
+the steps the conductor writes without planning (the warm-up), and fails the
+step when it cannot. Until then the conductor's thread waited in
+`Flow::lock_far` for ten seconds for a tier that could not give (the prompt
+cache, which only that thread can make give way, held the rest) and the engine
+failed; the tier's growth before a step failed the step when the books refused
+a piece (the prompt cache held more than the tier's allowance counted on: the
+refusal is no error now, `StoreError::NoRoom`); and the floor the tier found
+when every piece it tried had a busy slot stayed its floor for good, in the
+store (`at_floor`, now tried again after every step and before a step that
+needs room) and in the books (now forgotten when the tier gives or takes a
+piece).
 
 The books of the limit count what each user holds: a user asks to grow, a
 booking beyond the limit is refused, and the refusal names who holds what.

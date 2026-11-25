@@ -275,7 +275,12 @@ so nothing idle in VRAM needs lending.
   with far pools that was not prepared so fails. When the
   limit has no room the tier's allowance already leaves it
   (`PinnedRam::set_context_target`) and the tier gives pieces up then, with no
-  step running.
+  step running. Since 2026-11-25 the conductor has the pieces locked before it
+  writes a step, from the pool pages in use (`Model::make_room`), so that the
+  prompt cache can give way after the tier and a request ends when nothing
+  more can go, instead of the step failing ("Room before a step" in
+  [`host-memory.md`](host-memory.md)); and the prompt cache's floor keeps the far
+  pages one request can hold, so that a conversation's next turn finds them.
 - *Prompts.* Every row of a prompt reads the cells of its own pick, so a wide
   step that read the far pool in place would cross the link once per row. A
   step on lent VRAM (a prompt read alone, "Large prompt steps on lent VRAM")

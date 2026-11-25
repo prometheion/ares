@@ -1500,7 +1500,7 @@ impl Conductor {
         if let Err(message) = self.make_room() {
             return self.fail(message);
         }
-        if self.parts.is_empty() {
+        if self.parts.is_empty() || !self.step_is_taken() {
             return;
         }
         // The model's drafters run first, as a step of their own, and the

@@ -205,7 +205,13 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
 - *Who gets the wide step.* A prompt read alone; a generating sequence never shares a step
   with a loan (it rides along in pieces of the own scratch only), so nothing it holds in
   VRAM is lent while it generates. A request that arrives while a wide step runs waits for
-  that step, then for at most one piece.
+  that step, then for at most one piece. The planner keeps every step with the rows of more
+  than one sequence within the own rows (`ares_sched::Limits::shared_rows`): until
+  2026-11-25 two prompts that came while nothing generated were planned into one step up to
+  the widest (the piece bounded a prompt only beside generation), and a model that reads such
+  a step layer by layer refused it on the device and failed ("a step of 6112 rows in 2
+  segments"; `tests/cache/prefix.rs`
+  `long_prompts_that_come_together_are_read_one_at_a_time`).
 - *Exact?* The rows of a wide step are computed by the same kernels as in steps of the own
   scratch; what differs is the shape of the step: the attention plans' pieces and the order
   in which a wide step's experts add into a row (`red.add`, which differs from run to run
@@ -277,7 +283,13 @@ wider than the parts' own scratch runs as a **pass**:
   committed. The conductor keeps its part, plans the other sequences without it, and writes its
   rows again when it is its turn: alone when nothing else runs (no time bound), else as a piece
   of prompt in the share's turns, after the other prompts' pieces, for about `piece_ms` (500
-  ms). The model goes on where it stopped; its sequence never gives way, neither to a shortage
+  ms). While nothing generates it goes on, without a time bound, whenever it is the prompt the
+  planner reads first (by priority, then a starved one, then the fewest rows left), and the
+  other prompts wait for it; a shorter one that arrives is read in pieces of the own rows
+  meanwhile, since no other wide step runs while one is paused (the model keeps one paused
+  pass and its loan). Several prompts that wait while nothing generates are read so one at a
+  time: the planner's first alone, as wide as a prompt read alone, pausing only when a
+  request arrives. The model goes on where it stopped; its sequence never gives way, neither to a shortage
   of pages nor to a request of a better priority (`Claims::keep`: its state is neither before
   nor after its rows), and when it is cancelled nothing of it is kept and the next record gives
   the step up (`RecordView::gives_up_paused`). A request that arrives therefore waits for at

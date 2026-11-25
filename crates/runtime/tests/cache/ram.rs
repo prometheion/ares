@@ -147,10 +147,12 @@ fn a_conversation_that_ram_gave_up_comes_back_from_ssd() {
     let model = model();
     // RAM holds its floor of pages and nothing more.
     let e = engine(&model, config(32, 0, Some(store(&dir.0))));
-    let (one, two) = (text_of(30, 300), text_of(31, 300));
+    let (one, two, three) = (text_of(30, 300), text_of(31, 300), text_of(33, 300));
     let a = e.ask(&one, 10);
     let b = e.ask(&two, 10);
     assert_eq!(b.run.text, fresh(&two, 10));
+    // A third, so that RAM gives the first up whichever checkpoint it keeps last.
+    e.ask(&three, 10);
     let s = e.written();
     assert!(s.counters.ssd.pages_written > 0, "what left RAM was written: {s}");
     assert_eq!(s.counters.ram.pages_dropped, 0, "{s}");

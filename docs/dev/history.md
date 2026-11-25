@@ -43,6 +43,26 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
       `\` now. A scan of every string literal found no others (`expert_bench`'s
       `file {i}     {}`, named with them before, lines up with the labels around it).
 
+### Fixed on `fix/flash-crashes` (a report from a user of Flash-Next, 2026-11-25)
+
+Not items of `OPEN.md` before; each took the model down for every request in flight.
+
+- Two prompts that came 8 ms apart while nothing generated were planned into one step wider
+  than the parts' own rows ("a step of 8007 rows in 2 segments; a step wider than 512 rows
+  reads one prompt"): the planner bounded prompts by the piece only beside generation. Now a
+  step with several sequences stays within the own rows (`ares_sched::Limits::shared_rows`),
+  the prompt the planner reads first is read alone as a pass, no wide step runs beside a paused
+  one, and a step that breaks the rule ends its requests and not the engine.
+- "The RAM limit has no room for 4.4 MiB more of K and V beyond VRAM: the tier of experts is at
+  its floor and the prompt cache holds the rest", and the tier's growth refused by the books:
+  the conductor now makes room before it writes a step (`Model::make_room`,
+  `conductor/room.rs`): the tier gives what its allowance no longer holds, the prompt cache
+  gives up what it holds, and when nothing more can go one request ends with 507
+  `insufficient_memory`; the tier's floor no longer latches.
+- The same prompt of 49 965 tokens sent again was read again: the far pages and the anchor's
+  checkpoint of the first request had been given up for the tier. The cache's floor keeps the
+  far pages of one request, and the checkpoint used last goes last.
+
 Found done or stale by the triage of 2026-11-25 (branch `docs/triage`, every open item checked
 against `main` 4c834979): each item verbatim, then what did it or what changed. Items that only
 moved or were merged with a twin are not here; what is left of a partly done item is in

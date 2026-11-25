@@ -64,6 +64,38 @@ impl Conductor {
         }
     }
 
+    /// Whether the planned step is one the model takes: a step wider than its
+    /// own rows borrows memory for its time, which only a prompt read alone
+    /// gets, and none while another step is paused (the planner keeps to that;
+    /// a model that reads such a step layer by layer refuses any other, and its
+    /// refusal on the devices would fail the engine). A step that is not ends
+    /// its requests with an error, and the engine goes on.
+    pub(super) fn step_is_taken(&mut self) -> bool {
+        let rows: u32 = self.parts.iter().map(|p| p.rows).sum();
+        let own = self.model.own_rows().min(self.max_rows);
+        let paused = self.paused.is_some_and(|p| self.parts.iter().any(|q| q.slot != p.slot));
+        if rows <= own || (self.parts.len() == 1 && !paused) {
+            return true;
+        }
+        let message = format!(
+            "a step of {rows} rows for {} sequences{} was planned, wider than the {own} rows \
+             of a step that holds more than one prompt: the requests of the step end",
+            self.parts.len(),
+            if paused { " beside a paused step" } else { "" }
+        );
+        for slot in self.parts.iter().map(|p| p.slot).collect::<Vec<_>>() {
+            if let Some(a) = &self.slots[slot as usize] {
+                let _ = a.sink.send(Event::Error(EngineError::Internal(message.clone())));
+            }
+            self.retire_with(slot, FinishReason::Cancelled, false);
+        }
+        let saves = std::mem::take(&mut self.inner);
+        self.release_inner(saves);
+        self.inner_due.clear();
+        self.parts.clear();
+        false
+    }
+
     /// Ends the request in `slot` with `message`, for lack of memory: it leaves
     /// the planned step and keeps nothing in the cache.
     fn end_for_memory(&mut self, slot: u32, message: String) {
