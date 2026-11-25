@@ -1340,7 +1340,20 @@ impl Conductor {
         if pass {
             limits = wide;
         }
-        let planned = plan(&self.requests, &limits);
+        let mut planned = plan(&self.requests, &limits);
+        // A step wider than the model's own rows borrows memory for its time,
+        // which only a prompt read alone gets (`Model::own_rows`): a step of
+        // several sequences (prompts that arrived together, the forks of a
+        // decision) is planned within them.
+        let own = self.model.own_rows();
+        if planned.parts.len() > 1 && planned.rows() > own {
+            let narrow = Limits {
+                max_rows: limits.max_rows.min(own),
+                prefill_rows_with_windows: limits.prefill_rows_with_windows.min(own),
+                ..limits
+            };
+            planned = plan(&self.requests, &narrow);
+        }
         for request in &self.requests {
             if let Some(a) = self.slots[request.seq.0 as usize].as_mut() {
                 a.waited_steps = a.waited_steps.saturating_add(1);

@@ -522,6 +522,18 @@ impl Executor for HostExecutor {
         let paused_slot = self.pauses.as_ref().and_then(Pauses::paused_slot);
         // A save inside a step is one the model can make: in a step of one prompt wider than
         // its own rows (a pass), with as many rows as it asks for on either side.
+        // A step wider than the model's own rows is a prompt read alone.
+        if !view.drafts_only() && view.rows() > self.model.own_rows() && view.segments() > 1 {
+            note(
+                &self.problems,
+                format!(
+                    "a step of {} rows in {} segments, wider than the model's own {} rows",
+                    view.rows(),
+                    view.segments(),
+                    self.model.own_rows()
+                ),
+            );
+        }
         let margin = self.model.saves_inside_steps();
         for i in 0..view.inner_saves() {
             let save = view.inner_save(i);

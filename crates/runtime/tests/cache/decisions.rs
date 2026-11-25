@@ -283,6 +283,21 @@ fn one_question_is_its_own_prompt_and_a_model_without_a_cache_answers_the_same()
 }
 
 #[test]
+fn the_forks_of_a_model_with_few_rows_of_its_own_share_steps_within_them() {
+    // Flash-Next reads a prompt alone in steps wider than its own rows; forks
+    // that arrive together share steps of its own rows.
+    let mut shape = SyntheticConfig::small(Split::Single, 1);
+    shape.context_length = 2048;
+    shape.prefix_cache = Some(CHECKPOINT);
+    shape.own_rows = 16;
+    let model = Arc::new(SyntheticModel::new(shape).unwrap());
+    let e = engine(&model, config(8));
+    let request = decision(&text_of(21, 150), questions(6));
+    assert_eq!(decided(&e.rt, request.clone()).answers, alone_answers(&model, &request));
+    e.consistent();
+}
+
+#[test]
 fn more_questions_than_slots_take_turns_and_answer_the_same() {
     let model = model(Some(CHECKPOINT));
     let e = engine(&model, config(2));
