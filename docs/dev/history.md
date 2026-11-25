@@ -36,6 +36,12 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] A loan of VRAM stays while the engine is idle after a request that ended with its prompt
+      (it goes back at the next step only). Files: `crates/model/src/qwen4exp/device/flow.rs`,
+      `qwen4exp/device/runtime/pass.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the conductor tells the model when nothing runs and nobody waits (`Model::idle`), and Flash-Next gives back the VRAM lent for wide steps and the loan of a pass that has read its rows there (`Flow::idle`); a pass that has not read all its rows keeps its loan. Not covered by a host test (the GPU suites run it). Commit "ares-runtime: Flash-Next gives lent VRAM back when the engine idles".
+
 - [x] The heat counts the steps that measure the price of a step at the start (token 0, about a
       thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
       still counts it for a model without a profile. Files:

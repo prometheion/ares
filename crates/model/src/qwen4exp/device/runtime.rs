@@ -819,6 +819,12 @@ impl Model for Qwen4Exp {
         }
     }
 
+    fn idle(&self) {
+        if let Some(flow) = self.flow.get() {
+            flow.idle();
+        }
+    }
+
     fn measured(&self) {
         // The measurement's picks are no text's: with a usage profile or
         // without, the heat starts from what requests pick.

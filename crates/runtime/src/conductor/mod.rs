@@ -938,6 +938,9 @@ impl Conductor {
             if self.active == 0 && !self.shutting_down {
                 // Nothing runs. With nobody in line either, sleep until
                 // somebody asks for something.
+                if self.waiting.is_empty() {
+                    self.model.idle();
+                }
                 let command = if self.waiting.is_empty() && !moving {
                     self.rx.recv().map(Some).map_err(|_| RecvTimeoutError::Disconnected)
                 } else if self.stalled || self.waiting.is_empty() {

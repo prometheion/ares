@@ -376,7 +376,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 10 |
+| Model, runtime, kernels | 9 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -446,9 +446,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 - [ ] The MTP block's experts are not in the usage profile (they are filled in the order of their
       numbers at the start). Files: `crates/model/src/qwen4exp/device/usage.rs`,
       `qwen4exp/device/feed.rs` (`fill_mtp`), `crates/runtime/src/expert_store/profile.rs`.
-- [ ] A loan of VRAM stays while the engine is idle after a request that ended with its prompt
-      (it goes back at the next step only). Files: `crates/model/src/qwen4exp/device/flow.rs`,
-      `qwen4exp/device/runtime/pass.rs`.
 - [ ] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
       server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
       `crates/runtime/src/ram.rs`, the server's loader.

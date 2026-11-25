@@ -535,6 +535,29 @@ impl Flow {
         }
     }
 
+    /// Nothing runs and nobody waits ([`Model::idle`](ares_runtime::Model::idle)):
+    /// VRAM lent for wide steps and for a pass that has read its rows goes back
+    /// now, so that the tiers have their slots while the engine idles, not at
+    /// the next step. No step follows to read what the last one left there.
+    /// A pass that has not read all its rows keeps its loan.
+    pub(super) fn idle(&self) {
+        let mut feed = self.lock_feed();
+        if feed.store.in_step() {
+            return;
+        }
+        if !self.forget_done_pass() {
+            return;
+        }
+        self.on_loan.store(false, Ordering::Release);
+        for device in 0..self.lent.len() {
+            // What fails here (the fill from RAM into the slots given back)
+            // fails the next step, which gives back again.
+            if feed.store.return_scratch(device).is_err() {
+                return;
+            }
+        }
+    }
+
     /// A part has ended its step on the device: the last of them ends it for
     /// the store, unless it only drafted (`store` false).
     pub(super) fn finish(&self, store: bool) -> Result<(), ModelError> {
