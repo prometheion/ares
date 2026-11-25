@@ -431,7 +431,8 @@ fn a_tier_that_admits_what_it_read_and_protects_what_the_step_needs_reads_less()
         let outs: Vec<Outcome> = arms.iter().map(|arm| run(&work, *arm, params)).collect();
         for (arm, out) in arms.iter().zip(&outs) {
             eprintln!(
-                "  {:>14}: {:5.2} experts waited for, {:5.2} reads started by the model,                  {:5.2} layers of waiting; {} evicted in use, {} guessed reads",
+                "  {:>14}: {:5.2} experts waited for, {:5.2} reads started by the model, {:5.2} \
+                 layers of waiting; {} evicted in use, {} guessed reads",
                 format!("{arm:?}"),
                 out.misses_per_token(),
                 out.demand_reads_per_token(),

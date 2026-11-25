@@ -787,7 +787,9 @@ fn cpu_bench(map: &ExpertMap, reader: &Reader, shapes: &[ExpertShape]) -> Result
                 }
                 let (t, g) = (percentile(&mut total, 0.5), percentile(&mut gate_up, 0.5));
                 println!(
-                    "one {kind} (cpu {cpu}) blk.{layer} {}: {rows} row(s){}: {t:.0} us per expert                      (gate and up {g:.0}, down {:.0}) = {:.0} us per expert and row, load {}",
+                    "one {kind} (cpu {cpu}) blk.{layer} {}: {rows} row(s){}: {t:.0} us per \
+                     expert (gate and up {g:.0}, down {:.0}) = {:.0} us per expert and row, \
+                     load {}",
                     shape.gate_ty,
                     match (vnni, gather) {
                         (true, true) => "",
@@ -875,7 +877,8 @@ fn cpu_bench(map: &ExpertMap, reader: &Reader, shapes: &[ExpertShape]) -> Result
             }
             let median = percentile(&mut wall, 0.5);
             println!(
-                "pool {name}: {n_experts} expert(s) x {rows} row(s): {median:.0} us per job (p90 {:.0}) = {:.0} us per                  expert and row; threads busy {:.0} us per job, load {}",
+                "pool {name}: {n_experts} expert(s) x {rows} row(s): {median:.0} us per job (p90 \
+                 {:.0}) = {:.0} us per expert and row; threads busy {:.0} us per job, load {}",
                 percentile(&mut wall, 0.9),
                 median / (n_experts * rows) as f32,
                 busy / rounds as f64,

@@ -1712,7 +1712,8 @@ fn pruning_touches_only_what_the_file_alone_holds() {
         let store = session.take_store_stats();
         let pruned = session.take_prune_stats();
         eprintln!(
-            "  {} device(s), {rule:?} with {weights:?} weights: {} picks, {} left out, {} stood in              for; {} in a slot, {} from RAM, {} from the file",
+            "  {} device(s), {rule:?} with {weights:?} weights: {} picks, {} left out, {} stood \
+             in for; {} in a slot, {} from RAM, {} from the file",
             devices.len(),
             pruned.picks,
             pruned.left_out(),
