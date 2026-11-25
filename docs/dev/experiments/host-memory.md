@@ -114,3 +114,18 @@ the thread that did it before (the end of a step unlocked the tier's pieces on a
 device thread, the conductor does it now as it collects the step; the RAM
 thread's frees of checkpoint chunks, which ran beside the steps, wait for the
 end of the step they meet).
+
+## Long prompts together and again beyond VRAM, measured (2026-11-25)
+
+The defects a user of Flash-Next reported (one RTX 4080, `--ram 40G` and `52G`, coding-agent
+requests of 40k to 50k tokens, often two at once), reproduced on the RTX 4070 and RTX 3060
+(IQ2_XS with its MTP block, `--ram 8G --context 262144 --parallel 4`: K and V of the first
+18 048 tokens in VRAM, the rest in RAM; `fix/flash-crashes`, the script
+`/var/tmp/ares-crashfix/repro.py`), main 1a28fb5c against the branch; load average 18 to 33
+from other agents' builds.
+
+| | main | branch |
+| --- | --- | --- |
+| Two chat requests 8 ms apart (one of 17.6k tokens with 13 tools, one of 3.4k without; also 56k and 6k) | the engine failed at once ("a step of 6112 rows in 2 segments"), the model went down | both answer |
+| A prompt of 32 034 tokens, then the same again | the second: 17 920 tokens from the cache, all of them replayed, first token after 107 s | 32 033 from the cache, 33 rows replayed, first token after 6.5 s |
+| A prompt of 93 425 tokens, then the same again | the second was read again; its tier's growth before a step was refused by the books ("no room for 62.8 MiB more of the tier of experts") and the engine failed | |

@@ -493,10 +493,11 @@ fn flash_next_reads_long_prompts_together_and_again_beyond_vram() {
 
     // Two at once: about 6000 tokens with the tools and 1500 without.
     let (long, short) = (ask(&build_log(1, 300), true, 16), ask(&build_log(2, 75), false, 16));
+    let client: &Client = &server;
     let (a, b) = thread::scope(|s| {
-        let a = s.spawn(|| server.post("/v1/chat/completions", &long));
+        let a = s.spawn(|| client.post("/v1/chat/completions", &long));
         thread::sleep(Duration::from_millis(8));
-        let b = s.spawn(|| server.post("/v1/chat/completions", &short));
+        let b = s.spawn(|| client.post("/v1/chat/completions", &short));
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_eq!(a.status, 200, "{}", a.body);

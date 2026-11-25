@@ -493,11 +493,13 @@ impl Cache {
     }
 
     /// The policy with the budget the checkpoints have now: what the books
-    /// allow but the floor of pages, and never more than the budget the
-    /// places were counted for. Pages in RAM above their floor make room for
-    /// checkpoints, not the other way round.
+    /// allow but the floor of pages and the far pages the cache holds on the
+    /// devices (the floor keeps them: they are no room for a place), and never
+    /// more than the budget the places were counted for. Pages in RAM above
+    /// their floor make room for checkpoints, not the other way round.
     fn policy_now(&self) -> CheckpointPolicy {
-        let allowed = self.allowance().saturating_sub(self.page_floor);
+        let allowed =
+            self.allowance().saturating_sub(self.page_floor).saturating_sub(self.far_held);
         CheckpointPolicy { budget_bytes: self.policy.budget_bytes.min(allowed), ..self.policy }
     }
 

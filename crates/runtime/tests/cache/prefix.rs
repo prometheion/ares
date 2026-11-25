@@ -1387,6 +1387,17 @@ fn far_pages_of_a_finished_request_stay_when_the_tier_of_experts_wants_the_memor
         let found = again.run.usage.cached_prompt_tokens;
         assert!(cached_far >= 6 << 20, "hungry {hungry}: the far pages stayed: {cached_far}");
         assert!(found >= 10 * PAGE, "hungry {hungry}: the whole prompt stayed cached: {found}");
+        // Another prompt beside the far pages the floor keeps takes the one place for its
+        // own checkpoints (the far pages are no room for a place), so it too comes back
+        // from its last checkpoint and replays less than a page (beside a tier that wants
+        // little, the ranking of many places decides).
+        let other = Rng(32).prompt(10 * PAGE as usize + 5);
+        e.ask(&other, 4);
+        let replayed = e.snapshot().counters.replay_rows;
+        let next = e.ask(&other, 4);
+        let replayed = e.snapshot().counters.replay_rows - replayed;
+        assert!(next.run.usage.cached_prompt_tokens >= 10 * PAGE, "hungry {hungry}");
+        assert!(!hungry || replayed < u64::from(PAGE), "{replayed} rows replayed");
         assert_eq!(again.run.text, first.run.text, "hungry {hungry}");
         texts.push(first.run.text);
         e.consistent();
