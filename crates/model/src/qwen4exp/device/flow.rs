@@ -48,6 +48,9 @@ pub(super) const LEAD_LAYERS: usize = 6;
 /// an expert can end, before the device threads leave it.
 const DRAIN: Duration = Duration::from_secs(5);
 
+/// How often a wait of a second or more looks at what the steps moved ([`Flow::check`]).
+const LOOK_EVERY: Duration = Duration::from_millis(10);
+
 /// How long the tier of experts locks pieces at a time when it may hold
 /// more and no step runs: the thread that watches the machine's memory does
 /// it, it must look again soon, and a step that begins waits for it.
@@ -78,8 +81,8 @@ pub(super) struct Flow {
     pub(super) uploads_seen: AtomicU64,
     pub(super) stall: Duration,
     /// For a wait that has stood still a while ([`Flow::check`]): what the steps
-    /// had moved when it was last seen to change, and when.
-    pub(super) moved_at: Mutex<(u64, Instant)>,
+    /// had moved when it was last seen to change, when, and when it was last looked at.
+    pub(super) moved_at: Mutex<(u64, Instant, Instant)>,
     /// Reads of the n-gram table's rows done the last time anyone looked.
     pub(super) ngram_seen: AtomicU64,
     /// What the store counted, summed over the times it was read.
@@ -150,7 +153,7 @@ impl Flow {
             failed: AtomicBool::new(false),
             uploads_seen: AtomicU64::new(0),
             stall,
-            moved_at: Mutex::new((0, Instant::now())),
+            moved_at: Mutex::new((0, Instant::now(), Instant::now())),
             ngram_seen: AtomicU64::new(0),
             totals: Mutex::new(ExpertStats { ram_tier_bytes: ram_bytes, ..Default::default() }),
             wide: Mutex::new(WideStats::default()),
@@ -493,11 +496,24 @@ impl Flow {
         if waited < self.stall.min(Duration::from_secs(1)) {
             return Ok(());
         }
-        let moved = self.moved();
-        let still = {
-            let mut at = self.moved_at.lock().unwrap_or_else(|e| e.into_inner());
-            stood_still(waited, moved, &mut at, Instant::now())
+        // What moved is looked at every few milliseconds at most, by one waiting thread at a
+        // time: a look takes the store's lock, which the pumps of the waits need.
+        let mut at = match self.moved_at.try_lock() {
+            Ok(at) => at,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return Ok(()),
         };
+        let now = Instant::now();
+        let still = if now.saturating_duration_since(at.2) >= LOOK_EVERY {
+            at.2 = now;
+            let mut mark = (at.0, at.1);
+            let still = stood_still(waited, self.moved(), &mut mark, now);
+            (at.0, at.1) = mark;
+            still
+        } else {
+            waited.min(now.saturating_duration_since(at.1))
+        };
+        drop(at);
         if still < self.stall {
             return Ok(());
         }
