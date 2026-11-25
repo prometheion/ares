@@ -204,7 +204,7 @@ marks a line that only a GPU run can settle or check.
 
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
-| Server, API, cache | 1 | 1 |
+| Server, API, cache | 0 | 0 |
 | Model, runtime, kernels | 15 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
@@ -235,15 +235,6 @@ marks a line that only a GPU run can settle or check.
       panic decide what aborts.
 
 ### Server, API, cache
-- [ ] GPU. `ares-server --test real_cache`
-      `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd` failed once in the
-      full suite under load (2026-11-17: after two other conversations took the pool, 4096 or
-      fewer of 9851 tokens came from the cache); alone it passes (9728 from SSD). Suspected, and
-      still possible in today's code: a page on its way from RAM to the SSD is found in neither (a
-      RAM page whose bytes are with the writer is not `ready`, and the drive reports stored
-      records only). Since 2026-11-24 the test runs with K and V beyond VRAM (`--context 20480`).
-      Files: `crates/runtime/src/cache/moves.rs` (`import_from_ram`), `cache/ram.rs`,
-      `cache/ssd/mod.rs`, `cache/ssd/pump.rs`.
 
 ### Model, runtime, kernels
 Tests that fail:

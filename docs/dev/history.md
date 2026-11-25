@@ -377,6 +377,18 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-server: the chat reader refuses unknown members inside messages, tools and stream_options": what the clients read send is read by its meaning (`reasoning`, `reasoning_text`, `thinking` as `reasoning_content`; `include_obfuscation` and `continuous_usage_stats` only false) or accepted where it changes nothing here (cache markers `cache_control` and `prompt_cache_breakpoint`, `image_url.detail`, a call's `index`), said in `docs/user/api.md`; anything else is a 400 that names it. Read for it: Open WebUI 0.13.4, opencode 2.4.1 and 1.19.6 (with `@ai-sdk/openai-compatible`), Continue 1.3.40, LibreChat 0.8.9 (LangChain `@langchain/openai` 1.5.8), the llama.cpp web UI, the OpenAI SDK 7.64; Claude Code has no OpenAI chat mode. Tests in `openai/request.rs`.
 
+- [x] GPU. `ares-server --test real_cache`
+      `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd` failed once in the
+      full suite under load (2026-11-17: after two other conversations took the pool, 4096 or
+      fewer of 9851 tokens came from the cache); alone it passes (9728 from SSD). Suspected, and
+      still possible in today's code: a page on its way from RAM to the SSD is found in neither (a
+      RAM page whose bytes are with the writer is not `ready`, and the drive reports stored
+      records only). Since 2026-11-24 the test runs with K and V beyond VRAM (`--context 20480`).
+      Files: `crates/runtime/src/cache/moves.rs` (`import_from_ram`), `cache/ram.rs`,
+      `cache/ssd/mod.rs`, `cache/ssd/pump.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: a prompt waits for its pages on their way from RAM to the drive": the gap was there (a RAM page whose bytes are with the writer is not `ready`, and the store has no record of it yet); the probe now waits up to 250 ms for the writer to give such pages of the prompt back (`Cache::await_transit`). `real_cache` on the local cards, three runs (05:18, 05:29, 05:40): the Flash-Next test took 9728 of 9851 tokens from the SSD after eviction in each run that reached that step; one run (built while the branch was being rewritten, with a since-dropped change of the anchor) failed earlier with "the rows of slot 0 start at cell 9728 and its sequence is at cell 9820", which the branch without that change did not show. The original shortfall was not reproduced.
+
 ### From "Small fixes": "Server, API, cache"
 
 Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).
