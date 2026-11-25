@@ -147,3 +147,49 @@ the CPU and upload a mask only when none of them is allowed.
    drafter.
 10. llguidance with candidate validation, and a sort-free sampler with the
     grammar mask applied in the kernel.
+
+## References noted in OPEN.md (moved here on 2026-11-25)
+
+Engines the owner or an agent pointed to after this survey, as they were noted in
+[`OPEN.md`](../../OPEN.md), verbatim; each is to be read in its code before the piece it names is
+built (the owner's rule of 2026-11-24: take code, not ideas).
+
+### Strata-HotRod (2026-11-24)
+
+Reference (2026-11-24, the owner's link): Strata-HotRod, https://github.com/sangharshadhyeta/Strata-HotRod,
+MIT, a fork of Strata 0.1.45 for Flash-Next IQ3_S on an RTX 3060 12 GB with 30 GB RAM and NVMe on
+PCIe 3.0; one request at a time; the author's own measurements, many single runs. Claims 17 ->
+50-70 tokens/s decode on short answers (38-54 after a 45k prompt), UD-Q4_K_XL 15-25. Where it
+comes from: (1) stand-in experts, the big lever: a missing expert is replaced by the best expert
+on the card when router weight x logit gap is within a self-tuned budget (maths 47/50 against
+48/50, code 30/30 both; aggressive settings broke words and JSON and are off). A candidate for
+the owner's dynamic pruning (item 6), measured for quality against the reference (the owner's
+rule: differ for speed, never wrong). (2) A learned correction on the routers' look-ahead: of the
+needed experts not on the card, the plain router held 77-79 / 66-69 / 55-58 % at 1 / 2 / 4
+layers, the learned one 85-88 / 76-79 / 66-71 %; but read ahead only 29 % of the guesses were
+used (95 % unused as read-ahead rows): precision is the problem, as Ares measured (3-8 % in
+decode). (3) K/V from RAM past 64k with 32k on the card (as Ares's far pages); two I/O threads,
+next layer first; a pinned RAM tier with PCIe balance (+9 %); swaps across layers (one run). For
+Inkling 2 Mini it points to another fork, UnbiasedStrata (not read). To be read in its code
+before stand-ins are built; measure in the SSD comparison (item 3).
+
+### TokenWing (2026-11-17)
+
+Reference now in the open (2026-11-17): Run My AI's engine TokenWing, MIT, built on llama.cpp,
+https://github.com/runmyai/tokenwing (`docs/how-it-works.md`, `docs/architecture.md`,
+`docs/settings.md`); it runs Qwen3.8 Flash-Next (IQ3_S and UD-Q4_K_XL). Its README: expert reads
+with O_DIRECT through 8 I/O threads and a priority queue; the routers of layers L+1 and L+2 on
+layer L's hidden state (75.7 % of picks predicted one layer ahead, 67.2 % two, on Ling 3.0
+Flash); a RAM cache per layer (`--moe-stream-window`), a VRAM cache that follows the text (up to
+64 experts swapped every 8 tokens, `--moe-stream-vram-follow`); use counts halved every 64
+tokens, the lowest leaves first; prompts layer by layer, so each expert is read about once per
+prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before items 3 above
+(large prompt chunks) and the prediction's next step are built.
+
+### Basalt (2026-11-18)
+
+Reference to read (2026-11-18): Basalt, https://github.com/jesdga95/basalt (MIT, a fork of Strata,
+kernels from Infernix; NVIDIA Blackwell only, so it cannot run on these cards): Qwen3.8 Flash-Next
+with MTP, Qwen3.8-27B with DFlash 2 and DeepSeek-V4.1-Flash with DSpark, drafting on by default;
+OpenAI and Anthropic routes, a router, images, documents (PDF, text) and video (NVDEC for
+Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README gives no speeds.
