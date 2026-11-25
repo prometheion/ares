@@ -209,13 +209,12 @@ impl RequestSampler {
         p.dynatemp_exponent = sampling.dynatemp_exponent.unwrap_or(p.dynatemp_exponent);
         let tau = sampling.mirostat_tau.unwrap_or(5.0);
         let eta = sampling.mirostat_eta.unwrap_or(0.1);
+        // 0 is off; `Sampling::validate` refused every other value when the
+        // request came in (`Runtime::submit_filtered`), which holds the range.
         p.mirostat = match sampling.mirostat {
-            None | Some(0) => None,
             Some(1) => Some(Mirostat::V1),
             Some(2) => Some(Mirostat::V2),
-            Some(other) => {
-                return Err(invalid(format!("mirostat must be 0, 1 or 2, got {other}")));
-            }
+            _ => None,
         };
         p.mirostat_mu = 2.0 * tau;
         p.logprobs = match sampling.logprobs {
@@ -644,8 +643,6 @@ mod tests {
             p.mirostat_mu = 10.0 - 0.5 * (7.0 - 5.0);
             p.row(1)
         });
-        let wrong = Sampling { mirostat: Some(3), ..Sampling::default() };
-        assert!(sampler(&wrong).is_err());
     }
 
     #[test]

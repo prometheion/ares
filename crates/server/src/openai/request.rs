@@ -663,10 +663,12 @@ fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
         xtc_threshold: fields.f32("xtc_threshold")?,
         dynatemp_range: fields.f32("dynatemp_range")?,
         dynatemp_exponent: fields.f32("dynatemp_exponent")?,
+        // Its range is `Sampling::validate`'s: here only a number that does
+        // not fit the field is refused.
         mirostat: fields
             .int("mirostat")?
             .map(|m| {
-                u8::try_from(m).ok().filter(|m| *m <= 2).ok_or_else(|| {
+                u8::try_from(m).map_err(|_| {
                     ApiError::invalid_param(
                         "mirostat",
                         format!("mirostat must be 0, 1 or 2, got {m}"),

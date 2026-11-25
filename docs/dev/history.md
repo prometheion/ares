@@ -381,6 +381,11 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
 Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).
 
+- [x] The mirostat range is checked twice, by `Sampling::validate` and by the runtime's request
+      sampler. Files: `crates/api/src/sampling.rs`, `crates/runtime/src/sampling.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: the mirostat range is Sampling::validate's alone": the request sampler trusts the check every request passes in `Runtime::submit_filtered`, and the server's reader only refuses a number that does not fit the field.
+
 ## 2026-11-24
 
 ### From "In work now"

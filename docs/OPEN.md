@@ -360,7 +360,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 10 |
+| Server, API, cache | 9 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -409,8 +409,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 - [ ] The cache's transfer time is counted twice, exported as `cache_ram_transfer_nanoseconds_total`
       and `cache_ssd_transfer_nanoseconds_total` (cleanup phase 2: a metric's name). Files:
       `crates/runtime/src/cache/moves.rs`, `crates/server/src/metrics.rs`.
-- [ ] The mirostat range is checked twice, by `Sampling::validate` and by the runtime's request
-      sampler. Files: `crates/api/src/sampling.rs`, `crates/runtime/src/sampling.rs`.
 
 ### Model, runtime, kernels
 - [ ] Left of step 5 of the shared layer, the token rows: DFlash's newest token and mask rows are
