@@ -265,6 +265,17 @@ fn the_small_model_decides_as_the_reference_reads_each_question_alone() {
         result.prefix_tokens
     );
 
+    // The same decision again, before anything else takes the cache's tails:
+    // its shared start from the prefix cache, the same answers.
+    let again = decide(&runtime, email(2));
+    assert!(again.usage.cached_prompt_tokens > 0, "{again:?}");
+    for (a, b) in result.answers.iter().zip(&again.answers) {
+        let diff = probabilities(&a.verdict)
+            .iter()
+            .zip(probabilities(&b.verdict))
+            .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff < 0.01, "{a:?} against {b:?}");
+    }
     // The CPU reference on each question's whole prompt.
     let gguf = ares_gguf::Gguf::open(&path).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
@@ -300,16 +311,6 @@ fn the_small_model_decides_as_the_reference_reads_each_question_alone() {
     let checked = against_greedy(&runtime, &labels, &request, &result);
     eprintln!("RES {checked} of {} questions start with a label alone", request.questions.len());
 
-    // The same decision again: from the prefix cache, the same answers.
-    let again = decide(&runtime, email(2));
-    assert!(again.usage.cached_prompt_tokens > 0, "{again:?}");
-    for (a, b) in result.answers.iter().zip(&again.answers) {
-        let diff = probabilities(&a.verdict)
-            .iter()
-            .zip(probabilities(&b.verdict))
-            .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()));
-        assert!(diff < 0.01, "{a:?} against {b:?}");
-    }
     eprintln!("RES counters: {:?}", runtime.snapshot().unwrap().counters);
 }
 
@@ -335,8 +336,6 @@ fn the_27b_decides_as_each_question_alone_starts_its_reply() {
         result.usage.prompt_tokens,
         result.prefix_tokens
     );
-    let checked = against_greedy(&runtime, &labels, &request, &result);
-    assert!(checked >= 2, "the 27B answers most of these with a label: {checked}");
     let begun = Instant::now();
     let again = decide(&runtime, email(2));
     eprintln!(
@@ -350,6 +349,8 @@ fn the_27b_decides_as_each_question_alone_starts_its_reply() {
     {
         assert_eq!(chosen(question, &a.verdict), chosen(question, &b.verdict));
     }
+    let checked = against_greedy(&runtime, &labels, &request, &result);
+    assert!(checked >= 2, "the 27B answers most of these with a label: {checked}");
 }
 
 /// The 27B on both cards as the owner runs it: a tensor split of 0.625 and

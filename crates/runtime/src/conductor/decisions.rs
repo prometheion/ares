@@ -26,7 +26,9 @@
 //!
 //! When every fork has its logits, [`ares_api::Question::answer`] makes the
 //! answers. A decision of one question has no parent: its one fork computes
-//! everything. When the cache cannot keep what the parent left (no room, a
+//! everything; nor has a decision whose shared start the cache holds with the
+//! state at its end ([`Conductor::cached_with_state`]): its forks start from
+//! it at once. When the cache cannot keep what the parent left (no room, a
 //! model without a prefix cache), a fork computes what it misses, from an
 //! earlier checkpoint or from its first token: the answers are the same, only
 //! the work is not shared.
@@ -134,12 +136,37 @@ impl Conductor {
             cached: 0,
         };
         self.decisions.insert(id, decision);
-        if n > 1 && shared > 0 {
+        if n > 1 && shared > 0 && !self.cached_with_state(id) {
             let prompt = self.decisions[&id].prompts[0][..shared].to_vec();
             self.enqueue_part(id, prompt, Role::Parent { decision: id });
         } else {
             self.enqueue_forks(id);
         }
+    }
+
+    /// Whether the prefix cache holds all of decision `id`'s shared start
+    /// and the recurrent state at its end: then the forks start from it at
+    /// once and the decision needs no parent (whose one computed row would
+    /// cost a step, a replay of the start and a copy of its state). A state
+    /// the engine has read before, an agent's next question about it.
+    fn cached_with_state(&mut self, id: RequestId) -> bool {
+        let (Some(cache), Some(d)) = (&mut self.cache, self.decisions.get_mut(&id)) else {
+            return false;
+        };
+        // A prompt is looked up without its last token: the shared start and
+        // one token of the first question.
+        let names: Vec<u64> = d.prompts[0][..=d.shared].iter().map(|t| u64::from(*t)).collect();
+        let chain = cache.chain(&names);
+        let probe = cache.probe(&mut self.pool, None, &chain, &names);
+        let resume = &probe.resume;
+        let warm = probe.found.computing.is_none()
+            && resume.cached_cells == d.shared as u64
+            && resume.replay.is_empty()
+            && (resume.restore.is_some() || !cache.recurrent());
+        if warm {
+            d.cached = d.shared as u32;
+        }
+        warm
     }
 
     /// Puts the forks of decision `id` in line.

@@ -226,23 +226,39 @@ fn every_question_is_answered_as_its_prompt_alone_from_one_computation_of_the_st
 }
 
 #[test]
-fn a_state_the_engine_has_read_costs_the_second_decision_only_its_questions() {
+fn a_state_the_engine_has_read_costs_the_next_decision_only_its_questions() {
     let model = model(Some(CHECKPOINT));
     let e = engine(&model, config(8));
     let state = text_of(12, 200);
     let first = decided(&e.rt, decision(&state, questions(4)));
+    // Other questions about the same state, as an agent's next step asks
+    // them: their prompts share what the first ones shared.
+    let mut next = questions(4);
+    for (q, word) in next.iter_mut().zip(["Does", "Was", "Should", "Would"]) {
+        q.instructions = string(&format!("{word} it matter?"));
+    }
     let before = e.snapshot();
-    let request = decision(&state, questions(4));
+    let request = decision(&state, next);
     let second = decided(&e.rt, request.clone());
-    assert_eq!(second.answers, first.answers);
+    assert_eq!(second.prefix_tokens, first.prefix_tokens);
     assert_eq!(second.answers, alone_answers(&model, &request));
+    // The questions' rows and nothing else: the cache holds the state and the
+    // recurrent state at its end, so the forks start from it at once, without
+    // a parent, and keep no checkpoint of their own.
     let shared = second.prefix_tokens as u64;
-    assert!(second.usage.cached_prompt_tokens as u64 >= shared - PAGE as u64, "{second:?}");
-    // The questions' rows and what the cache could not hold of the state's
-    // last page at most.
     let rest: u64 = prompts_of(&model, &request).iter().map(|p| p.len() as u64 - shared).sum();
-    let computed = e.snapshot().counters.prefill_rows - before.counters.prefill_rows;
-    assert!(computed <= rest + u64::from(PAGE), "{computed} rows for {rest}");
+    let s = e.snapshot();
+    let computed = s.counters.prefill_rows - before.counters.prefill_rows;
+    let replayed = s.counters.replay_rows - before.counters.replay_rows;
+    assert_eq!((computed, replayed), (rest, 0), "{s}");
+    assert_eq!(s.counters.checkpoints_saved, before.counters.checkpoints_saved, "{s}");
+    assert_eq!(s.counters.checkpoints_restored - before.counters.checkpoints_restored, 4, "{s}");
+    assert_eq!(second.usage.cached_prompt_tokens as u64, shared);
+
+    // The same decision again: what the first decision's forks published of
+    // their own pages serves, from the checkpoint before them.
+    let again = decided(&e.rt, decision(&state, questions(4)));
+    assert_eq!(again.answers, first.answers);
     e.consistent();
 }
 

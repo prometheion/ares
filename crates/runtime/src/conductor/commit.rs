@@ -227,7 +227,9 @@ impl Conductor {
                     a.checkpoint_at = at;
                 }
                 let (last, mut from) = (a.checkpoint_at, part.from.max(a.checkpoint_at));
-                while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, reached)
+                while let Some(at) = cache
+                    .capture(a.prompt_len, &a.boundaries, last, from, reached)
+                    .filter(|_| a.takes_checkpoints())
                 {
                     if at < reached {
                         // Due inside the rows: a save planned there that found no place is
