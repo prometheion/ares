@@ -393,7 +393,12 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       after it was given up. The host executor frees it at once (its oracle plays the strictest
       device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
       for a checkpoint's lock was found on the devices only. Files: `crates/runtime/src/testing.rs`,
-      `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`.
+      `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`. Left by `fix/server-sweep`
+      (2026-11-25): it takes `PlaceChunks` without a device (a `LockedChunk` over plain memory,
+      booked as now), the host executor's places on it in place of `host_places` and
+      `host_place_held` (the oracle still forgets what a place called unused held), and the chunks
+      given back only by `sweep_checkpoints`, as the devices give them back; then a test of a
+      checkpoint whose chunk finds no room beside pages in RAM.
 - [ ] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
       fails about one run in four in the full suite (alone it passes): the third ask finds the first
       conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM
