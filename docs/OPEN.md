@@ -361,7 +361,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 8 |
+| Server, API, cache | 9 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -407,6 +407,11 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
       `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
       `docs/user/`.
+- [ ] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
+      fails about one run in four in the full suite (alone it passes): the third ask finds the first
+      conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM
+      gave them up is timing-dependent. Found 2026-11-25 by `fix/server-sweep` (fails before its
+      changes too). File: `crates/runtime/tests/cache/ram.rs`.
 
 ### Model, runtime, kernels
 - [ ] Left of step 5 of the shared layer, the token rows: DFlash's newest token and mask rows are
