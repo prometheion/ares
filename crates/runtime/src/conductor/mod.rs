@@ -1303,8 +1303,10 @@ impl Conductor {
             shared_rows: wide_rows,
             ..limits
         };
+        let deciding = self.requests.iter().any(|r| matches!(r.want, Want::Score { .. }));
         let pass = matches!(turn, Turn::Piece { .. })
             && paused.is_none()
+            && (generating > 0 || !deciding)
             && wide_rows > piece
             && self.model.pauses_wide_steps()
             && {
