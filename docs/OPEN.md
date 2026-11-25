@@ -376,7 +376,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 14 |
+| Model, runtime, kernels | 13 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -471,7 +471,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 - [ ] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
       its pool from the context alone and the device's ledger refuses the drafter (the server's
       plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.
-- [ ] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
 - [ ] The examples' own copies of `Rng` (attention, expert layer, expert rows, expert types,
       sampler steps, far attention benches) and `f32_bytes` (attention, expert layer, expert
       rows), where `crates/cuda/tests/common` has them. Left as it is on purpose: the runtime's

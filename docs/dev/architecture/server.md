@@ -277,8 +277,11 @@ generates, for a client that cannot add a member to a body (Claude Code's
 `ANTHROPIC_CUSTOM_HEADERS`, the `http_headers` of a provider of Codex); the
 Messages API has no such member, so there it is the header alone. Body and
 header that name two different ones are refused. It is always on: a server
-whose requests all say nothing behaves as before (the randomized test of
-admission, which plays one priority, still holds).
+whose requests all say nothing behaves as before. The randomized test of
+admission (`crates/sched/tests/admission.rs`) plays one priority in some runs
+and two or three in others, where it checks that a shortage spills the worst
+priority first, that a running request gives way only to a better one, and that
+a spilled request still in line holds back its own and every worse priority.
 
 What the others do. llama.cpp's server has no priority of requests (it puts
 only its own tasks, cancels and the like, at the front of its queue). vLLM
@@ -309,8 +312,11 @@ Here every place where the engine chooses between requests honours it:
   no threshold. The victims are spilled as for a shortage: their pages go to
   the prefix cache and their state becomes a checkpoint, so they come back as
   a prefix hit, and they do not come back in the pass that made them give
-  way. A shortage of pages spills the worst priority first (vLLM's victim),
-  then by the old rule. The sequence of a step the model paused (a prompt read
+  way. What they let go of is room for the newcomer except the pages of its
+  cached prefix that running sequences hold (it takes those again, and its
+  charge left them out; until 2026-11-25 they were counted twice). A shortage
+  of pages spills the worst priority first (vLLM's victim), then by the old
+  rule. The sequence of a step the model paused (a prompt read
   layer by layer) gives way to neither (`Claims::keep`): its state is neither
   before nor after its rows.
 - *The rows of a step* (`ares_sched::plan`): the newest tokens, the rows of

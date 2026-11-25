@@ -36,6 +36,10 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the test plays one priority in nine runs and two or three in four (shortage victims by priority, a running request outranked only by a better newcomer, a spilled one in line holds back its own and every worse priority, overtaking counted by the same or a worse priority). It found a defect of admission: a newcomer that made worse ones give way counted what they let go of as room, the pages of its own cached prefix among them, which its charge had left out already (`Admission::room` takes those of the prefixes that running sequences hold off now). Commit "ares-sched: the admission test plays several priorities, and a newcomer's prefix is not counted twice".
+
 - [x] Dev-only strings with runs of spaces (found 2026-11-24 by `fix/help-docs`; 4 in 3 files:
       `crates/model/tests/qwen4exp_device.rs`, `crates/runtime/examples/expert_pipe_bench.rs`,
       `crates/weights/tests/premises/cache.rs`).

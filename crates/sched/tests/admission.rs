@@ -18,9 +18,13 @@
 //! - nobody is spilled unless the step's required claims exceed the free and
 //!   evictable pages, the victims are the ones with the fewest generated
 //!   tokens, and none of them could have stayed;
-//! - a waiting request is overtaken by later arrivals in at most
-//!   `starvation_passes` passes, and when arrivals stop, every request is
-//!   admitted and ends.
+//! - a waiting request is overtaken by later arrivals of its own or a worse
+//!   priority in at most `starvation_passes` passes, and when arrivals stop,
+//!   every request is admitted and ends;
+//! - with several priorities: a shortage spills the worst priority first, a
+//!   running request gives way to a newcomer only for a better priority, and
+//!   a spilled request that stays in line holds back its own and every worse
+//!   priority.
 
 use std::collections::BTreeMap;
 
@@ -80,8 +84,11 @@ struct Req {
     generated: u32,
     /// For a spilled request: the prefixes it needs again.
     wanted: Vec<(usize, u32)>,
-    /// Passes in which a later arrival was admitted while this one waited.
+    /// Passes in which a later arrival of its own or a worse priority was
+    /// admitted while this one waited.
     overtaken: u32,
+    /// A lower number first.
+    priority: i32,
 }
 
 impl Req {
@@ -220,25 +227,27 @@ fn output_pages(tokens_left: u32, clip: u32, ratio: f64) -> u32 {
     ((f64::from(tokens_left.min(clip)) * ratio / f64::from(PER_PAGE)).ceil() as u32).max(1)
 }
 
-/// Who gives way, written the plain way: the fewest generated tokens first
-/// (ties: the longest prompt, then the newest) until the required claims fit,
+/// Who gives way, written the plain way: the worst priority first, among those
+/// the fewest generated tokens first (ties: the longest prompt, then the
+/// newest) until the required claims fit,
 /// never the last sequence for itself; then everyone who can stay stays, the
 /// last chosen first.
 fn reference_victims(world: &World, work: &[Work], free: u32) -> (Vec<u32>, Option<u32>, u32) {
     let claim = |seq: u32| work.iter().filter(|w| w.seq == seq).map(|w| w.required).sum::<u32>();
     let mut required: u32 = work.iter().map(|w| w.required).sum();
     let mut avail = free + world.evictable();
-    let mut order: Vec<(u32, u32, u32)> = world
+    let mut order: Vec<(i32, u32, u32, u32)> = world
         .reqs
         .iter()
         .filter(|(_, r)| r.phase == Phase::Running)
-        .map(|(seq, r)| (r.generated, r.prompt, *seq))
+        .map(|(seq, r)| (r.priority, r.generated, r.prompt, *seq))
         .collect();
-    order.sort_by_key(|(generated, prompt, seq)| {
-        (*generated, std::cmp::Reverse(*prompt), std::cmp::Reverse(*seq))
+    order.sort_by_key(|(priority, generated, prompt, seq)| {
+        use std::cmp::Reverse;
+        (Reverse(*priority), *generated, Reverse(*prompt), Reverse(*seq))
     });
     let (mut victims, mut exhausted) = (Vec::new(), None);
-    for (k, (_, _, seq)) in order.iter().enumerate() {
+    for (k, (_, _, _, seq)) in order.iter().enumerate() {
         if required <= avail {
             break;
         }
@@ -273,13 +282,25 @@ struct Totals {
     evicted: u64,
     /// Victims that could stay after all.
     returned: u64,
+    /// Running requests that gave way to a newcomer of a better priority.
+    outranked: u64,
     overtaken_max: u32,
+}
+
+/// The spills of an outcome: the ones a shortage made, then the ones that gave
+/// way to a better priority.
+fn split_spills(out: &Outcome) -> (Vec<u32>, Vec<u32>) {
+    let shortage = out.spill.len() - out.outranked as usize;
+    let mut short: Vec<u32> = out.spill[..shortage].iter().map(|s| s.0).collect();
+    short.sort_unstable();
+    (short, out.spill[shortage..].iter().map(|s| s.0).collect())
 }
 
 /// One run. `clip` is the output a request is charged for at most: with a
 /// small one the reservation is thin, many requests run next to each other
 /// and the pool runs short often, which is what exercises the spills.
-fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
+/// Arrivals take one of `priorities` priorities at random (from -1 up).
+fn run(seed: u64, capacity: u32, clip: u32, priorities: u64, passes: u32, totals: &mut Totals) {
     let mut rng = Rng(seed);
     let mut config = AdmissionConfig::new(capacity, PER_PAGE);
     config.output_clip = clip;
@@ -334,6 +355,9 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
             } else {
                 None
             };
+            // Drawn only with several, so that a run of one priority plays
+            // the same requests as before priorities were played.
+            let priority = if priorities > 1 { rng.below(priorities) as i32 - 1 } else { 0 };
             next_seq += 1;
             arrivals += 1;
             let mut r = Req {
@@ -349,6 +373,7 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                 generated: 0,
                 wanted: Vec::new(),
                 overtaken: 0,
+                priority,
             };
             let (cached, idle) = world.cached(&r);
             let arrival = Arrival {
@@ -357,8 +382,7 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                 cached_cells: cached * PER_PAGE,
                 idle_cached_pages: idle,
                 max_new_tokens: max_new,
-                // The world below plays the rules of one priority.
-                priority: 0,
+                priority,
             };
             let fits_at_all = pages_for(prompt + 1) <= capacity;
             match a.enqueue(arrival) {
@@ -439,8 +463,8 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                 claims.claim(SeqId(w.seq), w.required, 0, 0);
             }
             let out = claims.settle(&mut View(&world));
-            let mut spilled: Vec<u32> = out.spill.iter().map(|s| s.0).collect();
-            spilled.sort_unstable();
+            // A probe that fits admits, and a newcomer may outrank someone.
+            let (spilled, _) = split_spills(&out);
             want.sort_unstable();
             assert_eq!(spilled, want, "seed {seed} pass {pass_no}: {fake:?}");
             assert_eq!(out.exhausted.map(|s| s.0), exhausted, "seed {seed} pass {pass_no}");
@@ -463,22 +487,73 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
 
         // Who gives way.
         let required: u32 = work.iter().map(|w| w.required).sum();
-        let mut spilled: Vec<u32> = out.spill.iter().map(|s| s.0).collect();
-        spilled.sort_unstable();
+        let (spilled, outranked) = split_spills(&out);
         let mut want = want_spilled.clone();
         want.sort_unstable();
         assert_eq!(spilled, want, "{context}");
         assert_eq!(out.exhausted.map(|s| s.0), want_exhausted, "{context}");
         if required <= free + evictable {
-            assert!(out.spill.is_empty() && out.exhausted.is_none(), "{context}");
+            assert!(spilled.is_empty() && out.exhausted.is_none(), "{context}");
         }
-        if !out.spill.is_empty() || out.exhausted.is_some() {
+        if !spilled.is_empty() || out.exhausted.is_some() {
             assert!(out.admit.is_empty() && out.resume.is_empty(), "{context}");
         }
-        totals.spilled += out.spill.len() as u64;
+        // A running request gives way to a newcomer of a better priority only.
+        let best_seated = out
+            .resume
+            .iter()
+            .chain(&out.admit)
+            .map(|seq| world.reqs[&seq.0].priority)
+            .min()
+            .unwrap_or(i32::MAX);
+        for seq in &outranked {
+            assert!(world.reqs[seq].priority > best_seated, "{context}: {seq} outranked");
+        }
+        // What the outranked let go of is room for the newcomers.
+        let released: u32 = outranked.iter().map(|seq| world.releasable(*seq)).sum();
+        // A request spilled in an earlier pass that stays in line holds back
+        // the newcomers of its priority and everyone of a worse one.
+        for (seq, r) in world.reqs.iter().filter(|(_, r)| r.phase == Phase::Spilled) {
+            if out.resume.contains(&SeqId(*seq)) {
+                continue;
+            }
+            for other in &out.admit {
+                let p = world.reqs[&other.0].priority;
+                assert!(p < r.priority, "{context}: {} went ahead of spilled {seq}", other.0);
+            }
+            for other in &out.resume {
+                let p = world.reqs[&other.0].priority;
+                assert!(p <= r.priority, "{context}: {} went ahead of spilled {seq}", other.0);
+            }
+        }
+        totals.spilled += spilled.len() as u64;
+        totals.outranked += outranked.len() as u64;
         totals.cut += out.cut.len() as u64;
         totals.evicted += u64::from(out.evict);
 
+        // What the newcomers' prefixes were before the outranked let go: the
+        // idle pages the accounting was told of, and the pages of a prefix an
+        // outranked one held, which the newcomer takes again of what it let go
+        // (the pages it uses, as the real pool holds them; this world holds
+        // all of a prefix).
+        let before: BTreeMap<u32, (u32, u32)> = out
+            .admit
+            .iter()
+            .map(|seq| {
+                let r = &world.reqs[&seq.0];
+                let victims_held = match r.hit {
+                    Some((doc, want))
+                        if outranked
+                            .iter()
+                            .any(|v| world.reqs[v].docs.iter().any(|d| d.0 == doc)) =>
+                    {
+                        want.min(world.doc(doc).pages)
+                    }
+                    _ => 0,
+                };
+                (seq.0, (world.cached(r).1, victims_held))
+            })
+            .collect();
         // Carry it out: spills.
         for seq in &out.spill {
             let wanted = world.let_go(seq.0, true);
@@ -519,8 +594,13 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
             .sum();
         let granted = step_pages;
         let mut taken_idle = 0u32;
+        let mut taken_released = 0u32;
         let mut first = alone;
-        for seq in out.resume.iter().chain(&out.admit) {
+        // In the order they were seated: by priority, and in a priority the
+        // resumed ones first.
+        let mut seated: Vec<SeqId> = out.resume.iter().chain(&out.admit).copied().collect();
+        seated.sort_by_key(|seq| world.reqs[&seq.0].priority);
+        for seq in &seated {
             let r = world.reqs[&seq.0].clone();
             let resumed = r.phase == Phase::Spilled;
             assert_eq!(resumed, out.resume.contains(seq), "{context}");
@@ -531,15 +611,18 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                     + output_pages(r.max_new.saturating_sub(r.generated), clip, ratio);
                 (reserve, rows, idle)
             } else {
-                let (cached, idle) = world.cached(&r);
+                let cached = world.cached(&r).0;
+                let (idle, victims_held) = before[&seq.0];
+                taken_released += victims_held;
                 (pages_for(r.prompt) - cached + output_pages(r.max_new, clip, 1.0), 0, idle)
             };
             if !first {
                 let usable = evictable.saturating_sub(taken_idle + idle);
+                let released = released.saturating_sub(taken_released);
                 assert!(
-                    granted + held_back + charge <= free + usable,
+                    granted + held_back + charge <= free + released + usable,
                     "{context}: {} admitted against the rule ({granted} + {held_back} + {charge} \
-                     > {free} + {usable})",
+                     > {free} + {released} + {usable})",
                     seq.0
                 );
             }
@@ -634,12 +717,15 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
             world.reqs.remove(&seq);
         }
 
-        // Overtaking: a later arrival was admitted while an earlier one,
-        // never spilled, still waits.
-        let newest_admitted =
-            out.admit.iter().map(|s| world.reqs.get(&s.0).map_or(0, |r| r.order)).max();
+        // Overtaking: a later arrival of the same or a worse priority was
+        // admitted while an earlier one, never spilled, still waits.
+        let admitted: Vec<(u64, i32)> = out
+            .admit
+            .iter()
+            .filter_map(|s| world.reqs.get(&s.0).map(|r| (r.order, r.priority)))
+            .collect();
         for r in world.reqs.values_mut().filter(|r| r.phase == Phase::Waiting) {
-            if newest_admitted.is_some_and(|order| order > r.order) {
+            if admitted.iter().any(|&(order, priority)| order > r.order && priority >= r.priority) {
                 r.overtaken += 1;
                 totals.overtaken_max = totals.overtaken_max.max(r.overtaken);
                 assert!(
@@ -669,20 +755,25 @@ fn admission_never_overcommits_and_never_starves() {
         exhausted: 0,
         evicted: 0,
         returned: 0,
+        outranked: 0,
         overtaken_max: 0,
     };
-    for (seed, capacity, clip) in [
-        (1u64, 48u32, 256u32),
-        (0x9e3779b97f4a7c15, 96, 256),
-        (0xdeadbeef, 24, 256),
-        (77, 200, 256),
-        (4242, 12, 256),
-        (9, 64, 256),
-        (5, 64, 16),
-        (6, 160, 16),
-        (7, 32, 16),
+    for (seed, capacity, clip, priorities) in [
+        (1u64, 48u32, 256u32, 1u64),
+        (0x9e3779b97f4a7c15, 96, 256, 1),
+        (0xdeadbeef, 24, 256, 1),
+        (77, 200, 256, 1),
+        (4242, 12, 256, 1),
+        (9, 64, 256, 1),
+        (5, 64, 16, 1),
+        (6, 160, 16, 1),
+        (7, 32, 16, 1),
+        (11, 48, 256, 3),
+        (12, 96, 16, 3),
+        (13, 24, 256, 2),
+        (14, 160, 16, 3),
     ] {
-        run(seed, capacity, clip, 8000, &mut totals);
+        run(seed, capacity, clip, priorities, 8000, &mut totals);
     }
     // The run exercised every path it is meant to check.
     assert!(totals.admitted > 2000, "admitted {}", totals.admitted);
@@ -693,5 +784,6 @@ fn admission_never_overcommits_and_never_starves() {
     assert!(totals.cut > 10, "cut {}", totals.cut);
     assert!(totals.exhausted > 5, "exhausted {}", totals.exhausted);
     assert!(totals.evicted > 1000, "evicted {}", totals.evicted);
+    assert!(totals.outranked > 50, "outranked {}", totals.outranked);
     assert_eq!(totals.overtaken_max, STARVATION, "the starvation bound was never reached");
 }
