@@ -370,7 +370,10 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       rules (parity, and a pure improvement on by default) Flash-Next should too, once it is
       measured to pay there (the block's VRAM is taken from the expert slots). Files:
       `crates/server/src/load/qwen4exp.rs` (`in_model`), `crates/server/src/options.rs` (help),
-      `docs/user/options.md`.
+      `docs/user/options.md`. Left by `fix/server-sweep` (2026-11-25): the measurement needs a
+      Flash-Next file that carries the block, and this machine has none (the swift IQ2_XS has no
+      `mtp.*` tensor); on the test machine, check the unsloth files for `mtp.fc_embedding.weight`
+      and measure with and without it at the owner's budget before it becomes the default.
 - [ ] Larger. The roots and left-behind checkpoints with one place in RAM (Flash-Next at
       `--ram 8G`): a root that comes back from the drive is a plain checkpoint again (the store
       keeps no mark); message checkpoints that later requests left behind are not written to the
