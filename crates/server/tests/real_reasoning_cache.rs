@@ -240,6 +240,12 @@ impl Model for Templated {
     fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
         self.inner.before_step(record)
     }
+    fn measured(&self) {
+        self.inner.measured();
+    }
+    fn idle(&self) {
+        self.inner.idle();
+    }
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
         self.inner.open(cx)
     }

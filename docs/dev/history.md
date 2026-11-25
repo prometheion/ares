@@ -106,7 +106,7 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
       (it goes back at the next step only). Files: `crates/model/src/qwen4exp/device/flow.rs`,
       `qwen4exp/device/runtime/pass.rs`.
 
-  *Fixed on `fix/model-sweep`, 2026-11-25:* the conductor tells the model when nothing runs and nobody waits (`Model::idle`), and Flash-Next gives back the VRAM lent for wide steps and the loan of a pass that has read its rows there (`Flow::idle`); a pass that has not read all its rows keeps its loan. Not covered by a host test (the GPU suites run it). Commit "ares-runtime: Flash-Next gives lent VRAM back when the engine idles".
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the conductor tells the model when nothing runs and nobody waits (`Model::idle`), and Flash-Next gives back the VRAM lent for wide steps and the loan of a pass that has read its rows there (`Flow::idle`); a pass that has not read all its rows keeps its loan. GPU test `a_loan_goes_back_when_the_engine_idles` (`crates/model/tests/qwen4exp_runtime.rs`); the test wrappers of a model pass `measured` and `idle` on. Commit "ares-runtime: Flash-Next gives lent VRAM back when the engine idles".
 
 - [x] The heat counts the steps that measure the price of a step at the start (token 0, about a
       thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself

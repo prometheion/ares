@@ -502,6 +502,14 @@ impl Qwen4Exp {
         Some(self.flow.get()?.lock_feed().store.transit_odds())
     }
 
+    /// Whether a device has VRAM of its expert slots lent now (for wide steps or a pass);
+    /// `None` before the parts are open.
+    pub fn holds_loan(&self) -> Option<bool> {
+        let flow = self.flow.get()?;
+        let feed = flow.lock_feed();
+        Some((0..self.placement.n_devices()).any(|d| feed.store.has_scratch(d)))
+    }
+
     /// What the expert store counted since the last call; `None` before the
     /// parts are open.
     pub fn take_store_stats(&self) -> Option<StoreStats> {
