@@ -425,9 +425,24 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       has to be copied down), not the rule of a promotion (`promote_hot`); it was left for the work
       on prompt chunks that borrow expert slots, which is merged. Files:
       `crates/runtime/src/expert_store/transit.rs`, `expert_store/hybrid.rs`.
+      *Looked at on `fix/model-sweep` (2026-11-25), not changed:* the two rules differ where the
+      costs do. A promotion uploads the newcomer over the link, so it asks the margin and the bonus
+      of `SwapRule` (against trading places back and forth, an upload each time); an adoption finds
+      the newcomer on the device already (a copy inside VRAM), and asks the same margin exactly
+      when the swap costs a transfer (the member copied down to RAM). When RAM holds the member,
+      the swap moves nothing over the link, and a promotion back still needs the margin, so no
+      upload can trade places back and forth. The promotion's rule there would keep a colder member
+      in VRAM for nothing. Open only as a measurement (adoptions per prompt and the decode after it
+      with the margin on both), if someone doubts it.
 - [ ] The MTP block's experts are not in the usage profile (they are filled in the order of their
       numbers at the start). Files: `crates/model/src/qwen4exp/device/usage.rs`,
       `qwen4exp/device/feed.rs` (`fill_mtp`), `crates/runtime/src/expert_store/profile.rs`.
+      *Looked at on `fix/model-sweep` (2026-11-25), not a gap:* the MTP block's layer is resident
+      (`feed.rs`, `spec_of(.., true)`; its bytes, every expert, come out of the device's budget
+      before the tiers), and `fill_mtp` brings all of its experts when the parts open, before the
+      first step. A profile could only change the order of a fill that ends before the engine
+      serves; nothing of the block is chosen by heat. It matters only if the block stops being
+      resident (a block larger than VRAM), which nothing plans.
 - [ ] Float experts beyond the f16 range are not caught in the many-row kernels (`WeightRange` is
       applied to the dense matrices and the router only). Files:
       `crates/model/src/qwen4exp/device/load.rs`, `qwen4exp/device/part/wide.rs`,
