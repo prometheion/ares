@@ -376,7 +376,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 12 |
+| Model, runtime, kernels | 11 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -462,9 +462,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       `crates/cuda/src/experts.rs`.
 - [ ] The DFlash drafter's float matrices take the f16 tile path above eight rows without the
       range check of Flash-Next's (`WeightRange`). File: `crates/model/src/dflash/device.rs`.
-- [ ] Sampler: a row with no finite logit reports `-0.0` where the reference says minus infinity
-      (the test leaves such rows out). Files: `crates/cuda/kernels/sampler*.cuh`,
-      `crates/cuda/src/sampler.rs`, `crates/cuda/tests/sampler.rs`.
 - [ ] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
       its pool from the context alone and the device's ledger refuses the drafter (the server's
       plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.

@@ -607,15 +607,8 @@ fn rows_whose_best_tokens_crowd_together_equal_the_host() {
                 map.swap(i, rng.below(i + 1));
             }
             for (what, logits) in &shapes {
-                // A row without a token that reports the model's own
-                // probabilities is left out: the kernels report -0.0 for its
-                // pick where the reference has minus infinity.
-                let params: Vec<SampleRow> = settings
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| !(*what == "no token" && **p == own))
-                    .map(|(i, p)| p.row(i as u32))
-                    .collect();
+                let params: Vec<SampleRow> =
+                    settings.iter().enumerate().map(|(i, p)| p.row(i as u32)).collect();
                 let rows = vec![logits.clone(); params.len()];
                 let extras = Extras::none(rows.len());
                 check(device, &kernels, &rows, &params, &extras, &[], None, what);

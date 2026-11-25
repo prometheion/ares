@@ -36,6 +36,12 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] Sampler: a row with no finite logit reports `-0.0` where the reference says minus infinity
+      (the test leaves such rows out). Files: `crates/cuda/kernels/sampler*.cuh`,
+      `crates/cuda/src/sampler.rs`, `crates/cuda/tests/sampler.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the finishing kernel leaves minus infinity for a pick without a finite logit (`ares_lp_finish`, the model's own probabilities: the distance from the row's best was NaN and became 0); `crates/cuda/tests/sampler.rs` checks such rows now. Commit "ares-cuda: a pick without a finite logit has the probability minus infinity".
+
 - [x] Flash-Next's step scratch starts its buffers on a 64-byte line, not the 128-byte line fixed
       for the 27B (`Kernels::ACTIVATION_LINE`). File: `crates/model/src/qwen4exp/device/part/frame.rs`
       (`PieceCarve`).
