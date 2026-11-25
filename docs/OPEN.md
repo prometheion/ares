@@ -222,7 +222,17 @@ marks a line that only a GPU run can settle or check.
       RAM as prompt cache; the second read's new far pages then hit the RAM failure above. A repeat
       must reuse the finished sequence's pages and checkpoints. In work: `fix/flash-crashes`.
 - [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
-      hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
+      hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. Not reproduced on the
+      local cards by `fix/server-sweep` (2026-11-25, release build): Flash-Next IQ2_XS at `--ram` 8
+      to 16 GiB on both cards and on one (K/V beyond VRAM), and the 27B, stopped during a prompt,
+      during generation, with four sequences, with a prompt cache to write, with two and three
+      SIGTERMs, 5, 20 and 35 s into a reload after an unload, and with two SIGTERMs 6, 12 and 20 s
+      into a load: every stop clean (exit 0, or 1 for the stop at once). Added: a panic is written
+      into the log with its thread, place and stack before the abort; the stop at once ends with
+      `_exit`, so the CUDA driver's handlers for the end of a process do not run under the engine's
+      threads; every test that stops a server fails on a panic, and a GPU test stops Flash-Next with
+      SIGTERM while a request streams. Left: the reporter's stacks (`coredumpctl info`) or the logged
+      panic decide what aborts.
 
 ### Server, API, cache
 - [ ] GPU. `ares-server --test real_cache`
