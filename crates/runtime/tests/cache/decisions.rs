@@ -255,10 +255,17 @@ fn a_state_the_engine_has_read_costs_the_next_decision_only_its_questions() {
     assert_eq!(s.counters.checkpoints_restored - before.counters.checkpoints_restored, 4, "{s}");
     assert_eq!(second.usage.cached_prompt_tokens as u64, shared);
 
-    // The same decision again: what the first decision's forks published of
-    // their own pages serves, from the checkpoint before them.
-    let again = decided(&e.rt, decision(&state, questions(4)));
+    // The same decision again: its forks start from the state as well (the
+    // first decision's forks left no pages that would hide it).
+    let before = e.snapshot();
+    let request = decision(&state, questions(4));
+    let again = decided(&e.rt, request.clone());
     assert_eq!(again.answers, first.answers);
+    let rest: u64 = prompts_of(&model, &request).iter().map(|p| p.len() as u64 - shared).sum();
+    let s = e.snapshot();
+    let computed = s.counters.prefill_rows - before.counters.prefill_rows;
+    let replayed = s.counters.replay_rows - before.counters.replay_rows;
+    assert_eq!((computed, replayed), (rest, 0), "{s}");
     e.consistent();
 }
 

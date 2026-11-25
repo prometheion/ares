@@ -249,8 +249,11 @@ impl Conductor {
             let Resume { cached_cells: cached, restore, replay, .. } = probe.resume;
             a.cells = Sequence::from_shared(&mut self.pool, &probe.found.table(), cached);
             a.chain = cache.chain_after(&probe.found, &a.names[..a.known as usize]);
-            // The pages this sequence will fill are its to announce.
-            cache.index.announce(a.owner, a.chain.unpublished());
+            // The pages this sequence will fill are its to announce; a fork's
+            // stay its own.
+            if a.enters_cache() {
+                cache.index.announce(a.owner, a.chain.unpublished());
+            }
             a.replay_end = cached as u32;
             a.replay_left = (replay.end - replay.start) as u32;
             a.checkpoint_at = 0;

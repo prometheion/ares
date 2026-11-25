@@ -194,7 +194,7 @@ impl Conductor {
             // The cache: the pages that are full now enter the index, and a
             // checkpoint is taken where the rows ended on a position that is
             // due one (the rows were cut to end there).
-            if let Some(cache) = &mut self.cache {
+            if let Some(cache) = self.cache.as_mut().filter(|_| a.enters_cache()) {
                 let settled = a.cells.len();
                 cache.index.publish(
                     &mut self.pool,
@@ -227,9 +227,7 @@ impl Conductor {
                     a.checkpoint_at = at;
                 }
                 let (last, mut from) = (a.checkpoint_at, part.from.max(a.checkpoint_at));
-                while let Some(at) = cache
-                    .capture(a.prompt_len, &a.boundaries, last, from, reached)
-                    .filter(|_| a.takes_checkpoints())
+                while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, reached)
                 {
                     if at < reached {
                         // Due inside the rows: a save planned there that found no place is

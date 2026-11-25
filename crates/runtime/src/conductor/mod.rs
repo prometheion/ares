@@ -394,11 +394,14 @@ struct Active {
 }
 
 impl Active {
-    /// Whether the prefix cache takes checkpoints of the sequence's state as
-    /// its rows pass the places they are due. Not for a fork of a decision:
-    /// its state is its question's, which no later prompt starts from, and a
-    /// checkpoint would cut its step and cost a copy of the state.
-    fn takes_checkpoints(&self) -> bool {
+    /// Whether what the sequence computes enters the prefix cache: its pages
+    /// as they fill, and checkpoints of its state where they are due. Not for
+    /// a fork of a decision: its state is its question's, a checkpoint would
+    /// cut its step and cost a copy of the state, and its pages without one
+    /// would shadow the parent's checkpoint for the same question asked again
+    /// (a lookup takes the longest path of pages, and then replays from the
+    /// last checkpoint on it).
+    fn enters_cache(&self) -> bool {
         !matches!(self.role, Role::Fork { .. })
     }
 
@@ -1395,7 +1398,7 @@ impl Conductor {
                 let margin = self.model.saves_inside_steps();
                 let inside = !step.replay && margin > 0 && step.rows > self.model.own_rows();
                 let named = self.inner_due.len();
-                if let Some(cache) = self.cache.as_ref().filter(|_| a.takes_checkpoints()) {
+                if let Some(cache) = self.cache.as_ref().filter(|_| a.enters_cache()) {
                     let (mut last, mut from) = (a.checkpoint_at, step.from);
                     while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
                     {
