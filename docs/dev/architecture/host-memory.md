@@ -318,8 +318,9 @@ Nothing that costs speed happens silently:
 - **When the expert tier in RAM shrinks**, generation gets slower: experts
   that were in RAM now come from the SSD. The tier's bytes are a gauge, and
   the pieces given up and taken are counted (`StoreStats::pieces_released`,
-  `pieces_locked`, `piece_evictions`); a line in the log for it is not
-  written yet.
+  `pieces_locked`, `piece_evictions`), and the server writes a line in the
+  log for every shrink: what was given back, what the tier holds and may hold
+  (`ExpertStore::on_shrink`, `Qwen4Exp::with_log`).
 - **When the prompt cache in RAM shrinks**, that is routine and only counted
   (`ares_checkpoints_dropped_total`, `ares_cache_ram_pages`,
   `ares_cache_ram_bytes`). With `--cache` what only RAM holds goes to the

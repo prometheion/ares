@@ -126,6 +126,9 @@ pub struct Qwen4Exp {
     mtp_watch: Arc<Mutex<Watch>>,
     /// The usage profile of the experts, for a model that keeps one.
     usage: Usage,
+    /// Where the lines go that the owner should hear of while the model
+    /// serves ([`Qwen4Exp::with_log`]).
+    log: Option<Log>,
     /// The token embedding table where the file is mapped (`blocks/rows.rs`).
     rows: Arc<HostTable>,
     /// The rows of the widest step, once the parts are open: what the expert
@@ -239,6 +242,7 @@ impl Qwen4Exp {
             mtp_report: Mutex::new(None),
             mtp_watch: Arc::default(),
             usage: Usage::default(),
+            log: None,
             rows,
             lone_rows: OnceLock::new(),
             pass_span: OnceLock::new(),
@@ -289,6 +293,14 @@ impl Qwen4Exp {
         self.view = HeadView::new(n, n, Some(tokens)).map_err(OpenError::Choice)?;
         self.opts.part.head_order = self.view.order.clone();
         Ok(self)
+    }
+
+    /// Sends `log` the lines the owner should hear of while the model serves:
+    /// the tier of experts in RAM giving memory back to the machine. Before
+    /// the runtime opens the parts.
+    pub fn with_log(mut self, log: Log) -> Self {
+        self.log = Some(log);
+        self
     }
 
     /// Keeps the usage profile of the model's experts in `dir` (see

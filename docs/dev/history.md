@@ -36,6 +36,12 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
+      server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
+      `crates/runtime/src/ram.rs`, the server's loader.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the store tells a callback of every shrink of the RAM tier (`ExpertStore::on_shrink`, `RamShrink`: pieces, bytes, what it holds and may hold, at its floor), Flash-Next turns it into a line (`Qwen4Exp::with_log`), and the server logs it at info. Test in `crates/runtime/tests/expert_store.rs` (the shrink to half). Commit "ares-runtime: a log line when the tier of experts in RAM shrinks".
+
 - [x] A loan of VRAM stays while the engine is idle after a request that ended with its prompt
       (it goes back at the next step only). Files: `crates/model/src/qwen4exp/device/flow.rs`,
       `qwen4exp/device/runtime/pass.rs`.

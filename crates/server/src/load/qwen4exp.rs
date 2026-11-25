@@ -367,6 +367,8 @@ impl Asked {
         if let Some(dir) = profile_dir(options) {
             model = model.with_usage_profile(&dir, Arc::new(|line| tracing::warn!("{line}")));
         }
+        // The tier of experts in RAM giving memory back to the machine.
+        model = model.with_log(Arc::new(|line| tracing::info!("{line}")));
         if let Some(tokens) = &self.vocabulary {
             model = model
                 .with_draft_vocabulary(tokens)
