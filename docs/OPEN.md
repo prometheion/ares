@@ -358,7 +358,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 6 |
+| Model, runtime, kernels | 5 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -432,11 +432,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       applied to the dense matrices and the router only). Files:
       `crates/model/src/qwen4exp/device/load.rs`, `qwen4exp/device/part/wide.rs`,
       `crates/cuda/src/experts.rs`.
-- [ ] The examples' own copies of `Rng` (attention, expert layer, expert rows, expert types,
-      sampler steps, far attention benches) and `f32_bytes` (attention, expert layer, expert
-      rows), where `crates/cuda/tests/common` has them. Left as it is on purpose: the runtime's
-      `store_hidden` (a hot CPU path); optional: the kernel side's type lists per module as an
-      X-macro list. Files: `crates/cuda/examples/`.
 
 ### Decode under offload (a user's runs, 2026-11-25): the aim of item 3
 One RTX 4080 16 GB, Flash-Next UD-IQ4_XS (87 GiB), `--ram 52G`, `--context 131072`, `--parallel 1`, MTP:

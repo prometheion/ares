@@ -22,31 +22,14 @@ use ares_cuda::{
 };
 use ares_sampler::{Entry, LogprobOut, Logprobs, SampleParams, SamplePick, SampleRow, TokenMask};
 
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::Rng;
+
 /// The vocabulary of Qwen3.8.
 const VOCAB: usize = 248_320;
 const ROUNDS: usize = 45;
 const WARMUP: usize = 5;
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn unit(&mut self) -> f32 {
-        (self.next() >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    fn normal(&mut self) -> f32 {
-        let u1 = self.unit() + 1e-7;
-        let u2 = self.unit();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-    }
-}
 
 /// Rows as a model's: most tokens far below a few likely ones.
 fn peaked_row(rng: &mut Rng) -> Vec<f32> {

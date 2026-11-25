@@ -77,6 +77,14 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
 
 ### From "Small fixes", "Model, runtime, kernels"
 
+- [x] The examples' own copies of `Rng` (attention, expert layer, expert rows, expert types,
+      sampler steps, far attention benches) and `f32_bytes` (attention, expert layer, expert
+      rows), where `crates/cuda/tests/common` has them. Left as it is on purpose: the runtime's
+      `store_hidden` (a hot CPU path); optional: the kernel side's type lists per module as an
+      X-macro list. Files: `crates/cuda/examples/`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the six benches include `tests/common` (`#[path]`) and take its `Rng` (with `normal()`, the benches' Box-Muller, same sequence) and `f32_bytes`; their own copies are gone. Left as the item says: the runtime's `store_hidden`, and the kernel side's type lists. Commit "ares-cuda: the benches take the tests' generator and copies".
+
 - [x] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
       its pool from the context alone and the device's ledger refuses the drafter (the server's
       plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.
