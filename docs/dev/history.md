@@ -418,6 +418,11 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Not a defect, 2026-11-25:* the cut is not built by design (`dev/architecture/api.md`, "truncation": in a rendered conversation a cut to the last N tokens lands anywhere, the system prompt included; conversations are cut by whole turns, `truncation: auto` on `/v1/responses`), and none of the clients read for the sweep sends `truncate_prompt_tokens` or `truncate`. What was left: the refusal now says so and names the way that is served ("ares-server: a cut of the prompt to its last tokens is refused with the way that is served"; test in `tests/sampling.rs`).
 
+- [x] A test of the full drive for the SSD level (running out of room is handled, never tested).
+      Files: `crates/runtime/src/cache/ssd/mod.rs`, `crates/runtime/tests/cache/ssd.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: a test of a drive that runs full under the SSD level": the store lies in a tmpfs of 700 KiB that the test mounts in a user namespace of its own (it runs itself again in one, and passes with a note where that is not allowed); the drive's ENOSPC makes the store give up its oldest segments and write on, every answer stays right, and the newest text resumes from the drive in another engine.
+
 ## 2026-11-24
 
 ### From "In work now"

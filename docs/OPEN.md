@@ -361,7 +361,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 5 |
+| Server, API, cache | 4 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -391,8 +391,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
       for a checkpoint's lock was found on the devices only. Files: `crates/runtime/src/testing.rs`,
       `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`.
-- [ ] A test of the full drive for the SSD level (running out of room is handled, never tested).
-      Files: `crates/runtime/src/cache/ssd/mod.rs`, `crates/runtime/tests/cache/ssd.rs`.
 - [ ] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
       fails about one run in four in the full suite (alone it passes): the third ask finds the first
       conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM
