@@ -388,7 +388,8 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       index holds (the SSD level imports runs of pages with their deepest state only), or more
       places (int8 checkpoints, "Store of levers", "Checkpoints"). Files: `crates/runtime/src/cache/ssd/mod.rs`
       (`Cache::probe`), `cache/ssd/pump.rs` (`drain`), `cache/places.rs`, `crates/state/src/checkpoint.rs`
-      (`left_behind_on_pages`), `crates/store/src/lib.rs`.
+      (`left_behind_on_pages`), `crates/store/src/lib.rs`. Left by `fix/server-sweep` (2026-11-25) as
+      larger than a fix.
 - [ ] The host executor's places: on `PlaceChunks`, and a place whose memory a device keeps locked
       after it was given up. The host executor frees it at once (its oracle plays the strictest
       device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
