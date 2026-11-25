@@ -405,6 +405,13 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-runtime: the watchdog watches the warm-up, and --watchdog names its limit": `--watchdog <SECONDS>` (0: none, default 600), and the watch begins before the warm-up, whose stuck step now fails the load instead of holding it for ever (tests in `tests/conductor.rs` and `cli.rs`). The memory a stuck device holds is not a defect the process can fix: a context whose kernel never ends cannot be torn down, and the failure says so; whether the server should then exit so that its unit restarts it is a question to the owner (`OPEN.md`).
 
+- [x] Router: "no room" for Flash-Next is recognised by the message's text ("does not fit",
+      "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
+      `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
+      `docs/user/`.
+
+  *Fixed, 2026-11-25:* "ares-server: a load that finds no room says so by the kind of its error": `ModelError::NoRoom` for a placement that does not fit (Flash-Next's "do not fit" placements were not recognised by the text at all), `RuntimeError::NoRoom` for a device that could not be set up for lack of memory, and `is_no_room` on `ModelError`, `RuntimeError` and Flash-Next's `OpenError`, which `load/qwen4exp.rs` and `load/start.rs` ask instead of reading the message (test in `runtime/src/error.rs`). The load and unload times are in `docs/user/options.md`, "The preset file".
+
 ## 2026-11-24
 
 ### From "In work now"

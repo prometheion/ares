@@ -261,7 +261,12 @@ the server's limit and holds over `ram` in `[*]`.
 a request names it, unloaded when another model needs its room or when it was
 idle for its `idle-unload`, and loaded again by the next request for it. A
 request that waits for a load waits; it is not refused because another model is
-busy.
+busy. How long that is (measured 2026-11-25 on an RTX 4070 and an RTX 3060, the
+files in the page cache or not): the 27B (Q4_K_S) serves 22 to 44 s after its
+load begins, Flash-Next (IQ2_XS, `--ram` 8 to 16 GiB) 40 to 66 s, its first load
+on a machine longer by the warm-up that writes its usage profile; an unload
+takes 1 to 10 s, more when the prompt cache writes to `--cache` what only RAM
+holds.
 
 ```ini
 [*]

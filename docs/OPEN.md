@@ -361,7 +361,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 7 |
+| Server, API, cache | 6 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -396,10 +396,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 - [ ] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
       TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`. Files:
       `crates/server/src/openai/request.rs`, `crates/server/src/generate.rs`, the docs.
-- [ ] Router: "no room" for Flash-Next is recognised by the message's text ("does not fit",
-      "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
-      `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
-      `docs/user/`.
 - [ ] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
       fails about one run in four in the full suite (alone it passes): the third ask finds the first
       conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM

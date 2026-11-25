@@ -83,7 +83,7 @@ pub(crate) fn start<M: Model + 'static>(
         Runtime::start_gpu_following(model.clone(), devices, runtime_config, gpu, machine);
     let runtime = started.map_err(|e| {
         let error = e.to_string();
-        let short_of_memory = error.to_lowercase().contains("memory");
+        let short_of_memory = e.is_no_room();
         // The RAM tier's own refusal (not the VRAM budget's, whose words
         // contain these).
         let error = LoadError::Start(
