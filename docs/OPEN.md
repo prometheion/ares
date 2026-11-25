@@ -194,7 +194,7 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 12 | 11 |
+| Model, runtime, kernels | 13 | 12 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
 - [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
@@ -313,6 +313,25 @@ Wrong behaviour:
       slots (the item said `top_k + vram_reserve`), lower than when the stall was seen: check it
       again first. Files: `crates/runtime/src/expert_store/scratch.rs`, `hybrid.rs`,
       `transit.rs`, `crates/runtime/src/conductor/mod.rs`.
+      *Checked on `fix/model-sweep` (2026-11-25), not reproduced:* the local RTX 4070 alone,
+      IQ2_XS with the MTP block, `--ram 8G`, `--context 40960`; a fresh prompt of 31.1k to 31.2k
+      tokens read alone as a pass (steps of up to 32768 rows on lent VRAM), joined 3 s later by a
+      request that generates 400 tokens (`/var/tmp/ares-fixmodel/ab/d4.sh`): main a8920d61 4 runs
+      of 4 without a stall (prompt 62 to 69 s, the 400 tokens 104 to 114 s), the branch 2 of 2 and
+      4 more with the prompt cached, load 6 to 36. A pass opened beside generation is half as wide
+      (the conductor), where it never stalled. What is left is the robustness the item names (the
+      store bringing a step's experts whatever a loan holds), untested.
+- [ ] GPU. A step fails when the tier of experts cannot grow by a piece (found 2026-11-25 on
+      `fix/model-sweep`, 1 of 8 runs of the check above on the branch, none of 4 on main, not tied
+      to a change of the branch): `Flow::before_step` grows the RAM tier by a piece
+      (`grow_ram(1)`) and passes a refused booking on as the step's error, so the engine fails and
+      the model is taken down ("the RAM limit of 8.00 GiB has no room for 50.2 MiB more of the tier
+      of experts: the step record and read-back hold 41.2 MiB, the K/V beyond VRAM 285.3 MiB, the
+      tier of experts 7.54 GiB, the prompt cache 112.6 MiB"; a request generating beside a 31k
+      prompt's pass). The grow is optional; its refusal should leave the tier as it is (as
+      `Flow::follow_ram` does). Near `fix/flash-crashes`' far K/V item. Files:
+      `crates/model/src/qwen4exp/device/flow.rs` (`before_step`),
+      `crates/runtime/src/expert_store/elastic.rs` (`grow_ram`), `crates/runtime/src/ram.rs`.
 - [ ] GPU. **Lent steps with the CPU's share** (found by `kvfix`, 2026-11-24; main's, not the far
       pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
       loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
