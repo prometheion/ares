@@ -13,6 +13,11 @@ index through the same helpers (`run_of`, `deepest`, `run_pages`, `take_page`,
 `keeps_form`, `Cache::hang`), RAM's at once inside the look, the drive's across the
 pump's rounds.
 
+- **Who takes part.** Every request, unless it says `cache_prompt: false`
+  (`GenerateRequest::cache`): such a sequence asks the cache nothing when it
+  arrives or starts, publishes no pages, tails or checkpoints, and its pages go
+  back to the pool with it; the conductor skips the cache for it wherever it
+  would look at its chain (`Active::cache`).
 - **What it holds.** A page or tail that the index gives up is copied out of
   the pool into RAM before anything writes its page of the pool again
   (`Cache::settle_leaving`, which runs before every record and at the front

@@ -60,6 +60,7 @@ prompt and those marked "chat".
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number; `n_probs` (`0` is none) with OpenAI's fields must ask for the same, and the answer is then llama.cpp's |
 | `priority` | the request's priority | see [Priorities](#priorities) |
 | `draft` | `false` turns drafting off for this request | default `true` |
+| `cache_prompt` | `false`: the request neither starts from the prompt cache nor leaves anything in it (llama.cpp's) | default `true` |
 | `continue_final_message`, `add_generation_prompt` | chat: continue the last assistant message, or begin a new turn | a last assistant message is continued by default, unless it calls tools |
 | `user`, `metadata`, `store`, `service_tier`, `prompt_cache_key`, `safety_identifier` | bookkeeping | accepted, without effect |
 

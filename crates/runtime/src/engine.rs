@@ -345,6 +345,7 @@ impl Runtime {
             stop: Watch::new(&request.stop, thinking),
             sampling: request.sampling,
             draft: request.draft,
+            cache: request.cache,
             filter,
             priority: request.priority,
             displace,

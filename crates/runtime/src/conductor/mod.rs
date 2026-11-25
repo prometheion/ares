@@ -239,6 +239,8 @@ pub(crate) struct Submission {
     pub sampling: Sampling,
     /// Whether drafts may be verified for the request.
     pub draft: bool,
+    /// Whether the request uses the prompt cache (`GenerateRequest::cache`).
+    pub cache: bool,
     /// A rule about which tokens the request may pick, if it has one.
     pub filter: Option<Box<dyn TokenFilter>>,
     /// Who goes first: a lower number before a higher one.
@@ -345,6 +347,10 @@ struct Active {
     model_acceptance: Vec<Acceptance>,
     /// Whether the request lets drafts be verified for it.
     draft_allowed: bool,
+    /// The sequence uses the prompt cache: it starts from what the cache
+    /// holds and leaves what it computes there. Without, its pages are its
+    /// own and go with it, and it takes no checkpoints.
+    cache: bool,
     /// How the sequence's tokens are picked, and what that keeps from step
     /// to step.
     sampler: RequestSampler,
@@ -1102,7 +1108,7 @@ impl Conductor {
     /// up, and every request after pages were evicted.
     fn refresh_waiting(&mut self) {
         let Some(cache) = &mut self.cache else { return };
-        for a in &mut self.waiting {
+        for a in self.waiting.iter_mut().filter(|a| a.cache) {
             let changed = match a.waits_for {
                 Some(hash) => !matches!(cache.index.state(hash), PageState::Computing(_)),
                 None => a.looked_at != cache.evictions,
@@ -1339,7 +1345,7 @@ impl Conductor {
                 let margin = self.model.saves_inside_steps();
                 let inside = !step.replay && margin > 0 && step.rows > self.model.own_rows();
                 let named = self.inner_due.len();
-                if let Some(cache) = &self.cache {
+                if let Some(cache) = self.cache.as_ref().filter(|_| a.cache) {
                     let (mut last, mut from) = (a.checkpoint_at, step.from);
                     while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
                     {

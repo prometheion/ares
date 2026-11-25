@@ -154,6 +154,7 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<f64, LoadError> {
         max_tokens: Some(32),
         stop: Vec::new(),
         draft: true,
+        cache: true,
         structure: None,
         priority: 0,
         id: RequestId(0),

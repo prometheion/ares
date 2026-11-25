@@ -167,7 +167,7 @@ impl Conductor {
             // The cache: the pages that are full now enter the index, and a
             // checkpoint is taken where the rows ended on a position that is
             // due one (the rows were cut to end there).
-            if let Some(cache) = &mut self.cache {
+            if let Some(cache) = self.cache.as_mut().filter(|_| a.cache) {
                 let settled = a.cells.len();
                 cache.index.publish(
                     &mut self.pool,

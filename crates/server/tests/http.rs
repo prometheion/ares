@@ -243,6 +243,21 @@ async fn conventions_of_other_servers_are_understood() {
     assert_eq!(request.stop, ["x"]);
 }
 
+#[tokio::test]
+async fn cache_prompt_says_whether_the_request_uses_the_prompt_cache() {
+    // llama.cpp's member: true is what a request does anyway.
+    assert!(received(CHAT, &chat_body(json!({}))).await.cache);
+    assert!(received(CHAT, &chat_body(json!({"cache_prompt": true}))).await.cache);
+    assert!(!received(CHAT, &chat_body(json!({"cache_prompt": false}))).await.cache);
+    let body = completion_body(json!({"cache_prompt": false}));
+    assert!(!received(COMPLETIONS, &body).await.cache);
+    let (status, value) =
+        json(post(&app(&instant()).await, CHAT, &chat_body(json!({"cache_prompt": "no"}))).await)
+            .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"]["param"], "cache_prompt");
+}
+
 // --- streaming ---------------------------------------------------------------
 
 #[tokio::test]

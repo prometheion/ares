@@ -60,7 +60,8 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
   - The second card's role is remembered per model, cards, driver and binary, and measured again
     when one of them changes (to build: `fix/model-sweep`).
   - `cache_prompt` is accepted with its meaning: `true` is the normal behaviour, `false` makes the
-    request neither read nor write the prompt cache (to build: `fix/server-sweep`).
+    request neither read nor write the prompt cache (built on `fix/server-sweep`, "ares-runtime:
+    cache_prompt false keeps a request out of the prompt cache").
   - DFlash2 trees come after the few-row kernels and are decided with those costs.
 - Push day done 2026-11-25: the first push (prometheion/ares main at the scrubbed history) and
   the owner's production switched to Ares (llama-swap's two 27B entries run Ares from

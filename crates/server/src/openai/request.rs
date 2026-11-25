@@ -207,6 +207,7 @@ const SERVED: &[&str] = &[
     "post_sampling_probs",
     "min_keep",
     "priority",
+    "cache_prompt",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -331,6 +332,8 @@ pub(crate) fn from_json(
         max_tokens: max_tokens(&fields, endpoint)?,
         stop: stop(&fields)?,
         draft: fields.bool("draft")?.unwrap_or(true),
+        // llama.cpp's: `false` leaves the prompt cache out of the request.
+        cache: fields.bool("cache_prompt")?.unwrap_or(true),
         structure: structured::asked(&fields)?,
         priority: 0,
         id,

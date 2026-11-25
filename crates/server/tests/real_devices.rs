@@ -49,6 +49,7 @@ fn answer(engine: &Arc<dyn Engine>, model: &str, text: &str, max_tokens: u32) ->
         max_tokens: Some(max_tokens),
         stop: Vec::new(),
         draft: false,
+        cache: true,
         structure: None,
         priority: 0,
         id: RequestId(1),
