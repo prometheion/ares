@@ -127,8 +127,11 @@ use crate::record::{self, Commit, ImageRun, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 use crate::watch::Watch;
+use decisions::Decision;
+pub(crate) use decisions::{DecisionSubmission, Role};
 
 mod commit;
+mod decisions;
 mod drafting;
 mod images;
 mod lifecycle;
@@ -173,6 +176,8 @@ impl Heartbeat {
 /// What other threads ask of the conductor.
 pub(crate) enum Command {
     Submit(Box<Submission>),
+    /// A decision ([`decisions`]).
+    Decide(Box<DecisionSubmission>),
     Cancel(RequestId),
     Stats {
         reset: bool,
@@ -248,6 +253,8 @@ pub(crate) struct Submission {
     /// is refused as overloaded, or is refused itself.
     pub displace: bool,
     pub sink: EventSink,
+    /// What the request is for: a client's, or a part of a decision.
+    pub role: Role,
 }
 
 /// What the conductor knows about a running sequence, for tests and logs.
@@ -381,6 +388,9 @@ struct Active {
     /// Text produced this step, not yet delivered.
     emitted: String,
     finished: Option<FinishReason>,
+    /// What the request is for: a client's, or a part of a decision
+    /// ([`decisions`]), which reads its prompt and generates nothing.
+    role: Role,
 }
 
 impl Active {
@@ -533,9 +543,18 @@ impl Drop for Conductor {
             let _ = a.sink.send(Event::Error(gone.clone()));
             a.cells.release(&mut self.pool);
         }
+        for (_, decision) in self.decisions.drain() {
+            decision.fail(gone.clone());
+        }
         while let Ok(command) = self.rx.try_recv() {
-            if let Command::Submit(submission) = command {
-                let _ = submission.sink.send(Event::Error(gone.clone()));
+            match command {
+                Command::Submit(submission) => {
+                    let _ = submission.sink.send(Event::Error(gone.clone()));
+                }
+                Command::Decide(submission) => {
+                    submission.sink.send(ares_api::DecisionOutcome::Failed(gone.clone()))
+                }
+                _ => {}
             }
         }
     }
@@ -797,6 +816,14 @@ pub(crate) struct Conductor {
     mask_words: usize,
     /// What requests share that takes a pass over the vocabulary to find.
     sampling_context: Context,
+    /// The decisions held, by their ids ([`decisions`]).
+    decisions: HashMap<RequestId, Decision>,
+    /// The errors the requests of decisions were ended with, by the
+    /// request's id, until the decision is ended with it.
+    part_errors: Arc<std::sync::Mutex<Vec<(RequestId, EngineError)>>>,
+    /// The logits the record's scores name, for the step being written:
+    /// `(wanted row, token)`.
+    score_pairs: Vec<(u32, u32)>,
 }
 
 impl Conductor {
@@ -859,6 +886,7 @@ impl Conductor {
                 paused: false,
                 picks: Vec::with_capacity(max_rows as usize),
                 logprobs: Vec::new(),
+                scores: Vec::new(),
                 drafts: Vec::with_capacity(max_rows as usize),
                 draft_probs: Vec::with_capacity(max_rows as usize),
                 draft_ms: 0.0,
@@ -870,6 +898,9 @@ impl Conductor {
             step_rows: StepRows::default(),
             mask_words: TokenMask::words_for(model.vocab()),
             sampling_context: Context::default(),
+            decisions: HashMap::new(),
+            part_errors: Arc::default(),
+            score_pairs: Vec::new(),
             requests: Vec::with_capacity(slots),
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
@@ -993,6 +1024,10 @@ impl Conductor {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Submit(submission) => self.enqueue(*submission),
+            Command::Decide(submission) => self.take_decision(*submission),
+            Command::Cancel(id) if self.decisions.contains_key(&id) => {
+                self.end_decision(id, ares_api::DecisionOutcome::Cancelled)
+            }
             Command::Cancel(id) => match self.by_id.get(&id) {
                 Some(Place::Slot(slot)) => self.retire(*slot, FinishReason::Cancelled),
                 Some(Place::Waiting) => {

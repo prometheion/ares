@@ -446,6 +446,20 @@ impl SyntheticModel {
         ((h % u64::from(self.config.vocab())) as u32, (h >> 40) as f32)
     }
 
+    /// The logit the host executors give `token` at a wanted row whose pick
+    /// is `pick` (a score of the record): the pick's is the largest, 4, and
+    /// any other token's a number from -8 to 0 that follows from the two, so
+    /// that a row that picks another token scores every token otherwise.
+    pub fn host_score(&self, pick: u32, token: u32) -> f32 {
+        if token == pick {
+            return 4.0;
+        }
+        let mut h = u64::from(pick) << 32 | u64::from(token);
+        h = (h ^ (h >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        -((h % 8000) as f32) / 1000.0
+    }
+
     /// The context the row of `token` at `position` has: what the conductor
     /// derives from the tokens, for a model whose context reads one token.
     pub fn context_of(&self, token: u32, position: u32) -> u32 {

@@ -565,22 +565,6 @@ fn a_failing_warm_up_step_reports_the_device_and_the_cause() {
 }
 
 #[test]
-fn decisions_are_not_implemented_and_say_so() {
-    use ares_api::{DecisionRequest, DecisionSink, Json};
-    let model = model(|_| {});
-    let rt = runtime(&model, false);
-    let request = DecisionRequest {
-        model: "synthetic".into(),
-        state: Json::String("x".into()),
-        questions: Vec::new(),
-        priority: 0,
-        id: fresh_id(),
-    };
-    let error = rt.decide(request, DecisionSink::new(|_| {})).unwrap_err();
-    assert!(matches!(error, EngineError::Unsupported(_)));
-}
-
-#[test]
 fn stats_can_be_taken_and_reset_while_running() {
     let model = model(|_| {});
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_micros(100)));

@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::python;
-use crate::{EngineError, Json, RequestId};
+use crate::{EngineError, Json, Message, Prompt, RequestId, Role};
 
 /// The most options a [`QuestionKind::Choice`] question and the most levels a
 /// [`QuestionKind::Score`] question can have (Flide's `MAX_CHOICE_OPTIONS` and
@@ -344,6 +344,19 @@ pub fn user_turn(state: &Json, question: &str) -> String {
     text.push_str("\n\n");
     text.push_str(question);
     text
+}
+
+/// The prompt of a question as Flide's `next_token` format gives it to a chat
+/// model (`NextToken._render`, style `vllm`): one user turn ([`user_turn`]),
+/// rendered with the model's chat template and its generation prompt,
+/// thinking off.
+pub fn question_prompt(state: &Json, question: &str) -> Prompt {
+    Prompt::Chat {
+        messages: vec![Message::new(Role::User, user_turn(state, question))],
+        tools: None,
+        variables: vec![("enable_thinking".into(), Json::Bool(false))],
+        continue_final: false,
+    }
 }
 
 #[cfg(test)]

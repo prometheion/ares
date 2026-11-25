@@ -60,6 +60,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Claude Code | works against `/v1/messages`, with `context_management` and `thinking.display` |
 | Reply length | `--max-tokens` and the cap `--max-tokens-limit` |
 | Continuing a message | a last assistant message is continued (prefill) |
+| Decisions (Jev mode) | `/v1/systemone` as Flide serves it: questions about a state answered from the labels' logits, the state computed once and forked into the questions, several requests in one body |
 
 ## Server
 

@@ -8,6 +8,10 @@ impl Conductor {
     /// sequence.
     pub(super) fn commit(&mut self) {
         let mut cursor = 0usize;
+        // The scores of the step, in the order the record named them: the
+        // labels of the forks whose last row ran.
+        let mut score_at = 0usize;
+        let mut reads: Vec<(RequestId, usize, Vec<f32>)> = Vec::new();
         let mut row0 = 0u32;
         self.commits.clear();
         self.round_tokens = 0;
@@ -33,17 +37,40 @@ impl Conductor {
                         a.drafter.push(&mut self.corpus, a.tokens[at]);
                     }
                     if completes {
-                        let pick = self.output.picks[cursor];
-                        let probs = self.output.logprobs.get(cursor..=cursor).unwrap_or(&[]);
-                        a.sampler.picked(&[pick], probs);
-                        cursor += 1;
-                        a.accept(
-                            &*self.model,
-                            &self.spec,
-                            self.context_length,
-                            &mut self.corpus,
-                            &[pick.token],
-                        );
+                        match &a.role {
+                            // A part of a decision reads its prompt and ends:
+                            // the parent with its state in the cache, a fork
+                            // with the logits of its labels.
+                            Role::Parent { .. } => {
+                                cursor += 1;
+                                a.finished = Some(FinishReason::Stop);
+                            }
+                            Role::Fork { decision, question, labels } => {
+                                cursor += 1;
+                                let end = (score_at + labels.len()).min(self.output.scores.len());
+                                reads.push((
+                                    *decision,
+                                    *question,
+                                    self.output.scores[score_at.min(end)..end].to_vec(),
+                                ));
+                                score_at += labels.len();
+                                a.finished = Some(FinishReason::Stop);
+                            }
+                            Role::Request => {
+                                let pick = self.output.picks[cursor];
+                                let probs =
+                                    self.output.logprobs.get(cursor..=cursor).unwrap_or(&[]);
+                                a.sampler.picked(&[pick], probs);
+                                cursor += 1;
+                                a.accept(
+                                    &*self.model,
+                                    &self.spec,
+                                    self.context_length,
+                                    &mut self.corpus,
+                                    &[pick.token],
+                                );
+                            }
+                        }
                     }
                 }
                 PartKind::Window | PartKind::Score { .. } => {
@@ -226,14 +253,21 @@ impl Conductor {
         // A place taken for a checkpoint inside the rows that the commit did not name.
         let left = std::mem::take(&mut self.inner);
         self.release_inner(left);
+        for (decision, question, logits) in reads {
+            self.fork_read(decision, question, &logits);
+        }
     }
 
     /// Sends the text of the step to the sinks, ends the requests that are
     /// done and the ones whose sink gave up.
     pub(super) fn deliver(&mut self) {
         for i in 0..self.parts.len() {
-            let slot = self.parts[i].slot;
-            let a = self.slots[slot as usize].as_mut().expect("running");
+            let (slot, seq) = (self.parts[i].slot, self.parts[i].seq);
+            // A part of a decision that ended with its decision, earlier in
+            // this loop, has left its slot.
+            let Some(a) = self.slots[slot as usize].as_mut().filter(|a| a.seq == seq) else {
+                continue;
+            };
             // A rule that failed in the middle of the reply: the picks of
             // this step were made without it, and the text is not sent.
             if let Some(message) = a.sampler.failure() {

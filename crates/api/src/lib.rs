@@ -42,7 +42,8 @@ pub use answer::{Answer, DecisionOutcome, DecisionResult, Verdict};
 pub use chat::{ChatFormat, ThinkingFormat, ToolFormat};
 pub use decision::{
     ChoiceOption, DecisionError, DecisionRequest, Labels, MAX_BRANCH_TOKENS, MAX_OPTIONS,
-    MAX_REQUEST_TOKENS, Question, QuestionKind, Rendered, SINGLE_LABELS, state_text, user_turn,
+    MAX_REQUEST_TOKENS, Question, QuestionKind, Rendered, SINGLE_LABELS, question_prompt,
+    state_text, user_turn,
 };
 pub use engine::{Engine, ModelCard};
 pub use error::EngineError;

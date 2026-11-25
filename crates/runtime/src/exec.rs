@@ -64,6 +64,10 @@ pub struct StepOutput {
     /// The probabilities those rows report, one record per pick, when any row
     /// asked for them; empty otherwise.
     pub logprobs: Vec<ares_sampler::LogprobOut>,
+    /// The logits the record's scores name ([`RecordView::scores`](crate::RecordView)),
+    /// in their order, as the model computed them: before the sampler's
+    /// corrections, masks and temperature. Empty when the record names none.
+    pub scores: Vec<f32>,
     /// The tokens the model drafted itself for the windows that asked for
     /// them, in the order of the record's segments, window after window.
     pub drafts: Vec<u32>,

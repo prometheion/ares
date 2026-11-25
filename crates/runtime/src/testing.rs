@@ -142,6 +142,8 @@ pub struct HostExecutor {
     devices: usize,
     record: Vec<u8>,
     picks: Vec<Pick>,
+    /// The logits the record's scores name, from the step that ran last.
+    scores: Vec<f32>,
     delay: Duration,
     /// The time of a step by its rows, in place of `delay`.
     step_cost: Option<Box<dyn Fn(u32) -> Duration + Send>>,
@@ -258,6 +260,7 @@ impl HostExecutor {
             devices: 1,
             record: vec![0; record_bytes],
             picks: Vec::new(),
+            scores: Vec::new(),
             delay: Duration::ZERO,
             step_cost: None,
             step_delay: Duration::ZERO,
@@ -580,6 +583,16 @@ impl Executor for HostExecutor {
             }
         }
         drop(tables);
+        // The scores are read from the logits before the masks change them:
+        // here, from the picks the rows make without them.
+        self.scores.clear();
+        for i in 0..view.scores() {
+            let (row, token) = view.score(i);
+            self.scores.push(match self.picks.get(row as usize) {
+                Some(pick) => self.model.host_score(pick.token, token),
+                None => f32::NAN,
+            });
+        }
         Self::apply_masks(&view, &mut self.picks, self.model.config().vocab());
         // Rows the model left: from the first in a window on, another token.
         self.inexact.clear();
@@ -630,6 +643,8 @@ impl Executor for HostExecutor {
         }
         out.picks.clear();
         out.picks.extend_from_slice(&self.picks);
+        out.scores.clear();
+        out.scores.extend_from_slice(&self.scores);
         out.drafts.clear();
         out.drafts.extend_from_slice(&self.drafts);
         out.draft_probs.clear();
