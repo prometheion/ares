@@ -47,6 +47,15 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
 
 ### From "Defects", "Model, runtime, kernels"
 
+- [x] Device memory is not behind the gate of page-locked memory: `cuMemFree` "may perform
+      implicit synchronization" too (the libcuda deadlock's class). An engine allocates it when its
+      model opens and frees it when the model goes, but for the 27B's attention plan larger than
+      its buffer (`Plan::upload` inside a step) and an engine that unloads beside another that
+      serves. Files: `crates/cuda/src/memory.rs` (`DeviceBuffer::drop`), `crates/cuda/src/gate.rs`,
+      `crates/model/src/qwen35/device/part.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `DeviceBuffer` is freed through `gate::retire` (`DeviceFree`): at once when no job runs, otherwise when the last job ends; `Device::mem_info` and an allocation that finds no room first free what is due (`gate::settle`, which waits for the running jobs like `gate::change`), so a placement after an unload sees the freed memory. Unit test `settling_frees_what_a_step_gave_back_once_the_step_ends` (`crates/cuda/src/gate.rs`). Commit "ares-cuda: device memory is freed where no job runs".
+
 - [x] The 30-s checks of a step that waits count from the start of the wait, not from the last
       progress, and then fail the step (`Flow::check`): seen 2026-11-24 as "a step stood still for
       30s while rows of the n-gram table were read" at load 27 to 34 (main as well), beside the

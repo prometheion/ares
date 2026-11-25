@@ -338,8 +338,10 @@ impl Device {
     }
 
     /// Free and total memory of the device as the driver sees it now. Other
-    /// processes on the device count against `free`.
+    /// processes on the device count against `free`. Device memory given back
+    /// while a job runs is freed first ([`crate::gate::settle`]).
     pub fn mem_info(&self) -> Result<MemInfo> {
+        crate::gate::settle();
         let driver = self.bind()?;
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: both pointers are valid for the write of one size.

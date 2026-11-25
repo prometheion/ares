@@ -302,11 +302,16 @@ engine that loads beside one that serves waits for its steps, and what an
 engine frees while another runs a step waits for that step's end. What the
 frees between steps cost is measured in
 [`../experiments/host-memory.md`](../experiments/host-memory.md) ("Page-locked
-memory between steps"). Device memory (`cuMemAlloc`, `cuMemFree`) is not
-behind the gate: an engine takes it when its model is opened and frees it when
-the model goes, but for one fallback inside a step (a plan of the 27B's
-attention larger than its buffer, `Plan::upload`) and an engine that unloads
-beside another that serves ([`OPEN.md`](../../OPEN.md), "Host memory").
+memory between steps"). Device memory is freed behind the gate as well (since
+2026-11-25): `cuMemFree` "may perform implicit synchronization" too, so a
+`DeviceBuffer` dropped inside a step (a plan of the 27B's attention larger than
+its buffer, `Plan::upload`) or beside another engine's step is freed where no
+job runs (`gate::retire`). An engine takes most of it when its model opens, and
+the frees of one that unloads beside another that serves wait for that one's
+step; what looks at the free memory of a device (`Device::mem_info`, which a
+placement reads) or finds no room for an allocation (`DeviceBuffer::new`)
+first waits for the frees that are due (`gate::settle`), so that a model loaded
+after an unload sees the memory the unload gave back.
 
 Nothing that costs speed happens silently:
 

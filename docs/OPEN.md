@@ -193,7 +193,7 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 14 | 11 |
+| Model, runtime, kernels | 13 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
 - [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
@@ -307,12 +307,6 @@ Wrong behaviour:
       27B failed so on 2026-11-23, fixed there by 5d5aee5f). To size it with
       `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs. Files:
       `crates/model/src/qwen4exp/device/part/frame.rs`, `qwen4exp/device/part.rs` (`check_states`).
-- [ ] Device memory is not behind the gate of page-locked memory: `cuMemFree` "may perform
-      implicit synchronization" too (the libcuda deadlock's class). An engine allocates it when its
-      model opens and frees it when the model goes, but for the 27B's attention plan larger than
-      its buffer (`Plan::upload` inside a step) and an engine that unloads beside another that
-      serves. Files: `crates/cuda/src/memory.rs` (`DeviceBuffer::drop`), `crates/cuda/src/gate.rs`,
-      `crates/model/src/qwen35/device/part.rs`.
 - [ ] GPU. Flash-Next: rounds between the pieces of a paused pass can stall the expert store when
       the pass borrows all the slots can lend ("a step stood still for 30s while the host held
       back the next layer ... the store waits for 7 to 9 experts and is not settled": a 21k-row
