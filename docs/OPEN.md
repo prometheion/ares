@@ -326,7 +326,12 @@ Wrong behaviour:
       share on lent VRAM is computed differently in some runs. The reading of `misses.rs`,
       `hybrid/wide.rs`, `cpu/mod.rs` and `transit.rs` found no cause; a diagnostic that prints the
       first tokens' log-probabilities per run (`zz_dbg_lent_gaps`, with the serve mode and a log
-      line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`). Files:
+      line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`).
+      *Classified on `fix/model-sweep` (2026-11-25): a defect, not a near tie.* The CPU reference
+      (the patch's `zz_dbg_reference_margins`, same file and prompt) puts 58 first with a gap of
+      0.433 to 22 (logits); the common state's log-probabilities (-1.80..-1.85 against
+      -2.20..-2.25, a gap of about 0.40) agree with it, the other state's (-2.14 against -2.10, 22
+      ahead by 0.04) is off by about 0.47. The cause is not found. Files:
       `crates/model/src/qwen4exp/device/misses.rs`, `crates/runtime/src/expert_store/hybrid/wide.rs`,
       `expert_store/cpu/mod.rs`, `expert_store/transit.rs`.
 - [ ] GPU. With both devices on every layer the MTP block's chains after a pass agree with the
@@ -414,12 +419,20 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       still decoded on the host for every pass (both models). Files:
       `crates/model/src/dflash/device.rs` (`pass_layers`), `qwen35/device/part/dflash.rs`,
       `qwen4exp/device/part/dflash.rs`, `crates/model/src/blocks/rows.rs`.
+      *Not done on `fix/model-sweep` (2026-11-25):* what it takes: `pass_layers` writes a pass's
+      `block` rows per sequence on the host (the newest token's row decoded through the `embed`
+      callback, then the mask row) and uploads them, 16 rows of `n_embd` f32 a sequence (320 KiB
+      for the 27B). On the device: the mask row uploaded once at open and copied into rows 1 to
+      `block - 1`, the newest token's row gathered from the table's staged rows (`rows::source`,
+      `embed_gather`) into a row of its own and copied to row 0; the drafter's device test against
+      the reference (`crates/model/tests/dflash.rs`, the 27B's drafter file) checks it.
 - [ ] Flash-Next past the dense limit: a draft window's row that reaches across the point where
       a tile leaves the newest cells reads that tile exact, the row alone reads it converted
       (`Group::ahead` is planned for rows within the limit only; the lists are made on the
       device from the table, which still names the exact entry). A shadow row of the table for
       such rows would close it. Files: `crates/model/src/blocks/kv.rs`, `blocks/forms.rs`,
-      `crates/model/src/qwen4exp/device/part.rs` (`build_plan`).
+      `crates/model/src/qwen4exp/device/part.rs` (`build_plan`). *Not done on `fix/model-sweep`
+      (2026-11-25).*
 - [ ] Transit adoption (`transit_adopt`, the prompt chunks' experts taking VRAM slots after a
       wide step) asks only "hotter than the coldest member" (with the swap margin when the member
       has to be copied down), not the rule of a promotion (`promote_hot`); it was left for the work
@@ -447,6 +460,13 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       applied to the dense matrices and the router only). Files:
       `crates/model/src/qwen4exp/device/load.rs`, `qwen4exp/device/part/wide.rs`,
       `crates/cuda/src/experts.rs`.
+      *Looked at on `fix/model-sweep` (2026-11-25), not done:* the many-row kernels turn a float
+      expert's weights into f16 (`EngMmFloat`, `mm_types_more.cuh`; beyond 65504 an infinity). The
+      dense matrices are read at load, the experts are not (a streamed model's experts would all
+      have to be read), so the check belongs where the store reads an expert (float shapes only, a
+      pass over its bytes), and a wide step needs a way for a layer with such an expert that does
+      not exist yet (the decode kernels eight rows at a time, or the CPU). Only files with float
+      experts are concerned; none of the owner's are.
 
 ### Decode under offload (a user's runs, 2026-11-25): the aim of item 3
 One RTX 4080 16 GB, Flash-Next UD-IQ4_XS (87 GiB), `--ram 52G`, `--context 131072`, `--parallel 1`, MTP:
