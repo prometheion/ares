@@ -74,6 +74,34 @@ impl Cache {
         }
     }
 
+    /// Waits for the writer to give back the pages of `names` (from the
+    /// first on) that RAM handed it, for [`PATIENCE`] at most. Such a page is
+    /// found neither in RAM, whose bytes are with the writer, nor on the
+    /// drive, which has not stored it yet: a prompt that came in that moment
+    /// would compute it and every page after it.
+    pub(in crate::cache) fn await_transit(&mut self, names: &[ChainHash]) {
+        let begun = Instant::now();
+        loop {
+            self.collect();
+            let (Some(ram), Some(ssd)) = (&self.in_ram, &self.ssd) else { return };
+            let away = names
+                .iter()
+                .map_while(|hash| ram.get(*hash).map(|entry| (hash, entry)))
+                .any(|(hash, entry)| {
+                    entry.parts.is_none() && ssd.queued.contains(&(Kind::Page, *hash))
+                });
+            let left = PATIENCE.saturating_sub(begun.elapsed());
+            if !away || left.is_zero() {
+                return;
+            }
+            let Some(ssd) = &mut self.ssd else { return };
+            match ssd.from_writer.recv_timeout(left) {
+                Ok(done) => self.written(done),
+                Err(_) => return,
+            }
+        }
+    }
+
     /// The writer has finished a record: a page's buffers go back to its
     /// entry in RAM, which the drive has now too, and a checkpoint's buffer
     /// to the others.

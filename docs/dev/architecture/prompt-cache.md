@@ -176,7 +176,10 @@ and after a restart of the server. Nothing is written as it is computed.
   the reply) and computes from there, which costs the rows of the last reply
   once.
 - **A hit.** `Cache::probe` asks the store for the pages after the ones the
-  index (and RAM) have. For a model with recurrent state the run ends at its
+  index (and RAM) have. A page of the prompt that RAM has handed the writer
+  is in neither (its bytes are with the writer, and the store has no record
+  yet): the probe waits for the writer to give such pages back first, at
+  most 250 ms, and RAM brings them back (`Cache::await_transit`). For a model with recurrent state the run ends at its
   deepest checkpoint in the store (the pages behind it would be replayed row
   by row, which takes as long as computing them), and without a checkpoint
   nothing is brought back. The run is announced in the index under an owner

@@ -544,6 +544,13 @@ impl Cache {
         let looked = &tokens[..tokens.len() - 1];
         let mut found = self.index.lookup_chain(chain, looked);
         let mut brought = 0;
+        if exec.is_some() && found.computing.is_none() && self.ssd.is_some() {
+            // Pages of the prompt on their way from RAM to the drive come back
+            // to RAM first, so that the run below finds them.
+            let total = (looked.len() / self.cells_per_page as usize).min(chain.hashes().len());
+            let have = found.pages.len().min(total);
+            self.await_transit(&chain.hashes()[have..total]);
+        }
         if let (Some(exec), None) = (exec, found.computing) {
             brought = self.import_from_ram(pool, exec, chain, tokens, &found);
             if brought > 0 {
