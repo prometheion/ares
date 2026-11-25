@@ -46,6 +46,22 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
 | The push day's leftovers (`chore/leftovers`, 2026-11-25) | in work (under "Decided by the owner", the push day) |
 
 ## Decided by the owner (2026-11-22)
+- The triage's seven questions, answered 2026-11-25:
+  - `--generation-floor` stays 20 tokens/s (the fork's generation beside a prompt); looked at again
+    after the kernel pass makes steps cheaper.
+  - A checkpoint at the end of every request (a place per request end), so a repeated or continued
+    prompt resumes at its end, not at the last page or message boundary (to build: `fix/server-sweep`).
+  - The RTX 3060's prompt attention takes 5 pieces a tile (about 6 % of its attention for some 25 MB
+    of state slots a card); O in f16 is not taken (its error grows with the length). In the kernel pass.
+  - The roles of the cards are built and tested now on the local RTX 4070 + RTX 3060, not after the
+    RTX 5060 Ti: Flash-Next on these two cards with only the machine's 32 GB of RAM, the rest of its
+    experts from the SSD, must be usable (slower, but working well). The option's name and form go to
+    the owner before it is built.
+  - The second card's role is remembered per model, cards, driver and binary, and measured again
+    when one of them changes (to build: `fix/model-sweep`).
+  - `cache_prompt` is accepted with its meaning: `true` is the normal behaviour, `false` makes the
+    request neither read nor write the prompt cache (to build: `fix/server-sweep`).
+  - DFlash2 trees come after the few-row kernels and are decided with those costs.
 - Push day done 2026-11-25: the first push (prometheion/ares main at the scrubbed history) and
   the owner's production switched to Ares (llama-swap's two 27B entries run Ares from
   `~/Services/ares`, presets mapped from the fork's; both checked in a trial run and through
@@ -538,34 +554,7 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
       VRAM, quality.
 
 ## Questions to the owner
-- [ ] The default `--generation-floor` of 20 tokens/s is the fork's generation beside a prompt
-      (the floor measured by setting: [`dev/history.md`](dev/history.md), 2026-11-23): keep it, or
-      another value?
-- [ ] A checkpoint at a prompt's exact end: today checkpoints stand on page boundaries (128 cells)
-      and message boundaries 1024 cells apart, so a prompt of fewer than 129 tokens resumes from 0
-      and a 623-token one from 512; from the SSD every replayed slice is a wide step (3 to 30 s),
-      where Strata resumes 7 tokens before the end (its newest path). Keep it as built, add a
-      checkpoint at the prompt's end (a place per request end), or keep the newest path as Strata
-      does?
-- [ ] The prompt attention on the RTX 3060 at the owner's production settings (98k 6 % short of
-      the fork; the kernel reaches about 45 % of the capped cards' int8/f16 tensor rate, the fork
-      about 67 %): which lever, if any? 5 pieces a tile (7.0 waves for the 3060's 78 pieces in
-      2.8) save about 6 % of its attention for some 25 MB of state slots on each card, the
-      VRAM-tight 4070 included; O in f16 over the whole range is 7 % faster with 8 to 10 times the
-      error already at 1.4k cells, growing with the length; heads by speed need room on the 4070
-      these settings do not leave (other `--shares`).
-- [ ] The roles of the cards (Strata has Main, Helper and Off per card): what an aux card is
-      called and what goes on it (drafters, its free VRAM as an expert tier between the main cards
-      and RAM)? The name and form of the option go to the owner before it is built.
-- [ ] The trial of the second card's role costs 3.2 to 3.7 s at load (4.1 to 4.2 s of trial, of
-      which 1.6 s opening the first role's parts with the prefill paths measured): each role opens
-      its parts and runs a wide step of 512 rows. Is a choice remembered per model and cards
-      (without `--cache` as with it) still "measured at load"? Other ways: a narrower wide step,
-      or the kept role's parts handed to the load.
-- [ ] What `cache_prompt: true` should do (llama.cpp's clients send it; today a request with it is
-      refused, as every field the server does not know, unless its value asks for nothing).
-- [ ] The DFlash2 trees study (phase 1, "In work now"): what to build? The order of 2026-11-23 puts
-      the few-row kernels first and the trees right after them, measured with those costs.
+- None open (the seven of the triage answered 2026-11-25, under "Decided by the owner").
 
 ## Features
 Pieces of real work, days each, in the order of work where the owner placed them.
