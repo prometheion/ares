@@ -566,13 +566,14 @@ fn a_failing_warm_up_step_reports_the_device_and_the_cause() {
 
 #[test]
 fn decisions_are_not_implemented_and_say_so() {
-    use ares_api::{DecisionRequest, DecisionSink, Prompt};
+    use ares_api::{DecisionRequest, DecisionSink, Json};
     let model = model(|_| {});
     let rt = runtime(&model, false);
     let request = DecisionRequest {
         model: "synthetic".into(),
-        prompt: Prompt::Text("x".into()),
+        state: Json::String("x".into()),
         questions: Vec::new(),
+        priority: 0,
         id: fresh_id(),
     };
     let error = rt.decide(request, DecisionSink::new(|_| {})).unwrap_err();
