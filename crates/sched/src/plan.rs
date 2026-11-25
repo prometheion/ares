@@ -38,6 +38,12 @@ pub struct Request {
 pub struct Limits {
     /// The most rows a step can hold (the size of the step's scratch memory).
     pub max_rows: u32,
+    /// The most rows of a step that holds the rows of more than one
+    /// sequence. A model whose step wider than its own memory borrows memory
+    /// for its time (Flash-Next's expert slots lend VRAM, and a prompt is
+    /// read layer by layer there) runs such a step for one prompt alone; the
+    /// model's own rows ([`Limits::max_rows`] for any other model).
+    pub shared_rows: u32,
     /// The most prompt rows in a step that also carries generating
     /// sequences or decisions: a piece of prompt (see [`Share`](crate::Share)).
     pub prefill_rows_with_windows: u32,
@@ -104,9 +110,22 @@ impl Plan {
 /// The parts of the plan are in row order, which differs from the order of
 /// the grants because the drafts of a sequence follow its newest token:
 /// generating sequences (with their drafts), then decisions, then prompts.
+///
+/// A step wider than [`Limits::shared_rows`] holds one sequence's rows: when
+/// the grants above give more than one sequence rows beyond it, the step is
+/// planned again within it.
 pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
+    let plan = plan_within(requests, limits, limits.max_rows);
+    if plan.parts.len() > 1 && plan.rows() > limits.shared_rows {
+        return plan_within(requests, limits, limits.shared_rows.min(limits.max_rows));
+    }
+    plan
+}
+
+/// [`plan`] for a step of at most `max_rows` rows.
+fn plan_within(requests: &[Request], limits: &Limits, max_rows: u32) -> Plan {
     let mut parts = Vec::new();
-    let mut left = limits.max_rows;
+    let mut left = max_rows;
 
     // Generating sequences, longest wait first; the order is stable so equal
     // waits keep the caller's order.
@@ -195,8 +214,12 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
 mod tests {
     use super::*;
 
-    const LIMITS: Limits =
-        Limits { max_rows: 64, prefill_rows_with_windows: 24, starvation_steps: 8 };
+    const LIMITS: Limits = Limits {
+        max_rows: 64,
+        shared_rows: 64,
+        prefill_rows_with_windows: 24,
+        starvation_steps: 8,
+    };
 
     fn window(seq: u32, drafts: u32) -> Request {
         Request { seq: SeqId(seq), want: Want::Window { drafts }, waited_steps: 0, priority: 0 }
@@ -410,6 +433,34 @@ mod tests {
         let limits = Limits { max_rows: 4, ..LIMITS };
         let plan = super::plan(&[window(1, 4), urgent(window(2, 4))], &limits);
         assert_eq!(plan.parts, [part(2, 3, PartKind::Window), part(1, 1, PartKind::Window)]);
+    }
+
+    #[test]
+    fn a_step_wider_than_the_shared_rows_holds_one_sequence() {
+        // A model that borrows memory for a step wider than 16 rows: a prompt
+        // alone takes the widest step; two prompts, or a prompt and a decision,
+        // share a step of 16 rows at most, the shortest prompt first.
+        let limits = Limits { shared_rows: 16, ..LIMITS };
+        let alone = plan(&[prefill(1, 500, 0)], &limits);
+        assert_eq!(alone.parts, [part(1, 64, PartKind::Prefill { completes: false })]);
+        let two = plan(&[prefill(1, 500, 0), prefill(2, 10, 0)], &limits);
+        assert_eq!(
+            two.parts,
+            [
+                part(2, 10, PartKind::Prefill { completes: true }),
+                part(1, 6, PartKind::Prefill { completes: false }),
+            ]
+        );
+        assert!(two.rows() <= 16);
+        let short = plan(&[prefill(1, 5, 0), prefill(2, 10, 0)], &limits);
+        assert_eq!(short.rows(), 15, "steps within the shared rows are as before");
+        let decision = plan(&[score(5, 40, 0)], &limits);
+        assert_eq!(decision.parts, [part(5, 40, PartKind::Score { completes: true })]);
+        let mixed = plan(&[score(5, 40, 0), window(1, 0)], &limits);
+        assert_eq!(
+            mixed.parts,
+            [part(1, 1, PartKind::Window), part(5, 15, PartKind::Score { completes: false })]
+        );
     }
 
     #[test]

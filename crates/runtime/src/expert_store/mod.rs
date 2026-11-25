@@ -120,6 +120,10 @@ pub enum StoreError {
     Ledger(#[from] LedgerError),
     #[error("expert store: {0}")]
     Plan(String),
+    /// The RAM limit has no room for a piece of the tier now: the tier holds
+    /// what it has and tries again later.
+    #[error("expert store: {0}")]
+    NoRoom(String),
 }
 
 /// The key at the reader of part `part` (a matrix) of read `read`: an expert
@@ -1197,7 +1201,9 @@ impl<D: SlotDevice> ExpertStore<D> {
         // Memory the machine wants back goes before anything new is started
         // (unlocked once the step has ended on every device). What the tier
         // may take again its owner locks between steps ([`ExpertStore::grow_ram`]):
-        // a lock waits for no step to run.
+        // a lock waits for no step to run. A tier that found nothing to give
+        // tries again after every step: what was busy then may be free now.
+        self.retry_floor();
         self.shrink_ram(elastic::STEP_WAIT)?;
         if self.config.decay_every > 0 && self.step.is_multiple_of(self.config.decay_every) {
             self.heat.decay();

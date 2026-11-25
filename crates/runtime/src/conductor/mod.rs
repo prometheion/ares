@@ -133,6 +133,7 @@ mod drafting;
 mod images;
 mod lifecycle;
 mod measure;
+mod room;
 mod step_record;
 
 /// How long the conductor sleeps on its channel when requests wait and none
@@ -845,7 +846,7 @@ impl Conductor {
                 Cache::new(&model.card().id, &spec, durable.as_ref(), &config)
                     .with_reach(model.prompt_rows().min(max_rows))
                     .with_ram(exec.ram())
-                    .with_far(model.far_pages())
+                    .with_far(model.far_pages(), model.card().context_length)
             }),
             admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),
@@ -1236,7 +1237,11 @@ impl Conductor {
             }
         }
         // The paused step's turn for prompts, when no other prompt waits for a
-        // piece: it goes on for about the time of a piece.
+        // piece: it goes on for about the time of a piece. While nobody
+        // generates it goes on, without a bound in time, whenever it is the
+        // prompt the planner reads first: a prompt read layer by layer is
+        // read once for all its rows, and a request that arrives makes it
+        // pause again (a shorter one is then read in pieces beside it).
         if let (Some(p), Turn::Piece { .. }) = (paused, turn) {
             let others = self.slots.iter().enumerate().any(|(slot, a)| {
                 slot != p.slot as usize
@@ -1245,22 +1250,40 @@ impl Conductor {
             if !others {
                 return self.resume(began, self.config.piece_ms.max(1.0) as u32);
             }
+            if generating == 0 && self.first_prompt() == Some(SeqId(p.slot)) {
+                return self.resume(began, 0);
+            }
         }
         self.want(turn);
         let drafting =
             self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
+        // A step wider than the model's own rows borrows memory for its time,
+        // which only a prompt read alone gets: a step with the rows of several
+        // sequences stays within the own rows, and so does every step while
+        // another is paused (the model keeps one paused step and its loan).
+        let own_rows = self.model.own_rows().min(self.max_rows);
         let mut limits = Limits {
             max_rows: if drafting {
                 self.max_rows.min(self.model.draft_rows())
+            } else if paused.is_some() {
+                own_rows
             } else {
                 self.max_rows
             },
+            shared_rows: own_rows,
             prefill_rows_with_windows: match turn {
                 Turn::Piece { rows } => rows,
                 Turn::Round => 0,
             },
             starvation_steps: self.config.starvation_steps,
         };
+        // A piece of prompt while nobody generates (another prompt waits): the
+        // planner gives the prompts no more than the piece.
+        if let Turn::Piece { rows } = turn
+            && generating == 0
+        {
+            limits.max_rows = limits.max_rows.min(rows);
+        }
         // A long prompt next to generating sequences, for a model that pauses its
         // wide steps (a prompt read layer by layer): the prompt's step is as wide
         // as when it is read alone and has its rows alone, and it pauses once the
@@ -1270,10 +1293,17 @@ impl Conductor {
         // between its pieces then do without: it is half as wide as the widest, so
         // that the slots keep at least half of what they could lend (a pass of all the
         // rows they can lend for stalled Flash-Next's rounds on one card).
-        let wide_rows = self.max_rows / 2;
-        let wide = Limits { max_rows: wide_rows, prefill_rows_with_windows: wide_rows, ..limits };
+        // Next to other prompts while nobody generates, the prompt the planner reads
+        // first is read so, alone and as wide as a prompt read alone; the others wait
+        // for it, and it pauses only when a request arrives.
+        let wide_rows = if generating > 0 { self.max_rows / 2 } else { self.max_rows };
+        let wide = Limits {
+            max_rows: wide_rows,
+            prefill_rows_with_windows: wide_rows,
+            shared_rows: wide_rows,
+            ..limits
+        };
         let pass = matches!(turn, Turn::Piece { .. })
-            && generating > 0
             && paused.is_none()
             && wide_rows > piece
             && self.model.pauses_wide_steps()
@@ -1465,6 +1495,14 @@ impl Conductor {
         if let Some(cache) = &mut self.cache {
             cache.settle_leaving(&mut self.pool, &mut *self.exec);
         }
+        // The K and V beyond VRAM of the pages in use find room in the RAM
+        // limit now, or a request ends for it.
+        if let Err(message) = self.make_room() {
+            return self.fail(message);
+        }
+        if self.parts.is_empty() {
+            return;
+        }
         // The model's drafters run first, as a step of their own, and the
         // round verifies what the conductor takes of their drafts.
         let chain_ms = if self.parts.iter().any(|p| self.takes_model_drafts(p)) {
@@ -1475,13 +1513,44 @@ impl Conductor {
         } else {
             0.0
         };
-        let pause_ms = if pass { self.config.piece_ms.max(1.0) as u32 } else { 0 };
+        let pause_ms =
+            if pass && generating > 0 { self.config.piece_ms.max(1.0) as u32 } else { 0 };
         let used = match self.write_record(RecordKind::Round { pause_ms }) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
         };
         self.stats.record(Phase::Write, t_write.elapsed().as_nanos() as u64);
         self.run_record(began, used, turn, generating, chain_ms, true);
+    }
+
+    /// The prompt the planner reads first of those that have rows to read (the
+    /// paused step's among them, with all it has left): by priority, then one
+    /// that has starved, then the fewest rows left.
+    fn first_prompt(&self) -> Option<SeqId> {
+        let paused = self.paused.map(|p| p.slot as usize);
+        let prompts: Vec<Request> = (self.slots.iter().enumerate())
+            .filter_map(|(slot, a)| {
+                let a = a.as_ref().filter(|a| !a.generating())?;
+                let rows = if Some(slot) == paused {
+                    a.prefill_left()
+                } else {
+                    a.ready_rows(a.state_pos(), a.prefill_left(), &self.images)
+                };
+                (rows > 0).then_some(Request {
+                    seq: SeqId(slot as u32),
+                    want: Want::Prefill { tokens: rows },
+                    waited_steps: a.waited_steps,
+                    priority: a.priority,
+                })
+            })
+            .collect();
+        let limits = Limits {
+            max_rows: u32::MAX,
+            shared_rows: u32::MAX,
+            prefill_rows_with_windows: u32::MAX,
+            starvation_steps: self.config.starvation_steps,
+        };
+        plan(&prompts, &limits).parts.first().map(|p| p.seq)
     }
 
     /// The sequences that generate, besides the one in slot `besides` (the

@@ -193,6 +193,10 @@ impl Cache {
     /// allowance has room, or one that something which goes for nothing gave
     /// up. Never waits.
     pub(super) fn ram_buffer(&mut self) -> Option<Vec<crate::exec::TransitPart>> {
+        // Room is being made for running sequences: nothing new comes into RAM.
+        if self.giving_way {
+            return None;
+        }
         let mut dropped = 0;
         loop {
             let ram = self.in_ram.as_mut()?;
@@ -335,10 +339,11 @@ impl Cache {
         self.settle();
         let target = self.allowance();
         // Far pages that only the index holds are the prompt cache's lowest:
-        // they leave the devices first, and their memory goes back to the
-        // system once the pages of a piece are all free.
+        // those beyond what its floor keeps leave the devices first, and their
+        // memory goes back to the system once the pages of a piece are all free.
+        // The ones the floor keeps go last, when nothing else is left to give.
         self.count_far(pool);
-        while self.held() > target && self.far_held > 0 && self.evict_far(pool) {}
+        while self.held() > target && self.far_held > self.far_keep && self.evict_far(pool) {}
         self.settle_leaving(pool, exec);
         let mut dropped = 0;
         while self.held() > target && self.give_up_free(&mut dropped) {}
@@ -358,8 +363,14 @@ impl Cache {
                 None => break,
             }
         }
-        // The checkpoints that went are copied out of their places for the
-        // drive before their places can be called unused.
+        while self.held() > target && self.far_held > 0 && self.evict_far(pool) {}
+        self.release_places(pool, exec);
+        dropped
+    }
+
+    /// The checkpoints that went are copied out of their places for the drive,
+    /// and then their places are called unused, so that their memory can go.
+    fn release_places(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) {
         self.settle_leaving(pool, exec);
         // Nothing runs: a freed place that no copy of the next record uses
         // is unused already, and the others wait for that record.
@@ -373,7 +384,51 @@ impl Cache {
             }
         }
         self.settling = waiting;
-        dropped
+    }
+
+    /// Makes room in the RAM limit for the K and V beyond VRAM of running
+    /// sequences, which outrank all the prompt cache holds: the far pages only
+    /// the index holds leave the devices for nothing (the cache's floor keeps
+    /// them from the tier of experts, not from these), and the pages in RAM and
+    /// the checkpoints go at once, without a write, down to the one place of
+    /// the floor and the pages the level on SSD moves state through (a running
+    /// request waits for the memory). Returns the checkpoints that went and
+    /// whether anything went at all. Between steps.
+    pub(crate) fn give_way(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) -> (u32, bool) {
+        if self.books.is_none() {
+            return (0, false);
+        }
+        self.settle_leaving(pool, exec);
+        self.settle();
+        let mut gone = false;
+        let mut dropped = 0;
+        // The far pages leave first, and find no buffer in RAM: what they free is
+        // what the running sequences need.
+        self.giving_way = true;
+        self.count_far(pool);
+        while self.far_held > 0 && self.evict_far(pool) {
+            gone = true;
+        }
+        self.settle_leaving(pool, exec);
+        self.giving_way = false;
+        while let Some((_, item, hash)) = self.in_ram.as_ref().and_then(RamLevel::first) {
+            dropped += self.ram_give_up(item, hash);
+            gone = true;
+        }
+        if let Some(ram) = &mut self.in_ram
+            && ram.bytes() > self.page_floor
+            && ram.free_bytes() > 0
+        {
+            ram.shed();
+            gone = true;
+        }
+        let in_use = |cache: &Self| u64::from(cache.next_place) - cache.free_places.len() as u64;
+        while in_use(self) > 1 && self.give_up_index_checkpoint(false) {
+            dropped += 1;
+            gone = true;
+        }
+        self.release_places(pool, exec);
+        (dropped, gone)
     }
 
     /// The owner a run that comes back from RAM or the drive is announced to

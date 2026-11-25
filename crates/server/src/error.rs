@@ -212,6 +212,14 @@ impl ApiError {
                 ..Self::internal(message)
             },
             EngineError::Unsupported(_) => Self::unsupported(message),
+            // The request found no room in the engine's memory limit (`--ram`) and
+            // ended; the model serves on.
+            EngineError::NoMemory(_) => Self {
+                status: StatusCode::INSUFFICIENT_STORAGE,
+                code: "insufficient_memory",
+                retry_after: Some(1),
+                ..Self::internal(message)
+            },
             EngineError::Internal(_) => Self::internal(message),
         }
     }

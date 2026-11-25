@@ -227,6 +227,14 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.pieces.at_floor
     }
 
+    /// Forgets that the tier found nothing more to give: it tries again at
+    /// the next [`ExpertStore::shrink_ram`]. A slot that was busy (on its way
+    /// somewhere, or set aside) may be free since, so the floor the tier found
+    /// is not its floor for good.
+    pub fn retry_floor(&mut self) {
+        self.pieces.at_floor = false;
+    }
+
     /// Says how many bytes the tier may hold from now on. It follows between
     /// steps ([`ExpertStore::shrink_ram`], [`ExpertStore::grow_ram`]).
     pub fn set_ram_target(&mut self, bytes: u64) {
@@ -320,12 +328,19 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// Returns the pieces locked. Locking takes time (tens of milliseconds a
     /// piece) and is done here, by the caller's thread: call it between
     /// steps, where no step waits for the store (a lock waits for no step to
-    /// run, and inside one it fails: [`ares_cuda::gate`]).
+    /// run, and inside one it fails: [`ares_cuda::gate`]). A piece that the
+    /// RAM limit has no room for now (others hold more than the allowance
+    /// counted on, such as the prompt cache until it gives up what it holds
+    /// beyond its allowance) is no error: the tier stays as it is.
     pub fn grow_ram(&mut self, most: usize) -> Result<usize, StoreError> {
         let mut locked = 0;
         while locked < most {
             let Some(piece) = self.ram_piece_to_lock() else { break };
-            self.region.lock(piece)?;
+            match self.region.lock(piece) {
+                Ok(()) => {}
+                Err(StoreError::NoRoom(_)) => break,
+                Err(error) => return Err(error),
+            }
             self.revive(piece);
             self.stats.pieces_locked += 1;
             self.pieces.at_floor = false;
