@@ -67,6 +67,7 @@ async fn main() -> ExitCode {
     }
     // The first line of the log names the binary.
     tracing::info!("{}", ares_server::BUILD_INFO);
+    log_panics();
 
     match run(&host, port, timeout, log.text, &access, presets, single).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -75,6 +76,25 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Writes a panic into the log, with its thread, its place and the stack, before
+/// the default hook prints it and the release build aborts: a log file
+/// (`--log-file`) or a journal then says why a core dump was made.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let place = info.location().map(|at| format!("{}:{}", at.file(), at.line()));
+        tracing::error!(
+            thread = thread.name().unwrap_or("unnamed"),
+            place = place.as_deref().unwrap_or("unknown"),
+            stack = %std::backtrace::Backtrace::force_capture(),
+            "panicked: {}",
+            info.payload_as_str().unwrap_or("without a message"),
+        );
+        default(info);
+    }));
 }
 
 /// Where the log goes: standard error (stdout is for output a user asks for,
