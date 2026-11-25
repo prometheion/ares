@@ -356,6 +356,16 @@ Wrong behaviour:
       Not looked into (a cache replay runs as wide rows, which round differently from single rows,
       but then 160 tokens should differ too). Files: `crates/model/src/qwen35/device/`,
       `crates/runtime/src/cache/`, `crates/server/tests/real_drafts.rs`.
+      *Looked at on `fix/model-sweep` (2026-11-25, main a8920d61, the local RTX 4070, one card,
+      no drafts, `/var/tmp/ares-fixmodel/ab/d8.sh`): a near tie, not a defect by the owner's rule.*
+      The two replies of 40 tokens (the same hashes as above) part at their last token only: the
+      first, its prompt of 66 tokens read as one step, has " " -1.411 before ' "' -1.475; the second,
+      from the cache (`prompt_n` 1: one row computed after the state at cell 65), ' "' -1.428 before
+      " " -1.481. The first reply of 40 is the first 40 tokens of the reply of 160. At 160 all agree
+      because none came from the cache: each of the three requests read all 66 tokens (the reply
+      ends with its end token at 148 tokens, and the next request found no state to resume from;
+      after a reply cut at 40 it did). That difference of the cache is the server's
+      (`fix/server-sweep`: a checkpoint at the end of every request).
 
 ## Small fixes
 Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of a done piece.
