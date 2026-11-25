@@ -91,6 +91,12 @@ use crate::bridge::Stop;
 use crate::models::Models;
 pub use crate::reasoning::ReasoningFormat;
 
+/// What the binary is: `ares <version> (<commit>, <date of the build>)`, as
+/// `ares --version` prints it, the log's first line and `/props`
+/// (`build_info`) say it. `build.rs` says where the commit and the date come
+/// from.
+pub const BUILD_INFO: &str = env!("ARES_BUILD_INFO");
+
 /// Limits of the server. [`Config::default`] suits production; tests shrink
 /// them to hit the limits cheaply.
 #[derive(Debug, Clone)]

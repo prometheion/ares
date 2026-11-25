@@ -71,3 +71,4 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | The line | `--queue <N>` bounds it (503 with `Retry-After`); `--timeout` for slow clients |
 | Watchdog | a step that runs longer than 600 s fails its engine; its requests end with the reason |
 | Logs and metrics | a line per request, Prometheus metrics ([quickstart.md](quickstart.md#logs-and-metrics)) |
+| Version | `ares --version` names the version, the commit and the day of the build; so do the log's first line and `/props` |

@@ -152,6 +152,15 @@ variables of Ares' options are read (`ARES_LIBCUDA` and the variables of tests
 are other things), never a name without the prefix. An error names the
 variable or the file and its line.
 
+**What the binary is** (`crates/server/build.rs`). `ares --version` prints
+`ares_server::BUILD_INFO`, `ares <version> (<commit>, <date>)`; the log's first
+line and `build_info` of `/props` (llama-server's name for its build) say the
+same. The build script takes the commit from `git rev-parse --short HEAD` when
+the workspace is the top of a git checkout, else from `ARES_BUILD_COMMIT` (a
+`git archive` snapshot, a copy without `.git`), else `unknown`; the date is
+the UTC day the script ran, or that of `SOURCE_DATE_EPOCH`. It runs again when
+the checkout's HEAD moves, not on every edit.
+
 **Tokens and properties** (`crates/server/src/props.rs`). `POST /tokenize` takes
 `content`, a text, and gives the tokens the engine reads it as when it is the
 prompt of `/v1/completions`; or a chat request (`messages` and the fields of

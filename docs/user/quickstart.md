@@ -29,6 +29,8 @@ The build environment:
 | `ARES_CUDA_ARCHS` | Compute capabilities to build machine code for, such as `89` for one RTX 40 card. Default: the tested classes, `86,89`. A class that is not tested can be named on purpose; the build warns. Classes below Ampere are an error. |
 | `NVCC` | The CUDA compiler. Default: `$CUDA_PATH/bin/nvcc`, `$CUDA_HOME/bin/nvcc`, `nvcc` on `PATH`, `/opt/cuda/bin/nvcc`, `/usr/local/cuda/bin/nvcc`. |
 | `GLSLC` | The shader compiler. Default: `glslc` on `PATH`, `$VULKAN_SDK/bin/glslc`, `/usr/bin/glslc`, `/usr/local/bin/glslc`. |
+| `ARES_BUILD_COMMIT` | The commit `ares --version` names when the source is no git checkout (a `git archive` snapshot, a copy without `.git`). In a checkout git says it. Default: `unknown`. |
+| `SOURCE_DATE_EPOCH` | The date of the build `ares --version` names, in seconds since 1970, for a build that is to come out the same twice. Default: the day of the build. |
 
 ## Run a model
 

@@ -34,6 +34,7 @@ stand in a section of a preset file; all other options are options of a model.
 | --- | --- | --- |
 | `--config <FILE>` | A file of options, one on each line (see [The config file](#the-config-file)). Command line only. | `ARES_CONFIG`, else none |
 | `-h`, `--help` | Print the help and exit. | |
+| `-V`, `--version` | Print what the binary is and exit: `ares <version> (<commit>, <date of the build>)`. The log's first line and `build_info` of `/props` say the same. | |
 | `--model <PATH>` | The GGUF model file to serve; any part of a split model. Not with `--models-preset`. | none: `--model` or `--models-preset` is needed |
 | `--models-preset <FILE>` | Server option. Serve several models from a preset file (see [The preset file](#the-preset-file)). | none |
 | `--host <ADDR>` | Server option. Address to listen on. | `127.0.0.1` |
@@ -187,7 +188,7 @@ The log level is the `RUST_LOG` environment variable (default `info`).
 
 ## The environment
 
-Every option except `--config` and `--help` is also an environment variable:
+Every option except `--config`, `--help` and `--version` is also an environment variable:
 `ARES_`, then the option's name without its leading dashes, with every dash
 turned into an underscore, in capitals.
 
@@ -218,7 +219,7 @@ reader as the preset file, without sections.
 | an empty line | nothing |
 
 - A key stands once, except `chat-var`.
-- Server options and `models-preset` may stand here; `config` and `help` may not.
+- Server options and `models-preset` may stand here; `config`, `help` and `version` may not.
 - `[section]` lines are an error: several models go in a preset file.
 - An unknown key or a wrong value is an error that names the file and the line.
 - Paths are taken as written: `~` is not expanded, and a relative path starts at

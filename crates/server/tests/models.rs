@@ -849,6 +849,7 @@ async fn props_of_a_model_that_is_not_loaded_are_read_from_its_preset_and_file()
     let (status, props) = json(get(&app, "/props?model=t").await).await;
     assert_eq!(status, 200, "{props}");
     assert_eq!(props["model"], "t");
+    assert_eq!(props["build_info"], ares_server::BUILD_INFO);
     assert_eq!(props["loaded"], false);
     assert_eq!(props["context_length"], 8192, "the file's own");
     assert_eq!(props["default_generation_settings"]["params"]["temperature"], 0.5);

@@ -104,6 +104,18 @@ fn help_prints_every_option_and_exits_cleanly() {
 }
 
 #[test]
+fn version_prints_what_the_binary_is_and_exits_cleanly() {
+    for flag in ["--version", "-V"] {
+        let output = ares(&[flag]);
+        assert!(output.status.success(), "{flag}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout, format!("{}\n", ares_server::BUILD_INFO), "{flag}");
+        assert!(stdout.starts_with(&format!("ares {} (", env!("CARGO_PKG_VERSION"))));
+        assert!(output.stderr.is_empty(), "no log noise for {flag}");
+    }
+}
+
+#[test]
 fn a_mistyped_flag_is_named_and_exits_with_2() {
     let output = ares(&["--prot", "80"]);
     assert_eq!(output.status.code(), Some(2));
@@ -234,6 +246,10 @@ fn a_preset_file_is_served_with_its_defaults_in_the_log_and_in_the_model_list() 
     let list = server.get("/v1/models");
     let said = server.logged().join("\n");
     server.stop();
+
+    // The first line names the binary.
+    let first = said.lines().next().unwrap_or_default();
+    assert!(first.ends_with(ares_server::BUILD_INFO), "{said}");
 
     // The command line's option holds over the file's for every model.
     for line in [

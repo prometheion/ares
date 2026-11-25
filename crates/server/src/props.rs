@@ -23,7 +23,8 @@
 //! fields it leaves out, what its template can do (tools, thinking and its
 //! switches), and what input it takes: images when it was loaded with a
 //! projector (`--mmproj`), as llama-server says it, which clients such as
-//! Open WebUI read to offer an upload; never audio.
+//! Open WebUI read to offer an upload; never audio. `build_info` names the
+//! binary ([`crate::BUILD_INFO`]), where llama-server names its build.
 
 use ares_api::{Json, Prompt};
 use axum::extract::{Request, State};
@@ -91,6 +92,7 @@ fn body_of(
     }
     let mut body = serde_json::json!({
         "model": id,
+        "build_info": crate::BUILD_INFO,
         "modalities": {"vision": vision, "audio": false},
         "default_generation_settings": {"params": params},
         "chat_template_caps": {

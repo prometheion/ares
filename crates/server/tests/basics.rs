@@ -146,6 +146,7 @@ async fn props_say_what_the_model_is() {
     let (status, body) = json(get(&app, "/props").await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["model"], "synthetic");
+    assert_eq!(body["build_info"], ares_server::BUILD_INFO);
     assert_eq!(body["context_length"], 2048);
     assert_eq!(body["default_generation_settings"]["n_ctx"], 2048);
     assert_eq!(body["default_generation_settings"]["params"], json!({}));

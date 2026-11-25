@@ -33,6 +33,10 @@ async fn main() -> ExitCode {
             print!("{}", cli::usage());
             return ExitCode::SUCCESS;
         }
+        Ok(cli::Command::Version) => {
+            println!("{}", ares_server::BUILD_INFO);
+            return ExitCode::SUCCESS;
+        }
         Err(error) => {
             eprintln!("error: {error}\nrun 'ares --help' for the options");
             return ExitCode::from(2);
@@ -61,6 +65,8 @@ async fn main() -> ExitCode {
         eprintln!("error: {error}");
         return ExitCode::from(2);
     }
+    // The first line of the log names the binary.
+    tracing::info!("{}", ares_server::BUILD_INFO);
 
     match run(&host, port, timeout, log.text, &access, presets, single).await {
         Ok(()) => ExitCode::SUCCESS,

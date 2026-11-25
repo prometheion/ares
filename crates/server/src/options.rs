@@ -48,7 +48,8 @@ impl ModelOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// The command line alone: `--config` names where the others come from
-    /// (or `ARES_CONFIG`), `--help` prints them.
+    /// (or `ARES_CONFIG`), `--help` prints them, `--version` what the binary
+    /// is.
     Command,
     /// The server, which no model has: the command line, its variable of the
     /// environment and the configuration file, not a section of a preset file.
@@ -200,6 +201,14 @@ pub const OPTIONS: &[Opt] = &[
          comments [default: ARES_CONFIG, else none]",
     ),
     Opt::command("--help", "", "Print this help").short("-h").switch(None),
+    Opt::command(
+        "--version",
+        "",
+        "Print the version, the commit and the date of the build: ares <version> (<commit>, \
+         <date>)",
+    )
+    .short("-V")
+    .switch(None),
     Opt::model(
         "--model",
         "<PATH>",

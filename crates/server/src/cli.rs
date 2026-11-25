@@ -220,6 +220,8 @@ fn words(flag: &'static str, value: &str, expected: &'static str) -> Result<Vec<
 pub enum Command {
     Run(Box<Options>),
     Help,
+    /// `--version`: print [`ares_server::BUILD_INFO`].
+    Version,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -415,6 +417,7 @@ pub fn parse_with(
         };
         match flag {
             "--help" => return Ok(Command::Help),
+            "--version" => return Ok(Command::Version),
             "--config" => {
                 if config.is_some() {
                     return Err(CliError::Repeated("--config"));
@@ -512,8 +515,9 @@ fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
             "--config" => {
                 return Err(fail(key.line, "a configuration file does not name another".into()));
             }
-            "--help" => {
-                return Err(fail(key.line, "'help' is not an option to keep in a file".into()));
+            "--help" | "--version" => {
+                let message = format!("'{}' is not an option to keep in a file", opt.key());
+                return Err(fail(key.line, message));
             }
             _ => {}
         }
@@ -836,6 +840,33 @@ mod tests {
     fn help_wins_wherever_it_stands_before_an_error() {
         assert_eq!(parse_strs(&["--help"]), Ok(Command::Help));
         assert_eq!(parse_strs(&["--port", "1", "-h"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn version_wins_like_help_and_stays_out_of_files() {
+        assert_eq!(parse_strs(&["--version"]), Ok(Command::Version));
+        assert_eq!(parse_strs(&["--port", "1", "-V"]), Ok(Command::Version));
+        assert_eq!(parse_strs(&["--version=yes"]), Err(CliError::UnexpectedValue("--version")));
+        // The first of the two that stands first is done.
+        assert_eq!(parse_strs(&["-V", "--help"]), Ok(Command::Version));
+        // The environment has no variable for it.
+        let run = run_with(&["--model", "m.gguf"], &[("ARES_VERSION", "true")]);
+        assert_eq!(run.model.load.model, PathBuf::from("m.gguf"));
+        let config = file("version.conf", "model = m.gguf\nversion = true\n");
+        let said = parse_strs(&["--config", config.to_str().unwrap()]).unwrap_err().to_string();
+        assert!(said.ends_with(":2: 'version' is not an option to keep in a file"), "{said}");
+        std::fs::remove_file(config).unwrap();
+    }
+
+    #[test]
+    fn the_build_is_named_by_version_commit_and_date() {
+        let info = ares_server::BUILD_INFO;
+        let rest = info.strip_prefix(&format!("ares {} (", env!("CARGO_PKG_VERSION"))).unwrap();
+        let (commit, date) = rest.strip_suffix(')').unwrap().split_once(", ").unwrap();
+        assert!(!commit.is_empty() && !commit.contains(char::is_whitespace), "{info}");
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [4, 2, 2], "{info}");
+        assert!(parts.iter().all(|p| p.parse::<u32>().is_ok()), "{info}");
     }
 
     #[test]
