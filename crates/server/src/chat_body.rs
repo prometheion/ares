@@ -46,6 +46,27 @@ pub(crate) fn known<'a>(at: &str, value: &'a Json, names: &[&str]) -> Result<Fie
     Ok(Fields(members))
 }
 
+/// A cache marker: `{"type": "ephemeral"}`, with a `ttl` of `5m` or `1h`
+/// (Anthropic's, which clients also send through to OpenAI-compatible
+/// servers).
+///
+/// It is accepted and changes nothing: the server keeps what it computed of
+/// every prompt and starts the next one from the longest prefix it has, with
+/// or without a marker, and it drops what it kept by its own budget and not
+/// after a time.
+pub(crate) fn cache_control(at: &str, value: &Json) -> Result<(), ApiError> {
+    let fields = known(at, value, &["type", "ttl"])?;
+    match fields.get("type") {
+        Some(Json::String(kind)) if kind == "ephemeral" => {}
+        _ => return Err(refuse(at, format!("{at}.type must be \"ephemeral\""))),
+    }
+    match fields.get("ttl") {
+        None => Ok(()),
+        Some(Json::String(ttl)) if ttl == "5m" || ttl == "1h" => Ok(()),
+        Some(_) => Err(refuse(at, format!("{at}.ttl must be \"5m\" or \"1h\""))),
+    }
+}
+
 /// A member of an object that must be a string, if it is there.
 pub(crate) fn optional_text<'a>(
     at: &str,

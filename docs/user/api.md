@@ -3,9 +3,8 @@
 Ares speaks the OpenAI chat, completion and Responses APIs, Anthropic's Messages
 API, and llama.cpp's `/props`, `/tokenize` and `/detokenize`. A request is served
 in full or refused: a field the server does not serve is a 400 that names it,
-never dropped. On the chat and completion routes this holds for the members of
-the body; members inside a message, a tool or `stream_options` that the server
-does not read are passed over. `null` counts as "not set".
+never dropped, inside a message, a part, a tool or `stream_options` too.
+`null` counts as "not set".
 
 ## Routes
 
@@ -52,11 +51,11 @@ prompt and those marked "chat".
 
 | Field | Meaning | Notes |
 | --- | --- | --- |
-| `messages` | chat: the conversation | roles `system` (or `developer`), `user`, `assistant`, `tool`; `content` a string or parts `text` and `image_url`; also `name`, `tool_call_id`, `tool_calls`, `reasoning_content` |
+| `messages` | chat: the conversation | roles `system` (or `developer`), `user`, `assistant`, `tool`; `content` a string or parts `text` and `image_url`; also `name`, `tool_call_id`, `tool_calls`, `reasoning_content` (or `reasoning`, `reasoning_text`, `thinking`: the names other servers give it; two with different texts are refused) |
 | `prompt` | completions: the text | one string (or an array of one string); token ids and several prompts are refused |
 | `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; names that give different values are refused |
 | `stop` | stop strings | a string or an array; not empty |
-| `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
+| `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | `include_obfuscation` and `continuous_usage_stats` only `false` |
 | `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; both with different values are refused |
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number; `n_probs` (`0` is none) with OpenAI's fields must ask for the same, and the answer is then llama.cpp's |
 | `priority` | the request's priority | see [Priorities](#priorities) |
@@ -75,6 +74,16 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |
 | `ignore_eos`, `min_keep` | the reply does not end at the end token; `min_keep` is 0 or 1 |
+
+Accepted without effect, since they change nothing for this server: cache
+markers (`cache_control` on a message, a part, a call or a tool, and
+`prompt_cache_breakpoint` on a part; the server starts every prompt from the
+longest prefix it kept, with or without them), `detail` of an `image_url` (an
+image is read at the size the model's vision tower takes), and `index` of a
+call (its place in a stream). Refused by name: other members of a message
+(`audio`, `refusal`, `function_call`, `reasoning_details`, ...), of a part, a
+call (`extra_content`, calls that are not of a function) or a tool
+(`defer_loading`).
 
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
 `functions` and `function_call`, adaptive-p (`adaptive_target`,

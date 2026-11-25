@@ -369,6 +369,14 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-server: with keys, named allowed hosts check the page too": with keys, `--allowed-hosts` names turn on the check of pages as well as of names (`Access::checks_pages`); `*` and no option leave the key to decide. Test `with_keys_named_hosts_check_the_page_too` in `tests/access.rs`.
 
+- [x] Chat and completion bodies pass over unknown members nested in a message, a tool or
+      `stream_options`, where Messages and Responses refuse them; the server's rule is that
+      nothing is dropped silently (found 2026-11-24 by `fix/help-docs`, documented as it is in
+      `docs/user/api.md`). Files: `crates/server/src/openai/request.rs` (`message()`,
+      `stream_options`), `crates/server/src/tools.rs` (`tool()`), `docs/user/api.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: the chat reader refuses unknown members inside messages, tools and stream_options": what the clients read send is read by its meaning (`reasoning`, `reasoning_text`, `thinking` as `reasoning_content`; `include_obfuscation` and `continuous_usage_stats` only false) or accepted where it changes nothing here (cache markers `cache_control` and `prompt_cache_breakpoint`, `image_url.detail`, a call's `index`), said in `docs/user/api.md`; anything else is a 400 that names it. Read for it: Open WebUI 0.13.4, opencode 2.4.1 and 1.19.6 (with `@ai-sdk/openai-compatible`), Continue 1.3.40, LibreChat 0.8.9 (LangChain `@langchain/openai` 1.5.8), the llama.cpp web UI, the OpenAI SDK 7.64; Claude Code has no OpenAI chat mode. Tests in `openai/request.rs`.
+
 ### From "Small fixes": "Server, API, cache"
 
 Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).

@@ -55,6 +55,7 @@ use ares_api::{Engine, Interrupt, Json, Shape, Start, Structure, ToolFormat};
 use ares_grammar::calls::{CallRule, Callable};
 use serde_json::Value;
 
+use crate::chat_body::cache_control;
 use crate::error::ApiError;
 use crate::openai::request::{Fields, Parsed, wrong_type};
 use crate::reasoning::Applied;
@@ -162,13 +163,14 @@ pub(crate) fn asked(fields: &Fields<'_>) -> Result<Asked, ApiError> {
 }
 
 /// One entry of `tools`: `{"type": "function", "function": {"name",
-/// "description", "parameters", "strict"}}`.
+/// "description", "parameters", "strict"}}`, and a cache marker
+/// (`cache_control`), which changes nothing. Other members are refused.
 fn tool(index: usize, value: &Json) -> Result<Tool, ApiError> {
     let at = format!("tools[{index}]");
     let refuse = |message: String| ApiError::invalid_param("tools", message);
-    if !matches!(value, Json::Object(_)) {
+    let Json::Object(members) = value else {
         return Err(refuse(format!("{at} must be an object, got {}", value.kind())));
-    }
+    };
     match value.get("type").and_then(Json::as_str) {
         Some("function") => {}
         other => {
@@ -178,9 +180,14 @@ fn tool(index: usize, value: &Json) -> Result<Tool, ApiError> {
             )));
         }
     }
-    let Some(function @ Json::Object(_)) = value.get("function") else {
+    unknown(&at, members, &["type", "function", "cache_control"])?;
+    if let Some(marker) = Fields(members).get("cache_control") {
+        cache_control(&format!("{at}.cache_control"), marker).map_err(|e| refuse(e.message))?;
+    }
+    let Some(function @ Json::Object(inner)) = value.get("function") else {
         return Err(refuse(format!("{at}.function must be an object")));
     };
+    unknown(&format!("{at}.function"), inner, &["name", "description", "parameters", "strict"])?;
     let name = match function.get("name") {
         Some(Json::String(name)) if !name.is_empty() => name.clone(),
         _ => return Err(refuse(format!("{at}.function.name must be a string that is not empty"))),
@@ -206,6 +213,21 @@ fn tool(index: usize, value: &Json) -> Result<Tool, ApiError> {
         }
     };
     Ok(Tool { name, parameters })
+}
+
+/// Refuses a member of the object at `at` of a tool that is not one of
+/// `names`. A member that is `null` is not set.
+fn unknown(at: &str, members: &[(String, Json)], names: &[&str]) -> Result<(), ApiError> {
+    let Some((name, _)) =
+        members.iter().find(|(name, value)| !value.is_null() && !names.contains(&name.as_str()))
+    else {
+        return Ok(());
+    };
+    let why = match name.as_str() {
+        "defer_loading" => "every tool of a request is written into the prompt",
+        _ => "it is not a member of a tool this server reads",
+    };
+    Err(ApiError::invalid_param("tools", format!("{at}.{name} is not supported: {why}")))
 }
 
 /// Applies what `parsed` asks about tools to its request: the rule its reply
