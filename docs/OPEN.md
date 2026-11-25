@@ -491,6 +491,19 @@ under "Decided by the owner" and in work on `chore/leftovers`; they are not coun
       `store_hidden` (a hot CPU path); optional: the kernel side's type lists per module as an
       X-macro list. Files: `crates/cuda/examples/`.
 
+### Decode under offload (a user's runs, 2026-11-25): the aim of item 3
+One RTX 4080 16 GB, Flash-Next UD-IQ4_XS (87 GiB), `--ram 52G`, `--context 131072`, `--parallel 1`, MTP:
+prompt 1,240 / 1,167 / 1,212 tokens/s at 50k / 100k / 113k (Strata's level), decode 12.9 / 13.1 /
+13.8 tokens/s there and 18 to 22 at short contexts. Its log: 13.1 % of the experts in VRAM slots, 90.7 %
+in the RAM tier; a step's price measured at load 17.4 ms for one row but 126.9 ms for two (another row
+picks other experts, so drafts barely pay: 12 links in 6 steps), and real steps of 45 to 75 ms: the
+misses (a CPU job of 327 us per IQ4_XS expert and row, or an upload of 1.24 ms) dominate. Strata-HotRod
+reports 15 to 25 tokens/s for UD-Q4_K_XL on an RTX 3060 with 30 GB RAM, mostly from its stand-in experts.
+Item 3 starts here (on the test machine, the closest setup): a profile of a decode step under offload
+(VRAM hits, RAM uploads, CPU jobs, drive waits, attention and indexer at long context), then the
+stand-ins taken from HotRod's code (quality against the reference, the owner's rule), the VRAM hit
+rate, the miss path, and the few-row kernels so drafts pay again.
+
 ## Measurements owed
 Runs on a GPU with no code to write; the place each result goes is the experiments file named.
 
