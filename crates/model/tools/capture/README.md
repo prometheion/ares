@@ -1,6 +1,6 @@
 # capture: what llama.cpp computes for `qwen35`, block by block
 
-`capture.cpp` links the shared libraries of llama.cpp-native (read only, nothing is
+`capture.cpp` links the shared libraries of a llama.cpp build (read only, nothing is
 written there), runs a prompt and then generates tokens one at a time, and writes
 the output of every block, the output of the final norm and the logits. The Rust
 reference (`crates/model`) is compared with it by `examples/compare.rs` and by the
@@ -9,10 +9,22 @@ no Cargo project. Everything below is CPU only: `CUDA_VISIBLE_DEVICES=""`,
 `-ngl 0 -dev none`, 6 threads at `nice -n 10`. (llama.cpp still prints that it
 found no CUDA device; that is the point.)
 
+`L` is a llama.cpp tree that is only read: a fresh clone, built on the CPU as
+below (skip the clone and the build when `LLAMA_CPP_DIR` names one already built).
+The numbers below were taken with the owner's fork
+(https://github.com/Piggidragon/llama.cpp) at `f8f346786`; check that out to
+repeat them, or take upstream (https://github.com/ggml-org/llama.cpp).
+
+```sh
+L=${LLAMA_CPP_DIR:-/var/tmp/llama.cpp}
+git clone https://github.com/ggml-org/llama.cpp $L
+cmake -S $L -B $L/build -DGGML_CUDA=OFF
+cmake --build $L/build -j 6 --target llama llama-common
+```
+
 ```sh
 W=/var/tmp/ares-model-capture                  # about 0.8 GB for all runs below
-T=$HOME/Services/Engine/crates/model/tools/capture
-L=$HOME/Services/llama.cpp-native  # built, read only
+T=$(git rev-parse --show-toplevel)/crates/model/tools/capture
 M=$HOME/Services/models/test-small/Qwen3.5-0.8B-Q4_K_M.gguf
 mkdir -p $W/build
 ```

@@ -5,10 +5,22 @@ workspace member (it has its own `[workspace]`); it builds against
 `crates/quant` by path. Commands below are the ones that were used. CPU only:
 `CUDA_VISIBLE_DEVICES=""`, `-dev none`, `-ngl 0`, 6 threads at `nice -n 10`.
 
+`L` is a llama.cpp tree that is only read: a fresh clone, built on the CPU as
+below (skip the clone and the build when `LLAMA_CPP_DIR` names one already built).
+The numbers of the study were taken with the owner's fork
+(https://github.com/Piggidragon/llama.cpp) at `f8f346786`; check that out to
+repeat them, or take upstream (https://github.com/ggml-org/llama.cpp).
+
+```sh
+L=${LLAMA_CPP_DIR:-/var/tmp/llama.cpp}
+git clone https://github.com/ggml-org/llama.cpp $L
+cmake -S $L -B $L/build -DGGML_CUDA=OFF
+cmake --build $L/build -j 6 --target llama llama-common
+```
+
 ```sh
 W=/var/tmp/kvreal-data                       # any directory with ~1.5 GB free
-T=$HOME/Services/Engine/crates/quant/tools/kv_real
-L=$HOME/Services/llama.cpp-native   # built, read only
+T=$(git rev-parse --show-toplevel)/crates/quant/tools/kv_real
 mkdir -p $W/q08 $W/q27b $W/corpus $W/build
 ```
 
@@ -21,8 +33,7 @@ python3 -I $T/corpus/assemble.py $W/corpus/prompt.txt
 `corpus/segments.txt` (token ranges of the kinds of text, used by `run` for the
 per-text tables) is copied next to the data in step 3.
 
-## 2. The capture program (against libllama of llama.cpp-native, nothing is
-written there)
+## 2. The capture program (against libllama of `L`, nothing is written there)
 
 ```sh
 g++ -std=c++17 -O1 -o $W/build/kv-capture $T/capture/capture.cpp \

@@ -11,7 +11,8 @@ in the head of each source file. They are not built by cargo.
 | `reftok.cpp` | `llama_tokenize` and `llama_token_to_piece` on a vocabulary loaded once (and the speed of both) | `examples/fuzz.rs` |
 | `reftpl.cpp` | the Jinja interpreter of llama.cpp (`common/jinja`) on any template, without a model | `examples/probes.rs` |
 
-The checkout the crate is verified against is the one named in `gen_unicode.py` and in
-`tests/golden/generate.py`; the unicode tables and the golden files come from it. A prebuilt
+The revision the crate is verified against is the one named in the head of
+`src/unicode_table.rs`; the unicode tables and the golden files come from it. A llama.cpp
+tree is a fresh clone, built as in `crates/model/tools/capture/README.md`. A prebuilt
 `llama-tokenize` that is older than the libraries next to it crashes before it reads its
 arguments, so build one from the same checkout.

@@ -1,6 +1,6 @@
 # q4capture: what the llama.cpp fork computes for `qwen4exp`, layer by layer
 
-`q4capture.cpp` links the shared libraries of llama.cpp-native (read only, nothing
+`q4capture.cpp` links the shared libraries of a llama.cpp build (read only, nothing
 is written there), runs a token sequence on the CPU and writes named nodes of the
 graph: the two reads of every layer, the output of the recurrent or attention part,
 the output of the experts, the residual after the layer, the routed experts with
@@ -16,10 +16,22 @@ The model is the made-up one of `ares_model::qwen4exp::synthetic` (section 8.3 o
 on 2 key/value heads, an indexer budget of 8 cells in blocks of 4, an n-gram layer
 with a table of 424 rows. The fork loads it as it is.
 
+`L` is a llama.cpp tree that is only read: a fresh clone, built on the CPU as
+below (skip the clone and the build when `LLAMA_CPP_DIR` names one already built).
+The numbers below were taken with the owner's fork
+(https://github.com/Piggidragon/llama.cpp) at `f8f346786`; check that out to
+repeat them, or take upstream (https://github.com/ggml-org/llama.cpp).
+
+```sh
+L=${LLAMA_CPP_DIR:-/var/tmp/llama.cpp}
+git clone https://github.com/ggml-org/llama.cpp $L
+cmake -S $L -B $L/build -DGGML_CUDA=OFF
+cmake --build $L/build -j 6 --target llama llama-common
+```
+
 ```sh
 W=/var/tmp/ares-q4capture
-T=$HOME/Services/Engine/crates/model/tools/q4capture
-L=$HOME/Services/llama.cpp-native    # built, read only
+T=$(git rev-parse --show-toplevel)/crates/model/tools/q4capture
 mkdir -p $W/build $W/synth
 ```
 

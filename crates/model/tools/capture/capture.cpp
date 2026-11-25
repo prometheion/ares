@@ -1,8 +1,8 @@
 // Captures what llama.cpp computes for a qwen35 model on the CPU, so that the Rust
 // reference (crates/model) can be compared with it block by block.
 //
-// Built against the headers and shared libraries of llama.cpp-native, which is only
-// read. See README.md for the build and the run.
+// Built against the headers and shared libraries of a llama.cpp build tree, which is
+// only read. See README.md for the build and the run.
 //
 //   capture -m model.gguf -ngl 0 -dev none -t 6 -c 4096 -b 512 -ub 512 [llama args]
 //

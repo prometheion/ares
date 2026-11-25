@@ -1,8 +1,8 @@
 // Captures the Q, K and V tensors that feed attention (after normalisation and
 // RoPE) of every attention layer, as f32, per position and head.
 //
-// Built against the headers and shared libraries of llama.cpp-native, which is
-// only read. Usage: kv-capture -m model.gguf -f prompt.txt --out DIR [llama args]
+// Built against the headers and shared libraries of a llama.cpp build tree, which
+// is only read. Usage: kv-capture -m model.gguf -f prompt.txt --out DIR [llama args]
 // Environment: KVCAP_LAYERS=3,7,11 limits the layers (default: all that appear).
 //
 // Names in the qwen35 graph (src/models/qwen35.cpp, build_layer_attn):

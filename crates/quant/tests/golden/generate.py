@@ -11,10 +11,18 @@ it produces input floats and the bytes ggml's `quantize_row_*_ref` writes.
 Rerun (the output is deterministic, so a rerun changes nothing unless the
 library behaves differently):
 
-    python3 -I crates/quant/tests/golden/generate.py [path/to/libggml-base.so]
+    python3 -I crates/quant/tests/golden/generate.py <llama.cpp>
 
-The library path can also come from the GGML_BASE_LIB environment variable. The
-default is the checkout the engine is verified against. Needs numpy.
+<llama.cpp> is a llama.cpp tree built with CMake into its `build/` directory: the
+argument, else the LLAMA_CPP_DIR environment variable; there is no default. Build
+it from a fresh clone, on the CPU (the library is all this needs):
+
+    git clone https://github.com/ggml-org/llama.cpp $LLAMA_CPP_DIR
+    cmake -S $LLAMA_CPP_DIR -B $LLAMA_CPP_DIR/build -DGGML_CUDA=OFF
+    cmake --build $LLAMA_CPP_DIR/build --target ggml-base -j 6
+
+The fixtures checked in came from the llama.cpp fork
+(https://github.com/Piggidragon/llama.cpp) at f8f346786. Needs numpy.
 
 Files (all little endian), written next to this script:
 
@@ -76,7 +84,7 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LIB = os.path.expanduser("~/Services/llama.cpp-native/build/bin/libggml-base.so")
+USAGE = "usage: generate.py <llama.cpp>, or LLAMA_CPP_DIR=<llama.cpp> (a built tree; see the head of this file)"
 SEED = 20261109
 
 # ggml_type ids that have a fixture (decoding).
@@ -687,8 +695,20 @@ def quant_fixture(g, ty, rng):
     return name, write_fixture(path, b"EQGQ", ty, values, size, n_blocks, 0, x, expected)
 
 
+def llama_cpp_tree():
+    """The llama.cpp tree of the argument, else of LLAMA_CPP_DIR."""
+    if len(sys.argv) > 2:
+        sys.exit(USAGE)
+    tree = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LLAMA_CPP_DIR", "")
+    if not tree:
+        sys.exit(USAGE)
+    return os.path.abspath(tree)
+
+
 def main():
-    lib_path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GGML_BASE_LIB", DEFAULT_LIB)
+    lib_path = os.path.join(llama_cpp_tree(), "build", "bin", "libggml-base.so")
+    if not os.path.isfile(lib_path):
+        sys.exit(f"{lib_path} is not there: build the tree first (see the head of this file)")
     g = Ggml(lib_path)
     total = 0
     for ty in DEQUANT_IDS:

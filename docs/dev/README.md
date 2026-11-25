@@ -127,8 +127,12 @@ that lists the commands used: `crates/model/tools/capture` and
 `crates/model/tools/q4capture` (what llama.cpp computes for each model, block by
 block), `crates/quant/tools/kv_real` (the data of `studies/kv-real-data.md`) and
 `crates/tokenizer/tools/reference` (llama.cpp's tokenizer and chat templates on
-many inputs). They need a built llama.cpp checkout and model files, and are
-not part of the cargo build.
+many inputs), and the generators of `crates/quant/src/tables.rs`,
+`crates/tokenizer/src/unicode_table.rs` and `crates/quant/tests/golden/`. They
+need model files and a llama.cpp tree, a fresh clone built on the CPU (the
+commands are in `crates/model/tools/capture/README.md`), which the scripts take
+as an argument or as `LLAMA_CPP_DIR`, with no default; they are not part of the
+cargo build.
 
 `python3 tools/check-doc-links.py` checks the links between the documents, every
 mention of a document and every citation of a paragraph in the code

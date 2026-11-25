@@ -10,7 +10,7 @@ mode is `special` (the text of control tokens is turned into the tokens, which i
 chat prompts need) or `plain`, and the ids are separated by spaces.
 
 llama-tokenize must be built from the llama.cpp revision named in
-`tools/gen_unicode.py` or later, and must work: an old binary that does not match its
+`src/unicode_table.rs` or later, and must work: an old binary that does not match its
 libraries crashes before it reads its arguments. Run with CUDA_VISIBLE_DEVICES set to
 the empty string if the build has a GPU backend, since only the vocabulary is read.
 """

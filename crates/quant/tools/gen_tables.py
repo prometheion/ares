@@ -6,13 +6,15 @@ lookup tables that ggml keeps in `ggml/src/ggml-common.h`. Retyping 4000 hex
 constants would be an invitation for a typo that no review catches, so the Rust
 tables are produced from the header by this script and checked in.
 
-Rerun after pointing it at a different llama.cpp checkout:
+Rerun with a llama.cpp tree, a fresh clone (nothing needs to be built):
 
-    python3 -I crates/quant/tools/gen_tables.py [path/to/ggml-common.h]
+    python3 -I crates/quant/tools/gen_tables.py <llama.cpp>
 
-The default path is the checkout the engine is verified against. The output is
-`crates/quant/src/tables.rs`, relative to this script, never the current
-directory. The script fails (instead of writing a short table) when a table
+The tree is the argument, else the LLAMA_CPP_DIR environment variable; there is
+no default. The output names the tree's revision; the tables checked in came
+from the llama.cpp fork (https://github.com/Piggidragon/llama.cpp) at
+f8f346786. The output is `crates/quant/src/tables.rs`, relative to this script,
+never the current directory. The script fails (instead of writing a short table) when a table
 does not have the number of entries its declaration promises.
 """
 
@@ -21,7 +23,7 @@ import re
 import subprocess
 import sys
 
-DEFAULT_HEADER = os.path.expanduser("~/Services/llama.cpp-native/ggml/src/ggml-common.h")
+USAGE = "usage: gen_tables.py <llama.cpp>, or LLAMA_CPP_DIR=<llama.cpp>"
 
 # (name in the header, name in Rust, doc comment). Order is the order in the output.
 WANTED = [
@@ -83,8 +85,19 @@ def format_value(value, rust_type):
     return f"0x{value:0{WIDTH[rust_type] - 2}x}"
 
 
+def llama_cpp_tree():
+    """The llama.cpp tree of the argument, else of LLAMA_CPP_DIR."""
+    if len(sys.argv) > 2:
+        sys.exit(USAGE)
+    tree = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LLAMA_CPP_DIR", "")
+    if not tree:
+        sys.exit(USAGE)
+    return os.path.abspath(tree)
+
+
 def main():
-    header = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HEADER
+    tree = llama_cpp_tree()
+    header = os.path.join(tree, "ggml", "src", "ggml-common.h")
     here = os.path.dirname(os.path.abspath(__file__))
     out_path = os.path.join(here, "..", "src", "tables.rs")
     with open(header, encoding="utf-8") as f:
@@ -92,7 +105,7 @@ def main():
 
     try:
         rev = subprocess.run(
-            ["git", "-C", os.path.dirname(header), "rev-parse", "HEAD"],
+            ["git", "-C", tree, "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):

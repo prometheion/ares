@@ -1,8 +1,8 @@
 // Dumps what llama.cpp computes for a qwen4exp model on the CPU, so that the Rust
 // reference (crates/model, qwen4exp) can be compared with it layer by layer.
 //
-// Built against the headers and shared libraries of llama.cpp-native, which is only
-// read. See README.md for the build and the runs.
+// Built against the headers and shared libraries of a llama.cpp build tree, which is
+// only read. See README.md for the build and the runs.
 //
 //   q4capture -m model.gguf -ngl 0 -dev none -t 6 -c 1024 -b 512 -ub 512 -fa off -ctk f32 -ctv f32
 //
