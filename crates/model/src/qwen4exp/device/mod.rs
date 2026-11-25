@@ -66,7 +66,7 @@ pub use placement::{
     read_time,
 };
 pub use prune::{PruneMask, PruneSetup, PruneStats};
-pub use roles::{RoleTime, RoleTrial};
+pub use roles::{RoleMemory, RoleTime, RoleTrial};
 pub use runtime::{
     ExpertCosts, OpenError, Qwen4Exp, batch_rows, drafter_bytes, page_parts, place,
     reads_layer_by_layer, slot_floors, step_rows,

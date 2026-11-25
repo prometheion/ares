@@ -26,8 +26,9 @@ use ares_cuda::{CacheFormat, Device};
 use ares_gguf::Gguf;
 use ares_model::qwen3vl::Projector;
 use ares_model::qwen4exp::device::{
-    ModelOptions, Options, Placement, PruneSetup, Qwen4Exp, Spread, TensorChoice, batch_rows,
-    drafter_bytes, page_parts, place, profile_key, reads_layer_by_layer, slot_floors, step_rows,
+    ModelOptions, Options, Placement, PruneSetup, Qwen4Exp, RoleMemory, Spread, TensorChoice,
+    batch_rows, drafter_bytes, page_parts, place, profile_key, reads_layer_by_layer, slot_floors,
+    step_rows,
 };
 use ares_model::qwen4exp::weights::MTP_ARCHITECTURE;
 use ares_model::qwen4exp::{Config, MtpWeights};
@@ -517,6 +518,7 @@ impl Planning<'_> {
             },
             headroom: VRAM_HEADROOM,
             spread,
+            roles_dir: profile_dir(self.options),
             ..ModelOptions::default()
         }
     }
@@ -901,8 +903,20 @@ fn log_trial(placement: &Placement, held: &[Held]) {
             )
         }
     };
+    let (when, kept_in) = match &trial.memory {
+        RoleMemory::Remembered(path) => {
+            (format!("remembered from {} (timed in", path.display()), String::new())
+        }
+        RoleMemory::Written(path) => {
+            ("timed at load (in".to_owned(), format!("; remembered in {}", path.display()))
+        }
+        RoleMemory::NotWritten(why) => {
+            ("timed at load (in".to_owned(), format!("; not remembered: {why}"))
+        }
+        RoleMemory::None => ("timed at load (in".to_owned(), String::new()),
+    };
     tracing::info!(
-        "plan: the role of device {worker}, timed at load in {:.1} s ({}): {}; kept: {}",
+        "plan: the role of device {worker}, {when} {:.1} s: {}): {}; kept: {}{kept_in}",
         trial.took.as_secs_f64(),
         if trial.wide_rows > 0 {
             format!("a decode step and a step of {} rows each", trial.wide_rows)

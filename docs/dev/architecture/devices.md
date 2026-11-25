@@ -387,7 +387,16 @@ roles hold about equally (experts only gives the worker the bytes of its dense
 share for slots, and the mixer as many fewer). The trial runs in the first
 placement of a load (`place`, `Session::open`); later placements of the same load
 pin its choice, and with `--cache` the server keeps it next to the stores as
-before. A worker that holds experts only holds no state that a draft window
+before. What a trial kept is remembered (the owner, 2026-11-25), in a file per
+model, cards, driver and binary (`<fingerprint>.roles`: the model files' identity,
+each card's name and UUID, the driver's version and the CUDA version it implements,
+the binary's size and time, the rows of the wide step) in the directory of the
+usage profiles (`ModelOptions::roles_dir`: `--cache`, else `$XDG_CACHE_HOME/ares`,
+else `~/.cache/ares`). A load that finds it takes the choice it kept when that fits
+the cards now and measures nothing; one of the five changed is another file, so the
+trial runs again. The load's log says which ("remembered from ..." or "timed at
+load ...; remembered in ..."). Without any directory the trial runs at every
+load. A worker that holds experts only holds no state that a draft window
 changes, so it keeps nothing for windows and their commit does nothing there (it
 had refused windows, which took Flash-Next down with its MTP block once the trial
 chose that role; `qwen4exp_runtime` `a_worker_of_experts_only_runs_draft_windows`). The server's log says what each role took and which was kept;

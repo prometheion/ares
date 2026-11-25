@@ -10,7 +10,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 
 | | Qwen3.8 27B (`qwen35`, dense) | Qwen3.8 Flash-Next (`qwen4exp`, mixture of experts) |
 | --- | --- | --- |
-| Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer (the second card's role measured at load) |
+| Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer (the second card's role measured at the first load and remembered per model, cards, driver and binary) |
 | Weight types | all 28 GGUF types | all 28, in every tensor |
 | K and V | `f16`, `q8` to `q4`, K and V apart (`--kv`) | the same; the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and the SSD; the CPU computes missed ones |

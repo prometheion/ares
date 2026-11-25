@@ -58,7 +58,8 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
     experts from the SSD, must be usable (slower, but working well). The option's name and form go to
     the owner before it is built.
   - The second card's role is remembered per model, cards, driver and binary, and measured again
-    when one of them changes (to build: `fix/model-sweep`).
+    when one of them changes (built on `fix/model-sweep`, 2026-11-25: `roles.rs`, `<fingerprint>.roles`
+    beside the usage profiles; "The second card's role" in `dev/architecture/devices.md`).
   - `cache_prompt` is accepted with its meaning: `true` is the normal behaviour, `false` makes the
     request neither read nor write the prompt cache (to build: `fix/server-sweep`).
   - DFlash2 trees come after the few-row kernels and are decided with those costs.
