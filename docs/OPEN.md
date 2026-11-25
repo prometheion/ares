@@ -213,6 +213,10 @@ marks a line that only a GPU run can settle or check.
       `--ram 52G` repeating a 50k prompt: the prompt cache (lowest rank) does not give way, the tier's
       floor latches for good (`runtime/src/ram.rs` `experts_floor`), and the engine takes the model
       down instead of ending one request. In work: `fix/flash-crashes`.
+- [ ] The same 49,965-token prompt sent again (one sequence, `--ram 52G`) was read again from the
+      start instead of taken from the prompt cache, while the first request's far pages still held
+      RAM as prompt cache; the second read's new far pages then hit the RAM failure above. A repeat
+      must reuse the finished sequence's pages and checkpoints. In work: `fix/flash-crashes`.
 - [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
       hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
 
