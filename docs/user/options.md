@@ -49,8 +49,8 @@ All four are server options.
 | --- | --- | --- |
 | `--api-key <KEYS>` | Keys a request must carry one of, separated by commas, as `Authorization: Bearer <key>` or `x-api-key: <key>`; a key holds no white space. `/health` stays open. | none: no key is asked for |
 | `--api-key-file <FILE>` | More keys, one on each line; lines that begin with `#` are comments, and a line with a space is an error. A file without a key is an error when `--api-key` names none either. | none |
-| `--allowed-hosts <LIST>` | Names in a request's `Host` header that the server answers to besides its local ones (`localhost`, addresses), separated by commas, or `*` for any. Names given here are checked on every address and with keys too. | the local names only, when the server listens on a loopback address without keys; else any name |
-| `--cors-origins <LIST>` | Origins whose web pages may call the server from a browser and read its answers, such as `https://chat.example.org`, separated by commas, or `*` for any. Without keys, a request from a page of another site is refused unless the page is of this machine (`localhost`, a loopback address), of the server's own name or of an `--allowed-hosts` name; with keys pages are not checked. | none |
+| `--allowed-hosts <LIST>` | Names in a request's `Host` header that the server answers to besides its local ones (`localhost`, addresses), separated by commas, or `*` for any. Names given here are checked on every address and with keys too, and with keys they turn the check of pages (`--cors-origins`) on as well. | the local names only, when the server listens on a loopback address without keys; else any name |
+| `--cors-origins <LIST>` | Origins whose web pages may call the server from a browser and read its answers, such as `https://chat.example.org`, separated by commas, or `*` for any. Without keys, a request from a page of another site is refused unless the page is of this machine (`localhost`, a loopback address), of the server's own name or of an `--allowed-hosts` name; with keys pages are checked only when `--allowed-hosts` names hosts. | none |
 
 ## Where the model goes
 

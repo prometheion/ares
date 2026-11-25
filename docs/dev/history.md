@@ -363,6 +363,12 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-server: two names of one parameter that differ are refused": one rule for every twin (`max_tokens`, `max_completion_tokens`, `n_predict`; `n`, `n_cmpl`; `n_probs` against `logprobs`/`top_logprobs`; `typical`, `repetition_penalty`): the same value is served, different values are a 400 naming the second name. None of the clients read (Open WebUI, opencode, Continue, LibreChat, the llama.cpp web UI) sends two names with different values; only a user's free-form extra parameters can. Test `two_names_of_one_parameter_must_agree` in `tests/sampling.rs`.
 
+- [x] With API keys the Origin check never runs, even when `--allowed-hosts` is named (written so
+      in `access.rs`; with the option named it is not what the option says). Found 2026-11-24 by
+      `fix/help-docs`. Files: `crates/server/src/access.rs`, `docs/user/options.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: with keys, named allowed hosts check the page too": with keys, `--allowed-hosts` names turn on the check of pages as well as of names (`Access::checks_pages`); `*` and no option leave the key to decide. Test `with_keys_named_hosts_check_the_page_too` in `tests/access.rs`.
+
 ### From "Small fixes": "Server, API, cache"
 
 Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).

@@ -266,9 +266,9 @@ an HTTP status, or after 10 seconds without it. A failure later is an error even
 | --- | --- |
 | key | with `--api-key` or `--api-key-file`, every route but `/health` wants `Authorization: Bearer <key>` or `x-api-key: <key>` |
 | `Host` | a server on a loopback address without keys answers only to `localhost` and to addresses; `--allowed-hosts` adds names |
-| `Origin` | without keys, a request a browser sends from a page of another site is refused; local pages, pages of the server's own name or of an `--allowed-hosts` name, and `--cors-origins` pass |
+| `Origin` | without keys, or with keys and `--allowed-hosts` names, a request a browser sends from a page of another site is refused; local pages, pages of the server's own name or of an `--allowed-hosts` name, and `--cors-origins` pass |
 | CORS | answers to an origin of `--cors-origins` carry the CORS headers, and its preflight is answered without a key |
 
-With keys, the key decides: pages are not checked, and names only when
-`--allowed-hosts` names hosts. A server that listens beyond this machine without
+With keys, the key decides, unless `--allowed-hosts` names hosts: then names
+and pages are checked as without keys. A server that listens beyond this machine without
 keys warns at start. [features.md](features.md) lists what Ares can do.

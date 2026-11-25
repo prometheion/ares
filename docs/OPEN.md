@@ -192,7 +192,7 @@ marks a line that only a GPU run can settle or check.
 
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
-| Server, API, cache | 3 | 1 |
+| Server, API, cache | 2 | 1 |
 | Model, runtime, kernels | 15 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
@@ -218,9 +218,6 @@ marks a line that only a GPU run can settle or check.
       nothing is dropped silently (found 2026-11-24 by `fix/help-docs`, documented as it is in
       `docs/user/api.md`). Files: `crates/server/src/openai/request.rs` (`message()`,
       `stream_options`), `crates/server/src/tools.rs` (`tool()`), `docs/user/api.md`.
-- [ ] With API keys the Origin check never runs, even when `--allowed-hosts` is named (written so
-      in `access.rs`; with the option named it is not what the option says). Found 2026-11-24 by
-      `fix/help-docs`. Files: `crates/server/src/access.rs`, `docs/user/options.md`.
 - [ ] GPU. `ares-server --test real_cache`
       `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd` failed once in the
       full suite under load (2026-11-17: after two other conversations took the pool, 4096 or

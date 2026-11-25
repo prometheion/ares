@@ -108,7 +108,8 @@ route looks at a request in this order:
 2. A browser's preflight (`OPTIONS` with `Access-Control-Request-Method`) from
    an origin of `--cors-origins` is answered at once, without a key, which a
    browser does not send with it: `GET, POST` and the headers it asks for.
-3. The page a request comes from (`Origin`). Without keys, a request a browser
+3. The page a request comes from (`Origin`). Without keys, or with keys and
+   names of `--allowed-hosts`, a request a browser
    sent from a page of another site gets 403 (`forbidden_origin`): pages of
    this machine (`localhost`, a loopback address), of the server's own name, of
    an allowed host and of `--cors-origins` pass. Programs send no `Origin`.

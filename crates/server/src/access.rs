@@ -19,17 +19,18 @@
 //!    that a browser sent from a page of another site gets 403, so that a page
 //!    cannot make a local server work for it. Pages of this machine
 //!    (`localhost`, a loopback address), pages of the server's own name and of
-//!    an allowed host, and the origins of `--cors-origins` pass. A program that is no browser sends
-//!    no `Origin` and passes.
+//!    an allowed host, and the origins of `--cors-origins` pass. A program
+//!    that is no browser sends no `Origin` and passes.
 //! 4. **The key.** With keys, every route but `/health` wants one of them, as
 //!    `Authorization: Bearer <key>` or as `x-api-key: <key>` (Anthropic's
 //!    header, which its SDKs send). It is compared in constant time with every
 //!    key. Without, 401 in the error shape of the route's API.
 //!
-//! With a key the key decides: the page is not checked, and the name only
-//! when `--allowed-hosts` names hosts (the server's start sets that, see
-//! `crate::Access`). An answer to an origin of `--cors-origins` carries the
-//! headers that let the page read it, errors included.
+//! With a key the key decides, unless `--allowed-hosts` names hosts: then
+//! the name and the page are checked as without a key (the server's start
+//! sets that, see `crate::Access`), since naming hosts asks for the checks.
+//! An answer to an origin of `--cors-origins` carries the headers that let
+//! the page read it, errors included.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -62,6 +63,13 @@ impl Access {
         !self.keys.is_empty()
     }
 
+    /// Whether the page a request comes from is checked: always without
+    /// keys, and with keys when names are given (`--allowed-hosts`); a server
+    /// with keys gets [`Access::hosts`] only from the option.
+    fn checks_pages(&self) -> bool {
+        !self.locked() || self.hosts.is_some()
+    }
+
     fn any_origin(&self) -> bool {
         self.origins.iter().any(|origin| origin == "*")
     }
@@ -80,8 +88,8 @@ impl Access {
         }
     }
 
-    /// Whether the page of `origin` may call a server without keys that was
-    /// asked as `host`.
+    /// Whether the page of `origin` may call a server that was asked as
+    /// `host`, where pages are checked.
     fn origin_allowed(&self, origin: &str, host: Option<&str>) -> bool {
         if self.cors(origin) {
             return true;
@@ -236,7 +244,7 @@ pub(crate) async fn guard(
         return preflight(&access, origin, &request);
     }
     if let Some(text) = &text
-        && !access.locked()
+        && access.checks_pages()
         && !access.origin_allowed(text, host.as_deref())
     {
         return refusal(&path, ApiError::forbidden_origin(text));
