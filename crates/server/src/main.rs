@@ -182,7 +182,7 @@ async fn run(
                     () = signals.next() => {
                         if stop_after_load {
                             tracing::warn!("second signal: exiting without cleaning up");
-                            std::process::exit(1);
+                            exit_now(1);
                         }
                         tracing::warn!(
                             "stopping as soon as the model is loaded: the upload of the weights \
@@ -212,7 +212,7 @@ async fn run(
         let _ = hurry.send(());
         signals.next().await;
         tracing::warn!("third signal: exiting without cleaning up");
-        std::process::exit(1);
+        exit_now(1);
     });
     let served = serve_models(
         listener,
@@ -235,6 +235,19 @@ async fn run(
     served.map_err(|e| format!("the server failed: {e}"))?;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// Ends the process at once, as a signal asked, while the engine's threads may
+/// still be inside the CUDA driver (a load uploads its weights, a step runs).
+/// `std::process::exit` would run the driver's handlers for the end of the
+/// process (`atexit`), which tear its state down under those threads, and the
+/// driver may abort then: a SIGABRT and a core dump of all the RAM the process
+/// holds.
+/// `_exit` hands the process to the kernel, which frees everything.
+fn exit_now(code: i32) -> ! {
+    // SAFETY: `_exit` ends the process without running anything of it; no
+    // state of this program is touched.
+    unsafe { libc::_exit(code) }
 }
 
 /// SIGINT and SIGTERM, one after the other: the first asks for an orderly
