@@ -857,6 +857,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
     assert_eq!(text.matches("transfer_nanoseconds").count(), 3, "{text}");
     for line in [
         "ares_requests_finished_total 2",
+        "ares_model_loaded 1",
         "ares_cache_ram_pages 20",
         "ares_cache_ram_bytes 92405760",
         "ares_cache_ram_pages_in_total 25",

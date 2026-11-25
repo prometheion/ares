@@ -39,7 +39,7 @@ the server has one.
 | 403 | a `Host` or a web page's `Origin` the server does not answer to (see [Keys and access](#keys-and-access)) |
 | 404 / 405 | an unknown route or model / a wrong method |
 | 408 / 413 | the body did not arrive within `--timeout` / the body is larger than 64 MiB |
-| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/metrics`, and `/tokenize` and `/detokenize` without a `model`), the server is stopping |
+| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/tokenize` and `/detokenize` without a `model`), the server is stopping |
 
 Errors have OpenAI's shape `{"error": {"message", "type", "param", "code"}}`,
 and Anthropic's `{"type": "error", "error": {"type", "message"}}` on `/v1/messages`.
@@ -267,7 +267,7 @@ an HTTP status, or after 10 seconds without it. A failure later is an error even
 | `/props` | `model`, `build_info` (what the binary is, as `ares --version` prints it), `loaded`, `context_length`, `default_generation_settings` (`params`, `n_ctx`), `chat_template`, `chat_template_caps` (tools, reasoning, effort, `enable_thinking`, thinks by default), `reasoning` (its tags), `modalities` (`vision` true when the model was loaded with `--mmproj`, or its preset names one; `audio` false); a model that is not loaded is described from its file without a load |
 | `/tokenize` | `content` (a text, read as a completion prompt) or a chat request (`messages` and the chat fields); `parse_special: false` and `add_special` are refused; answers `{"tokens": [...]}`, with `with_pieces` `{"tokens": [{"id", "piece"}, ...]}` (the text, or its bytes where a token is not whole characters) |
 | `/detokenize` | `tokens`; answers `{"content": "..."}`; control tokens write nothing |
-| `/metrics` | the histograms `ares_request_queue_seconds`, `ares_request_prompt_seconds`, `ares_time_to_first_token_seconds`, `ares_time_per_output_token_seconds`, `ares_request_seconds`, and counters and gauges of requests, tokens, drafts, the prompt cache in RAM and on the SSD, and Flash-Next's experts |
+| `/metrics` | `ares_model_loaded` (1, or 0 alone for a model that is not loaded); the histograms `ares_request_queue_seconds`, `ares_request_prompt_seconds`, `ares_time_to_first_token_seconds`, `ares_time_per_output_token_seconds`, `ares_request_seconds`, and counters and gauges of requests, tokens, drafts, the prompt cache in RAM and on the SSD, and Flash-Next's experts |
 | `/models/load`, `/models/unload` | an unload takes new requests away and unloads the model when its running requests have ended; the next request loads it again. Also with one `--model` (see [options.md](options.md#the-preset-file) for several) |
 
 ## Keys and access

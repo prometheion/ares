@@ -392,6 +392,12 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-runtime: the prompt cache's transfer time is counted once": the levels' batches of transfers are counted by the cache (`TransferCounters`), exported once as `ares_cache_transfer_nanoseconds_total`; the two old names are gone.
 
+- [x] `/metrics` of a model that is not loaded is still 503 (its `/props` is read from its
+      preset and file since 2026-11-22). Files: `crates/server/src/metrics.rs`,
+      `crates/server/src/load/mod.rs` (`Described`), `docs/user/api.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: /metrics of a model that is not loaded says so with a 200": `ares_model_loaded 0` alone (and `1` before the counters of a loaded one), so a scraper does not take the server for down; the counters of an engine start again at its load. Tests in `tests/models.rs` and `tests/http.rs`.
+
 ## 2026-11-24
 
 ### From "In work now"

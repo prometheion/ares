@@ -361,7 +361,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 9 |
+| Server, API, cache | 8 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -400,9 +400,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       `RuntimeConfig`, 600 s); the steps of the warm-up are not watched (the watch starts after
       it); the memory a stuck device holds stays taken until the process ends. Files:
       `crates/server/src/options.rs`, `crates/server/src/plan.rs`, `crates/runtime/src/engine.rs`.
-- [ ] `/metrics` of a model that is not loaded is still 503 (its `/props` is read from its
-      preset and file since 2026-11-22). Files: `crates/server/src/metrics.rs`,
-      `crates/server/src/load/mod.rs` (`Described`), `docs/user/api.md`.
 - [ ] Router: "no room" for Flash-Next is recognised by the message's text ("does not fit",
       "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
       `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
