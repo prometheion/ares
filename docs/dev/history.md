@@ -7,6 +7,42 @@ they were written then; an open remainder of an item is listed in `OPEN.md` agai
 
 ## 2026-11-25
 
+Done on `chore/leftovers` (2026-11-25), each item verbatim and then what was done:
+
+### From "Decided by the owner (2026-11-22)"
+
+From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay in `OPEN.md`):
+
+  - [x] `ares --version` does not exist; a deployed binary is named by its commit only.
+        Done: `ares --version` and `-V` print `ares <version> (<commit>, <date>)`, which is
+        also the log's first line and `build_info` of `/props`; `crates/server/build.rs` takes
+        the commit from git in a checkout, else from `ARES_BUILD_COMMIT`, else `unknown`.
+  - [x] Dev tools whose default paths name the removed `~/Services/llama.cpp-native`
+        (`crates/quant/tests/golden/generate.py`, `crates/quant/tools/gen_tables.py`, the
+        capture tools' READMEs): take the llama.cpp tree as an argument; comparisons against
+        the fork need a build from a fresh clone.
+        Done: the three generators (with `crates/tokenizer/tools/gen_unicode.py`, which also
+        wrote a fixed revision) take the tree as an argument or `LLAMA_CPP_DIR`, with no
+        default; the READMEs of `capture`, `q4capture` and `kv_real` build it from a fresh
+        clone on the CPU. Checked against a fresh clone of the fork (3f38177): the golden
+        fixtures the same bytes, the tables the same but for the revision they name, the
+        capture programs built and one ran.
+  - [x] The owner's small calls of the cleanup (2026-11-25, as proposed): `examples/launch_cost.rs`
+        and `q4_bench.rs` go, `matvec_bench` folds into `few_rows_bench` and `weight_pass`; the
+        tools `qwen4exp_run` and `qwen4exp_prune` stay on `Session`.
+        Done: the three examples are gone; `few_rows_bench` times every type with a fast kernel
+        (`all`, and `all:17408x5120` by default) with GB/s, which is what `matvec_bench` had and
+        the other two did not (`weight_pass` needed nothing).
+
+### From "Small fixes / Model, runtime, kernels"
+
+- [x] Dev-only strings with runs of spaces (found 2026-11-24 by `fix/help-docs`; 4 in 3 files:
+      `crates/model/tests/qwen4exp_device.rs`, `crates/runtime/examples/expert_pipe_bench.rs`,
+      `crates/weights/tests/premises/cache.rs`).
+      Done: the four were format strings continued over a line without `\` and continue with
+      `\` now. A scan of every string literal found no others (`expert_bench`'s
+      `file {i}     {}`, named with them before, lines up with the labels around it).
+
 Found done or stale by the triage of 2026-11-25 (branch `docs/triage`, every open item checked
 against `main` 4c834979): each item verbatim, then what did it or what changed. Items that only
 moved or were merged with a twin are not here; what is left of a partly done item is in

@@ -70,14 +70,6 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
   - [ ] llama-swap updated to upstream with the owner's evict-lock patch (agent working).
   - [ ] The unit's stop timeout (CachyOS defaults to 10 s; Ares writes its prompt cache when it
         stops): the new unit is ready for the owner to copy (sudo).
-  - [ ] `ares --version` does not exist; a deployed binary is named by its commit only.
-  - [ ] Dev tools whose default paths name the removed `~/Services/llama.cpp-native`
-        (`crates/quant/tests/golden/generate.py`, `crates/quant/tools/gen_tables.py`, the
-        capture tools' READMEs): take the llama.cpp tree as an argument; comparisons against
-        the fork need a build from a fresh clone.
-  - [ ] The owner's small calls of the cleanup (2026-11-25, as proposed): `examples/launch_cost.rs`
-        and `q4_bench.rs` go, `matvec_bench` folds into `few_rows_bench` and `weight_pass`; the
-        tools `qwen4exp_run` and `qwen4exp_prune` stay on `Session`.
 - Push day (the owner, 2026-11-24): when the cleanup and the docs are done, the first push and
   the switch of the owner's production to Ares come together. Before it: the libcuda deadlock
   of page-locked frees fixed (it reaches the 27B too, through the prompt cache's checkpoints).
@@ -380,13 +372,11 @@ Wrong behaviour:
 
 ## Small fixes
 Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of a done piece.
-The push day's leftovers (`--version`, the dev tools' paths, the examples the owner retired) are
-under "Decided by the owner" and in work on `chore/leftovers`; they are not counted here.
 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 15 |
+| Model, runtime, kernels | 14 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -481,9 +471,6 @@ under "Decided by the owner" and in work on `chore/leftovers`; they are not coun
 - [ ] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
       its pool from the context alone and the device's ledger refuses the drafter (the server's
       plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.
-- [ ] Dev-only strings with runs of spaces (found 2026-11-24 by `fix/help-docs`; 4 in 3 files:
-      `crates/model/tests/qwen4exp_device.rs`, `crates/runtime/examples/expert_pipe_bench.rs`,
-      `crates/weights/tests/premises/cache.rs`).
 - [ ] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
 - [ ] The examples' own copies of `Rng` (attention, expert layer, expert rows, expert types,
       sampler steps, far attention benches) and `f32_bytes` (attention, expert layer, expert
