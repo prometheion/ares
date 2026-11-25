@@ -1013,6 +1013,7 @@ impl Conductor {
                 if let Some(cache) = &mut self.cache {
                     self.stats.counters.ssd = cache.ssd_counters();
                     self.stats.counters.ram = cache.ram_counters();
+                    self.stats.counters.cache_transfers = cache.transfer_counters();
                 }
                 let copy = StatsCopy {
                     stats: self.stats.clone(),

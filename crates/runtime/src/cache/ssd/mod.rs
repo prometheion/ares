@@ -155,10 +155,6 @@ pub struct SsdCounters {
     /// early.
     pub imports: u64,
     pub imports_cut: u64,
-    /// Transfers between the devices and the host: calls, and the
-    /// nanoseconds the conductor waited for them.
-    pub transfers: u64,
-    pub transfer_ns: u64,
     /// Checkpoints that were due and were not written: none could be in
     /// transit (the writer held every buffer), or the checkpoint was given
     /// up before the record with its save had run, so that its place never

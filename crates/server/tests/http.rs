@@ -834,6 +834,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
             ahead_used: 2,
             ..ExpertStats::default()
         },
+        cache_transfer_ns: 1_500_000,
         ram: ares_api::RamCacheStats {
             pages: 20,
             bytes: 92_405_760,
@@ -852,6 +853,8 @@ async fn metrics_are_the_engines_statistics_as_text() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/plain"));
     let text = body_text(response).await;
+    // The transfers serve both levels and are counted once, under one name.
+    assert_eq!(text.matches("transfer_nanoseconds").count(), 3, "{text}");
     for line in [
         "ares_requests_finished_total 2",
         "ares_cache_ram_pages 20",
@@ -865,6 +868,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
         "ares_cache_ssd_bytes 0",
         "ares_cache_ssd_pending 0",
         "ares_cache_ssd_checkpoints_skipped_total 0",
+        "ares_cache_transfer_nanoseconds_total 1500000",
         "ares_requests_cancelled_total 1",
         "ares_requests_refused_total 0",
         "ares_requests_outranked_total 0",

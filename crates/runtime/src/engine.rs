@@ -556,13 +556,13 @@ impl Engine for Runtime {
             cached_pages: snapshot.cached_pages,
             checkpoint_ram: snapshot.checkpoint_ram,
             experts: self.model.expert_stats().unwrap_or_default(),
+            cache_transfer_ns: c.cache_transfers.ns,
             ram: ares_api::RamCacheStats {
                 pages: c.ram.pages,
                 bytes: c.ram.bytes,
                 pages_in: c.ram.pages_in,
                 pages_read: c.ram.pages_read,
                 pages_dropped: c.ram.pages_dropped,
-                transfer_ns: c.ram.transfer_ns,
             },
             ssd: ares_api::SsdStats {
                 pages_written: c.ssd.pages_written,
@@ -573,7 +573,6 @@ impl Engine for Runtime {
                 checkpoints_read: c.ssd.states_read,
                 bytes_read: c.ssd.bytes_read,
                 read_ns: c.ssd.read_ns,
-                transfer_ns: c.ssd.transfer_ns,
                 store_bytes: c.ssd.store_bytes,
                 pending: c.ssd.pending,
                 checkpoints_skipped: c.ssd.states_skipped,

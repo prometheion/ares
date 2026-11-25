@@ -386,6 +386,12 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-runtime: the mirostat range is Sampling::validate's alone": the request sampler trusts the check every request passes in `Runtime::submit_filtered`, and the server's reader only refuses a number that does not fit the field.
 
+- [x] The cache's transfer time is counted twice, exported as `cache_ram_transfer_nanoseconds_total`
+      and `cache_ssd_transfer_nanoseconds_total` (cleanup phase 2: a metric's name). Files:
+      `crates/runtime/src/cache/moves.rs`, `crates/server/src/metrics.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: the prompt cache's transfer time is counted once": the levels' batches of transfers are counted by the cache (`TransferCounters`), exported once as `ares_cache_transfer_nanoseconds_total`; the two old names are gone.
+
 ## 2026-11-24
 
 ### From "In work now"

@@ -548,15 +548,9 @@ impl Cache {
                 transfer.ok = false;
             }
         }
-        let ns = begun.elapsed().as_nanos() as u64;
-        if let Some(ram) = &mut self.in_ram {
-            ram.counters.transfers += 1;
-            ram.counters.transfer_ns += ns;
-        }
-        if let Some(ssd) = &mut self.ssd {
-            ssd.counters.transfers += 1;
-            ssd.counters.transfer_ns += ns;
-        }
+        // Once for the cache, whichever level the batch is for.
+        self.transfers.batches += 1;
+        self.transfers.ns += begun.elapsed().as_nanos() as u64;
         self.finish(pool, batch, notes);
     }
 

@@ -41,7 +41,14 @@ pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Respons
 /// The counters and gauges of `GET /metrics`.
 fn stats_text(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 65] = [
+    let rows: [(&str, &str, &str, u64); 64] = [
+        (
+            "cache_transfer_nanoseconds_total",
+            "counter",
+            "Time the step loop waited while the prompt cache moved state between the devices \
+             and host memory, for RAM and the SSD alike",
+            stats.cache_transfer_ns,
+        ),
         (
             "cache_ram_pages",
             "gauge",
@@ -66,12 +73,6 @@ fn stats_text(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Pages worth keeping that the prompt cache in RAM gave up unwritten",
             ram.pages_dropped,
-        ),
-        (
-            "cache_ram_transfer_nanoseconds_total",
-            "counter",
-            "Time the step loop waited while pages moved between the devices and RAM",
-            ram.transfer_ns,
         ),
         (
             "cache_ssd_pages_written_total",
@@ -120,12 +121,6 @@ fn stats_text(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Time the prompt cache's readers spent reading and checking, summed",
             ssd.read_ns,
-        ),
-        (
-            "cache_ssd_transfer_nanoseconds_total",
-            "counter",
-            "Time the step loop waited while cached state moved between devices and host",
-            ssd.transfer_ns,
         ),
         ("cache_ssd_bytes", "gauge", "Bytes the model's store takes on SSD", ssd.store_bytes),
         (

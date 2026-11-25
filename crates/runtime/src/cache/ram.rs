@@ -150,10 +150,6 @@ pub struct RamCounters {
     /// were worth writing. Copies of pages the devices hold, pages the drive
     /// has, and pages of texts too short for the drive are not counted.
     pub pages_dropped: u64,
-    /// Transfers between the devices and the host for the levels below the
-    /// devices: calls, and the nanoseconds the conductor waited for them.
-    pub transfers: u64,
-    pub transfer_ns: u64,
 }
 
 /// The pages and tails in RAM. See the module's documentation.

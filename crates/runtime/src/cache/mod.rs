@@ -80,6 +80,16 @@ mod ram;
 mod ssd;
 
 pub use ram::RamCounters;
+
+/// The batches of transfers between the devices and host memory that the
+/// levels below the devices carried out (to RAM, from it, and through the
+/// buffers of the drive), and the nanoseconds the conductor waited for them.
+/// One batch can serve both levels; it is counted once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferCounters {
+    pub batches: u64,
+    pub ns: u64,
+}
 use ram::{Class, Entry, Held, Item, RamLevel};
 pub use ssd::{SsdConfig, SsdCounters};
 
@@ -246,6 +256,8 @@ pub(crate) struct Cache {
     /// Counts what was given up, so that waiting requests can tell their
     /// numbers are out of date.
     pub evictions: u64,
+    /// The transfers the levels below the devices carried out.
+    transfers: TransferCounters,
     /// What the model offers the levels below the devices.
     durable: Option<Durable>,
     /// The level in RAM, for a model that moves its pages to the host.
@@ -367,6 +379,7 @@ impl Cache {
             page_copies: Vec::new(),
             scratch: Vec::new(),
             evictions: 0,
+            transfers: TransferCounters::default(),
             far: None,
             far_held: 0,
         }
@@ -590,6 +603,11 @@ impl Cache {
     /// tails: for the counters.
     pub(crate) fn ram_counters(&self) -> RamCounters {
         self.in_ram.as_ref().map_or_else(RamCounters::default, RamLevel::snapshot)
+    }
+
+    /// The transfers of the levels below the devices, counted once.
+    pub(crate) fn transfer_counters(&self) -> TransferCounters {
+        self.transfers
     }
 
     /// Writes the copies for this record and starts the next ones afresh.
