@@ -311,7 +311,7 @@ one array per part, indexed by page number.
     words follow with a wide margin; a text with near ties (a list whose order
     the model is unsure of) can part at one, as can two requests that decode
     together instead of alone.
-- Decisions ("Jev mode"): typed questions about a state answered by choosing
+- **Decisions** ("Jev mode"): typed questions about a state answered by choosing
   among fixed options, with no generation, on `POST /v1/systemone` for every
   model. The request, the answers and the way a chat model is asked are
   Flide's (https://github.com/OmniJev/Flide, its `next_token` format in style

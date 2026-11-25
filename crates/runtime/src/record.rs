@@ -120,7 +120,7 @@
 //! at a wanted row, before the sampler touches it. A decision reads the labels
 //! of its options this way at the last row of each question's prompt (see
 //! "Decisions" in `docs/dev/architecture/sequence-state.md`). A wanted row
-//! names at most [`SCORES_PER_ROW`] tokens.
+//! names at most 256 tokens, the most options of a question.
 //!
 //! **Row worth** says what each draft row of a step is worth, for a model that
 //! may leave such a row without something it would have to wait for (an expert
@@ -546,7 +546,8 @@ impl<'a> RecordWriter<'a> {
 
     /// The logits the step hands back besides the picks: `(wanted row,
     /// token)`, the wanted row by its place among the wanted rows, in the
-    /// order they come back. At most [`SCORES_PER_ROW`] for one wanted row.
+    /// order they come back. At most 256 for one wanted row (the most options of a
+    /// question).
     pub fn scores(&mut self, scores: &[(u32, u32)]) -> Result<(), RecordFull> {
         let off = self.end;
         let words: Vec<u32> = scores.iter().flat_map(|&(row, token)| [row, token]).collect();
