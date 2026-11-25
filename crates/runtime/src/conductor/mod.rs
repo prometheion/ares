@@ -1121,7 +1121,7 @@ impl Conductor {
             // rows are given up before anybody has to wait.
             let (must, prompt_rows) = match part.kind {
                 PartKind::Prefill { .. } => (writes, writes),
-                PartKind::Window | PartKind::Score { .. } => (1, 0),
+                PartKind::Window => (1, 0),
             };
             let required = a.cells.pages_to_append(&self.pool, u64::from(must));
             let all = a.cells.pages_to_append(&self.pool, u64::from(writes));

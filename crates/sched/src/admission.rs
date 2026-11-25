@@ -737,7 +737,7 @@ impl Claims<'_> {
     }
 
     /// A running sequence's claim for this step: `required` pages for the
-    /// rows it must get (its newest token, decision rows, prompt rows) and
+    /// rows it must get (its newest token, prompt rows) and
     /// `optional` pages more for rows it can do without (drafts), of which
     /// `prompt_rows` rows are rows of its prompt. Claims of sequences that do
     /// not run are ignored.

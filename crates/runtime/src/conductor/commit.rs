@@ -73,7 +73,7 @@ impl Conductor {
                         }
                     }
                 }
-                PartKind::Window | PartKind::Score { .. } => {
+                PartKind::Window => {
                     let picks = &self.output.picks[cursor..cursor + part.rows as usize];
                     let probs_at = cursor;
                     cursor += part.rows as usize;

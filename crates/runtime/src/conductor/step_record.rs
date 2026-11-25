@@ -323,7 +323,7 @@ impl Conductor {
                         }
                     }
                 }
-                PartKind::Window | PartKind::Score { .. } => {
+                PartKind::Window => {
                     has_generation = !drafts_only;
                     if !drafts_only {
                         counters.window_rows += 1;
