@@ -36,6 +36,12 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] Flash-Next's step scratch starts its buffers on a 64-byte line, not the 128-byte line fixed
+      for the 27B (`Kernels::ACTIVATION_LINE`). File: `crates/model/src/qwen4exp/device/part/frame.rs`
+      (`PieceCarve`).
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `PieceCarve` starts every buffer on `Kernels::ACTIVATION_LINE` (128 bytes), as the 27B's carve; a piece of a loan starts at an expert slot, and a real file's slots are multiples of 256 bytes. Unit test `the_carve_starts_every_buffer_on_a_line_and_in_one_piece`. Commit "ares-model: Flash-Next's step scratch starts its buffers on 128-byte lines".
+
 - [x] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
 
   *Fixed on `fix/model-sweep`, 2026-11-25:* the test plays one priority in nine runs and two or three in four (shortage victims by priority, a running request outranked only by a better newcomer, a spilled one in line holds back its own and every worse priority, overtaking counted by the same or a worse priority). It found a defect of admission: a newcomer that made worse ones give way counted what they let go of as room, the pages of its own cached prefix among them, which its charge had left out already (`Admission::room` takes those of the prefixes that running sequences hold off now). Commit "ares-sched: the admission test plays several priorities, and a newcomer's prefix is not counted twice".

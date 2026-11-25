@@ -376,7 +376,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 13 |
+| Model, runtime, kernels | 12 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -456,9 +456,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 - [ ] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
       server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
       `crates/runtime/src/ram.rs`, the server's loader.
-- [ ] Flash-Next's step scratch starts its buffers on a 64-byte line, not the 128-byte line fixed
-      for the 27B (`Kernels::ACTIVATION_LINE`). File: `crates/model/src/qwen4exp/device/part/frame.rs`
-      (`PieceCarve`).
 - [ ] Float experts beyond the f16 range are not caught in the many-row kernels (`WeightRange` is
       applied to the dense matrices and the router only). Files:
       `crates/model/src/qwen4exp/device/load.rs`, `qwen4exp/device/part/wide.rs`,

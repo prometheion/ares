@@ -262,10 +262,13 @@ impl Layers {
     }
 }
 
-/// The scratch of a step as it is carved buffer by buffer, every buffer at a
-/// multiple of 64 bytes, in `pieces` when it is laid out in VRAM the expert
-/// slots lend: a buffer that the end of a piece would cut goes to the start of
-/// the next, and what each piece holds is counted.
+/// The scratch of a step as it is carved buffer by buffer, every buffer from
+/// the start of a line of the devices' caches ([`Kernels::ACTIVATION_LINE`],
+/// as the 27B's scratch: the tile kernels read the f16 activations fastest
+/// from there), in `pieces` when it is laid out in VRAM the expert slots lend:
+/// a buffer that the end of a piece would cut goes to the start of the next,
+/// and what each piece holds is counted. A piece starts at a slot of its
+/// pool, and a slot of a real file's experts is a multiple of 256 bytes.
 struct PieceCarve {
     len: u64,
     /// The pieces as ranges of the layout's offsets, and what each holds.
@@ -306,7 +309,7 @@ impl PieceCarve {
                 None => self.fits = false,
             }
         }
-        self.len = (at + bytes).next_multiple_of(64);
+        self.len = (at + bytes).next_multiple_of(Kernels::ACTIVATION_LINE);
         at
     }
 
@@ -892,5 +895,26 @@ impl Frame {
 
     pub(super) fn tables_bytes(&self, opts: &Options) -> u64 {
         (2 * 4 * u64::from(opts.table_entries())).next_multiple_of(64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_carve_starts_every_buffer_on_a_line_and_in_one_piece() {
+        let line = Kernels::ACTIVATION_LINE;
+        for pieces in [vec![], vec![3000, 5000, 100_000], vec![1 << 20, 4096]] {
+            let mut carve = PieceCarve::new(&pieces);
+            let ends: Vec<u64> = carve.ends.clone();
+            let starts: Vec<u64> = carve.starts.clone();
+            for bytes in [1, 16, 80, 130, 700, 2049, 64, 3, 1000, 1500] {
+                let at = carve.take(bytes);
+                assert_eq!(at % line, 0, "{pieces:?}: a buffer of {bytes} at {at}");
+                let inside = starts.iter().zip(&ends).any(|(s, e)| at >= *s && at + bytes <= *e);
+                assert!(pieces.is_empty() || inside || !carve.fits, "{pieces:?}: {at}+{bytes}");
+            }
+        }
     }
 }
