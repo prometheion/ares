@@ -77,6 +77,12 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
 
 ### From "Small fixes", "Model, runtime, kernels"
 
+- [x] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
+      its pool from the context alone and the device's ledger refuses the drafter (the server's
+      plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `--engine` sizes its pool as the server's plan does: the pages of the context, at most what every device holds beside the model's footprint (`Estimate::footprint_of`, the drafters included) with 256 MiB left free, and says when it holds fewer. A dev tool: no test. Commit "ares-model: qwen35_run sizes its pool by what the devices hold".
+
 - [x] The DFlash drafter's float matrices take the f16 tile path above eight rows without the
       range check of Flash-Next's (`WeightRange`). File: `crates/model/src/dflash/device.rs`.
 
