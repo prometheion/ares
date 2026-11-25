@@ -939,6 +939,22 @@ The runs of 2026-11-22 evening that passed are in [`dev/history.md`](dev/history
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- Push day done 2026-11-25: the first push (prometheion/ares main at the scrubbed history) and
+  the owner's production switched to Ares (llama-swap's two 27B entries run Ares from
+  `~/Services/ares`, presets mapped from the fork's; both checked in a trial run and through
+  the gateway); the llama.cpp trees, Spark, SGLang, vLLM and the fork's prompt caches are
+  deleted (archived locally first). Left from it:
+  - [ ] llama-swap updated to upstream with the owner's evict-lock patch (agent working).
+  - [ ] The unit's stop timeout (CachyOS defaults to 10 s; Ares writes its prompt cache when it
+        stops): the new unit is ready for the owner to copy (sudo).
+  - [ ] `ares --version` does not exist; a deployed binary is named by its commit only.
+  - [ ] Dev tools whose default paths name the removed `~/Services/llama.cpp-native`
+        (`crates/quant/tests/golden/generate.py`, `crates/quant/tools/gen_tables.py`, the
+        capture tools' READMEs): take the llama.cpp tree as an argument; comparisons against
+        the fork need a build from a fresh clone.
+  - [ ] The owner's small calls of the cleanup (2026-11-25, as proposed): `examples/launch_cost.rs`
+        and `q4_bench.rs` go, `matvec_bench` folds into `few_rows_bench` and `weight_pass`; the
+        tools `qwen4exp_run` and `qwen4exp_prune` stay on `Session`.
 - Push day (the owner, 2026-11-24): when the cleanup and the docs are done, the first push and
   the switch of the owner's production to Ares come together. Before it: the libcuda deadlock
   of page-locked frees fixed (it reaches the 27B too, through the prompt cache's checkpoints).
