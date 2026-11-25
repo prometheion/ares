@@ -194,7 +194,7 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 13 | 11 |
+| Model, runtime, kernels | 12 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
 - [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
@@ -302,12 +302,6 @@ Tests that fail:
       `crates/sched/src/confidence.rs`, the test.
 
 Wrong behaviour:
-- [ ] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
-      the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
-      another sequence, or past its first tiles with K and V in `q7` to `q4`, can take more (the
-      27B failed so on 2026-11-23, fixed there by 5d5aee5f). To size it with
-      `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs. Files:
-      `crates/model/src/qwen4exp/device/part/frame.rs`, `qwen4exp/device/part.rs` (`check_states`).
 - [ ] GPU. Flash-Next: rounds between the pieces of a paused pass can stall the expert store when
       the pass borrows all the slots can lend ("a step stood still for 30s while the host held
       back the next layer ... the store waits for 7 to 9 experts and is not settled": a 21k-row

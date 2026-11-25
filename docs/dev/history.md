@@ -47,6 +47,15 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
 
 ### From "Defects", "Model, runtime, kernels"
 
+- [x] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
+      the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
+      another sequence, or past its first tiles with K and V in `q7` to `q4`, can take more (the
+      27B failed so on 2026-11-23, fixed there by 5d5aee5f). To size it with
+      `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs. Files:
+      `crates/model/src/qwen4exp/device/part/frame.rs`, `qwen4exp/device/part.rs` (`check_states`).
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the frame sizes the partial states with `PlanConfig::state_slots_bound` (the 27B's; `alone` = draft window rows or sequences, a tile mean with `q7` to `q4`) and, for steps past the dense limit, with the bound of device-made lists (`list_state_slots`: the step's pieces and one of exact entries a row, which the old bound left out). Cost of the step scratch the parts keep (24 query heads of 256, 24.7 KB a state slot; computed): with `q8` -1 to +17 MB a card at 256 to 512 own rows (the 4070 at 512 rows 1444 -> 1921 slots, +11 MB), with a tile mean +18 to +53 MB; on lent VRAM the wide steps reserve more of the loan. Unit test `device_made_lists_stay_in_their_bound_of_states` (the dense bound is the 27B's, tested in `ares-cuda`). Commit "ares-model: Flash-Next reserves the partial states its plans take".
+
 - [x] Device memory is not behind the gate of page-locked memory: `cuMemFree` "may perform
       implicit synchronization" too (the libcuda deadlock's class). An engine allocates it when its
       model opens and frees it when the model goes, but for the 27B's attention plan larger than

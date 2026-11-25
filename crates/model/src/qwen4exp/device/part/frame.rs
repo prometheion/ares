@@ -651,16 +651,16 @@ impl Frame {
         let max_blocks = u64::from(opts.cells.div_ceil(ix.block)).max(1);
         s.scores = take!(rows.min(u64::from(SCORE_ROWS)) * att * max_blocks * 4);
         s.counts = take!(rows * 16);
-        // The most partial states a plan makes: the planner's own bound for
-        // dense rows (`Planner::finish`) and the pieces of device-made lists
-        // (a row has one piece when there are as many rows as the plan has
-        // blocks, so this is at most one state per row then).
-        let state_slots =
-            (20 * u64::from(plan_config.target_blocks) / u64::from(geo.kv_heads) + 64).max(
-                (rows * u64::from(MAX_PIECES)).min(
-                    (u64::from(plan_config.target_blocks) / u64::from(geo.kv_heads)).max(rows),
-                ),
-            );
+        // The most partial states a plan makes: the planner's bound for dense
+        // rows (`PlanConfig::state_slots_bound`, as the 27B: a row that reads its
+        // prefix with another sequence, or past its first tiles with a tile
+        // mean, has several pieces) and the pieces of device-made lists
+        // (`build_plan`).
+        let alone = opts.window_rows.max(opts.max_slots);
+        let mean = opts.kv.0.has_mean() || opts.kv.1.has_mean();
+        let state_slots = plan_config
+            .state_slots_bound(geo.kv_heads, geo.q_per_kv, rows as u32, alone, opts.max_slots, mean)
+            .max(list_state_slots(plan_config, geo.kv_heads, rows, alone));
         // A state is, per query head, the weighted V and the log of the sum.
         let state = c.attention.n_head as u64 * (u64::from(geo.head_dim) + 1) * 4;
         let attn_state_bytes = att * state_slots * state;
@@ -898,9 +898,46 @@ impl Frame {
     }
 }
 
+/// The most partial states a plan of device-made lists takes (`Part::build_plan`, a
+/// step with a row past the dense limit): a row of a prompt has the step's pieces of
+/// converted entries (the plan's blocks over the rows, at least one) and one of exact
+/// entries, a row alone (a generated row, a row of a draft window; at most `alone` in a
+/// step) the pieces it has alone and one of exact entries.
+fn list_state_slots(config: PlanConfig, kv_heads: u32, rows: u64, alone: u32) -> u64 {
+    let budget = u64::from(config.target_blocks / kv_heads.max(1));
+    let alone_pieces = budget.clamp(1, u64::from(MAX_PIECES));
+    budget.max(rows) + rows + u64::from(alone) * (alone_pieces + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every step of device-made lists stays in [`list_state_slots`]: `prompt` rows of
+    /// prompts with the step's pieces and `alone` rows with their own, each with a piece
+    /// of exact entries (the counts of `Part::build_plan`).
+    #[test]
+    fn device_made_lists_stay_in_their_bound_of_states() {
+        for sms in [28, 34, 46, 170] {
+            let config = PlanConfig::for_multiprocessors(sms);
+            for kv_heads in [1, 2, 4] {
+                for (rows, most_alone) in [(8u32, 8u32), (64, 8), (512, 4), (4096, 8)] {
+                    let bound = list_state_slots(config, kv_heads, u64::from(rows), most_alone);
+                    let alone_pieces = (config.target_blocks / kv_heads).clamp(1, MAX_PIECES);
+                    for alone in 0..=most_alone.min(rows) {
+                        let prompt = rows - alone;
+                        let step = (config.target_blocks / (prompt.max(1) * kv_heads))
+                            .clamp(1, MAX_PIECES);
+                        let slots = u64::from(prompt * (step + 1) + alone * (alone_pieces + 1));
+                        assert!(
+                            slots <= bound,
+                            "{sms} {kv_heads} {rows} {alone}: {slots} > {bound}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_carve_starts_every_buffer_on_a_line_and_in_one_piece() {
