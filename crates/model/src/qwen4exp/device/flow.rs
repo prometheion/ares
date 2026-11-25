@@ -77,6 +77,11 @@ pub(super) struct Flow {
     /// Uploads and reads the store had finished the last time anyone looked.
     pub(super) uploads_seen: AtomicU64,
     pub(super) stall: Duration,
+    /// For a wait that has stood still a while ([`Flow::check`]): what the steps
+    /// had moved when it was last seen to change, and when.
+    pub(super) moved_at: Mutex<(u64, Instant)>,
+    /// Reads of the n-gram table's rows done the last time anyone looked.
+    pub(super) ngram_seen: AtomicU64,
     /// What the store counted, summed over the times it was read.
     pub(super) totals: Mutex<ExpertStats>,
     /// What the wide steps found and waited for, since the engine started.
@@ -145,6 +150,8 @@ impl Flow {
             failed: AtomicBool::new(false),
             uploads_seen: AtomicU64::new(0),
             stall,
+            moved_at: Mutex::new((0, Instant::now())),
+            ngram_seen: AtomicU64::new(0),
             totals: Mutex::new(ExpertStats { ram_tier_bytes: ram_bytes, ..Default::default() }),
             wide: Mutex::new(WideStats::default()),
             own_rows,
@@ -473,13 +480,25 @@ impl Flow {
         layers as u64 + self.uploads_seen.load(Ordering::Relaxed)
     }
 
-    /// An error when another part failed, or when the step has stood still
-    /// since `started` for longer than a step may.
+    /// An error when another part failed, or when the step has stood still for
+    /// longer than a step may: since the wait began at `started`, and since
+    /// anything of the steps last moved ([`Flow::moved`]). What moved is looked at
+    /// only in a wait of a second or more; a wait that holds the store (the
+    /// lend waits) sees no read or upload end and counts from its start.
     pub(super) fn check(&self, started: Instant, what: &str) -> Result<(), ModelError> {
         if self.failed.load(Ordering::Acquire) {
             return Err(ModelError::Aborted);
         }
-        if started.elapsed() < self.stall {
+        let waited = started.elapsed();
+        if waited < self.stall.min(Duration::from_secs(1)) {
+            return Ok(());
+        }
+        let moved = self.moved();
+        let still = {
+            let mut at = self.moved_at.lock().unwrap_or_else(|e| e.into_inner());
+            stood_still(waited, moved, &mut at, Instant::now())
+        };
+        if still < self.stall {
             return Ok(());
         }
         self.fail();
@@ -488,7 +507,26 @@ impl Flow {
             Ok(feed) => feed.standing_still(&enqueued),
             Err(_) => "the expert store is busy".to_owned(),
         };
-        Err(invalid(format!("a step stood still for {:.0?} while {what}: {state}", self.stall)))
+        Err(invalid(format!("a step stood still for {still:.0?} while {what}: {state}")))
+    }
+
+    /// A number that changes whenever anything of the steps moves: what
+    /// [`Flow::progress`] counts, a pass's rows handed on, taken or let run, and
+    /// reads of the n-gram table's rows that ended.
+    fn moved(&self) -> u64 {
+        let ngram = match self.ngram.try_lock() {
+            Ok(ngram) => {
+                self.ngram_seen.store(ngram.completed(), Ordering::Relaxed);
+                ngram.completed()
+            }
+            Err(_) => self.ngram_seen.load(Ordering::Relaxed),
+        };
+        let pass =
+            self.pass_sent.load(Ordering::Acquire) + self.pass_released.load(Ordering::Acquire);
+        self.progress()
+            .wrapping_add(pass as u64)
+            .wrapping_add(self.pass_go.load(Ordering::Acquire))
+            .wrapping_add(ngram)
     }
 
     /// Serves the store until `part` has no layer enqueued more than the lead
@@ -683,6 +721,16 @@ impl Flow {
     }
 }
 
+/// How long a wait that began `waited` ago has stood still: since it began or since
+/// the steps last moved, whichever is later. `at` is what they had `moved` when that
+/// was last seen to change, and when; it takes `moved` at `now` when that differs.
+fn stood_still(waited: Duration, moved: u64, at: &mut (u64, Instant), now: Instant) -> Duration {
+    if at.0 != moved {
+        *at = (moved, now);
+    }
+    waited.min(now.saturating_duration_since(at.1))
+}
+
 /// Marks pool page `page` in use in `pages`, a flag per page.
 fn mark_live(pages: &mut Vec<bool>, page: u32) {
     if pages.len() <= page as usize {
@@ -769,5 +817,24 @@ impl Routing {
     /// Whether both devices work on every layer.
     pub(super) fn shared(&self) -> bool {
         self.owned.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_stands_still_from_its_start_or_the_last_move_whichever_is_later() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        // Nothing moved since long before the wait: it counts from its start.
+        let mut at = (7, t0);
+        assert_eq!(stood_still(s(31), 7, &mut at, t0 + s(100)), s(31));
+        // Something moved: it counts from when that was seen.
+        assert_eq!(stood_still(s(32), 8, &mut at, t0 + s(101)), s(0));
+        assert_eq!(at, (8, t0 + s(101)));
+        assert_eq!(stood_still(s(50), 8, &mut at, t0 + s(119)), s(18));
+        assert_eq!(stood_still(s(70), 8, &mut at, t0 + s(139)), s(38));
     }
 }

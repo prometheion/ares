@@ -151,7 +151,11 @@ running. What was chosen:
   while the conductor still decides.
 - The first part to reach a step begins it for the store, the last to end it
   ends it. A part that fails makes the others give up, and a step that stands
-  still for 30 s ends with an error that says what it waited for.
+  still for 30 s ends with an error that says what it waited for (`Flow::check`:
+  30 s since its wait began and since anything of the steps last moved, a layer
+  enqueued or followed, an upload or a read the store finished, a pass's rows
+  handed on, rows of the n-gram table read; the lend waits hold the store and
+  count from their start).
 - The conductor sees none of this. It dispatches a step and collects it when
   every device has ended; a step that misses experts is a longer step, and
   cancellation and new requests are handled between steps as for any model.

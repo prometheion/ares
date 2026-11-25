@@ -36,6 +36,29 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] Dev-only strings with runs of spaces (found 2026-11-24 by `fix/help-docs`; 4 in 3 files:
+      `crates/model/tests/qwen4exp_device.rs`, `crates/runtime/examples/expert_pipe_bench.rs`,
+      `crates/weights/tests/premises/cache.rs`).
+      Done: the four were format strings continued over a line without `\` and continue with
+      `\` now. A scan of every string literal found no others (`expert_bench`'s
+      `file {i}     {}`, named with them before, lines up with the labels around it).
+
+Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim, then what fixed it.
+
+### From "Defects", "Model, runtime, kernels"
+
+- [x] The 30-s checks of a step that waits count from the start of the wait, not from the last
+      progress, and then fail the step (`Flow::check`): seen 2026-11-24 as "a step stood still for
+      30s while rows of the n-gram table were read" at load 27 to 34 (main as well), beside the
+      hang after a long far request (the libcuda deadlock, fixed 2026-11-24). Timed from the start:
+      the n-gram wait, the throttle, `follow`, the lend waits and the pass's waits; only `wait_for`
+      and `complete` restart on progress. Files: `crates/model/src/qwen4exp/device/flow.rs`,
+      `qwen4exp/device/runtime/pass.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `Flow::check` counts 30 s from the later of the wait's start and the last time anything of the steps moved (`Flow::moved`: what `Flow::progress` counts, a pass's rows handed on, taken or let run, rows of the n-gram table read; `NgramFeed::completed`), looked at once a wait passes a second, so every wait (the n-gram wait, the throttle, `follow`, the pass's waits) restarts on progress; the lend waits hold the store and still count from their start. Unit test `a_wait_stands_still_from_its_start_or_the_last_move_whichever_is_later`. Commit "ares-model: a step that waits stands still only when nothing has moved for 30 s".
+
+### From "Small fixes", "Model, runtime, kernels"
+
 - [x] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
       server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
       `crates/runtime/src/ram.rs`, the server's loader.
@@ -70,13 +93,6 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 - [x] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
 
   *Fixed on `fix/model-sweep`, 2026-11-25:* the test plays one priority in nine runs and two or three in four (shortage victims by priority, a running request outranked only by a better newcomer, a spilled one in line holds back its own and every worse priority, overtaking counted by the same or a worse priority). It found a defect of admission: a newcomer that made worse ones give way counted what they let go of as room, the pages of its own cached prefix among them, which its charge had left out already (`Admission::room` takes those of the prefixes that running sequences hold off now). Commit "ares-sched: the admission test plays several priorities, and a newcomer's prefix is not counted twice".
-
-- [x] Dev-only strings with runs of spaces (found 2026-11-24 by `fix/help-docs`; 4 in 3 files:
-      `crates/model/tests/qwen4exp_device.rs`, `crates/runtime/examples/expert_pipe_bench.rs`,
-      `crates/weights/tests/premises/cache.rs`).
-      Done: the four were format strings continued over a line without `\` and continue with
-      `\` now. A scan of every string literal found no others (`expert_bench`'s
-      `file {i}     {}`, named with them before, lines up with the labels around it).
 
 Found done or stale by the triage of 2026-11-25 (branch `docs/triage`, every open item checked
 against `main` 4c834979): each item verbatim, then what did it or what changed. Items that only

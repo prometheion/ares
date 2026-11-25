@@ -193,7 +193,7 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 15 | 11 |
+| Model, runtime, kernels | 14 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
 - [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
@@ -313,13 +313,6 @@ Wrong behaviour:
       its buffer (`Plan::upload` inside a step) and an engine that unloads beside another that
       serves. Files: `crates/cuda/src/memory.rs` (`DeviceBuffer::drop`), `crates/cuda/src/gate.rs`,
       `crates/model/src/qwen35/device/part.rs`.
-- [ ] The 30-s checks of a step that waits count from the start of the wait, not from the last
-      progress, and then fail the step (`Flow::check`): seen 2026-11-24 as "a step stood still for
-      30s while rows of the n-gram table were read" at load 27 to 34 (main as well), beside the
-      hang after a long far request (the libcuda deadlock, fixed 2026-11-24). Timed from the start:
-      the n-gram wait, the throttle, `follow`, the lend waits and the pass's waits; only `wait_for`
-      and `complete` restart on progress. Files: `crates/model/src/qwen4exp/device/flow.rs`,
-      `qwen4exp/device/runtime/pass.rs`.
 - [ ] GPU. Flash-Next: rounds between the pieces of a paused pass can stall the expert store when
       the pass borrows all the slots can lend ("a step stood still for 30s while the host held
       back the next layer ... the store waits for 7 to 9 experts and is not settled": a 21k-row
