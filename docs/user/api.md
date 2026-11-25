@@ -74,7 +74,7 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 | `top_k`, `seed`, `repeat_last_n` | `top_k` `0` or `-1` is no cut; `seed: -1` draws a seed of its own; a window of `-1` (the whole context) is refused |
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |
-| `ignore_eos`, `min_keep` | the reply does not end at the end token; a `min_keep` above 1 is refused |
+| `ignore_eos`, `min_keep` | the reply does not end at the end token; `min_keep` is 0 or 1 |
 
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
 `functions` and `function_call`, adaptive-p (`adaptive_target`,

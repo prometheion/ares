@@ -199,6 +199,7 @@ async fn a_value_out_of_its_range_is_refused_by_the_name_of_its_field() {
         ("repeat_last_n", json!(100_000)),
         ("dry_penalty_last_n", json!(5000)),
         ("min_keep", json!(5)),
+        ("min_keep", json!(-1)),
         ("dry_sequence_breakers", json!("\n")),
         ("ignore_eos", json!("yes")),
         ("top_n_sigma", json!("a lot")),

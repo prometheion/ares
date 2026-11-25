@@ -346,6 +346,19 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
 
   *Triage, 2026-11-25:* Done parts: the server's draft vocabulary reader uses the model's (a951a913); the tools stay on `Session` (the owner, 2026-11-25). The rest is in `OPEN.md`, "Features", the cleanup.
 
+### From "Defects": "Server, API, cache"
+
+Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).
+
+- [x] A negative `min_keep` is accepted (only values above 1 are refused). Found 2026-11-24 by
+      `fix/help-docs`. File: `crates/server/src/openai/request.rs`.
+
+  *Fixed, 2026-11-25:* "ares-server: a negative min_keep is refused": `min_keep` is 0 or 1, as every cut keeps the most probable token; a test in `tests/sampling.rs`.
+
+### From "Small fixes": "Server, API, cache"
+
+Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).
+
 ## 2026-11-24
 
 ### From "In work now"

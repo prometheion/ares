@@ -192,7 +192,7 @@ marks a line that only a GPU run can settle or check.
 
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
-| Server, API, cache | 5 | 1 |
+| Server, API, cache | 4 | 1 |
 | Model, runtime, kernels | 15 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
@@ -223,8 +223,6 @@ marks a line that only a GPU run can settle or check.
       `logprobs`; only `typical` and `repetition_penalty` against their twins are a 400
       (`f32_alias`). Found 2026-11-24 by `fix/help-docs`. Files:
       `crates/server/src/openai/request.rs`, `docs/user/api.md`.
-- [ ] A negative `min_keep` is accepted (only values above 1 are refused). Found 2026-11-24 by
-      `fix/help-docs`. File: `crates/server/src/openai/request.rs`.
 - [ ] With API keys the Origin check never runs, even when `--allowed-hosts` is named (written so
       in `access.rs`; with the option named it is not what the option says). Found 2026-11-24 by
       `fix/help-docs`. Files: `crates/server/src/access.rs`, `docs/user/options.md`.

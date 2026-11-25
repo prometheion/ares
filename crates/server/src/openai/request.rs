@@ -573,7 +573,7 @@ pub(crate) fn expect_str<'a>(name: &str, value: &'a Json) -> Result<&'a str, Api
 fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
     let min_keep = fields.int("min_keep")?;
     if let Some(n) = min_keep
-        && n > 1
+        && !(0..=1).contains(&n)
     {
         return Err(ApiError::invalid_param(
             "min_keep",
