@@ -77,6 +77,11 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
 
 ### From "Small fixes", "Model, runtime, kernels"
 
+- [x] The DFlash drafter's float matrices take the f16 tile path above eight rows without the
+      range check of Flash-Next's (`WeightRange`). File: `crates/model/src/dflash/device.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* every matrix of the drafter keeps its `WeightRange` (read when it is uploaded), and a product of more than eight rows takes the tiles only where `WeightRange::path` leaves them; a float matrix beyond f16 runs the decode kernels eight rows at a time; the model's head passes its own range (`head_product`). No test of its own: the drafter's device test needs the real drafter files, whose matrices are quantized; the rule is `WeightRange::path`, tested in `ares-cuda`. Commit "ares-model: the DFlash drafter keeps float weights beyond f16 off the tiles".
+
 - [x] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
       server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
       `crates/runtime/src/ram.rs`, the server's loader.
