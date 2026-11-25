@@ -355,6 +355,14 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-server: a negative min_keep is refused": `min_keep` is 0 or 1, as every cut keeps the most probable token; a test in `tests/sampling.rs`.
 
+- [x] Two names of one limit or count with different values let one win silently: `n_predict`
+      over `max_completion_tokens` and `max_tokens`, `n_cmpl` over `n`, `n_probs` over
+      `logprobs`; only `typical` and `repetition_penalty` against their twins are a 400
+      (`f32_alias`). Found 2026-11-24 by `fix/help-docs`. Files:
+      `crates/server/src/openai/request.rs`, `docs/user/api.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: two names of one parameter that differ are refused": one rule for every twin (`max_tokens`, `max_completion_tokens`, `n_predict`; `n`, `n_cmpl`; `n_probs` against `logprobs`/`top_logprobs`; `typical`, `repetition_penalty`): the same value is served, different values are a 400 naming the second name. None of the clients read (Open WebUI, opencode, Continue, LibreChat, the llama.cpp web UI) sends two names with different values; only a user's free-form extra parameters can. Test `two_names_of_one_parameter_must_agree` in `tests/sampling.rs`.
+
 ### From "Small fixes": "Server, API, cache"
 
 Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).

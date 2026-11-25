@@ -365,10 +365,8 @@ pub(crate) fn from_json(
 /// How many completions the request asks for: `n` of OpenAI or llama.cpp's
 /// `n_cmpl`.
 fn completions(fields: &Fields<'_>) -> Result<u32, ApiError> {
-    let (name, n) = match (fields.int("n_cmpl")?, fields.int("n")?) {
-        (Some(n), _) => ("n_cmpl", n),
-        (None, Some(n)) => ("n", n),
-        (None, None) => return Ok(1),
+    let Some((name, n)) = fields.alias(&["n", "n_cmpl"], Fields::int)? else {
+        return Ok(1);
     };
     u32::try_from(n).ok().filter(|n| (1..=N_MAX).contains(n)).ok_or_else(|| {
         ApiError::invalid_param(name, format!("{name} must be between 1 and {N_MAX}, got {n}"))
@@ -378,10 +376,12 @@ fn completions(fields: &Fields<'_>) -> Result<u32, ApiError> {
 /// The probabilities a request asks for, and the format of the answer.
 ///
 /// OpenAI's chat `logprobs: true` with `top_logprobs`, its completions
-/// `logprobs: n`, and llama.cpp's `n_probs` (which wins when both are there,
-/// as it does in llama-server) with `post_sampling_probs`. The probabilities
-/// are the model's own unless `post_sampling_probs` says they belong to the
-/// distribution the token is drawn from.
+/// `logprobs: n`, and llama.cpp's `n_probs` with `post_sampling_probs`. A
+/// request that asks in both forms must ask for the same (`n_probs: 0` is
+/// nothing, as `logprobs: false` is), and then gets llama.cpp's format, as
+/// llama-server answers it. The probabilities are the model's own unless
+/// `post_sampling_probs` says they belong to the distribution the token is
+/// drawn from.
 fn logprobs(
     endpoint: Endpoint,
     fields: &Fields<'_>,
@@ -396,51 +396,66 @@ fn logprobs(
         })
     };
     // llama.cpp's n_probs: 0 asks for nothing.
-    if let Some(n) = fields.int("n_probs")? {
-        if n == 0 {
-            if post {
-                return Err(ApiError::invalid_param(
-                    "post_sampling_probs",
-                    "post_sampling_probs needs n_probs to be greater than 0",
-                ));
-            }
-            return Ok((None, None));
-        }
-        let format = if post { LogprobFormat::ContentProbs } else { LogprobFormat::Content };
-        return Ok((
-            Some(LogprobRequest { top: top("n_probs", n)?, after_chain: post }),
-            Some(format),
-        ));
-    }
-    if post {
+    let llama = match fields.int("n_probs")? {
+        None => None,
+        Some(0) => Some(None),
+        Some(n) => Some(Some(top("n_probs", n)?)),
+    };
+    if post && !matches!(llama, Some(Some(_))) {
         return Err(ApiError::invalid_param(
             "post_sampling_probs",
             "post_sampling_probs needs n_probs to be greater than 0",
         ));
     }
+    let openai = openai_logprobs(endpoint, fields, top)?;
+    let nothing = |asked: Option<u32>| asked.map_or("nothing".to_owned(), |n| n.to_string());
+    match (llama, openai) {
+        (Some(asked), Some(other)) if asked != other => Err(ApiError::invalid_param(
+            "n_probs",
+            format!(
+                "n_probs asks for {} alternatives of each token and logprobs for {}: they are \
+                 the same parameter and differ, give one",
+                nothing(asked),
+                nothing(other)
+            ),
+        )),
+        (Some(Some(top)), _) => {
+            let format = if post { LogprobFormat::ContentProbs } else { LogprobFormat::Content };
+            Ok((Some(LogprobRequest { top, after_chain: post }), Some(format)))
+        }
+        (None, Some(Some(top))) => {
+            let format = match endpoint {
+                Endpoint::Chat => LogprobFormat::Content,
+                Endpoint::Completions => LogprobFormat::Legacy,
+            };
+            Ok((Some(LogprobRequest { top, after_chain: false }), Some(format)))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+/// The alternatives OpenAI's fields ask for: `None` when the request names
+/// none of them, `Some(None)` for `logprobs: false`.
+fn openai_logprobs(
+    endpoint: Endpoint,
+    fields: &Fields<'_>,
+    top: impl Fn(&str, i64) -> Result<u32, ApiError>,
+) -> Result<Option<Option<u32>>, ApiError> {
+    let without = || {
+        if fields.get("top_logprobs").is_some() {
+            return Err(ApiError::invalid_param(
+                "top_logprobs",
+                "top_logprobs requires logprobs to be set to true",
+            ));
+        }
+        Ok(())
+    };
     match (endpoint, fields.get("logprobs")) {
-        (_, None) => {
-            if fields.get("top_logprobs").is_some() {
-                return Err(ApiError::invalid_param(
-                    "top_logprobs",
-                    "top_logprobs requires logprobs to be set to true",
-                ));
-            }
-            Ok((None, None))
-        }
-        (Endpoint::Chat, Some(Json::Bool(false))) => {
-            if fields.get("top_logprobs").is_some() {
-                return Err(ApiError::invalid_param(
-                    "top_logprobs",
-                    "top_logprobs requires logprobs to be set to true",
-                ));
-            }
-            Ok((None, None))
-        }
+        (_, None) => without().map(|()| None),
+        (Endpoint::Chat, Some(Json::Bool(false))) => without().map(|()| Some(None)),
         (Endpoint::Chat, Some(Json::Bool(true))) => {
             let n = fields.int("top_logprobs")?.unwrap_or(0);
-            let request = LogprobRequest { top: top("top_logprobs", n)?, after_chain: false };
-            Ok((Some(request), Some(LogprobFormat::Content)))
+            Ok(Some(Some(top("top_logprobs", n)?)))
         }
         (Endpoint::Chat, Some(other)) => Err(wrong_type("logprobs", "a boolean", other)),
         (Endpoint::Completions, Some(_)) => {
@@ -452,8 +467,7 @@ fn logprobs(
                 ));
             }
             let n = fields.int("logprobs")?.expect("present");
-            let request = LogprobRequest { top: top("logprobs", n)?, after_chain: false };
-            Ok((Some(request), Some(LogprobFormat::Legacy)))
+            Ok(Some(Some(top("logprobs", n)?)))
         }
     }
 }
@@ -512,26 +526,35 @@ impl<'a> Fields<'a> {
         Ok(self.float(name)?.map(|v| v as f32))
     }
 
-    /// An `f32` parameter that goes by several names (llama.cpp's and
-    /// another engine's): the first one given, and a request that gives two
-    /// with different values is refused.
-    fn f32_alias(&self, names: &[&str]) -> Result<Option<f32>, ApiError> {
-        let mut found: Option<(&str, f32)> = None;
-        for name in names {
-            if let Some(value) = self.f32(name)? {
-                match found {
-                    Some((first, other)) if other != value => {
-                        return Err(ApiError::invalid_param(
-                            *name,
-                            format!("{first} and {name} are the same parameter and differ"),
-                        ));
-                    }
-                    Some(_) => {}
-                    None => found = Some((name, value)),
+    /// A parameter that goes by several names (OpenAI's, llama.cpp's and
+    /// another engine's), each read with `read`: the value and the first
+    /// name it is given under. No name wins over another: a request that
+    /// gives two of them different values is refused.
+    fn alias<T: PartialEq>(
+        &self,
+        names: &[&'static str],
+        read: impl Fn(&Self, &str) -> Result<Option<T>, ApiError>,
+    ) -> Result<Option<(&'static str, T)>, ApiError> {
+        let mut found: Option<(&'static str, T)> = None;
+        for &name in names {
+            let Some(value) = read(self, name)? else { continue };
+            match &found {
+                Some((first, other)) if *other != value => {
+                    return Err(ApiError::invalid_param(
+                        name,
+                        format!("{first} and {name} are the same parameter and differ: give one"),
+                    ));
                 }
+                Some(_) => {}
+                None => found = Some((name, value)),
             }
         }
-        Ok(found.map(|(_, value)| value))
+        Ok(found)
+    }
+
+    /// An `f32` parameter that goes by several names ([`Fields::alias`]).
+    fn f32_alias(&self, names: &[&'static str]) -> Result<Option<f32>, ApiError> {
+        Ok(self.alias(names, Self::f32)?.map(|(_, value)| value))
     }
 
     /// A whole number of at least 0.
@@ -781,18 +804,15 @@ fn seed(fields: &Fields<'_>) -> Result<Option<u64>, ApiError> {
 fn max_tokens(fields: &Fields<'_>, endpoint: Endpoint) -> Result<Option<u32>, ApiError> {
     // llama.cpp's `n_predict` is the same limit; `max_completion_tokens`
     // replaces `max_tokens` on the chat endpoint.
-    let (name, value) = match endpoint {
-        _ if fields.get("n_predict").is_some() => ("n_predict", fields.int("n_predict")?),
-        Endpoint::Chat if fields.get("max_completion_tokens").is_some() => {
-            ("max_completion_tokens", fields.int("max_completion_tokens")?)
-        }
-        _ => ("max_tokens", fields.int("max_tokens")?),
+    let names: &[&'static str] = match endpoint {
+        Endpoint::Chat => &["max_tokens", "max_completion_tokens", "n_predict"],
+        Endpoint::Completions => &["max_tokens", "n_predict"],
     };
-    match value {
+    match fields.alias(names, Fields::int)? {
         // llama.cpp clients write "no limit" as -1.
-        Some(n) if n < 0 => Ok(None),
-        Some(0) => Err(ApiError::invalid_param(name, format!("{name} must be at least 1"))),
-        Some(n) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+        Some((_, n)) if n < 0 => Ok(None),
+        Some((name, 0)) => Err(ApiError::invalid_param(name, format!("{name} must be at least 1"))),
+        Some((_, n)) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
         None => Ok(None),
     }
 }

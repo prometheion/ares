@@ -340,9 +340,70 @@ async fn llama_cpp_asks_for_probabilities_with_n_probs() {
     let (_, param, _) =
         refused(COMPLETIONS, &completion_body(json!({"post_sampling_probs": true}))).await;
     assert_eq!(param.as_deref(), Some("post_sampling_probs"));
-    // n_probs wins over logprobs, as in llama-server.
-    let r = received(COMPLETIONS, &completion_body(json!({"n_probs": 3, "logprobs": 1}))).await;
+    // Both forms that ask for the same are llama.cpp's.
+    let r = received(COMPLETIONS, &completion_body(json!({"n_probs": 3, "logprobs": 3}))).await;
     assert_eq!(r.sampling.logprobs, Some(LogprobRequest { top: 3, after_chain: false }));
+}
+
+#[tokio::test]
+async fn two_names_of_one_parameter_must_agree() {
+    // Each pair: the request is served when both names give the same value
+    // and refused, by the second name, when they differ. No name wins.
+    let pairs = [
+        (CHAT, json!({"max_tokens": 9, "n_predict": 9}), json!({"n_predict": 10}), "n_predict"),
+        (
+            CHAT,
+            json!({"max_tokens": 9, "max_completion_tokens": 9}),
+            json!({"max_completion_tokens": 10}),
+            "max_completion_tokens",
+        ),
+        (
+            CHAT,
+            json!({"max_completion_tokens": -1, "n_predict": -1}),
+            json!({"n_predict": 10}),
+            "n_predict",
+        ),
+        (
+            COMPLETIONS,
+            json!({"max_tokens": 9, "n_predict": 9}),
+            json!({"n_predict": 10}),
+            "n_predict",
+        ),
+        (CHAT, json!({"n": 2, "n_cmpl": 2}), json!({"n_cmpl": 3}), "n_cmpl"),
+        (CHAT, json!({"typical_p": 0.5, "typical": 0.5}), json!({"typical": 0.6}), "typical"),
+        (
+            CHAT,
+            json!({"repeat_penalty": 1.1, "repetition_penalty": 1.1}),
+            json!({"repetition_penalty": 1.2}),
+            "repetition_penalty",
+        ),
+        (
+            CHAT,
+            json!({"logprobs": true, "top_logprobs": 2, "n_probs": 2}),
+            json!({"n_probs": 3}),
+            "n_probs",
+        ),
+        (CHAT, json!({"logprobs": false, "n_probs": 0}), json!({"n_probs": 1}), "n_probs"),
+        (COMPLETIONS, json!({"logprobs": 2, "n_probs": 2}), json!({"logprobs": 0}), "n_probs"),
+    ];
+    for (path, agree, change, param) in pairs {
+        let body = |fields: &Value| match path {
+            CHAT => chat_body(fields.clone()),
+            _ => completion_body(fields.clone()),
+        };
+        received(path, &body(&agree)).await;
+        let mut differ = agree.clone();
+        for (name, value) in change.as_object().unwrap() {
+            differ[name] = value.clone();
+        }
+        let (status, refused_param, message) = refused(path, &body(&differ)).await;
+        assert_eq!(
+            (status, refused_param.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(param)),
+            "{path} {differ}: {message}"
+        );
+        assert!(message.contains("differ"), "{message}");
+    }
 }
 
 #[tokio::test]

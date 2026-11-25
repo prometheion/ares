@@ -54,11 +54,11 @@ prompt and those marked "chat".
 | --- | --- | --- |
 | `messages` | chat: the conversation | roles `system` (or `developer`), `user`, `assistant`, `tool`; `content` a string or parts `text` and `image_url`; also `name`, `tool_call_id`, `tool_calls`, `reasoning_content` |
 | `prompt` | completions: the text | one string (or an array of one string); token ids and several prompts are refused |
-| `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; of several, `n_predict` holds, then `max_completion_tokens` |
+| `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; names that give different values are refused |
 | `stop` | stop strings | a string or an array; not empty |
 | `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
-| `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
-| `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
+| `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; both with different values are refused |
+| `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number; `n_probs` (`0` is none) with OpenAI's fields must ask for the same, and the answer is then llama.cpp's |
 | `priority` | the request's priority | see [Priorities](#priorities) |
 | `draft` | `false` turns drafting off for this request | default `true` |
 | `continue_final_message`, `add_generation_prompt` | chat: continue the last assistant message, or begin a new turn | a last assistant message is continued by default, unless it calls tools |
@@ -70,7 +70,7 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 
 | Field | Notes |
 | --- | --- |
-| `typical`, `repetition_penalty` | other names of `typical_p` and `repeat_penalty` |
+| `typical`, `repetition_penalty` | other names of `typical_p` and `repeat_penalty`; two names of one field with different values are refused |
 | `top_k`, `seed`, `repeat_last_n` | `top_k` `0` or `-1` is no cut; `seed: -1` draws a seed of its own; a window of `-1` (the whole context) is refused |
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |

@@ -161,14 +161,14 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
         "tool_choice": "none",
         "temperature": 0.5, "top_p": 0.75, "top_k": 40, "min_p": 0.0625,
         "presence_penalty": 0.5, "frequency_penalty": -0.25, "repeat_penalty": 1.5, "seed": 42,
-        "max_tokens": 100, "max_completion_tokens": 50,
+        "max_tokens": 50, "max_completion_tokens": 50,
         "stop": ["\n\n", "END"],
         "response_format": {"type": "text"}, "user": "u"
     }"#;
     let request = received(CHAT, body).await;
 
     assert_eq!(request.model, "mock");
-    assert_eq!(request.max_tokens, Some(50), "max_completion_tokens replaces max_tokens");
+    assert_eq!(request.max_tokens, Some(50), "one limit under two names that agree");
     assert_eq!(request.stop, ["\n\n", "END"]);
     let sampling = &request.sampling;
     assert_eq!(sampling.temperature, Some(0.5));
