@@ -819,6 +819,14 @@ impl Model for Qwen4Exp {
         }
     }
 
+    fn measured(&self) {
+        // The measurement's picks are no text's: with a usage profile or
+        // without, the heat starts from what requests pick.
+        if let Some(flow) = self.flow.get() {
+            flow.lock_feed().store.forget_heat();
+        }
+    }
+
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {
         // The attention kernels store 128 cells per entry; `open` refuses any
         // other page size.

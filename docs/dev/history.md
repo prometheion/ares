@@ -36,6 +36,13 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### From "Small fixes / Model, runtime, kernels"
 
+- [x] The heat counts the steps that measure the price of a step at the start (token 0, about a
+      thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
+      still counts it for a model without a profile. Files:
+      `crates/runtime/src/conductor/measure.rs`, `crates/model/src/qwen4exp/device/usage.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the conductor tells the model when the steps that measure are done (`Model::measured`, at the end of the warm-up), and Flash-Next forgets the heat they left (`ExpertStore::forget_heat`), with a usage profile or without. Test `the_model_hears_once_that_the_steps_that_measure_are_done` (`crates/runtime/tests/conductor.rs`). Commit "ares-runtime: Flash-Next forgets the heat of the steps that measure".
+
 - [x] Sampler: a row with no finite logit reports `-0.0` where the reference says minus infinity
       (the test leaves such rows out). Files: `crates/cuda/kernels/sampler*.cuh`,
       `crates/cuda/src/sampler.rs`, `crates/cuda/tests/sampler.rs`.

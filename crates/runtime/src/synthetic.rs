@@ -420,6 +420,8 @@ pub struct SyntheticModel {
     /// context: their MTP block drafts from it. The parts share it, so that
     /// all of them draft the same tokens.
     seen: Arc<Mutex<HashMap<(u32, u32), u32>>>,
+    /// How often the runtime said the steps that measure were done.
+    measured: std::sync::atomic::AtomicU32,
 }
 
 impl SyntheticModel {
@@ -427,7 +429,12 @@ impl SyntheticModel {
     /// opens the device parts.
     pub fn new(config: SyntheticConfig) -> Result<Self, ModelError> {
         config.validate()?;
-        Ok(Self { config: Arc::new(config), seen: Arc::default() })
+        Ok(Self { config: Arc::new(config), seen: Arc::default(), measured: Default::default() })
+    }
+
+    /// How often [`Model::measured`] was called.
+    pub fn measured_calls(&self) -> u32 {
+        self.measured.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn config(&self) -> &SyntheticConfig {
@@ -527,6 +534,10 @@ impl SyntheticModel {
 }
 
 impl Model for SyntheticModel {
+    fn measured(&self) {
+        self.measured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn card(&self) -> ModelCard {
         ModelCard {
             id: self.config.name.clone(),
