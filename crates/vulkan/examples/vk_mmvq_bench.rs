@@ -1,10 +1,9 @@
-//! Times the quantized decode weight kernels on each Vulkan device, the way
-//! `crates/cuda/examples/matvec_bench.rs` times CUDA's: the same matrix (17408 x
-//! 5120, the FFN of Qwen3.8-27B), the same types in the same order, 1, 2, 4 and 8
-//! rows of activations, `quantize_activations` once and then 40 launches of `matvec`
-//! in a row between two timed events, over copies of the matrix that together are
-//! far larger than any L2 cache, the median of 5 runs after a warm-up of at least
-//! 300 ms.
+//! Times the quantized decode weight kernels on each Vulkan device: the matrix of
+//! CUDA's `few_rows_bench all:17408x5120` (17408 x 5120, the FFN of Qwen3.8-27B), the
+//! types of Qwen3.8-27B first, 1, 2, 4 and 8 rows of activations,
+//! `quantize_activations` once and then 40 launches of `matvec` in a row between two
+//! timed events, over copies of the matrix that together are far larger than any L2
+//! cache, the median of 5 runs after a warm-up of at least 300 ms.
 //!
 //! Decode is bound by how fast the weights can be read, so each line also gives the
 //! share of a plain read of the same memory (`stream_read.comp`, measured first on
@@ -30,7 +29,7 @@ const N_IN: u32 = 5120;
 const N_OUT: u32 = 17408;
 
 /// The types with a kernel: first the eleven of Qwen3.8-27B, in the order of their bytes
-/// there (the ones CUDA's benchmark times), then the other seventeen a GGUF file can carry.
+/// there, then the other seventeen a GGUF file can carry.
 const FAST_TYPES: [GgmlType; 28] = [
     GgmlType::IQ4_XS,
     GgmlType::Q4_K,

@@ -32,7 +32,9 @@ only, because no model at hand carries them.
 
 Measured 2026-11-10 against the memory limit of each card (479 GB/s on the
 RTX 4070, 341 GB/s on the RTX 3060, measured with a plain reading kernel), at
-17408 x 5120, in percent of the limit:
+17408 x 5120, in percent of the limit, with the decode kernels alone (the tool
+now: `examples/few_rows_bench.rs all:17408x5120`, which times what a model runs,
+the tile kernels above a type's decode rows among it):
 
 | Types | RTX 4070, 1 row | 8 rows | RTX 3060, 1 row | 8 rows |
 | --- | --- | --- | --- | --- |
