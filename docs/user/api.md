@@ -87,7 +87,8 @@ call (`extra_content`, calls that are not of a function) or a tool
 (`defer_loading`).
 
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
-`functions` and `function_call`, adaptive-p (`adaptive_target`,
+`functions` and `function_call`, a cut of the prompt to its last tokens
+(`truncate_prompt_tokens`, `truncate`; `/v1/responses` cuts whole turns), adaptive-p (`adaptive_target`,
 `adaptive_decay`), and tools and thinking fields on `/v1/completions`, which has
 no chat template.
 

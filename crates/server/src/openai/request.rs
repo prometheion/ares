@@ -279,6 +279,11 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
         "functions" | "function_call" => {
             "the functions of the first chat API are not served: send tools and tool_choice"
         }
+        "truncate_prompt_tokens" | "truncate" => {
+            "a prompt is not cut to its last tokens: in a conversation the cut lands anywhere, \
+             the system prompt included. /v1/responses leaves the oldest whole turns out with \
+             truncation: auto"
+        }
         name if tools::FIELDS.contains(&name) => {
             "tools belong to chat requests: /v1/completions has no chat template"
         }

@@ -361,7 +361,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 6 |
+| Server, API, cache | 5 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -393,9 +393,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`.
 - [ ] A test of the full drive for the SSD level (running out of room is handled, never tested).
       Files: `crates/runtime/src/cache/ssd/mod.rs`, `crates/runtime/tests/cache/ssd.rs`.
-- [ ] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
-      TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`. Files:
-      `crates/server/src/openai/request.rs`, `crates/server/src/generate.rs`, the docs.
 - [ ] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
       fails about one run in four in the full suite (alone it passes): the third ask finds the first
       conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM

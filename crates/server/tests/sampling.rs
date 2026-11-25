@@ -219,6 +219,10 @@ async fn a_value_out_of_its_range_is_refused_by_the_name_of_its_field() {
     let (_, param, message) = refused(CHAT, &chat_body(json!({"adaptive_target": 0.5}))).await;
     assert_eq!(param.as_deref(), Some("adaptive_target"));
     assert!(message.contains("adaptive-p"), "{message}");
+    // vLLM's and TGI's cut of a prompt to its last tokens, with the way that is served.
+    let (_, param, message) = refused(CHAT, &chat_body(json!({"truncate_prompt_tokens": 9}))).await;
+    assert_eq!(param.as_deref(), Some("truncate_prompt_tokens"));
+    assert!(message.contains("truncation: auto"), "{message}");
     let (_, param, _) = refused(CHAT, &chat_body(json!({"made_up_option": 1}))).await;
     assert_eq!(param.as_deref(), Some("made_up_option"));
 }

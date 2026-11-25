@@ -412,6 +412,12 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-server: a load that finds no room says so by the kind of its error": `ModelError::NoRoom` for a placement that does not fit (Flash-Next's "do not fit" placements were not recognised by the text at all), `RuntimeError::NoRoom` for a device that could not be set up for lack of memory, and `is_no_room` on `ModelError`, `RuntimeError` and Flash-Next's `OpenError`, which `load/qwen4exp.rs` and `load/start.rs` ask instead of reading the message (test in `runtime/src/error.rs`). The load and unload times are in `docs/user/options.md`, "The preset file".
 
+- [x] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
+      TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`. Files:
+      `crates/server/src/openai/request.rs`, `crates/server/src/generate.rs`, the docs.
+
+  *Not a defect, 2026-11-25:* the cut is not built by design (`dev/architecture/api.md`, "truncation": in a rendered conversation a cut to the last N tokens lands anywhere, the system prompt included; conversations are cut by whole turns, `truncation: auto` on `/v1/responses`), and none of the clients read for the sweep sends `truncate_prompt_tokens` or `truncate`. What was left: the refusal now says so and names the way that is served ("ares-server: a cut of the prompt to its last tokens is refused with the way that is served"; test in `tests/sampling.rs`).
+
 ## 2026-11-24
 
 ### From "In work now"
