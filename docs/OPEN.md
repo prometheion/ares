@@ -226,13 +226,29 @@ marks a line that only a GPU run can settle or check.
       local cards by `fix/server-sweep` (2026-11-25, release build): Flash-Next IQ2_XS at `--ram` 8
       to 16 GiB on both cards and on one (K/V beyond VRAM), and the 27B, stopped during a prompt,
       during generation, with four sequences, with a prompt cache to write, with two and three
-      SIGTERMs, 5, 20 and 35 s into a reload after an unload, and with two SIGTERMs 6, 12 and 20 s
-      into a load: every stop clean (exit 0, or 1 for the stop at once). Added: a panic is written
-      into the log with its thread, place and stack before the abort; the stop at once ends with
-      `_exit`, so the CUDA driver's handlers for the end of a process do not run under the engine's
-      threads; every test that stops a server fails on a panic, and a GPU test stops Flash-Next with
-      SIGTERM while a request streams. Left: the reporter's stacks (`coredumpctl info`) or the logged
-      panic decide what aborts.
+      SIGTERMs, 5, 20 and 35 s into a reload after an unload, 5 and 20 s into the reload that
+      follows an engine failure (four long prompts at once take the model down, 2026-11-26), and
+      with two SIGTERMs 6, 12 and 20 s into a load: every stop clean (exit 0, or 1 for the stop at
+      once). Added: a panic is written into the log with its thread, place and stack before the
+      abort; the stop at once and, since 2026-11-26, the orderly stop after its last line
+      ("stopped") end with `_exit`, so the CUDA driver's handlers for the end of a process do not
+      run under threads that outlive the engine; every test that stops a server fails on a panic,
+      and a GPU test stops Flash-Next with SIGTERM while a request streams. Found 2026-11-26 (the
+      SIGTERM 20 s into the reload after an engine failure, while the tiers filled from the expert
+      profile; log `/var/tmp/ares-fixserver/repro/fr-20.log`): the engine's ordered stop took 35.5 s
+      and gave back neither the devices' memory (device 0: 0 B of 11.29 GiB, device 1: 132 MiB of
+      11.34 GiB) nor the RAM (11.71 GiB before and after), with no request holding the engine; the
+      old binary then returned from `main`, and the exit handlers ran beside that memory: the
+      reporter's timeline (SIGTERM shortly after an engine failure and its reload). It did not abort
+      here; the orderly `_exit` now ends the process without those handlers. Open: what keeps
+      Flash-Next's memory after its runtime is dropped when the stop meets a fill of the tiers
+      (`qwen4exp/device/runtime/parts.rs`, the expert store's threads), and why that stop takes
+      35 s. Still unexplained: what aborts on the reporter's machine. The suspects the code leaves: the
+      watch of the machine's memory upgrades Flash-Next's flow (`qwen4exp/device/runtime/parts.rs`,
+      `on_experts`) and can hold, and then free, the tier of experts on its own thread after the
+      engine's ordered stop; a device thread that did not stop in time (`GpuExecutor::shutdown`); a
+      panic in the drain of a large prompt cache. A logged "panicked" line in the reporter's log, or
+      its stacks (`coredumpctl info`), decide; an abort without such a line points at the driver.
 
 ### Server, API, cache
 - [ ] With several checkpoint places to a chunk (a device part whose checkpoint is under 16 MiB,
