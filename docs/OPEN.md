@@ -264,6 +264,14 @@ Tests that fail:
       rule); the wide step's bound or its spread is to be settled (whether the integer prompt
       kernel raised the spread is not measured). Files: `crates/model/tests/qwen4exp_runtime.rs`,
       `crates/model/tests/qwen4exp_device.rs`.
+      *Seen on `fix/model-sweep` (2026-11-26, both local cards, load 10 to 30):* in the whole
+      `qwen4exp_runtime` suite `a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it` failed
+      (its message was lost: the run was stopped) and the next test,
+      `a_prompt_read_layer_by_layer_reads_k_and_v_beyond_vram_from_a_copy`, did not end in 20
+      minutes (device 0 at 100 %, its device thread spinning, device 1 idle), as if a kernel the
+      failed test left behind still waited. Alone both passed (10 s and 3 s), and the suite again
+      31 of 31 at load 8 to 15. A test that fails should not leave the cards waiting for the
+      next.
 - [ ] GPU (two cards). `qwen4exp_device` with both cards on every layer
       (`ARES_TEST_SPREAD=tensor`, the share 0.5 and experts only alike), 2026-11-23 on main a36d379:
       `every_layer_of_wide_steps_matches_the_reference` (attention core 5.16e-2 against a bound of
