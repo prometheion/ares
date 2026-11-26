@@ -37,6 +37,7 @@ const SERVED: &[&str] = &[
     "background",
     "priority",
     "thinking_token_budget",
+    "return_progress",
 ];
 
 /// Bookkeeping of the client or of OpenAI's service that is a string:
@@ -127,7 +128,10 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<(Json, Echo), Api
     // `priority` is vLLM's and SGLang's member of this route, as of the chat
     // route, and is checked there.
     // `thinking_token_budget` is vLLM's member of this route, read there too.
-    for name in ["model", "temperature", "top_p", "priority", "thinking_token_budget"] {
+    // `return_progress` is llama.cpp's member of this route, as of the chat route.
+    for name in
+        ["model", "temperature", "top_p", "priority", "thinking_token_budget", "return_progress"]
+    {
         if let Some(value) = fields.get(name) {
             chat.push((name, value.clone()));
         }

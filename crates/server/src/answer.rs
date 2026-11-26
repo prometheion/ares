@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
+use ares_api::Progress;
 use axum::response::Response;
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 
@@ -32,6 +33,10 @@ pub(crate) trait Writer: Send + 'static {
     fn end(&mut self, end: End, out: &mut VecDeque<Written>);
     /// The event of a failure after the stream started, its last one.
     fn error(&mut self, error: &ApiError) -> Written;
+    /// The events that say how far the prompt has got, for a request that
+    /// asked (llama.cpp's `return_progress`); none from an API that has no
+    /// place for it.
+    fn progress(&mut self, _progress: &Progress, _out: &mut VecDeque<Written>) {}
     /// Takes pieces of a reply that is answered whole.
     fn take(&mut self, pieces: Vec<Piece>);
     /// The body of a reply that is answered whole, at its end.
@@ -50,7 +55,8 @@ pub(crate) async fn answer<W: Writer>(
     keep_alive: KeepAlive,
 ) -> Result<Response, ApiError> {
     let (streamed, lowered) = (parsed.stream, parsed.lowered);
-    let reply = Generation::start(app, lease, parsed.request, sorter)?;
+    let progress = parsed.stream && parsed.progress;
+    let reply = Generation::start(app, lease, parsed.request, sorter)?.reporting(progress);
     let response = if streamed {
         stream(reply, writer, app, keep_alive).await
     } else {
@@ -65,7 +71,7 @@ async fn whole<W: Writer>(mut reply: Generation, mut writer: W) -> Result<Respon
     loop {
         match reply.next().await? {
             Step::Pieces(pieces) => writer.take(pieces),
-            Step::Probs(_) => {}
+            Step::Probs(_) | Step::Progress(_) => {}
             Step::End(end) => return Ok(json_response(writer.whole(end))),
         }
     }
@@ -126,12 +132,14 @@ impl<W: Writer> Events<W> {
             };
             match step {
                 Ok(Step::Pieces(pieces)) => self.writer.pieces(pieces, &mut self.queue),
+                Ok(Step::Progress(progress)) => self.writer.progress(&progress, &mut self.queue),
                 Ok(Step::Probs(_)) => {}
                 Ok(Step::End(end)) => {
                     self.writer.end(end, &mut self.queue);
                     self.over = true;
                 }
                 Err(error) => {
+                    error.tell("the stream failed");
                     self.over = true;
                     return Some(self.writer.error(&error));
                 }

@@ -181,6 +181,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
         .method_not_allowed_fallback(routes::method_not_allowed)
         .with_state(routes::App { models, config, stop })
         .layer(axum::middleware::from_fn_with_state(access, access::guard))
+        .layer(axum::middleware::from_fn(routes::tell_refusals))
 }
 
 /// Serves `models` on `listener` until `shutdown` completes.

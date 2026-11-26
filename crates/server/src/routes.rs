@@ -184,6 +184,25 @@ pub(crate) fn model_in_query(query: Option<&str>) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Writes every refusal and failure that a client gets as its response into
+/// the log, with its route: the error the response carries
+/// ([`Refused`](crate::error::Refused): its status, code and message), or its
+/// status alone. A failure in the middle of a stream is told where the stream
+/// writes it.
+pub(crate) async fn tell_refusals(request: Request, next: axum::middleware::Next) -> Response {
+    let (method, uri) = (request.method().clone(), request.uri().clone());
+    let response = next.run(request).await;
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        let at = format!("{method} {}", uri.path());
+        match response.extensions().get::<crate::error::Refused>() {
+            Some(refused) => refused.0.tell(&at),
+            None => tracing::warn!("{at}: {status}"),
+        }
+    }
+    response
+}
+
 pub(crate) async fn not_found(request: Request) -> ApiError {
     ApiError::not_found(request.uri().path())
 }

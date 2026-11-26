@@ -87,6 +87,9 @@ pub(crate) struct Parsed {
     /// The priority the body names (`priority`), which the request has
     /// unless a header names another ([`Parsed::take_priority`]).
     pub priority: Option<i32>,
+    /// llama.cpp's `return_progress`: a stream says how far the prompt has
+    /// got (`prompt_progress`) before its first text.
+    pub progress: bool,
 }
 
 /// The header that gives a request its priority, for a client that cannot
@@ -206,6 +209,7 @@ const SERVED: &[&str] = &[
     "post_sampling_probs",
     "min_keep",
     "priority",
+    "return_progress",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -359,6 +363,7 @@ pub(crate) fn from_json(
         fresh_seed,
         lowered: None,
         priority,
+        progress: fields.bool("return_progress")?.unwrap_or(false),
     })
 }
 

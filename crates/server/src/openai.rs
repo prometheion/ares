@@ -89,7 +89,8 @@ async fn try_completion(
                 request.sampling.seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
         let sorter = sorter.with_call_ids(tools::call_ids(request.id));
-        runs.push(Generation::start(&app, &lease, request, sorter)?);
+        let progress = parsed.stream && parsed.progress;
+        runs.push(Generation::start(&app, &lease, request, sorter)?.reporting(progress));
     }
     let response = if parsed.stream {
         stream(runs, head, parsed.include_usage, app.config.stream_wait).await
@@ -137,6 +138,7 @@ async fn collect_one(mut reply: Generation) -> Result<Collected, ApiError> {
     };
     loop {
         match reply.next().await? {
+            Step::Progress(_) => {}
             Step::Pieces(pieces) => take(pieces),
             Step::Probs(more) => probs.extend(more),
             Step::End(End { rest, finish, stop, usage, timings }) => {
@@ -344,6 +346,10 @@ impl Chunks {
                     self.phase = Phase::Pull;
                     return Some(self.head.probs_chunk(&probs, self.sent));
                 }
+                Phase::Ready(Step::Progress(progress)) => {
+                    self.phase = Phase::Pull;
+                    return Some(self.head.progress_chunk(&progress));
+                }
                 Phase::Ready(Step::End(End { rest, finish, stop, usage, timings })) => {
                     self.enqueue(rest);
                     let finish = finish_reason(finish, self.calls);
@@ -363,6 +369,7 @@ impl Chunks {
                 Phase::Pull => match self.reply.next().await {
                     Ok(step) => self.phase = Phase::Ready(step),
                     Err(error) => {
+                        error.tell("the stream failed");
                         if let Some(shared) = &self.shared {
                             shared.failed.store(true, Ordering::Release);
                         }

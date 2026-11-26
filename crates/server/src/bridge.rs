@@ -40,10 +40,23 @@
 //! The times of a request are taken where its events arrive, on the engine's
 //! thread, so that neither the channel nor a slow client is in them: when the
 //! request was handed to the engine, when its first output came (the model's
-//! first token ends the prompt), and when it ended. The counts of draft
-//! tokens are the engine's totals before and after ([`Flight`]), which are
-//! this request's own only when no other request ran in between; the engine
-//! does not report them per request yet.
+//! first token ends the prompt), and when it ended. The time of the prompt is
+//! the engine's own when it says it ([`Usage::prompt_time`]: from the
+//! request's start, after its wait in line, to its first token), and the drafts
+//! are the request's own when the engine counts them ([`Usage::drafts`]);
+//! from an engine that does not, they are the engine's totals before and after
+//! ([`Flight`]), which are this request's own only when no other request ran in
+//! between.
+//!
+//! # The log
+//!
+//! A request's lines are for a person, laid out as llama.cpp's server lays out
+//! its timings: when it starts in the engine (its prompt, what the cache gave),
+//! how far a long prompt has got (from 3 s into it, at most once in 3 s, when
+//! another tenth is done or 10 s have passed), and at its end the prompt's
+//! rate over the rows the engine ran for it, the rate of generation, the total
+//! and the drafts. The same in fields, for a program, is the debug line
+//! `request finished`.
 //!
 //! # Decisions
 //!
@@ -55,11 +68,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ares_api::{
     DecisionOutcome, DecisionRequest, DecisionResult, DecisionSink, Engine, EngineStats, Event,
-    EventSink, FinishReason, GenerateRequest, RequestId, TokenProbs, Usage,
+    EventSink, FinishReason, GenerateRequest, Progress, RequestId, TokenProbs, Usage,
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
@@ -69,6 +82,8 @@ use crate::metrics::latency::{Latency, Took};
 /// What a request produces, minus the failures.
 #[derive(Debug)]
 pub(crate) enum Item {
+    /// How far the prompt has got.
+    Progress(Progress),
     Text(String),
     /// The probabilities of the tokens whose text went out.
     Probs(Vec<TokenProbs>),
@@ -88,10 +103,14 @@ pub(crate) enum Item {
 pub(crate) struct Timings {
     /// Tokens of the prompt that were computed.
     pub prompt_tokens: u32,
+    /// The prompt: from the request's start in the engine to its first token,
+    /// as the engine says it ([`Usage::prompt_time`]); from an engine that does
+    /// not, `first_ms`.
+    pub prompt_ms: f64,
     /// From the hand-over to the engine to the first output: tokenizing, any
     /// wait for room, and the prompt. The first token comes out of the step
     /// that ends the prompt.
-    pub prompt_ms: f64,
+    pub first_ms: f64,
     /// All generated tokens, the first one included.
     pub generated_tokens: u32,
     /// From the first output to the end: the time of every generated token
@@ -315,7 +334,40 @@ pub(crate) struct Run {
     seed: Option<u64>,
     /// The reply's text, kept for the log when it is to have it.
     text: Option<String>,
+    /// What the log said of the prompt's progress.
+    told: Told,
 }
+
+/// What the log said of a prompt's progress: its last line, when and how far.
+#[derive(Debug, Default)]
+struct Told {
+    started: bool,
+    last: Option<(Duration, f64)>,
+}
+
+impl Told {
+    /// Whether a line is due for a prompt that has run `t` and has `share` of
+    /// it done (the module documentation says when), and notes it if it is.
+    fn due(&mut self, t: Duration, share: f64) -> bool {
+        if t < PROGRESS_LINES || share >= 1.0 {
+            return false;
+        }
+        if let Some((at, said)) = self.last
+            && (t < at + PROGRESS_LINES || (share < said + 0.1 && t < at + PROGRESS_SILENCE))
+        {
+            return false;
+        }
+        self.last = Some((t, share));
+        true
+    }
+}
+
+/// A prompt that is read longer than this has lines of its progress in the log,
+/// at most one in this time.
+const PROGRESS_LINES: Duration = Duration::from_secs(3);
+/// A line of the progress is due when another tenth of the prompt is done or
+/// this time has passed since the last.
+const PROGRESS_SILENCE: Duration = Duration::from_secs(10);
 
 impl std::fmt::Debug for Run {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -350,8 +402,14 @@ impl Run {
 
         let flag = overflow.clone();
         let clock = marks.clone();
+        let room = buffer.max(1) + 1;
         let sink = EventSink::new(move |event| {
             clock.note(&event);
+            // A report of progress that finds the queue half full is let go:
+            // the next one says more, and it must not end the request.
+            if matches!(event, Event::Progress(_)) && tx.capacity() * 2 <= room {
+                return true;
+            }
             if !event.is_terminal() && tx.capacity() <= 1 {
                 flag.flagged.store(true, Ordering::Release);
                 flag.wake.notify_one();
@@ -375,6 +433,7 @@ impl Run {
             model,
             seed,
             text: log_text.then(String::new),
+            told: Told::default(),
         })
     }
 
@@ -383,19 +442,18 @@ impl Run {
     /// After an `Err` (or after `Item::Done`) the request is over and
     /// `next` must not be called again.
     pub async fn next(&mut self) -> Result<Item, ApiError> {
+        let id = self.guard.id;
+        self.pull().await.map_err(|error| error.of_request(id))
+    }
+
+    async fn pull(&mut self) -> Result<Item, ApiError> {
         // `biased`: events that are already queued come before the overflow
         // notice, so the client receives every piece of text the engine
         // managed to deliver.
         let event = loop {
             tokio::select! {
                 biased;
-                event = self.rx.recv() => {
-                    // How far the prompt has got is not told yet.
-                    if matches!(event, Some(Event::Progress(_))) {
-                        continue;
-                    }
-                    break event;
-                }
+                event = self.rx.recv() => break event,
                 () = self.overflow.wake.notified() => return Err(self.slow()),
                 () = self.stop.raised() => {
                     tracing::info!(id = %self.guard.id, "the server is stopping: ending the request");
@@ -425,6 +483,10 @@ impl Run {
             });
         };
         match event {
+            Event::Progress(progress) => {
+                self.tell_progress(&progress);
+                Ok(Item::Progress(progress))
+            }
             Event::Text(text) => {
                 if let Some(kept) = &mut self.text {
                     kept.push_str(&text);
@@ -432,7 +494,6 @@ impl Run {
                 Ok(Item::Text(text))
             }
             Event::Logprobs(probs) => Ok(Item::Probs(probs)),
-            Event::Progress(_) => unreachable!("the progress is passed over where it arrives"),
             Event::Done { finish, usage } => {
                 self.guard.disarm();
                 let timings = self.timings(usage).await;
@@ -443,12 +504,13 @@ impl Run {
                     let ms = |ms: f64| std::time::Duration::from_secs_f64(ms / 1e3);
                     self.seat.flight.latency.observe(Took {
                         queued: usage.queued,
-                        first: ms(timings.prompt_ms),
-                        whole: ms(timings.prompt_ms + timings.generated_ms),
+                        first: ms(timings.first_ms),
+                        whole: ms(timings.first_ms + timings.generated_ms),
                         tokens: usage.completion_tokens,
                     });
                 }
-                tracing::info!(
+                tell_end(self.guard.id, finish, &usage, &timings);
+                tracing::debug!(
                     id = %self.guard.id,
                     model = %self.model,
                     ?finish,
@@ -485,7 +547,6 @@ impl Run {
             }
             Event::Error(error) => {
                 self.guard.disarm();
-                tracing::info!(id = %self.guard.id, %error, "request failed");
                 Err(ApiError::from_engine(&*self.engine, error))
             }
         }
@@ -498,11 +559,18 @@ impl Run {
             0 => end,
             first => first,
         };
-        let drafts = self.seat.drafts(&self.engine).await;
+        // The engine's own counts of the request's drafts, or the difference of
+        // its totals for a request that ran alone.
+        let drafts = match usage.drafts {
+            Some(drafts) => Some((u64::from(drafts.proposed), u64::from(drafts.accepted))),
+            None => self.seat.drafts(&self.engine).await,
+        };
         self.seat.release();
+        let first_ms = first as f64 / 1e6;
         Timings {
             prompt_tokens: usage.prompt_tokens.saturating_sub(usage.cached_prompt_tokens),
-            prompt_ms: first as f64 / 1e6,
+            prompt_ms: usage.prompt_time.map_or(first_ms, |time| time.as_secs_f64() * 1e3),
+            first_ms,
             generated_tokens: usage.completion_tokens,
             generated_ms: end.saturating_sub(first) as f64 / 1e6,
             drafts,
@@ -510,10 +578,118 @@ impl Run {
         }
     }
 
+    /// The lines of the log of a prompt's progress: where it starts, and how far
+    /// it has got while it is read long (see the module documentation).
+    fn tell_progress(&mut self, progress: &Progress) {
+        let id = self.guard.id;
+        if !std::mem::replace(&mut self.told.started, true) {
+            let waited = self.marks.started.elapsed().saturating_sub(progress.elapsed);
+            tracing::info!(
+                "request {id} started after {}: prompt of {} tokens, {} from the cache, {} to compute",
+                duration(waited),
+                progress.total,
+                progress.cached,
+                progress.total.saturating_sub(progress.cached),
+            );
+            return;
+        }
+        let t = progress.elapsed;
+        let share = f64::from(progress.processed) / f64::from(progress.total.max(1));
+        if !self.told.due(t, share) {
+            return;
+        }
+        let done = progress.processed.saturating_sub(progress.cached);
+        tracing::info!(
+            "request {id} prompt processing, n_tokens = {done:6}, progress = {share:.2}, t = {:6.2} s / {:.2} tokens per second",
+            t.as_secs_f64(),
+            f64::from(done) / t.as_secs_f64(),
+        );
+    }
+
     fn slow(&mut self) -> ApiError {
         tracing::warn!(id = %self.guard.id, "event queue overflowed: the client is too slow, cancelling");
         self.guard.cancel_now();
         ApiError::slow_client()
+    }
+}
+
+/// A short duration for a person: microseconds, milliseconds or seconds.
+fn duration(time: Duration) -> String {
+    let ms = time.as_secs_f64() * 1e3;
+    if ms < 1.0 {
+        format!("{:.0} us", ms * 1e3)
+    } else if ms < 10_000.0 {
+        format!("{ms:.1} ms")
+    } else {
+        format!("{:.1} s", ms / 1e3)
+    }
+}
+
+/// The lines of the log of a request that ended: what it was, then its timings
+/// as llama.cpp's server prints them (`print_timings`), with the prompt's rate
+/// over the rows the engine ran for it (the computed ones and the replayed).
+fn tell_end(id: RequestId, finish: FinishReason, usage: &Usage, timings: &Timings) {
+    let reason = match finish {
+        FinishReason::Stop => "stop".to_owned(),
+        FinishReason::StopString(index) => format!("stop string {index}"),
+        FinishReason::Length => "length".to_owned(),
+        FinishReason::Cancelled => "cancelled".to_owned(),
+    };
+    let mut cache = format!("{} from the cache", usage.cached_prompt_tokens);
+    if usage.replayed_prompt_tokens > 0 {
+        cache.push_str(&format!(", {} of them replayed", usage.replayed_prompt_tokens));
+    }
+    let mut made = format!("{} generated", usage.completion_tokens);
+    if let Some(thinking) = usage.reasoning_tokens.filter(|n| *n > 0) {
+        made.push_str(&format!(" ({thinking} of them thinking)"));
+    }
+    if let Some(queued) = usage.queued.filter(|q| *q >= Duration::from_millis(1)) {
+        made.push_str(&format!(", {} in line", duration(queued)));
+    }
+    tracing::info!(
+        "request {id} finished ({reason}): prompt of {} tokens ({cache}), {made}",
+        usage.prompt_tokens
+    );
+    let rows = timings.prompt_tokens + usage.replayed_prompt_tokens;
+    let per = |ms: f64, n: u32| if n > 0 { ms / f64::from(n) } else { 0.0 };
+    let rate = |ms: f64, n: u32| if ms > 0.0 { f64::from(n) * 1e3 / ms } else { 0.0 };
+    let (prompt_ms, generated_ms) = (timings.prompt_ms, timings.generated_ms);
+    // The first token comes with the prompt: the rate of generation is over
+    // the others.
+    let after_first = timings.generated_tokens.saturating_sub(1);
+    tracing::info!(
+        "request {id} prompt eval time = {prompt_ms:10.2} ms / {rows:5} tokens ({:8.2} ms per token, {:8.2} tokens per second)",
+        per(prompt_ms, rows),
+        rate(prompt_ms, rows),
+    );
+    tracing::info!(
+        "request {id}        eval time = {generated_ms:10.2} ms / {:5} tokens ({:8.2} ms per token, {:8.2} tokens per second)",
+        timings.generated_tokens,
+        per(generated_ms, after_first),
+        rate(generated_ms, after_first),
+    );
+    tracing::info!(
+        "request {id}       total time = {:10.2} ms / {:5} tokens",
+        prompt_ms + generated_ms,
+        rows + timings.generated_tokens,
+    );
+    if let Some(drafts) = usage.drafts.filter(|d| d.proposed > 0) {
+        let windows = f64::from(drafts.windows.max(1));
+        tracing::info!(
+            "request {id} draft acceptance = {:.5} ({:5} accepted / {:5} proposed), mean len = {:5.2}, mean chain = {:5.2}",
+            f64::from(drafts.accepted) / f64::from(drafts.proposed),
+            drafts.accepted,
+            drafts.proposed,
+            1.0 + f64::from(drafts.accepted) / windows,
+            f64::from(drafts.proposed) / windows,
+        );
+    } else if usage.drafts.is_none()
+        && let Some((proposed, accepted)) = timings.drafts.filter(|d| d.0 > 0)
+    {
+        tracing::info!(
+            "request {id} draft acceptance = {:.5} ({accepted:5} accepted / {proposed:5} proposed)",
+            accepted as f64 / proposed as f64,
+        );
     }
 }
 
@@ -601,5 +777,25 @@ impl DecisionRun {
                 Err(ApiError::from_engine(&*self.engine, error))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A long prompt's progress is in the log from 3 s on, at most once in 3 s,
+    /// when another tenth is done or 10 s have passed; never for its end.
+    #[test]
+    fn the_lines_of_a_prompts_progress_come_every_tenth_or_ten_seconds() {
+        let s = Duration::from_secs_f64;
+        let mut told = Told::default();
+        assert!(!told.due(s(2.9), 0.5), "a prompt that ends within 3 s has none");
+        assert!(told.due(s(3.0), 0.5));
+        assert!(!told.due(s(4.0), 0.9), "not within 3 s of the last");
+        assert!(!told.due(s(6.5), 0.55), "not before another tenth");
+        assert!(told.due(s(6.5), 0.6));
+        assert!(told.due(s(16.5), 0.61), "after 10 s whatever it did");
+        assert!(!told.due(s(30.0), 1.0), "the end is the request's own line");
     }
 }

@@ -632,6 +632,7 @@ fn ending(finish: &'static str) -> Ending {
     let timings = Timings {
         prompt_tokens: 10,
         prompt_ms: 4.0,
+        first_ms: 4.0,
         generated_tokens: 12,
         generated_ms: 22.0,
         drafts: None,
