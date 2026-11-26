@@ -323,6 +323,26 @@ is on the host.
   1 900-2 000 duplicate slots observed), batched expert uploads through
   `cudaMemcpyBatchAsync` (CUDA 13), an expert cache in segments that can be
   given back.
+- **LES, Lookahead Expert Scheduling** (OpenBMB, read 2026-11-26:
+  `docs/les/lookahead-expert-scheduling.md` of github.com/OpenBMB/llama.cpp-omni
+  at a64932ec, MIT; the repository holds the document and its figures, not
+  the code; a copy is in `/var/tmp/ares-survey/src/llama.cpp-omni-les/`).
+  MiniCPM-V 4.7 35B-A3B runs with its experts on the flash of an iPhone 18 Pro
+  Max (12 GB) and an iPad Pro M4 (16 GB). Stated in stages over loading on
+  demand from the flash (iPhone, decode):
+  - reading ahead of the router and computing first the picked experts that
+    are already loaded, as in ProMoE's reordered inference: 3.38 to 6.57
+    tokens/s, 1.94x;
+  - the experts repacked to lie together in the file, fewer read calls, and
+    reads straight into memory the GPU sees: 11.34, 1.73x;
+  - a quantization mixed by layer: 17.16, 1.51x;
+  - DSpark drafting fitted to it: 20.51, 1.19x.
+
+  The prediction across layers only schedules: the model's own routing
+  decides, and a missed pick is loaded as usual. The document gives no hit
+  rates and no details of the layout. On a phone the GPU shares memory with
+  the CPU, so the third lever has no counterpart on a card behind PCIe
+  beyond reads into page-locked memory.
 
 ## For Ares
 

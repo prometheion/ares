@@ -829,6 +829,16 @@ TokenWing): [`dev/studies/engines-survey.md`](dev/studies/engines-survey.md).
       reach 0.7 to 0.8; the gain of larger ones could not be measured on the shared drive), the
       profile's fill in large ordered reads, or answering once VRAM is filled and filling the RAM
       tier behind it until the first request (which then misses what RAM would have held).
+- [ ] A layer's resident picks computed while its misses are still being read. ProMoE calls
+      this "reordered inference"; LES (OpenBMB, 2026-10) states 1.94x together with its reads
+      ahead, on a phone; see [`dev/studies/moe-offload-survey.md`](dev/studies/moe-offload-survey.md).
+      Not checked yet: whether a decode layer's resident experts run before a read from the
+      file arrives (experts.md: "the layer waits for it"). The sums must not depend on the
+      order (kernels.md), so the late experts would add into a buffer of their own. Here a read
+      (1.4 to 4 ms) is far longer than the resident experts' work: measure what it hides first.
+      The same source repacks the experts so that each lies whole in its file. In GGUF, gate,
+      up and down are tensors of their own, so an expert takes three reads. That would be a file
+      of Ares's own, beside the neighbouring reads above.
 - [ ] The slots per layer from the profile when the store is planned (`StorePlan::new` takes
       a heat; the runtime passes none, and the slots move between layers by need as it runs).
       Tried 2026-11-22 (`flash/ssd-stream`, reverted): VRAM by each layer's hottest and RAM by
