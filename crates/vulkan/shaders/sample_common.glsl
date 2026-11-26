@@ -68,7 +68,9 @@ const uint KEY_MAX = 0x7f7fffffu;
 // The smallest temperature that scales the logits.
 const float TEMPERATURE_MIN = 1e-6;
 
-const float NEG_INF = uintBitsToFloat(0xff800000u);
+// A built-in call is not a constant expression, so this cannot be a global
+// const: strict glslang rejects it. A macro is evaluated where it is used.
+#define NEG_INF uintBitsToFloat(0xff800000u)
 
 // What the host sets per row (128 bytes, `ares_sampler::SampleRow`).
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Params {
