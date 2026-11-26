@@ -304,9 +304,14 @@ frees between steps cost is measured in
 [`../experiments/host-memory.md`](../experiments/host-memory.md) ("Page-locked
 memory between steps"). Device memory is freed behind the gate as well (since
 2026-11-25): `cuMemFree` "may perform implicit synchronization" too, so a
-`DeviceBuffer` dropped inside a step (a plan of the 27B's attention larger than
-its buffer, `Plan::upload`) or beside another engine's step is freed where no
-job runs (`gate::retire`). An engine takes most of it when its model opens, and
+`DeviceBuffer` dropped inside a step or beside another engine's step is freed
+where no job runs (`gate::retire`). A step allocates no device memory and makes
+no blocking copy either (since 2026-11-26, GitHub issue #2): the 27B's part
+keeps room for the largest attention plans its steps can make
+(`PlanConfig::plan_bytes_bound`, per group of rows and number of KV heads),
+and a plan that does not fit fails the step instead of taking `Plan::upload`,
+whose allocation and synchronous copy can wait for a kernel that waits for
+the other device's thread. An engine takes most of it when its model opens, and
 the frees of one that unloads beside another that serves wait for that one's
 step; what looks at the free memory of a device (`Device::mem_info`, which a
 placement reads) or finds no room for an allocation (`DeviceBuffer::new`)

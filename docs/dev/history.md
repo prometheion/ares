@@ -47,6 +47,23 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
 
 ### From "Defects", "Model, runtime, kernels"
 
+- [x] GitHub issue #2 (the owner, 2026-11-25): the production 27B (tensor split 0.625 / 0.375,
+      P2P, context 262144, parallel 4, MTP, binary 406cfe99) hangs at the prefill of a new large
+      request after two parallel requests ended; both GPUs at 0 %, the two device threads parked
+      in libcuda, the conductor on `GpuExecutor::collect`'s done bell. Suspects: `cuMemFree` of
+      a `DeviceBuffer` inside a step, and `Plan::upload` (`cuMemAlloc` and a blocking copy) when
+      a step's attention plan does not fit the plan buffer (`qwen35/device/part.rs`).
+
+  *Fixed on `fix/model-sweep`, 2026-11-26:* the first suspect by 415d99ed (device memory freed
+  behind the gate). The second: the 27B's part sizes its room for plans by
+  `PlanConfig::plan_bytes_bound` (per group of rows and number of KV heads: the budget, the
+  tiles and chunks with their runs of kinds, the rows alone with theirs, 48 bytes an item and
+  12 a range), and a step writes its plans there (`stage_plan`) or fails with an error; it no
+  longer calls `Plan::upload`. Tests: `the_state_slots_stay_in_their_bound` checks every random
+  plan against the bound (worst 25 to 52 KB of 87 to 187 KB at 512 rows),
+  `a_plan_larger_than_the_room_is_refused_not_uploaded` (`qwen35/device/part.rs`). Commit
+  "ares-model: a 27B step never allocates or waits for the device for its attention plans".
+
 - [x] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
       the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
       another sequence, or past its first tiles with K and V in `q7` to `q4`, can take more (the

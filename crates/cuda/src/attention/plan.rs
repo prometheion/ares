@@ -293,6 +293,43 @@ impl PlanConfig {
     pub fn row_slots_bound(cells: u32) -> u64 {
         u64::from(cells.div_ceil(ENTRY_CELLS)) + 1
     }
+
+    /// The most bytes ([`Plan::layout`]) a plan of [`Planner::finish`] of dense rows and
+    /// windows (no lists of ranges) takes, for `kv_heads` KV heads of `q_per_kv` query
+    /// heads each, in steps of at most `rows` rows of at most `sequences` sequences, of
+    /// which at most `alone` rows are planned as alone; `mean` as for
+    /// [`PlanConfig::state_slots_bound`]. A buffer of this size holds every such plan, so
+    /// a step never needs memory of its own for one.
+    ///
+    /// An item is a piece for one KV head (48 bytes), and a piece is one range of whole
+    /// entries (12 bytes). A sequence gives the planner at most two windows a step (its
+    /// rows that read together and its rows alone). The rows that are not alone are cut
+    /// into tiles of up to 128 query vectors, those of a shared prefix into chunks as
+    /// wide: per window at most one more than the rows over a tile's rows. The tiles and
+    /// chunks share the budget in proportion to their cells, and each has at least one
+    /// piece and one more for every run of a kind of entry (one run, or three with a tile
+    /// mean); a tile of rows alone has the budget (at most `max_pieces`) and the runs. A
+    /// row takes 16 bytes and at most 8 in the lists of rows, and each of the four arrays
+    /// is padded to 16 bytes. Checked against random steps
+    /// (`bound_tests::the_state_slots_stay_in_their_bound`).
+    pub fn plan_bytes_bound(
+        &self,
+        kv_heads: u32,
+        q_per_kv: u32,
+        rows: u32,
+        alone: u32,
+        sequences: u32,
+        mean: bool,
+    ) -> u64 {
+        let budget = u64::from((self.target_blocks / kv_heads.max(1)).max(1));
+        let per = u64::from((128 / q_per_kv.max(1)).max(1));
+        let runs = if mean { 3 } else { 1 };
+        let (rows, windows) = (u64::from(rows), 2 * u64::from(sequences));
+        let tiles = 2 * (rows.div_ceil(per) + windows);
+        let alone_pieces = budget.min(u64::from(self.max_pieces)) + runs;
+        let pieces = budget + tiles * (1 + runs) + u64::from(alone) * alone_pieces;
+        pieces * (48 * u64::from(kv_heads.max(1)) + 12) + rows * (16 + 8) + 4 * 16
+    }
 }
 
 /// A window of consecutive rows of one sequence that attend causally: row `i`
@@ -1264,7 +1301,10 @@ mod bound_tests {
                     let bound = cfg.state_slots_bound(
                         kv_heads, q_per_kv, max_rows, alone_rows, sequences, mean,
                     );
-                    let mut worst = 0;
+                    let bytes_bound = cfg.plan_bytes_bound(
+                        kv_heads, q_per_kv, max_rows, alone_rows, sequences, mean,
+                    );
+                    let (mut worst, mut worst_bytes) = (0, 0);
                     for _ in 0..1500 {
                         // 0: prompts; 1: prompts and rows alone; 2: rows alone.
                         let kind = random(3);
@@ -1330,20 +1370,27 @@ mod bound_tests {
                             assert!(
                                 u64::from(r.n_slots) <= row_bound,
                                 "{kv_heads} heads, mean {mean}: row {i} at {} of {longest} cells \
-                             takes {} slots, more than {row_bound}",
+                                 takes {} slots, more than {row_bound}",
                                 r.pos,
                                 r.n_slots
                             );
                         }
                         worst = worst.max(plan.state_slots);
+                        worst_bytes = worst_bytes.max(plan.layout().bytes);
                     }
                     eprintln!(
                         "{kv_heads} KV heads of {q_per_kv}, {sms} SMs, tile mean {mean}, sequences \
-                     from {apart} cells: worst {worst} of {bound}"
+                         from {apart} cells: worst {worst} of {bound} slots, {worst_bytes} of \
+                         {bytes_bound} bytes"
                     );
                     assert!(
                         u64::from(worst) <= bound,
                         "{kv_heads} heads, mean {mean}: {worst} > {bound}"
+                    );
+                    assert!(
+                        worst_bytes <= bytes_bound,
+                        "{kv_heads} heads, mean {mean}: a plan of {worst_bytes} bytes > \
+                         {bytes_bound}"
                     );
                 }
             }

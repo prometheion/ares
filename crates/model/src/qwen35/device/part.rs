@@ -2,10 +2,8 @@
 //! scratch, and the kernels of a step.
 //!
 //! A step is enqueued whole on the device's stream and nothing here waits for
-//! the device, with one exception that is not the part's own: the attention
-//! plan of a step is uploaded with a blocking copy (`Plan::upload` of
-//! `ares-cuda`), which the part does before it enqueues anything, when the
-//! stream is idle.
+//! the device or allocates: the attention plans of a step go into room the
+//! part keeps for the largest plans its steps can make ([`stage_plan`]).
 //!
 //! Under a tensor split a part is a narrower model (fewer heads, fewer inner
 //! rows) whose two outputs per block are partial sums; under a layer split it
@@ -18,7 +16,7 @@ use ares_core::Ledger;
 use ares_cuda::{
     ActivationForm, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry, Device,
     DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels, LayerKernels, MAX_BATCH,
-    OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner, Precision,
+    OutputGate, PUSH_MAX_VALUES, PinnedBuffer, Plan, PlanBuffers, PlanConfig, Planner, Precision,
     PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout, WeightRange,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
@@ -623,19 +621,52 @@ fn group_bytes(placement: &Placement, opts: &Options, max_slots: u32) -> u64 {
 }
 
 /// Room for the attention plans of a step: one per group of rows and number
-/// of KV heads a block of the part has (`attention_at`). A plan is a few dozen
-/// bytes per row and per item; one that does not fit is uploaded on its own
-/// (`Part::begin`), which makes the host wait for the device.
-fn plan_bytes(attention_at: &[Option<AttentionAt>], placement: &Placement, opts: &Options) -> u64 {
-    let mut heads: Vec<u32> = attention_at.iter().flatten().map(|a| a.geo.kv_heads).collect();
-    heads.sort_unstable();
-    heads.dedup();
+/// of KV heads a block of the part has (`attention_at`), each as large as a plan
+/// of a step can be (`PlanConfig::plan_bytes_bound`, with the rows alone and the
+/// sequences of the partial states' bound), on a line of its own. A step puts
+/// its plans there ([`stage_plan`]) and never allocates or waits for the device
+/// for one: an allocation or a blocking copy inside a step can wait for a kernel
+/// that waits for the other device's thread, the libcuda deadlock of
+/// `ares_cuda::gate`.
+fn plan_bytes(
+    attention_at: &[Option<AttentionAt>],
+    placement: &Placement,
+    opts: &Options,
+    config: PlanConfig,
+    slots: u32,
+) -> u64 {
+    let mut geos: Vec<CacheGeometry> = attention_at.iter().flatten().map(|a| a.geo).collect();
+    geos.sort_unstable_by_key(|geo| geo.kv_heads);
+    geos.dedup_by_key(|geo| geo.kv_heads);
     let groups = match (placement.split, opts.pipeline_rows) {
         (Split::Single, _) | (_, 0) => 1,
         (_, per) => u64::from(opts.max_rows.div_ceil(per)),
     };
-    let rows = u64::from(opts.max_rows);
-    (heads.len() as u64 * (groups * (64 << 10) + 96 * rows)).next_multiple_of(64).max(64)
+    let alone = opts.window_rows.max(slots);
+    let mean = opts.kv.0.has_mean() || opts.kv.1.has_mean();
+    let plan = |geo: &CacheGeometry| {
+        config
+            .plan_bytes_bound(geo.kv_heads, geo.q_per_kv, opts.max_rows, alone, slots, mean)
+            .next_multiple_of(PLAN_LINE)
+    };
+    (groups * geos.iter().map(plan).sum::<u64>()).max(PLAN_LINE)
+}
+
+/// Where each plan of a step starts in the room for plans ([`plan_bytes`]).
+const PLAN_LINE: u64 = 64;
+
+/// Writes `plan` into `room` (page-locked memory that one copy of the step
+/// sends to the device) after the `used` bytes the step's plans took before,
+/// and returns where it starts, a multiple of [`PLAN_LINE`]; `used` then covers
+/// it. `None` when the plan does not fit: the room holds every plan a step of
+/// the part can make, and a step neither allocates nor waits for the device
+/// for one that is larger (`Plan::upload` would do both).
+fn stage_plan(room: &mut [u8], used: &mut usize, plan: &Plan) -> Option<u64> {
+    let at = used.next_multiple_of(PLAN_LINE as usize);
+    let bytes = plan.layout().bytes as usize;
+    plan.write(room.get_mut(at..at.checked_add(bytes)?)?);
+    *used = at + bytes;
+    Some(at as u64)
 }
 
 /// Where a recurrent block keeps its state and what a draft window keeps: a
@@ -1054,7 +1085,7 @@ impl Part {
 
         let group_bytes = group_bytes(placement, opts, max_slots);
         ledger.reserve("qwen35 group records", group_bytes)?;
-        let plan_bytes = plan_bytes(&survey.attention_at, placement, opts);
+        let plan_bytes = plan_bytes(&survey.attention_at, placement, opts, plan_config, max_slots);
         ledger.reserve("qwen35 attention plans", plan_bytes)?;
         let has_attention = survey.attention_at.iter().any(Option::is_some) || mtp_sizes.is_some();
         let attention = has_attention.then(|| AttentionKernels::load(device)).transpose()?;
@@ -1772,19 +1803,20 @@ impl Part {
                 // The plan goes to the device with the one copy below, which
                 // the stream orders in front of the step's kernels; nothing
                 // is allocated and the host does not wait.
-                let bytes = plan.layout().bytes as usize;
-                let buffers = match self.plan_host.get_mut(planned..planned + bytes) {
-                    Some(host) => {
-                        plan.write(host);
-                        let base = self.plan_device.ptr().offset(planned as u64);
-                        planned = (planned + bytes).next_multiple_of(64);
-                        // SAFETY: the copy below puts the plan's bytes at
-                        // `base` before any launch of the step reads them,
-                        // and the buffer lives as long as the part.
-                        unsafe { plan.on_device(base) }
-                    }
-                    None => plan.upload(&self.device)?,
-                };
+                let at = stage_plan(&mut self.plan_host, &mut planned, &plan).ok_or_else(|| {
+                    invalid(format!(
+                        "an attention plan of {} bytes ({heads} KV heads, a step of {} rows) \
+                         does not fit the {} bytes kept for the plans of a step, {planned} of \
+                         them taken",
+                        plan.layout().bytes,
+                        env.dims.n_rows,
+                        self.plan_host.len()
+                    ))
+                })?;
+                // SAFETY: the copy below puts the plan's bytes at `at` of the
+                // device's room before any launch of the step reads them, and
+                // the room lives as long as the part.
+                let buffers = unsafe { plan.on_device(self.plan_device.ptr().offset(at)) };
                 self.plans.push((g, heads, buffers));
             }
         }
@@ -2553,6 +2585,45 @@ impl Part {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step's plans go into the room for plans one after the other, each on a line; one
+    /// larger than what is left is refused and leaves the room as it was, so a step never
+    /// takes the path that allocates and waits for the device (`Plan::upload`, the libcuda
+    /// deadlock of `ares_cuda::gate`).
+    #[test]
+    fn a_plan_larger_than_the_room_is_refused_not_uploaded() {
+        let geo = CacheGeometry {
+            k: CacheFormat::Q8,
+            v: CacheFormat::Q8,
+            head_dim: 256,
+            kv_heads: 4,
+            kv_total: 4,
+            first_kv_head: 0,
+            q_per_kv: 6,
+        };
+        let config = PlanConfig::for_multiprocessors(46);
+        let plan = |rows: u32, pos0: u32| {
+            let entries: Vec<u32> = (0..(pos0 + rows).div_ceil(ENTRY_CELLS)).collect();
+            let mut planner = Planner::new(geo, config, rows);
+            planner.dense(0, &entries, 0, rows, pos0);
+            planner.finish()
+        };
+        let (small, large) = (plan(8, 300), plan(256, 20_000));
+        let small_bytes = small.layout().bytes as usize;
+        assert!(large.layout().bytes as usize > 2 * small_bytes);
+        let mut room = vec![0u8; 2 * small_bytes.next_multiple_of(PLAN_LINE as usize)];
+        let mut used = 0;
+        assert_eq!(stage_plan(&mut room, &mut used, &small), Some(0));
+        assert_eq!(used, small_bytes);
+        let before = room.clone();
+        assert_eq!(stage_plan(&mut room, &mut used, &large), None, "the large plan is refused");
+        assert_eq!((used, &room), (small_bytes, &before), "a refused plan leaves the room");
+        let at = stage_plan(&mut room, &mut used, &small).expect("a second small plan fits");
+        assert_eq!(at, small_bytes.next_multiple_of(PLAN_LINE as usize) as u64);
+        let mut written = vec![0u8; small_bytes];
+        small.write(&mut written);
+        assert_eq!(&room[at as usize..at as usize + small_bytes], &written[..]);
+    }
 
     /// Every buffer of a scratch starts on a line, whatever the sizes of the
     /// buffers in front of it, and none reaches into the next.
