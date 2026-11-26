@@ -353,7 +353,10 @@ one array per part, indexed by page number.
   its end (an agent's next question about a state read before): its forks
   start from it at once. The parts of a decision are requests the conductor makes (ids with
   the top bit set); the counts of requests and the accounting of what
-  requests produce leave them out.
+  requests produce leave them out. On the 27B at the owner's production
+  settings (two slots) a decision answers 1.5 to 1.9 times the questions per
+  second that a chat completion of one token per question does (2026-11-26,
+  [`../experiments/decisions.md`](../experiments/decisions.md)).
 - `PageLayout`: bytes per page per device, from which the pool's capacity
   follows. For a `qwen4exp`-shaped model the full 262 144-token context is
   3.47 GiB with K and V as Strata stores them (int8, a scale per 64 values)

@@ -721,7 +721,9 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
 ### Jev mode (`feat/jev`, 2026-11-25)
 - [ ] Forks as rows of one step whatever `--parallel` is: a fork today is a sequence with a slot
       of its own (150 MiB of recurrent state on the 27B) that restores the parent's checkpoint
-      from RAM, so with the owner's `--parallel 2` the questions of a decision run two at a time.
+      from RAM, so with the owner's `--parallel 2` the questions of a decision run two at a time
+      (1.3 to 2.1 s a decision of 8 questions on the 27B, 2026-11-26,
+      [`dev/experiments/decisions.md`](dev/experiments/decisions.md)).
       Flide's way is a fork that reads the parent's state and writes none: a segment flag for the
       delta-rule and convolution kernels (state read from the parent's slot), page tables and
       exact entries for fork slots that have no recurrent state, the MTP block and DFlash
