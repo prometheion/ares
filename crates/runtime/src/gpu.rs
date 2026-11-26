@@ -614,6 +614,7 @@ impl Executor for GpuExecutor {
                     kind: transfer.kind,
                     object: transfer.object,
                     keep_form: transfer.keep_form,
+                    tail: transfer.tail,
                     ptr: part.mem.as_mut_ptr(),
                     room: part.mem.len(),
                     len: part.len,

@@ -413,15 +413,17 @@ impl Group {
         self.forms.as_ref()?.slot_of(page)
     }
 
-    /// Makes `page` an exact entry that holds all its cells, whatever the
-    /// group kept for it before: a page that comes back from the prefix
-    /// cache's level on SSD in that form. Returns its slot and the conversions
-    /// that made room, which must run before the slot is written.
-    pub(crate) fn adopt_exact(&mut self, page: u32) -> Result<(u32, Vec<Convert>), ModelError> {
+    /// Makes `page` an exact entry, whatever the group kept for it before: a
+    /// page that comes back from the prefix cache's levels in RAM or on SSD in
+    /// that form, full or a tail ([`Forms::adopt`]). Returns its slot and the
+    /// conversions that made room, which must run before the slot is written.
+    pub(crate) fn adopt_exact(
+        &mut self,
+        page: u32,
+        tail: bool,
+    ) -> Result<(u32, Vec<Convert>), ModelError> {
         let forms = self.forms.as_mut().ok_or_else(|| invalid("the group has no exact entries"))?;
-        forms.release(page);
-        let slot = forms.ensure(page, None).map_err(exhausted)?;
-        forms.settle_page(page);
+        let slot = forms.adopt(page, tail).map_err(exhausted)?;
         Ok((slot, forms.take_jobs()))
     }
 
@@ -925,7 +927,8 @@ impl Group {
 
     /// Copies the entries of `page` in the group's layers from `src` on the
     /// host, which holds them as exact entries (`exact`) or as converted ones.
-    /// An exact page that is not to `keep` its form is converted at once.
+    /// An exact page that is not to `keep` its form is converted at once; a
+    /// `tail` of the prefix cache keeps it, and is not taken for a full page.
     /// Returns the bytes read. Runs between steps: conversions that it needs
     /// are waited for.
     ///
@@ -945,9 +948,10 @@ impl Group {
         len: usize,
         exact: bool,
         keep: bool,
+        tail: bool,
     ) -> Result<usize, ModelError> {
         let slot = if exact {
-            let (slot, jobs) = self.adopt_exact(page)?;
+            let (slot, jobs) = self.adopt_exact(page, tail)?;
             self.convert_now(kernels, stream, pages, status, &jobs)?;
             Some(slot)
         } else {
@@ -988,7 +992,7 @@ impl Group {
             }
             at += bytes;
         }
-        if exact && !keep {
+        if exact && !keep && !tail {
             let jobs = self.convert_page(page);
             self.convert_now(kernels, stream, pages, status, &jobs)?;
         }
