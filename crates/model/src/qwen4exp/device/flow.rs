@@ -372,9 +372,11 @@ impl Flow {
     /// step. The tier of experts gives up what its allowance no longer holds: a
     /// running sequence's K and V rank above it (see "Host memory" in
     /// `docs/dev/architecture/host-memory.md`); what the prompt cache holds
-    /// beyond its allowance is the conductor's to give. Returns the bytes the
-    /// limit still lacks once the tier holds no more than its allowance (or has
-    /// nothing more to give) and `wait` has passed, `None` when all is locked.
+    /// beyond its allowance is the conductor's to give. Once all is locked, a
+    /// tier above its allowance gives the difference too: the K and V may have
+    /// taken room that was free for the prompt cache's floor. Returns the bytes
+    /// the limit still lacks once the tier holds no more than its allowance (or
+    /// has nothing more to give) and `wait` has passed, `None` when all is locked.
     fn lock_far(
         &self,
         feed: &mut Feed,
@@ -436,7 +438,22 @@ impl Flow {
                 }
             }
         }
-        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+        let now: u64 = pools.iter().map(|p| p.locked()).sum();
+        self.ram.set_context_target(now);
+        // K and V that found the room they took free leave the tier above its
+        // allowance when that room was the prompt cache's floor, such as the place
+        // of a checkpoint the step locks as it is handed over: the tier gives the
+        // difference now, before that lock (it waits for none).
+        let allowance = self.ram.experts_allowance();
+        if now > locked && feed.store.ram_bytes().0 > allowance {
+            feed.store.set_ram_target(allowance);
+            feed.store.retry_floor();
+            feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
+            drop(feed.store.take_released());
+            if feed.store.ram_at_floor() {
+                self.ram.experts_floor(feed.store.ram_bytes().0);
+            }
+        }
         last.clear();
         last.extend_from_slice(live);
         Ok(None)

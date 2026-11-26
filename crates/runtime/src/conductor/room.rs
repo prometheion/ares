@@ -3,7 +3,8 @@
 //! `docs/dev/architecture/host-memory.md`): the tier of experts gives what its
 //! allowance no longer holds (the model does that), the prompt cache gives up
 //! what it holds, and when nothing more can go one request ends with an error
-//! that says so, while the others go on.
+//! that says so, while the others go on. The checkpoints of the step keep to
+//! the room that is left for their places.
 
 use ares_core::units::Bytes;
 use ares_state::PageId;
@@ -14,8 +15,20 @@ impl Conductor {
     /// Makes room for the K and V beyond VRAM of the pages in use once the
     /// planned step (`self.parts`) has run, before its record is written. A
     /// request that finds none ends ([`EngineError::NoMemory`]) and leaves the
-    /// step. `Err` only when the model failed.
+    /// step. The step's checkpoints then keep to the room the limit leaves for
+    /// their places ([`crate::cache::Cache::fit_saves`]). `Err` only when the
+    /// model failed.
     pub(super) fn make_room(&mut self) -> Result<(), String> {
+        self.make_far_room()?;
+        // What the K and V took may be the room the step's places lock.
+        if let Some(cache) = &mut self.cache {
+            self.stats.counters.checkpoints_dropped += u64::from(cache.fit_saves(&mut self.inner));
+        }
+        Ok(())
+    }
+
+    /// The K and V beyond VRAM of [`Conductor::make_room`].
+    fn make_far_room(&mut self) -> Result<(), String> {
         let Some(far) = self.model.far_pages() else { return Ok(()) };
         loop {
             let live: Vec<bool> =

@@ -91,6 +91,46 @@ impl Cache {
         self.saves.iter().map(|copy| copy.place).chain(self.reserved.iter().copied()).collect()
     }
 
+    /// Keeps the saves of the next record and the saves inside its step
+    /// (`inner`, the conductor's, whose places are reserved here) within the
+    /// room the limit leaves for the memory their places lock as the step is
+    /// handed over. The room was free when the places were taken, and only
+    /// what outranks the prompt cache takes it before the step: the K and V
+    /// beyond VRAM of running sequences, locked just before the record is
+    /// written. When they did, what goes for nothing goes first, then the
+    /// saves whose places need memory, those inside the step first and the
+    /// last of each first: their checkpoints are not taken, and no step fails
+    /// for the lock of a place. Returns the checkpoints given up.
+    pub(crate) fn fit_saves(&mut self, inner: &mut Vec<crate::InnerSave>) -> u32 {
+        let Some(books) = self.books.clone() else { return 0 };
+        let mut dropped = 0;
+        while books.unbooked() < self.pending_locks() {
+            if self.give_up_free(&mut dropped) {
+                continue;
+            }
+            if let Some(at) = inner.iter().rposition(|save| books.place_lock(save.place) > 0) {
+                self.unreserve(inner.remove(at).place);
+                dropped += 1;
+                continue;
+            }
+            let restores = &self.restores;
+            let save = self.saves.iter().rposition(|copy| {
+                books.place_lock(copy.place) > 0
+                    && !restores.iter().any(|restore| restore.place == copy.place)
+            });
+            let Some(at) = save else { break };
+            let place = self.saves[at].place;
+            if let Some(hash) = self.placed.get(&place).copied()
+                && self.index.checkpoint(hash) == Some(CheckpointId(u64::from(place)))
+            {
+                let _ = self.index.set_checkpoint(hash, None);
+            }
+            self.give_up(place, None);
+            dropped += 1;
+        }
+        dropped
+    }
+
     /// A place never used so far, if there is one.
     pub(super) fn unused_place(&mut self) -> Option<u32> {
         (self.next_place < self.capacity).then(|| {
