@@ -1221,6 +1221,36 @@ fn long_prompts_that_come_together_are_read_one_at_a_time() {
     e.consistent();
 }
 
+/// Prompts that come together while nothing generates, such as the forks of a decision (one
+/// text and a question each), on a model with few rows of its own that does not pause its
+/// steps: they share steps within the own rows, and each answers as it does alone (the shape
+/// of `feat/jev`'s test of a decision's forks, which met the refusal of a wider step of
+/// several prompts on Flash-Next, 2026-11-25).
+#[test]
+fn prompts_that_come_together_share_steps_within_the_own_rows() {
+    let mut rng = Rng(21);
+    let text = rng.prompt(150);
+    let prompts: Vec<String> = (0..6).map(|_| format!("{text}{}", rng.prompt(10))).collect();
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let seen: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let observed = seen.clone();
+    let e = engine_with(&model, config(256, 16), |host| {
+        host.with_observer(move |view| {
+            observed.lock().unwrap().push((view.rows(), view.segments()));
+        })
+    });
+    let started: Vec<_> =
+        prompts.iter().map(|prompt| start(&e.rt, request(prompt, Some(8))).unwrap()).collect();
+    for (handle, prompt) in started.into_iter().zip(&prompts) {
+        assert_eq!(handle.finish().text, fresh_run(shape, prompt, 8).text);
+    }
+    let steps = seen.lock().unwrap().clone();
+    assert!(steps.iter().any(|s| s.1 > 1), "they shared steps: {steps:?}");
+    assert!(steps.iter().all(|s| s.0 <= 16 || s.1 == 1), "{steps:?}");
+    e.consistent();
+}
+
 /// A request whose step is paused can be cancelled: what it computed is not kept, the
 /// model is told to give the step up, and the next request runs as it would alone.
 #[test]
