@@ -1,6 +1,9 @@
 //! How far the prompt of a request has got: the progress events a request
 //! gets while its prompt is read ([`Event::Progress`]), in the terms of
-//! llama.cpp's `prompt_progress`.
+//! llama.cpp's `prompt_progress`, and when it sends them (after
+//! `send_partial_response` and its callers in `tools/server/server-context.cpp`
+//! of <https://github.com/ggml-org/llama.cpp>, commit d92ea9b, MIT; see
+//! THIRD-PARTY-NOTICES).
 //!
 //! A request hears where its prompt begins when it first starts (the tokens the
 //! cache gave are done), then after every step that ran rows of its prompt, up

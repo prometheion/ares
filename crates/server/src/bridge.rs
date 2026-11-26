@@ -579,7 +579,9 @@ impl Run {
     }
 
     /// The lines of the log of a prompt's progress: where it starts, and how far
-    /// it has got while it is read long (see the module documentation).
+    /// it has got while it is read long (see the module documentation), the
+    /// latter laid out as llama.cpp's `print_timings_pp` (`tools/server/server-context.cpp`,
+    /// commit d92ea9b, MIT).
     fn tell_progress(&mut self, progress: &Progress) {
         let id = self.guard.id;
         if !std::mem::replace(&mut self.told.started, true) {
@@ -626,8 +628,10 @@ fn duration(time: Duration) -> String {
 }
 
 /// The lines of the log of a request that ended: what it was, then its timings
-/// as llama.cpp's server prints them (`print_timings`), with the prompt's rate
-/// over the rows the engine ran for it (the computed ones and the replayed).
+/// as llama.cpp's server prints them (`print_timings` in
+/// `tools/server/server-context.cpp` of <https://github.com/ggml-org/llama.cpp>,
+/// commit d92ea9b, MIT; see THIRD-PARTY-NOTICES), with the prompt's rate over
+/// the rows the engine ran for it (the computed ones and the replayed).
 fn tell_end(id: RequestId, finish: FinishReason, usage: &Usage, timings: &Timings) {
     let reason = match finish {
         FinishReason::Stop => "stop".to_owned(),
