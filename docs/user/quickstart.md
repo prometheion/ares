@@ -11,7 +11,18 @@ and Anthropic HTTP APIs. This page goes from the source to a first answer.
 | An Ampere (RTX 30) or Ada (RTX 40) card | running; other GPUs are refused, see [hardware.md](hardware.md) |
 | Rust 1.95 or newer (`rust-toolchain.toml` picks the stable channel) | building |
 | CUDA toolkit 13.0 or newer, for `nvcc` | building only, not running |
-| `glslc`, the shader compiler of the Vulkan SDK or of the shaderc package | building the Vulkan shaders |
+| `glslc` 2024 or newer, from the Vulkan SDK or from LunarG's `shaderc` package | building the Vulkan shaders |
+
+A distribution's `shaderc` may be too old: Ubuntu 24.04 ships 2023.8, which does
+not know `GL_EXT_integer_dot_product` and fails on the `mmvq` shaders. LunarG's
+package (2025.2 was used) carries a current `glslc` and replaces the
+distribution's `glslc`, which owns the same path:
+
+```sh
+curl -sS -o /etc/apt/trusted.gpg.d/lunarg.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc
+curl -sS -o /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+sudo apt update && sudo apt remove glslc && sudo apt install shaderc
+```
 
 ## Build
 

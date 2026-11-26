@@ -1,19 +1,22 @@
-# Builds Ares on a machine that is not the author's.
+# Builds and checks Ares on a machine that is not the author's.
 #
-# Both build scripts run under `cargo check`, so this compiles every CUDA kernel
-# and every GLSL shader without needing a GPU or the slow release link. That is
-# what catches the two things a local build cannot: a toolchain older or stricter
-# than the one it was written against.
+# Both build scripts run here, so every CUDA kernel and every GLSL shader is
+# compiled without a GPU. That is what catches what a local build cannot: a
+# toolchain older or stricter than the one the code was written against.
 #
-# The shader compiler is LunarG's current shaderc, not the distribution's. The
-# distribution package named in the quickstart is from 2023 and does not know
-# GL_EXT_integer_dot_product, which the mmvq shaders require.
+# The shader compiler is LunarG's, not the distribution's: Ubuntu 24.04 ships
+# shaderc 2023.8, which does not know GL_EXT_integer_dot_product.
 name: build
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# A check on a public repository needs no more, and a pull request from a fork
+# gets no more.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,7 +32,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential curl ca-certificates git pkg-config
+            build-essential curl ca-certificates git pkg-config python3
 
       - name: Shader compiler
         run: |
@@ -39,31 +42,49 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y shaderc
           glslc --version
 
+      # rust-toolchain.toml picks the channel and brings rustfmt and clippy.
       - name: Rust
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # The key ends in the commit, so every run saves its own and restores the
+      # newest through the prefix; a key that only followed Cargo.lock would be
+      # written once and never again. A release build of the kernels measured
+      # 547 MiB, so several of these sit inside the repository's 10 GB.
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-
 
-      # Both GPU classes the engine is tested on, so the kernels are compiled
-      # the way a user's build compiles them.
-      - name: Check
-        env:
-          ARES_CUDA_ARCHS: "86,89"
-        run: cargo check --workspace --all-targets
-
+      # ARES_CUDA_ARCHS is left unset on purpose: the build script compiles the
+      # tested classes, so CI compiles what a default build compiles and follows
+      # that list when it changes.
       - name: Format
         run: cargo fmt --all --check
 
-      # Compiled, not run: the runners have no GPU.
-      - name: Build the tests
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The CUDA tests skip without ARES_TEST_CUDA, the model and server tests
+      # without their ARES_TEST_* model paths, so the host tests run here.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Docs
         env:
-          ARES_CUDA_ARCHS: "86,89"
-        run: cargo test --workspace --no-run
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      - name: Doc links
+        run: python3 tools/check-doc-links.py
+
+      - name: Disk
+        if: always()
+        run: df -h
