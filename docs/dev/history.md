@@ -435,6 +435,14 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-25:* "ares-runtime: a test of a drive that runs full under the SSD level": the store lies in a tmpfs of 700 KiB that the test mounts in a user namespace of its own (it runs itself again in one, and passes with a note where that is not allowed); the drive's ENOSPC makes the store give up its oldest segments and write on, every answer stays right, and the newest text resumes from the drive in another engine.
 
+- [x] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
+      fails about one run in four in the full suite (alone it passes): the third ask finds the first
+      conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM
+      gave them up is timing-dependent. Found 2026-11-25 by `fix/server-sweep` (fails before its
+      changes too). File: `crates/runtime/tests/cache/ram.rs`.
+
+  *Fixed, 2026-11-26:* "ares-runtime: a RAM test makes RAM give the first conversation up": RAM gives up a text's end first, and of the 8 pages the second text pushed off the devices RAM kept 5 or 6, as the checkpoint places in use at their arrival left room; with 6 the pages the next turn resumes from were all in RAM. A third text pushes 28 pages through a RAM that holds 24 at most, so the resume reads from the SSD every time (32 runs of the suite, four at once, none failed; before, 9 of 24).
+
 ## 2026-11-24
 
 ### From "In work now"
