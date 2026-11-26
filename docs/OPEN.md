@@ -742,6 +742,16 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       and opens only the tested classes, Ampere (8.6) and Ada (8.9) (`cuda/tested-archs`); Turing,
       Pascal, Hopper, data-centre Blackwell, Jetson and every other GPU are to run through the
       Vulkan backend once it runs models. What was not tuned on CUDA goes there too.
+      **Turing on CUDA after all** (the owner, 2026-11-26): after Blackwell's tests on the RTX 5060 Ti.
+      Someone interested may give access to a Turing card for the tests. Turing (7.5) lacks
+      several things the kernels use:
+      - `cp.async` (13 kernel files);
+      - `mma` m16n8k16 (9 files); Turing has m16n8k8 for f16 and m8n8k16 for int8;
+      - bf16 in hardware (5 files);
+      - more than 64 KiB of shared memory per block.
+
+      llama.cpp's `mma.cuh` has Turing's paths (MIT). Its cards have 8 to 11 GiB, the T4 16 and
+      the Titan RTX 24.
 - [ ] Left of cleanup phase 1, at Vulkan parity: Vulkan's draft carry
       (`SamplerKernels::{shift,keep,commit}_hidden`, shaders `draft_{shift,keep,commit}.comp`),
       which CUDA no longer has (no caller there, removed on `cleanup/cuda`), and its test: drop it
@@ -771,6 +781,44 @@ The audit, its reports and the plan: `/var/tmp/ares-audit/` (`PLAN.md`); what wa
       `ares-api` instead of raw OpenAI JSON across the API, one JSON value type in the server
       (three today: `ares_api::Json`, `ares_tokenizer::Json`, `serde_json::Value`), with the rule
       for integers above `i64::MAX` decided once.
+
+### LoRA adapters, and a scheduler that picks one per task (the owner, 2026-11-26; its place in the order not decided)
+The owner's idea:
+- **Adapters per task.** Each adapter is trained by RL for one task and harness, and carries a tag.
+- **A decision before each request.** The same model, in Jev mode, decides which adapter fits.
+  Ares loads that adapter and computes only what the adapter changes, where it can; the task
+  goes on with it. That gives many fine-tunes, each chosen by its task.
+- **A learned scheduler** instead of Jev mode is the other way.
+- **Training stays outside Ares.** Unsloth or another existing trainer does it; Ares gets a script
+  or a pipe that drives it, not a trainer of its own.
+
+The work:
+- [ ] **LoRA adapters.** GGUF adapters as llama.cpp loads them (`--lora`, the request's `lora`
+      field, `/lora-adapters`). Several adapters in one step, by their rows (the batched kernels of
+      Punica or S-LoRA). For the 27B and Flash-Next (parity). The survey's row:
+      [`dev/studies/feature-checklist.md`](dev/studies/feature-checklist.md) M10.
+- [ ] **What a switch must compute again.** An adapter that acts on every token changes K, V and
+      the recurrent state of the whole prompt, so a switch means a new prefill. Three ways
+      around it, to decide with the owner:
+      - (a) Adapters trained to act only from a point on: IBM's Activated LoRA (arXiv 2504.12397;
+        PEFT can train it). The prefix that the base model computed stays exact, and only the
+        tokens after that point run with the adapter. This is the owner's "only the part for the
+        adapter".
+      - (b) Adapters on the upper layers only. A switch computes those layers again; Flash-Next's
+        pass already reads a prompt layer by layer.
+      - (c) A decision that holds for a whole task, and a prompt cache keyed by adapter, so that a
+        conversation pays for a switch once.
+- [ ] **The scheduler.**
+      - First a decision in Jev mode, rendered after the request's own prompt as a fork. It then
+        shares its prefix with the request and costs only the rows of its question.
+      - Later a learned one: a probe on the hidden state of the prompt's last row, which is
+        computed anyway. It is trained on the RL runs' results and on the decisions made so far.
+- [ ] **The RL pipe.**
+      - Ares serves the rollouts (generation is most of an RL step) and loads each new adapter
+        while it runs.
+      - The trainer (Unsloth, TRL) takes the gradient steps, and the harness gives the reward.
+      - Training an adapter of the 27B needs more VRAM than these cards have: small models here,
+        the 27B on a larger card.
 
 ## Store of levers
 Optimisations, taken by the owner's reasons, not as a phase; measured on a quiet machine against
