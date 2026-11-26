@@ -45,7 +45,9 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
 
 ### Fixed on `fix/flash-crashes` (a report from a user of Flash-Next, 2026-11-25)
 
-Not items of `OPEN.md` before; each took the model down for every request in flight.
+The three lines of `OPEN.md`'s "From a user's report" that `main` added while the work ran
+(the fourth, SIGTERM, is `fix/server-sweep`'s); each took the model down for every request in
+flight.
 
 - Two prompts that came 8 ms apart while nothing generated were planned into one step wider
   than the parts' own rows ("a step of 8007 rows in 2 segments; a step wider than 512 rows
@@ -62,6 +64,14 @@ Not items of `OPEN.md` before; each took the model down for every request in fli
 - The same prompt of 49 965 tokens sent again was read again: the far pages and the anchor's
   checkpoint of the first request had been given up for the tier. The cache's floor keeps the
   far pages of one request, and the checkpoint used last goes last.
+- Found on the way (2026-11-25, the branch's own GPU test): the far K/V that the conductor now
+  locks before a step took the room the step's checkpoint place was to lock, and its lock was
+  refused ("the checkpoint places of the step: the RAM limit of 8.00 GiB has no room for
+  112.6 MiB more of checkpoints"; at warm-up and on a request, the engine failed). The tier
+  gives what its allowance no longer holds after the far K/V too, and saves without room are
+  given up before the step (`Cache::fit_saves`). And `fix/model-sweep`'s finding that the
+  tier's growth by a piece before a step failed the step when the books refused it: no error
+  since `StoreError::NoRoom` (a host test in `tests/expert_store.rs`).
 
 Found done or stale by the triage of 2026-11-25 (branch `docs/triage`, every open item checked
 against `main` 4c834979): each item verbatim, then what did it or what changed. Items that only

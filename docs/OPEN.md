@@ -193,22 +193,9 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 16 | 11 |
+| Model, runtime, kernels | 16 | 12 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
-- [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
-      Flash-Next's layer pass refuses ("a step wider than 512 rows reads one prompt",
-      `qwen4exp/device/runtime/pass.rs` `pass_of`): both requests get 500 and the model is unloaded.
-      In work: `fix/flash-crashes`.
-- [ ] Far K/V finds no RAM room ("the tier of experts is at its floor and the prompt cache holds the
-      rest", `qwen4exp/device/flow.rs` `FAR_WAIT`) at `--ram 40G` beside a 39,810-token request and at
-      `--ram 52G` repeating a 50k prompt: the prompt cache (lowest rank) does not give way, the tier's
-      floor latches for good (`runtime/src/ram.rs` `experts_floor`), and the engine takes the model
-      down instead of ending one request. In work: `fix/flash-crashes`.
-- [ ] The same 49,965-token prompt sent again (one sequence, `--ram 52G`) was read again from the
-      start instead of taken from the prompt cache, while the first request's far pages still held
-      RAM as prompt cache; the second read's new far pages then hit the RAM failure above. A repeat
-      must reuse the finished sequence's pages and checkpoints. In work: `fix/flash-crashes`.
 - [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
       hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
 
@@ -239,13 +226,6 @@ marks a line that only a GPU run can settle or check.
       `cache/ssd/mod.rs`, `cache/ssd/pump.rs`.
 
 ### Model, runtime, kernels
-- [ ] The step price the server measures at load is not monotonic in the rows (Flash-Next on
-      the local cards, 2026-11-25: 1 row 22.9 ms, 2 rows 118.7, 3 rows 166.4, 8 rows 80.9; the
-      report on an RTX 4080: 1 row 17.4, 2 rows 126.9, 8 rows 55.5). It is measured before the
-      warm-up fills the tiers, so the steps of few rows wait for experts from the drive; the
-      share and the piece size price steps by it until real steps teach the prices. Seen by
-      `fix/flash-crashes`, not the cause of its defects. Files: `crates/server/src/load/start.rs`,
-      `crates/runtime/src/conductor/measure.rs`.
 Tests that fail:
 - [ ] GPU. `qwen4exp_runtime`'s `flash_next_writes_with_drafts_what_it_writes_without` fails on
       the two local cards in some runs (2026-11-23, IQ2_XS with the MTP block): the greedy reply
@@ -308,6 +288,13 @@ Tests that fail:
       `crates/sched/src/confidence.rs`, the test.
 
 Wrong behaviour:
+- [ ] GPU. The step price the server measures at load is not monotonic in the rows (Flash-Next on
+      the local cards, 2026-11-25: 1 row 22.9 ms, 2 rows 118.7, 3 rows 166.4, 8 rows 80.9; the
+      report on an RTX 4080: 1 row 17.4, 2 rows 126.9, 8 rows 55.5). It is measured before the
+      warm-up fills the tiers, so the steps of few rows wait for experts from the drive; the
+      share and the piece size price steps by it until real steps teach the prices. Seen by
+      `fix/flash-crashes`, not the cause of its defects. Files: `crates/server/src/load/start.rs`,
+      `crates/runtime/src/conductor/measure.rs`.
 - [ ] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
       the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
       another sequence, or past its first tiles with K and V in `q7` to `q4`, can take more (the

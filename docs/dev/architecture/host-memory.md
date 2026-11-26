@@ -66,6 +66,19 @@ store (`at_floor`, now tried again after every step and before a step that
 needs room) and in the books (now forgotten when the tier gives or takes a
 piece).
 
+The places of the step's checkpoints take their memory as the step is handed
+over (`PinnedRam::hold_places`, from `Gpu::dispatch`), in room the limit had
+free when the prompt cache took them (`Cache::free_place`). The K and V that
+the conductor locks before the step outrank them and may take that room: the
+tier then gives what its allowance no longer holds as well (the room was the
+prompt cache's floor, its one place), and the conductor checks that what the
+places lock still fits (`Cache::fit_saves`): when it does not, what goes for
+nothing goes, then the saves themselves (those inside the step first), and
+their checkpoints are not taken. Until 2026-11-26 the far K/V took the room of
+the floor's place and its lock was refused, which failed the step and the
+engine (Flash-Next on the two local cards at `--ram 8G`, at warm-up and on a
+long request).
+
 The books of the limit count what each user holds: a user asks to grow, a
 booking beyond the limit is refused, and the refusal names who holds what.
 Below the limit every elastic user keeps to an **allowance**, the bytes it may
