@@ -5,3 +5,5 @@ target/
 *.spv
 .vscode/
 .idea/
+AGENTS.local.md
+CLAUDE.local.md

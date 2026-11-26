@@ -10,17 +10,15 @@ serves them over the OpenAI and Anthropic HTTP APIs.
 
 ## Why Ares
 
-Ares exists for six reasons, and every piece of work is weighed against them:
+Ares exists for five reasons, and every piece of work is weighed against them:
 
-1. **Control over the features.** The engine does what its owner needs, and no
-   feature waits for another project.
-2. **Speed**, always.
-3. **Parallel requests.** llama.cpp serves several requests at once poorly, and
+1. **Speed**, always.
+2. **Parallel requests.** llama.cpp serves several requests at once poorly, and
    vLLM needs a lot of VRAM to do it well.
-4. **Efficient use of VRAM and RAM.**
-5. **Large mixtures of experts streamed from the SSD:** a model larger than RAM,
+3. **Efficient use of VRAM and RAM.**
+4. **Large mixtures of experts streamed from the SSD:** a model larger than RAM,
    in a 4- or 5-bit quantization, without a large loss of speed.
-6. **Room for experiments:** new ways to read experts ahead, to draft, to read
+5. **Room for experiments:** new ways to read experts ahead, to draft, to read
    prompts and to prune experts.
 
 It supports the newest model architectures only and keeps no options for
@@ -54,7 +52,8 @@ target/release/ares --model ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf
 
 [`docs/user/quickstart.md`](docs/user/quickstart.md) has what the build needs,
 both models, a first request and Claude Code; [`docs/README.md`](docs/README.md)
-lists every document, for running Ares and for developing it.
+lists every document, for running Ares and for developing it. The rules for
+changing Ares, for people and coding agents, are in [`AGENTS.md`](AGENTS.md).
 
 ## Measured
 
@@ -64,7 +63,7 @@ and one model, not general claims.
 
 **The 27B against llama.cpp at production settings.** Qwen3.8 27B UD-Q4_K_S on
 an RTX 4070 and an RTX 3060 (12 GiB each) with peer access, 2026-11-23. The
-other engine is the author's llama.cpp fork
+other engine is the llama.cpp fork Ares grew out of
 ([Piggidragon/llama.cpp](https://github.com/Piggidragon/llama.cpp)), with quantized flash
 attention, tensor split with peer-to-peer sums and MTP drafts, run with its production preset. Both
 engines at the same settings: tensor split 0.625 / 0.375, 262144 cells of K and
@@ -121,8 +120,8 @@ With thanks to:
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): GGUF and its
   weight types (`ares-quant` is a port of ggml's quantization code), the shape of
   many kernels, the server's API shapes, and the reference every test is held to.
-- [Piggidragon/llama.cpp](https://github.com/Piggidragon/llama.cpp), the author's
-  fork: quantized flash attention, tensor split with peer-to-peer sums, MTP and
+- [Piggidragon/llama.cpp](https://github.com/Piggidragon/llama.cpp), the llama.cpp
+  fork Ares grew out of: quantized flash attention, tensor split with peer-to-peer sums, MTP and
   DSpark drafts, the drafts' price rule and the conversation cache, which Ares
   set out to beat.
 - [Strata](https://github.com/Niko1221/Strata): the reference for mixtures of
