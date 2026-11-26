@@ -50,6 +50,7 @@ repository and are not needed to build, run or test Ares.
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
 | [`host-memory.md`](experiments/host-memory.md) | the expert tier's worth, giving memory back |
 | [`server.md`](experiments/server.md) | priorities of requests |
+| [`decisions.md`](experiments/decisions.md) | decisions (Jev mode): the answers against the CPU reference and greedy generation, decisions per second on the 27B |
 
 ## Studies
 

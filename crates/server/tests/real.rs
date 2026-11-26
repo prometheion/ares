@@ -460,12 +460,17 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
     let error =
         refused("/v1/completions", json!({"model": server.model, "prompt": long}), 400, &["8192"]);
     assert_eq!(error["code"], "context_length_exceeded");
-    // Decisions need more of the runtime than it has.
+    // A decision whose state does not fit is told so in Flide's shape: a 422
+    // at the body, with both numbers.
     let decision = json!({
-        "model": server.model, "state": "s",
+        "model": server.model, "state": long,
         "questions": {"q": {"type": "noul", "instructions": "x"}},
     });
-    refused("/v1/systemone", decision, 501, &["decisions are not implemented"]);
+    let reply = server.post("/v1/systemone", &decision);
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    let detail = reply.json()["detail"][0].clone();
+    assert_eq!(detail["loc"], json!(["body"]), "{detail}");
+    assert!(detail["msg"].as_str().unwrap().contains("8192"), "{detail}");
     refused("/v1/embeddings", json!({"model": server.model, "input": "x"}), 404, &["no endpoint"]);
 
     // None of that reached the devices, and a neutral value is no refusal.
