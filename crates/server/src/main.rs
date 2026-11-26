@@ -69,13 +69,23 @@ async fn main() -> ExitCode {
     tracing::info!("{}", ares_server::BUILD_INFO);
     log_panics();
 
-    match run(&host, port, timeout, log.text, &access, presets, single).await {
-        Ok(()) => ExitCode::SUCCESS,
+    let code = match run(&host, port, timeout, log.text, &access, presets, single).await {
+        Ok(()) => 0,
         Err(message) => {
             tracing::error!("{message}");
-            ExitCode::FAILURE
+            1
         }
-    }
+    };
+    // The engine has stopped in order, or never started, and the log is
+    // written (its writers do not buffer). What may still run are threads
+    // that outlive an engine: the watch of the machine's memory, which can
+    // hold a model's tier of experts for a moment and free it there, and a
+    // device thread that did not stop in time. The handlers for the end of
+    // the process would tear the CUDA driver down under them (`exit_now`),
+    // and the async runtime would wait for its blocking threads.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    exit_now(code)
 }
 
 /// Writes a panic into the log, with its thread, its place and the stack, before
@@ -237,8 +247,9 @@ async fn run(
     Ok(())
 }
 
-/// Ends the process at once, as a signal asked, while the engine's threads may
-/// still be inside the CUDA driver (a load uploads its weights, a step runs).
+/// Ends the process at once: as a signal asked, while the engine's threads may
+/// still be inside the CUDA driver (a load uploads its weights, a step runs),
+/// and after an orderly stop, beside threads that outlived the engine.
 /// `std::process::exit` would run the driver's handlers for the end of the
 /// process (`atexit`), which tear its state down under those threads, and the
 /// driver may abort then: a SIGABRT and a core dump of all the RAM the process
