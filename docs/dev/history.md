@@ -5,7 +5,52 @@ newest first. An item stands under the latest date it names (items that name non
 the end), below the section of `OPEN.md` it stood in. Branch names, commits and paths are as
 they were written then; an open remainder of an item is listed in `OPEN.md` again.
 
+## 2026-11-26
+
+Found and fixed on `feat/jev` (2026-11-26):
+
+- [x] A tail of the prompt cache that went to RAM and came back was settled as a full page on
+      the devices (`Group::adopt_exact`), so with K/V in `q7` to `q4` the exact pool converted
+      it for room when it was short, and the next prompt that continued the tail failed with
+      "page N is copied while it is a converted entry" and took the model down. Met every time
+      on the 27B at the owner's production settings by decisions followed by the chat
+      completions of their questions. Done: a transfer says whether a page on its way in is a
+      tail (`Transfer::tail`), and the exact pool takes it without settling it
+      (`Forms::adopt`).
+
 ## 2026-11-25
+
+Done on `feat/jev` (2026-11-25 to 2026-11-26), the item verbatim and then what was done:
+
+### From "Features / Jev mode"
+
+- [x] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime. Later.
+      Reference (2026-11-18): Flide, https://github.com/OmniJev/Flide (Apache-2.0, Python and
+      Triton, a server for the Jev `/v1/systemone` API, paper arXiv:2610.42148): "exact state
+      forking", one state forked into the questions, each answered in one forward pass, the
+      answer the one the model gives the question alone; a gated delta-rule kernel (from
+      flash-linear-attention), so recurrent state is forked as in our models; Qwen3.5 and Gemma 4
+      chat models and the OneJev / Open-Jev decision models; several requests in one body, up
+      to 256 options a question, a session cache (`--session-cache-gb`), `--batch-invariant`.
+      Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
+      in 28 s; "up to 9.5 times faster than vLLM and SGLang".
+      Its groundwork in the runtime, kept by the cleanup for it (2026-11-24): the decisions of
+      `ares-sched` (`Want::Score`, `PartKind::Score`, the option rows first in `plan`), the
+      conductor's arms for them, and `Engine::decide`, which answers Unsupported today.
+      Done: `/v1/systemone` served for every model with Flide's API (commit caffe660: its
+      request, answers, limits of 256 options, errors, several requests in one body) and its
+      way of asking a chat model (`next_token`, style `vllm`); `Engine::decide` on the runtime:
+      the shared start of the questions' prompts is a parent request, every question a fork
+      that starts from the parent's pages and checkpoint in the prefix cache (Flide's exact
+      state forking), its last row's label logits read back (the record's scores). A fork
+      leaves nothing in the cache; a decision whose shared start and state the cache holds
+      needs no parent. The groundwork of `ares-sched` (`Want::Score`, `PartKind::Score`) went:
+      the forks are prompts. Checked: the 0.8B against the CPU reference (largest difference
+      of a probability 0.0064) and greedy generation alone (4 of 4), the 27B and Flash-Next
+      against greedy generation alone (4 of 4, 3 of 3). How it works: "Decisions" in
+      [`architecture/sequence-state.md`](architecture/sequence-state.md); the numbers in
+      [`experiments/decisions.md`](experiments/decisions.md). What is left stays in `OPEN.md`
+      ("Features", "Jev mode").
 
 Done on `chore/leftovers` (2026-11-25), each item verbatim and then what was done:
 

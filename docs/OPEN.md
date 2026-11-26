@@ -42,7 +42,7 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
 | --- | --- |
 | Parallel requests against the owner's fork at production settings (the owner, 2026-11-23: "the whole reason I am making the engine"): two generating, one generating beside a long prompt, two agent sessions, 3 to 8 at once, priorities | measured (see "Parallel requests against the owner's production"); the fixes merged 2026-11-24 (above). Open: the expert store stalling under a full loan ("Defects"), a floor that rises for a request near its end ("Features"); `--parallel` defaults to 4 (the owner, 2026-11-24) |
 | DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 | measured (`flash/trees-study`, instruments only, not merged): Flash-Next +1 to 3 % with a tree of 4, larger trees lose, reading ahead from token tables or route memory +1 % (they name 1.4 to 6 % of a round's missing experts); 27B +9 % with trees of at most 8 rows; the MTP chain with its own candidates as siblings is as good as a DFlash tree of 8 nodes. The lever the data point at: a distinct expert in a few-row step costs 16.5 µs (about 80 GB/s of the cards' 360 / 500); at 5 µs chains reach about 120 tokens/s and trees then pay +15 %. Owner's decision on what to build ("Questions to the owner") |
-| Jev mode (`feat/jev`, 2026-11-25) | built ("Features", "Jev mode"); measurements on the 27B at production settings below |
+| Jev mode (`feat/jev`, 2026-11-25) | built and measured (what was done in [`dev/history.md`](dev/history.md), the numbers in [`dev/experiments/decisions.md`](dev/experiments/decisions.md)); what is left under "Features", "Jev mode" |
 | The push day's leftovers (`chore/leftovers`, 2026-11-25) | in work (under "Decided by the owner", the push day) |
 
 ## Decided by the owner (2026-11-22)
@@ -719,16 +719,6 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       as fast as the fork and Strata in everything, one piece at a time.
 
 ### Jev mode (`feat/jev`, 2026-11-25)
-- [x] `/v1/systemone` served for every model with Flide's API (https://github.com/OmniJev/Flide,
-      commit caffe660, Apache-2.0: its request, answers, limits of 256 options, errors, several
-      requests in one body) and its way of asking a chat model (`next_token`, style `vllm`);
-      `Engine::decide` on the runtime: the shared start of the questions' prompts is a parent
-      request, every question a fork that starts from the parent's pages and checkpoint in the
-      prefix cache (Flide's exact state forking), its last row's label logits read back (the
-      record's scores). Checked: the 0.8B against the CPU reference (largest difference of a
-      probability 0.0064) and greedy generation alone (4 of 4), the 27B and Flash-Next against
-      greedy generation alone (4 of 4, 3 of 3). How it works: "Decisions" in
-      [`dev/architecture/sequence-state.md`](dev/architecture/sequence-state.md).
 - [ ] Forks as rows of one step whatever `--parallel` is: a fork today is a sequence with a slot
       of its own (150 MiB of recurrent state on the 27B) that restores the parent's checkpoint
       from RAM, so with the owner's `--parallel 2` the questions of a decision run two at a time.

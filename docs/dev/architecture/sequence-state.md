@@ -338,16 +338,20 @@ one array per part, indexed by page number.
   - **The read**: a fork's last row is wanted, and the step hands back the
     logits of the question's label tokens there, before the sampler changes
     any (the record's *scores*, gathered on the device that holds each token's
-    column, see `record.rs`). The fork then ends and keeps nothing but the full
-    pages it published (a checkpoint of its state would cost a copy and serve
-    nobody).
+    column, see `record.rs`). The fork then ends and leaves nothing in the
+    cache: no checkpoint (it would cut the fork's step, cost a copy and serve
+    nobody) and no pages (without a checkpoint they would shadow the parent's
+    for the same question asked again, since a lookup takes the longest path of
+    pages and replays from the last checkpoint on it).
   A question alone gets the same logits up to the rounding of its rows' steps
   (see "Rounding" above): the parent and the forks are prompts computed from
   the same pages and state a request of the whole prompt would read. When the
   cache cannot hold what the parent left, a fork restores an earlier
   checkpoint and replays, or computes from its first token: the answers are
   the same and only the work is not shared. A decision of one question has no
-  parent. The parts of a decision are requests the conductor makes (ids with
+  parent, nor has one whose shared start the cache holds with the state at
+  its end (an agent's next question about a state read before): its forks
+  start from it at once. The parts of a decision are requests the conductor makes (ids with
   the top bit set); the counts of requests and the accounting of what
   requests produce leave them out.
 - `PageLayout`: bytes per page per device, from which the pool's capacity
@@ -414,7 +418,10 @@ same way on every device, from the segments of the record:
   cache. When it is short the full page that was used least recently and that
   no sequence of the step reads is converted for room (a cached page loses its
   exactness, never its text); a partly used page never is, which is why the
-  cache keeps at most one tail per slot (`PrefixCache::tails_per_slot`).
+  cache keeps at most one tail per slot (`PrefixCache::tails_per_slot`). A
+  tail that comes back from RAM is such a page too: the transfer says it is a
+  tail (`Transfer::tail`), and the pool takes it without settling it
+  (`Forms::adopt`).
 - Page copies copy the exact entry; a page that is copied is always partly
   used, hence exact.
 - A row reads a tile converted from the position at which the tile has left
