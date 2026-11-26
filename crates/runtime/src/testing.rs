@@ -47,12 +47,16 @@
 //! them changes the generated tokens.
 //!
 //! Given the books of page-locked RAM as well ([`HostExecutor::with_ram`]),
-//! the oracle plays the strictest device those books allow: a checkpoint
-//! place holds memory from the first copy into it, booked as a device part
-//! books its chunks, and loses it, with what it held, as soon as the
-//! conductor has called the place unused. A save into a place that is not in
-//! use, and a checkpoint that leaves such a place for the drive, are problems;
-//! a restore from one finds nothing.
+//! the checkpoint places lie in chunks of those books as a device part's do
+//! ([`PlaceChunks`](crate::PlaceChunks), ordinary memory here): a chunk of
+//! a few places is booked when a copy first writes one of them, and stays
+//! booked, as the devices keep it locked, until the books' sweep gives it
+//! back with no place in it in use ([`PinnedRam::sweep_checkpoints`]). What
+//! a place held the oracle forgets as soon as the conductor has called the
+//! place unused, the strictest a device may be. A save into a place that is
+//! not in use, a checkpoint that leaves such a place for the drive, and a
+//! copy whose chunk the limit has no room for are problems; a restore from a
+//! place called unused finds nothing.
 //!
 //! # What a step costs
 //!
@@ -135,6 +139,13 @@ pub type Problems = Arc<Mutex<Vec<String>>>;
 
 /// How many problems the oracle writes down.
 const MAX_PROBLEMS: usize = 16;
+/// The checkpoint places of the host executor in books of RAM: more than any
+/// budget of a test names.
+const HOST_PLACES: u32 = 1 << 16;
+/// The places in one chunk of them after the first, which holds place 0
+/// alone: more than one, so that a chunk holds places the conductor calls
+/// unused beside places it uses, as a device part's chunks do.
+const HOST_PLACES_PER_CHUNK: u32 = 4;
 
 /// An executor that computes picks on the host.
 pub struct HostExecutor {
@@ -290,20 +301,34 @@ impl HostExecutor {
     /// a model that takes part in the prefix cache.
     pub fn with_pool(mut self, pages: u32, cells_per_page: u32) -> Self {
         let slots = self.tables.lock().expect("tables").len();
-        self.oracle = Some(Oracle::new(&self.model, pages, cells_per_page, slots));
+        let mut oracle = Oracle::new(&self.model, pages, cells_per_page, slots);
+        oracle.chunks = self.ram.as_ref().map(|ram| self.place_chunks(ram));
+        self.oracle = Some(oracle);
         self
     }
 
     /// Makes the checkpoint places lie in the page-locked memory of `ram`,
     /// as a device's do: the conductor keeps to the allowance of these books,
-    /// and the oracle holds the memory of a place only while the conductor
-    /// has the place in use (see the module documentation).
+    /// the places' chunks stay booked until the books' sweep gives them back,
+    /// and the oracle keeps what a place holds only while the conductor has
+    /// the place in use (see the module documentation).
     pub fn with_ram(mut self, ram: PinnedRam) -> Self {
-        // The places are booked here as they are first used, as a device
-        // part locks them: the books learn which hold memory.
-        ram.host_places(self.model.config().prefix_cache.unwrap_or(0));
+        // The places lie in chunks of the books, booked as they are first
+        // used and given back by the books' sweep, as a device part's are.
+        let chunks = self.place_chunks(&ram);
+        if let Some(oracle) = &mut self.oracle {
+            oracle.chunks = Some(chunks);
+        }
         self.ram = Some(ram);
         self
+    }
+
+    /// The checkpoint places in `ram`, in chunks of [`HOST_PLACES_PER_CHUNK`]
+    /// places (the first holds place 0 alone, as a device part's does).
+    fn place_chunks(&self, ram: &PinnedRam) -> Arc<crate::PlaceChunks> {
+        let bytes = self.model.config().prefix_cache.unwrap_or(0);
+        let chunk = bytes as usize * HOST_PLACES_PER_CHUNK as usize;
+        ram.place_chunks(None, bytes, HOST_PLACES, chunk)
     }
 
     /// What the oracle found wrong so far: empty when everything the
@@ -777,10 +802,8 @@ struct Oracle {
     cells: Vec<Cell>,
     slots: Vec<Slot>,
     places: HashMap<u32, State>,
-    /// The bytes of a checkpoint place, and the places that hold memory in
-    /// the books the executor was given.
-    place_bytes: u64,
-    held: Vec<u32>,
+    /// The memory of the places in the books the executor was given.
+    chunks: Option<Arc<crate::PlaceChunks>>,
     vocab: u32,
 }
 
@@ -801,42 +824,29 @@ impl Oracle {
             cells: vec![Cell::default(); pages as usize * cells_per_page as usize],
             slots: (0..slots).map(|_| Slot::default()).collect(),
             places: HashMap::new(),
-            place_bytes: config.prefix_cache.unwrap_or(0),
-            held: Vec::new(),
+            chunks: None,
             vocab: config.vocab(),
         }
     }
 
-    /// The places the conductor has called unused lose their memory, and
-    /// what they held with it. Between steps, as a device part gives chunks
-    /// back; a device may keep them longer, never shorter.
+    /// The places the conductor has called unused lose what they held, between
+    /// steps: a device part may keep it longer, never shorter. Their memory
+    /// stays in its chunk until the books' sweep gives the chunk back
+    /// ([`PinnedRam::sweep_checkpoints`]), as a device part's does.
     fn give_back(&mut self, ram: Option<&PinnedRam>) {
         let Some(ram) = ram else { return };
-        let (places, bytes) = (&mut self.places, self.place_bytes);
-        self.held.retain(|place| {
-            let live = ram.place_is_live(*place);
-            if !live {
-                places.remove(place);
-                ram.release_checkpoints(bytes);
-                ram.host_place_held(*place, false);
-            }
-            live
-        });
+        self.places.retain(|place, _| ram.place_is_live(*place));
     }
 
-    /// A copy writes place `place`: it takes memory in the books when it
-    /// holds none, and it must be a place the conductor has in use.
+    /// A copy writes place `place`: its chunk takes memory in the books when
+    /// it holds none, and it must be a place the conductor has in use.
     fn take(&mut self, place: u32, what: &str, ram: Option<&PinnedRam>, problems: &Problems) {
         let Some(ram) = ram else { return };
         if !ram.place_is_live(place) {
             note(problems, format!("{what} place {place}, which the conductor called unused"));
         }
-        if !self.held.contains(&place) {
-            ram.host_place_held(place, true);
-            if let Err(error) = ram.book_checkpoints(self.place_bytes) {
-                note(problems, format!("{what} place {place}: {error}"));
-            }
-            self.held.push(place);
+        if let Some(Err(error)) = self.chunks.as_ref().map(|chunks| chunks.pointer(place)) {
+            note(problems, format!("{what} place {place}: {error}"));
         }
     }
 

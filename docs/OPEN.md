@@ -204,7 +204,7 @@ marks a line that only a GPU run can settle or check.
 
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
-| Server, API, cache | 0 | 0 |
+| Server, API, cache | 2 | 0 |
 | Model, runtime, kernels | 15 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
@@ -235,6 +235,32 @@ marks a line that only a GPU run can settle or check.
       panic decide what aborts.
 
 ### Server, API, cache
+- [ ] With several checkpoint places to a chunk (a device part whose checkpoint is under 16 MiB,
+      `CHUNK_BYTES` 32 MiB: the 0.8B split over two cards, the synthetic test models; the 27B and
+      Flash-Next have one place a chunk), the cache counts the places it uses and the books whole
+      chunks: the checkpoint it keeps at its floor when the machine runs short can lie in a chunk
+      of four, which then stays locked (160 of 48 allowed units in the test below) while the cache
+      believes it holds one place, so the prompt cache stays above its allowance until a later
+      request frees that place. Found 2026-11-26 by `fix/server-sweep` with the host executor on
+      `PlaceChunks`: the test `a_chunk_of_places_given_back_finds_its_room_again_beside_pages_in_ram`
+      (`/var/tmp/ares-fixserver/chunk-floor-test.patch`, for `crates/runtime/tests/cache/ram.rs`)
+      waits for the chunk to be given back and never sees it. Wanted: the cache's `held` counts the
+      chunks its places lie in (`PinnedRam::places_lock`'s geometry), or the floor's checkpoint goes
+      to place 0, which lies alone in its chunk for that reason. Files: `crates/runtime/src/cache/mod.rs`
+      (`held`), `cache/moves.rs` (`trim`), `cache/places.rs` (`free_place`), `crates/runtime/src/ram.rs`.
+- [ ] `cargo test -p ares-runtime --test cache` under CPU load (four runs of the suite at once, 32
+      rounds, 2026-11-26): `ram::a_shrink_writes_what_only_ram_holds_and_gives_the_memory_back`
+      fails 5 of 32 on main and 2 to 3 of 32 on `fix/server-sweep` (2 pages "dropped unwritten" in
+      its last part, on a machine with room for the floor alone: a precious page that found no
+      buffer while the writer was behind), `prefix::a_request_runs_between_the_pieces_of_a_paused_step`
+      1 of 32 on main; once, in a `cargo test -p ares-runtime` beside other agents' builds, both
+      `ram::nothing_is_written_while_ram_holds_a_conversation_and_all_of_it_when_the_engine_ends`
+      and `ram::the_anchor_that_later_turns_share_inside_its_page_reaches_the_drive` saw fewer
+      records right after the engine before them was dropped (and
+      `ram::an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram` once found nothing
+      cached after the restart), which 72 runs of the three alone under load did not repeat.
+      Alone and on an idle machine all pass. Files: `crates/runtime/tests/cache/ram.rs`,
+      `prefix.rs`, `crates/runtime/src/cache/moves.rs` (`page_room`).
 
 ### Model, runtime, kernels
 Tests that fail:
@@ -373,7 +399,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 3 |
+| Server, API, cache | 2 |
 | Model, runtime, kernels | 14 |
 
 ### Server, API, cache
@@ -402,16 +428,6 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       (`Cache::probe`), `cache/ssd/pump.rs` (`drain`), `cache/places.rs`, `crates/state/src/checkpoint.rs`
       (`left_behind_on_pages`), `crates/store/src/lib.rs`. Left by `fix/server-sweep` (2026-11-25) as
       larger than a fix.
-- [ ] The host executor's places: on `PlaceChunks`, and a place whose memory a device keeps locked
-      after it was given up. The host executor frees it at once (its oracle plays the strictest
-      device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
-      for a checkpoint's lock was found on the devices only. Files: `crates/runtime/src/testing.rs`,
-      `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`. Left by `fix/server-sweep`
-      (2026-11-25): it takes `PlaceChunks` without a device (a `LockedChunk` over plain memory,
-      booked as now), the host executor's places on it in place of `host_places` and
-      `host_place_held` (the oracle still forgets what a place called unused held), and the chunks
-      given back only by `sweep_checkpoints`, as the devices give them back; then a test of a
-      checkpoint whose chunk finds no room beside pages in RAM.
 
 ### Model, runtime, kernels
 - [ ] Left of step 5 of the shared layer, the token rows: DFlash's newest token and mask rows are

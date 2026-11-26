@@ -443,6 +443,19 @@ Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit'
 
   *Fixed, 2026-11-26:* "ares-runtime: a RAM test makes RAM give the first conversation up": RAM gives up a text's end first, and of the 8 pages the second text pushed off the devices RAM kept 5 or 6, as the checkpoint places in use at their arrival left room; with 6 the pages the next turn resumes from were all in RAM. A third text pushes 28 pages through a RAM that holds 24 at most, so the resume reads from the SSD every time (32 runs of the suite, four at once, none failed; before, 9 of 24).
 
+- [x] The host executor's places: on `PlaceChunks`, and a place whose memory a device keeps locked
+      after it was given up. The host executor frees it at once (its oracle plays the strictest
+      device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
+      for a checkpoint's lock was found on the devices only. Files: `crates/runtime/src/testing.rs`,
+      `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`. Left by `fix/server-sweep`
+      (2026-11-25): it takes `PlaceChunks` without a device (a `LockedChunk` over plain memory,
+      booked as now), the host executor's places on it in place of `host_places` and
+      `host_place_held` (the oracle still forgets what a place called unused held), and the chunks
+      given back only by `sweep_checkpoints`, as the devices give them back; then a test of a
+      checkpoint whose chunk finds no room beside pages in RAM.
+
+  *Fixed, 2026-11-26:* "ares-runtime: the host executor's checkpoint places lie in PlaceChunks": `PinnedRam::place_chunks` and `lock_checkpoints` take no device for an executor that has none (ordinary memory, booked the same), the host executor's places lie in chunks of four after place 0 (`HOST_PLACES_PER_CHUNK`), booked at a place's first copy and given back only by the books' sweep, as the devices do; `host_places` and `host_place_held` are gone. The oracle still forgets what a place called unused held. A unit test in `ram.rs` books, keeps and sweeps device-less chunks. The test of a checkpoint whose chunk finds no room beside pages in RAM found a fault of the cache's own accounting with several places to a chunk, which is in "Defects" now.
+
 ## 2026-11-24
 
 ### From "In work now"
