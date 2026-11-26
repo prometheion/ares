@@ -782,7 +782,7 @@ The audit, its reports and the plan: `/var/tmp/ares-audit/` (`PLAN.md`); what wa
       (three today: `ares_api::Json`, `ares_tokenizer::Json`, `serde_json::Value`), with the rule
       for integers above `i64::MAX` decided once.
 
-### LoRA adapters, and a scheduler that picks one per task (the owner, 2026-11-26; its place in the order not decided)
+### LoRA adapters, and a scheduler that picks one per task (the owner, 2026-11-26: far back, an experiment and a new feature, after the important work is done)
 The owner's idea:
 - **Adapters per task.** Each adapter is trained by RL for one task and harness, and carries a tag.
 - **A decision before each request.** The same model, in Jev mode, decides which adapter fits.
@@ -798,16 +798,19 @@ The work:
       Punica or S-LoRA). For the 27B and Flash-Next (parity). The survey's row:
       [`dev/studies/feature-checklist.md`](dev/studies/feature-checklist.md) M10.
 - [ ] **What a switch must compute again.** An adapter that acts on every token changes K, V and
-      the recurrent state of the whole prompt, so a switch means a new prefill. Three ways
-      around it, to decide with the owner:
-      - (a) Adapters trained to act only from a point on: IBM's Activated LoRA (arXiv 2504.12397;
-        PEFT can train it). The prefix that the base model computed stays exact, and only the
-        tokens after that point run with the adapter. This is the owner's "only the part for the
-        adapter".
-      - (b) Adapters on the upper layers only. A switch computes those layers again; Flash-Next's
-        pass already reads a prompt layer by layer.
-      - (c) A decision that holds for a whole task, and a prompt cache keyed by adapter, so that a
-        conversation pays for a switch once.
+      the recurrent state of the whole prompt, so a switch means a new prefill.
+      **Decided by the owner (2026-11-26): adapters on the upper layers only.** A switch computes
+      those layers again for the prompt, and keeps the layers below; Flash-Next's pass already
+      reads a prompt layer by layer. The owner's reasons:
+      - Unsloth trains adapters that way too.
+      - The adapters must be trainable on the owner's own cards, and for Flash-Next only this way
+        fits. The backward pass stops at the lowest adapted layer, so the layers below keep no
+        activations for it.
+
+      Not taken:
+      - IBM's Activated LoRA (arXiv 2504.12397): adapters that act only from a point in the
+        prompt on.
+      - A decision for a whole task, with a prompt cache keyed by adapter.
 - [ ] **The scheduler.**
       - First a decision in Jev mode, rendered after the request's own prompt as a fork. It then
         shares its prefix with the request and costs only the rows of its question.
@@ -817,8 +820,7 @@ The work:
       - Ares serves the rollouts (generation is most of an RL step) and loads each new adapter
         while it runs.
       - The trainer (Unsloth, TRL) takes the gradient steps, and the harness gives the reward.
-      - Training an adapter of the 27B needs more VRAM than these cards have: small models here,
-        the 27B on a larger card.
+      - The adapters are trained on the owner's own cards, with the upper layers only (above).
 
 ## Store of levers
 Optimisations, taken by the owner's reasons, not as a phase; measured on a quiet machine against
