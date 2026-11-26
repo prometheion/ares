@@ -378,7 +378,7 @@ pub struct StepContext<'a> {
 
 /// The value of [`StepContext::share`] for `done` of `of` pieces of a step.
 pub fn share_of(done: u64, of: u64) -> u32 {
-    if of == 0 { 0 } else { (done.min(of) * 1_000_000 / of) as u32 + 1 }
+    (done.min(of) * 1_000_000).checked_div(of).map_or(0, |share| share as u32 + 1)
 }
 
 /// What a model that reads images tells the runtime ([`Model::vision`]).
