@@ -9,6 +9,7 @@
 //! `ares_server::models`).
 
 mod cli;
+mod restart;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -19,7 +20,7 @@ use ares_server::models::{AcquireError, Models, SystemClock};
 use ares_server::preset::Presets;
 use ares_server::{Config, serve_models};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -149,10 +150,17 @@ async fn run(
 
     // The port first: a port that is taken is known at once, before seconds
     // are spent on the weights. Connections wait in the backlog until the
-    // model is loaded.
-    let listener = TcpListener::bind((host, port))
-        .await
-        .map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
+    // model is loaded. An image that restarted in place takes the socket of
+    // the image before over.
+    let listener = match restart::inherited() {
+        Some(listener) => TcpListener::from_std(listener)
+            .map_err(|e| format!("cannot serve the inherited listening socket: {e}"))?,
+        None => TcpListener::bind((host, port))
+            .await
+            .map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?,
+    };
+    // A second descriptor of it, which a restart in place hands on.
+    let kept = restart::keep(&listener)?;
     let address =
         listener.local_addr().map_err(|e| format!("cannot read the listen address: {e}"))?;
     let access = access.access(address.ip().is_loopback())?;
@@ -213,32 +221,46 @@ async fn run(
         None => tracing::info!(%address, models = offered, "listening"),
     }
 
-    let (drain, drained) = oneshot::channel::<()>();
-    let (hurry, hurried) = oneshot::channel::<()>();
+    // How far the stop has come: 1, no new connections and running requests
+    // finish; 2, they are ended. The signals step it up one at a time, and a
+    // restart in place takes it to 2 at once: every request is answered that
+    // the server restarts.
+    let (stage, staged) = watch::channel(0u8);
+    let raise = move |to: u8| stage.send_modify(|now| *now = (*now).max(to));
+    let raised = raise.clone();
     tokio::spawn(async move {
         signals.next().await;
-        let _ = drain.send(());
+        raised(1);
         signals.next().await;
-        let _ = hurry.send(());
+        raised(2);
         signals.next().await;
         tracing::warn!("third signal: exiting without cleaning up");
         exit_now(1);
     });
-    let served = serve_models(
-        listener,
-        models.clone(),
-        config,
-        async {
-            let _ = drained.await;
-        },
-        async {
-            // A sender that is gone means no second signal can come.
-            if hurried.await.is_err() {
+    let asked = models.clone();
+    tokio::spawn(async move {
+        asked.restart_asked().await;
+        raise(2);
+    });
+    let at = |stage: u8| {
+        let mut staged = staged.clone();
+        async move {
+            if staged.wait_for(|now| *now >= stage).await.is_err() {
                 std::future::pending::<()>().await;
             }
-        },
-    )
-    .await;
+        }
+    };
+    let served = serve_models(listener, models.clone(), config, at(1), at(2)).await;
+    if let Some(reason) = models.restarting() {
+        // The other models are unloaded in order (their prompt caches are
+        // written) while the driver answers, for a while at most; the stuck
+        // one is left to the new image.
+        if tokio::time::timeout(RESTART_UNLOADS, models.shutdown()).await.is_err() {
+            tracing::warn!("the other models did not unload in time: restarting without them");
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        restart::restart_in_place(kept, &reason);
+    }
     // Every model is unloaded and the devices are released, whatever became
     // of the HTTP side.
     models.shutdown().await;
@@ -246,6 +268,10 @@ async fn run(
     tracing::info!("stopped");
     Ok(())
 }
+
+/// How long a restart in place waits for the models that are not stuck to
+/// unload in order.
+const RESTART_UNLOADS: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Ends the process at once: as a signal asked, while the engine's threads may
 /// still be inside the CUDA driver (a load uploads its weights, a step runs),

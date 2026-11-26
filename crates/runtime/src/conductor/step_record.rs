@@ -20,6 +20,10 @@ impl Conductor {
         self.after_idle = false;
         self.heartbeat.begin();
         let dispatched = self.exec.dispatch(&meta);
+        // A test holds the step as a device that does not come back would.
+        while self.hold.as_ref().is_some_and(|file| file.exists()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t_wait = Instant::now();
         let collected = dispatched
             .and_then(|()| self.exec.collect(self.config.conductor_spin, &mut self.output));

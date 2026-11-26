@@ -573,11 +573,6 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
       VRAM, quality.
 
 ## Questions to the owner
-- [ ] An engine whose device never ends a step (the watchdog, `--watchdog`) fails its requests and
-      is taken down, but its device threads and the memory they hold stay with the process until it
-      ends (a context whose kernel never ends cannot be torn down). Should the server then exit with
-      an error, so that its unit or llama-swap starts it again, or keep serving its other models?
-      (Asked 2026-11-25 by `fix/server-sweep`.)
 
 ## Features
 Pieces of real work, days each, in the order of work where the owner placed them.

@@ -116,7 +116,7 @@ What is left out is decided from the devices and the model, and the log says how
 | --- | --- | --- |
 | `--queue <N>` | The most requests that may wait for a sequence while `--parallel` run; one more is refused with 503 and `Retry-After`, unless it has a better priority than one waiting that has not started: then that one is refused in its place (see [api.md](api.md#priorities)). | no limit: a request waits until it runs |
 | `--generation-floor <TOKENS/S>` | The rate every generating request keeps while a prompt is read beside it; the prompt gets the rest of the devices' time, and at least half. `0` reads prompts at once. | `20` |
-| `--watchdog <SECONDS>` | The longest one step may take, the warm-up's too, before the engine is taken for stuck: its requests end with the reason and the model is taken down. `0` watches nothing. | `600` |
+| `--watchdog <SECONDS>` | The longest one step may take, the warm-up's too, before the engine is taken for stuck: every request then gets 503 `restarting` with the reason, and the server restarts in place (the same process and port, a new image that loads the model again, which frees the devices); when it cannot, it exits with code 75 for its supervisor to start it again. A warm-up that does not come back fails the load. `0` watches nothing. | `600` |
 
 ## Thinking
 

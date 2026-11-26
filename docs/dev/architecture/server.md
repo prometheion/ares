@@ -354,15 +354,40 @@ the devices and when the step is back (`Heartbeat`), and a thread of the
 runtime looks every second: a step that has run longer than
 `RuntimeConfig::watchdog` (600 s; SGLang's `--watchdog-timeout` is 300 s and
 kills its server) fails the engine as a device error does (`Engine::failure`,
-whose reason names the watchdog). A request that waits for such an engine
-looks at the failure every second (`bridge::Run`) and ends with it, since the
-stuck conductor sends nothing more; the router then unloads the model as a
-broken one, and the runtime, which would wait for ever for the stuck
-conductor, leaves its threads behind, with the memory they hold on the
-devices, until the process ends. The limit is above any step that works: the
-widest step of a prompt of Flash-Next with experts from the SSD takes tens of
-seconds. A step is watched from its dispatch to its collect; the steps of the
-warm-up are not.
+whose reason names the watchdog, and `Engine::stuck`). A request that waits
+for such an engine looks at the failure every second (`bridge::Run`) and ends
+with it, since the stuck conductor sends nothing more. The limit is above any
+step that works: the widest step of a prompt of Flash-Next with experts from
+the SSD takes tens of seconds. A step is watched from its dispatch to its
+collect, the steps of the warm-up as well (a warm-up that does not come back
+fails the load).
+
+**The restart in place** (the owner, 2026-11-26; `main.rs`, `restart.rs`). A
+stuck engine's threads wait in the step for good and hold the memory of the
+devices, which no unload gives back and the driver may not answer for any
+more (issue 2: device threads parked in libcuda, both cards held until the
+process was killed). So the server replaces its image: the router finds the
+stuck engine (`Models`, whoever holds the model, also every second while one
+is loaded), logs it at ERROR, leaves its unit untouched (a drop would ask the
+driver to free it) and answers every request from then on with 503
+`restarting`, the reason and `Retry-After: 10`; the requests in flight end with
+the same error at once (`bridge::Stop` carries it). Then the other models are
+unloaded in order, for a minute at most, every descriptor is marked
+close-on-exec (`close_range`) but a second one of the listening socket, and
+`execve` of `/proc/self/exe` starts the same program with the same arguments
+and environment, and `ARES_LISTEN_FD` naming the socket (`ARES_RESTARTED` the
+reason). The kernel ends the old image's threads, frees its memory, the
+page-locked RAM among it, and closes the driver's files, which gives the
+devices' memory back. The new image takes the socket over (`restart::inherited`)
+and loads the model as at any start, while connections wait in the socket's
+backlog: the PID and the port stay, and a supervisor sees a short outage.
+When the exec cannot be done, or a thread sits in the kernel without a way
+out (state D) for 5 s, the process exits with 75 for its supervisor to start
+it again (a thread in state D holds an exit as it holds an exec). Test hooks:
+`ARES_TEST_HOLD_STEPS_WHILE` names a file while which the conductor holds every
+step between its dispatch and its collect, and a model file of architecture
+`ares-host` makes the binary serve the host executor's synthetic model, so
+that `tests/binary.rs` runs the whole restart without a GPU.
 
 **What the server logs and measures.** Every generating request has a line
 with its parameters when it is taken (the model, the limit of tokens, the

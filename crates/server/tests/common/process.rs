@@ -181,6 +181,11 @@ impl Server {
         assert!(status.success());
     }
 
+    /// The process's id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The exit status, once the process has ended.
     pub fn exited(&mut self) -> Option<ExitStatus> {
         self.child.try_wait().unwrap()

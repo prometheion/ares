@@ -543,6 +543,10 @@ impl Engine for Runtime {
         self.failure.get().cloned()
     }
 
+    fn stuck(&self) -> bool {
+        self.stuck.load(Ordering::Acquire)
+    }
+
     fn stats(&self) -> Option<EngineStats> {
         let snapshot = self.snapshot()?;
         let c = &snapshot.counters;

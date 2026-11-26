@@ -5,6 +5,21 @@ newest first. An item stands under the latest date it names (items that name non
 the end), below the section of `OPEN.md` it stood in. Branch names, commits and paths are as
 they were written then; an open remainder of an item is listed in `OPEN.md` again.
 
+## 2026-11-26
+
+### From "Questions to the owner"
+
+Answered by the owner (2026-11-26, after issue 2: the production 27B deadlocked inside a step)
+and built on `fix/server-sweep`:
+
+- [x] An engine whose device never ends a step (the watchdog, `--watchdog`) fails its requests and
+      is taken down, but its device threads and the memory they hold stay with the process until it
+      ends (a context whose kernel never ends cannot be torn down). Should the server then exit with
+      an error, so that its unit or llama-swap starts it again, or keep serving its other models?
+      (Asked 2026-11-25 by `fix/server-sweep`.)
+
+  *Done, 2026-11-26:* "ares-server: a stuck engine restarts the server in place": the server answers every request with 503 `restarting` and the reason, then `execve`s `/proc/self/exe` with the same arguments and environment and the listening socket kept (`ARES_LISTEN_FD`): the same PID and port, the devices' memory freed, the model loaded again; it exits with 75 when the exec cannot be done or a thread sits in the driver without a way out. `dev/architecture/server.md` ("The restart in place"), `tests/binary.rs` on the host (the `ares-host` model, `ARES_TEST_HOLD_STEPS_WHILE`), and once on the local cards with the 0.8B.
+
 ## 2026-11-25
 
 Done on `chore/leftovers` (2026-11-25), each item verbatim and then what was done:

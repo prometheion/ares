@@ -63,7 +63,7 @@ pub(crate) async fn model_of(app: &App, model: &mut String) -> Result<Lease, Api
     let mut stop = app.stop.clone();
     let lease = tokio::select! {
         lease = app.models.acquire(model) => lease?,
-        () = stop.raised() => return Err(ApiError::cancelled()),
+        error = stop.raised() => return Err(error),
     };
     lease.id().clone_into(model);
     Ok(lease)

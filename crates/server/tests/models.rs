@@ -585,6 +585,29 @@ async fn an_engine_that_fails_takes_its_model_down_and_no_other() {
     assert_eq!(w.status("a"), ("loaded".into(), None));
 }
 
+#[tokio::test]
+async fn an_engine_stuck_in_a_step_asks_for_a_restart_and_every_request_is_told_so() {
+    let w = world(THREE, &[10, 10]);
+    let on_a = w.models.acquire("a").await.unwrap();
+    drop(w.models.acquire("d").await.unwrap());
+    w.machine.engine("a").set_stuck("the engine has been in one step for 600 s");
+
+    // A request to the model finds it stuck: the server is to restart in
+    // place, whoever still holds the model, and every request is told so.
+    let next = w.request("a").await.unwrap().unwrap_err();
+    let reason = "the engine of the model 'a' is stuck: the engine has been in one step for 600 s";
+    assert_eq!(next, AcquireError::Restarting { reason: reason.into() });
+    assert_eq!(w.models.restart_asked().await, reason);
+    assert_eq!(w.models.restarting().as_deref(), Some(reason));
+    let other = w.models.acquire("d").await.unwrap_err();
+    assert_eq!(other, AcquireError::Restarting { reason: reason.into() });
+    // The stuck model's unit is left as it is, for the new image to free:
+    // an unload would ask its driver to free what it holds.
+    drop(on_a);
+    w.models.shutdown().await;
+    assert_eq!(w.machine.log(), ["load a", "load d", "unload d"]);
+}
+
 // --- start and shutdown -----------------------------------------------------------
 
 #[tokio::test]

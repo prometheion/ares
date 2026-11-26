@@ -235,23 +235,25 @@ impl Drop for Seat {
 
 /// Tells running requests that the server is stopping and will not wait for
 /// them any longer. The handlers then cancel them in the engine and end
-/// their responses with an error.
+/// their responses with the error the signal carries.
 #[derive(Debug, Clone)]
-pub(crate) struct Stop(watch::Receiver<bool>);
+pub(crate) struct Stop(watch::Receiver<Option<ApiError>>);
 
 impl Stop {
-    /// A signal and the sender that raises it by sending `true`. While the
-    /// sender lives and has not sent, and after it is dropped without having
-    /// sent, the signal stays down.
-    pub fn new() -> (watch::Sender<bool>, Self) {
-        let (tx, rx) = watch::channel(false);
+    /// A signal and the sender that raises it by sending the error the
+    /// requests end with. While the sender lives and has not sent, and after
+    /// it is dropped without having sent, the signal stays down.
+    pub fn new() -> (watch::Sender<Option<ApiError>>, Self) {
+        let (tx, rx) = watch::channel(None);
         (tx, Self(rx))
     }
 
-    /// Completes when the signal is raised.
-    pub async fn raised(&mut self) {
-        if self.0.wait_for(|stop| *stop).await.is_err() {
-            std::future::pending::<()>().await;
+    /// Completes when the signal is raised, with the error to end with.
+    pub async fn raised(&mut self) -> ApiError {
+        let raised = self.0.wait_for(Option::is_some).await.ok().and_then(|error| error.clone());
+        match raised {
+            Some(error) => error,
+            None => std::future::pending().await,
         }
     }
 }
@@ -391,18 +393,22 @@ impl Run {
                 biased;
                 event = self.rx.recv() => break event,
                 () = self.overflow.wake.notified() => return Err(self.slow()),
-                () = self.stop.raised() => {
+                error = self.stop.raised() => {
                     tracing::info!(id = %self.guard.id, "the server is stopping: ending the request");
                     self.guard.cancel_now();
-                    return Err(ApiError::cancelled());
+                    return Err(error);
                 }
                 // An engine whose watchdog found it stuck sends nothing more:
-                // the request ends with its reason.
+                // the request ends with its reason, and with a stuck step the
+                // server restarts in place (`Engine::stuck`).
                 () = tokio::time::sleep(FAILURE_LOOK) => {
                     if let Some(why) = self.engine.failure() {
                         tracing::error!(id = %self.guard.id, %why, "the engine failed: ending the request");
                         self.guard.cancel_now();
-                        return Err(ApiError::internal(why));
+                        return Err(match self.engine.stuck() {
+                            true => ApiError::restarting(&format!("the engine is stuck: {why}")),
+                            false => ApiError::internal(why),
+                        });
                     }
                 }
             }
@@ -561,10 +567,10 @@ impl DecisionRun {
         let outcome = tokio::select! {
             biased;
             outcome = &mut self.rx => outcome,
-            () = self.stop.raised() => {
+            error = self.stop.raised() => {
                 tracing::info!(id = %self.guard.id, "the server is stopping: ending the decision");
                 self.guard.cancel_now();
-                return Err(ApiError::cancelled());
+                return Err(error);
             }
         };
         let Ok(outcome) = outcome else {

@@ -25,6 +25,7 @@
 
 mod devices;
 mod files;
+mod host;
 mod qwen35;
 mod qwen4exp;
 mod ram;
@@ -346,6 +347,7 @@ pub fn load_at(options: &LoadOptions, site: &Site) -> Result<Loaded, LoadError> 
     match architecture.as_str() {
         ares_model::qwen35::config::ARCHITECTURE => qwen35::load(gguf, options, site, begun),
         ares_model::qwen4exp::config::ARCHITECTURE => qwen4exp::load(gguf, options, site, begun),
+        host::ARCHITECTURE => host::load(options, begun),
         _ => Err(LoadError::Architecture(architecture)),
     }
 }

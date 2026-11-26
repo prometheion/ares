@@ -39,7 +39,7 @@ the server has one.
 | 403 | a `Host` or a web page's `Origin` the server does not answer to (see [Keys and access](#keys-and-access)) |
 | 404 / 405 | an unknown route or model / a wrong method |
 | 408 / 413 | the body did not arrive within `--timeout` / the body is larger than 64 MiB |
-| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/tokenize` and `/detokenize` without a `model`), the server is stopping |
+| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/tokenize` and `/detokenize` without a `model`), the server is stopping, `restarting` with `Retry-After: 10` (an engine was stuck in a step and the server restarts in place, `--watchdog`) |
 
 Errors have OpenAI's shape `{"error": {"message", "type", "param", "code"}}`,
 and Anthropic's `{"type": "error", "error": {"type", "message"}}` on `/v1/messages`.

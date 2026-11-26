@@ -128,6 +128,13 @@ use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 use crate::watch::Watch;
 
+/// The variable of the environment that names a file while which the
+/// conductor holds every step between its dispatch and its collection, as a
+/// device that never finishes its work would: a test of the watchdog and of
+/// what follows it (the server's restart in place), on the host and on the
+/// cards. Nothing reads it otherwise.
+pub const HOLD_STEPS_WHILE: &str = "ARES_TEST_HOLD_STEPS_WHILE";
+
 mod commit;
 mod drafting;
 mod images;
@@ -752,6 +759,9 @@ pub(crate) struct Conductor {
     stalled: bool,
     /// When the step in flight began, for the watchdog.
     heartbeat: Arc<Heartbeat>,
+    /// A test's file while which every step is held between its dispatch and
+    /// its collection ([`HOLD_STEPS_WHILE`]).
+    hold: Option<std::path::PathBuf>,
     /// The step the model paused between two of its pieces (a long prompt read layer by
     /// layer, [`StepOutput::paused`]): its one part, which runs again, alone, when it is its
     /// turn; its sequence's cells are claimed and its state is the model's until it ends.
@@ -917,6 +927,7 @@ impl Conductor {
             shutting_down: false,
             stalled: false,
             heartbeat: Arc::new(Heartbeat::new()),
+            hold: std::env::var_os(HOLD_STEPS_WHILE).map(std::path::PathBuf::from),
         }
     }
 
