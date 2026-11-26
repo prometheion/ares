@@ -180,7 +180,7 @@ All three are server options.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--log-format <text\|json>` | `text`: a line for people. `json`: one JSON object a line, for collectors. | `text` |
+| `--log-format <text\|json>` | `text`: a line for people. `json`: one JSON object a line, for collectors (the fields of a request's lines are at debug level). | `text` |
 | `--log-file <FILE>` | Append the log to this file. | standard error |
 | `--log-text` | The prompt and the reply of every request go into the log as well; without it the log holds neither. | off |
 

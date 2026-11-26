@@ -282,6 +282,11 @@ wider than the parts' own scratch runs as a **pass**:
   nor after its rows), and when it is cancelled nothing of it is kept and the next record gives
   the step up (`RecordView::gives_up_paused`). A request that arrives therefore waits for at
   most a layer's experts of the pass in flight and a micro-batch, then runs its own steps.
+- *How far it has got.* After every micro-batch the part raises the step's share
+  (`StepContext::share`: the micro-batches of the model's layers done, of all of them, the
+  layers before a part's own counted), which the conductor reads about once a second while the
+  pass runs and at every pause, for the progress of the request's prompt (see "Prompt progress"
+  in [Server](server.md)); a count of finished rows would stand still until the last layer.
 - *Images.* A prompt with an image is read layer by layer as any other (see "Images in a
   prompt"): each micro-batch's record carries its rows' rotary positions (the span's record all
   of them), the part that embeds copies the staged rows of the micro-batch's image cells over

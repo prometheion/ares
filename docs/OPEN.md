@@ -44,6 +44,7 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
 | DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 | measured (`flash/trees-study`, instruments only, not merged): Flash-Next +1 to 3 % with a tree of 4, larger trees lose, reading ahead from token tables or route memory +1 % (they name 1.4 to 6 % of a round's missing experts); 27B +9 % with trees of at most 8 rows; the MTP chain with its own candidates as siblings is as good as a DFlash tree of 8 nodes. The lever the data point at: a distinct expert in a few-row step costs 16.5 µs (about 80 GB/s of the cards' 360 / 500); at 5 µs chains reach about 120 tokens/s and trees then pay +15 %. Owner's decision on what to build ("Questions to the owner") |
 | Jev mode (`feat/jev`, 2026-11-25) | in work ("Features", "Jev mode") |
 | The push day's leftovers (`chore/leftovers`, 2026-11-25) | in work (under "Decided by the owner", the push day) |
+| Prompt progress as llama.cpp's server sends it, and a default log for a person (`feat/progress-logs`, the owner, 2026-11-26) | built (see [`dev/history.md`](dev/history.md), 2026-11-26), not merged; what is left is under "Features", "Server and API" |
 
 ## Decided by the owner (2026-11-22)
 - The triage's seven questions, answered 2026-11-25:
@@ -664,6 +665,16 @@ Pieces of real work, days each, in the order of work where the owner placed them
       is a question to the owner).
 
 ### Server and API
+- [ ] llama.cpp's web UI (`ui/apps/chat` of llama.cpp) sends `sse_ping_interval: 1` with every
+      stream, beside `return_progress`; Ares refuses it as a member it does not know, so that
+      client cannot talk to Ares yet (found 2026-11-26 by `feat/progress-logs`). Its tests also
+      send `timings_per_token`. Files: `crates/server/src/openai/request.rs` (`SERVED`).
+- [ ] Left of the prompt progress and the log (`feat/progress-logs`, 2026-11-26): no lines of a
+      long generation's speed (llama.cpp's `print_timings_tg`: `n_gen`, the rate and the rate of
+      the last 3 s, every 3 s after 100 tokens); a step of Flash-Next's prompt on lent VRAM that
+      is not a pass, and the 27B's prompt steps, report after each step only (the share inside a
+      step comes from the pass alone); the acceptance of drafts by position is in `/metrics`, not
+      in a request's lines (llama.cpp prints it at trace).
 - [ ] Left of the thinking budget and the loop guard (K03, K05, done 2026-11-22): the
       thresholds are fixed (no option); a passage loop of longer cycles (Strata's opt-in #728)
       is not looked for; `reasoning_control` is not built (refused with a 400).

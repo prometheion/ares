@@ -363,12 +363,33 @@ widest step of a prompt of Flash-Next with experts from the SSD takes tens of
 seconds. A step is watched from its dispatch to its collect; the steps of the
 warm-up are not.
 
-**What the server logs and measures.** Every generating request has a line
-with its parameters when it is taken (the model, the limit of tokens, the
-sampling fields in effect, the stop strings and tools it has, whether it
-continues a message) and one when it ends (the reason, prompt and cached
-tokens, generated and reasoning tokens, the wait in the line, the times, the
-drafts, the seed it asked for). `--log-text` adds the prompt and the reply,
+**What the server logs and measures** (`crates/server/src/bridge.rs`,
+`generate.rs`, `routes::tell_refusals`; the owner, 2026-11-26: as informative
+as llama.cpp's by default, and for a person). A request's lines are sentences,
+the timings laid out as llama.cpp's `print_timings`, each beginning with
+`request <id>`: when it is taken (its API, model and the parameters it gives);
+when it starts in the engine (at its first progress event: the prompt, what the
+cache gave, the time since the hand-over); how far a long prompt has got
+(`prompt processing, n_tokens = , progress = , t = s / tokens per second`, as
+llama.cpp's `print_timings_pp`: from 3 s into the prompt, when another tenth is
+done or 10 s have passed, never within 3 s of the last line); and at its end the
+reason, the prompt with the cached and replayed tokens apart, the generated and
+thinking tokens and the wait in line, then `prompt eval time` (the engine's
+time of the prompt, `Usage::prompt_time`, over the rows it ran for it: the
+computed and the replayed), `eval time` (the tokens after the first over the
+time after the first token), `total time`, and `draft acceptance` (accepted of
+proposed, the mean length `1 + accepted / windows` and the mean chain
+`proposed / windows`, from the request's own counts, `Usage::drafts`). Until
+2026-11-26 the end was one line of fields whose prompt rate divided the
+computed tokens by the time from the hand-over, queue and cache restore
+included (0.6 tokens/s for one token computed of 55). The same fields as
+before are the debug lines `request` and `request finished`. Every refusal and
+failure that a client gets is written by one layer over all routes
+(`tell_refusals`, from the error the response carries, `error::Refused`): the
+method and path, the status, the code, the request's id when the engine had it,
+and the message, a warning (a 500 an error); a failure inside a stream is
+written where the stream writes it (`ApiError::tell`). An unload after an
+engine failure is an error with the cause. `--log-text` adds the prompt and the reply,
 which a log otherwise never holds. `--log-format json` writes every line as a
 JSON object for collectors, `--log-file <FILE>` appends to a file instead of
 standard error; the level is `RUST_LOG`. `/metrics` has, for every model, the
@@ -376,6 +397,36 @@ histograms of the requests that ended with a reply (`crates/server/src/metrics/l
 the wait in the engine's line (`ares_request_queue_seconds`, from the watch),
 the prompt after it, the time to the first token, the time per token after the
 first, and the whole request, all from the hand-over to the engine.
+
+**Prompt progress** (`crates/runtime/src/conductor/progress.rs`,
+`openai/reply.rs`, `responses/reply.rs`; llama.cpp's `return_progress`, taken
+over 2026-11-26). The engine sends `Event::Progress` {total, cached, processed,
+elapsed} to every request whose prompt it reads: when it first starts (the
+cached tokens are done), after every step that ran rows of its prompt (in
+`Conductor::deliver`, before the step's text, so the step that ends the prompt
+reports it whole first), never after the first token; `processed` only rises.
+What is left is counted in the rows still to run for the prompt (the replayed
+ones included), spread over the tokens the cache did not give, so a replay
+moves the count. A long step of one prompt is waited for in slices of a second
+(`Executor::wait_for_step`: the bell's wait with a time limit, only for a step
+whose one part is a prompt that still reports), and after each slice the
+conductor reports the share the model says it has done
+(`Executor::step_share`, from `StepContext::share`, which Flash-Next's pass
+raises after every micro-batch: the micro-batches of the model's layers done),
+and again at every pause of the pass. Steps of generation wait as before, and a
+model that says nothing of its steps costs one slice per long step. The bridge
+uses every event for the log and lets one go that finds the queue half full;
+`Generation::reporting` passes them to a stream that asked (`return_progress` on
+chat, completions and Responses, read by the chat reader), which writes
+llama.cpp's `prompt_progress` {total, cache, processed, time_ms}: on a chunk
+with the role and no text on chat, with `text: ""` on completions, in a
+`response.in_progress` event on Responses; Messages has none, as llama.cpp.
+llama.cpp sends one per batch of the prompt and its web UI shows
+`(processed - cache) / (total - cache)`; the same holds here. Tests:
+`crates/runtime/tests/cache/prefix.rs` (steps and the cache, the pauses of a
+pass, a long step's share; every test's `Handle::finish` checks the order and
+the rise), `crates/server/tests/progress.rs` (the chunks of the three APIs as
+llama.cpp's test `test_return_progress` checks them, and the log).
 
 **Several models (router mode).** `ares --models-preset <file.ini>` serves the
 models of a preset file. A model is loaded when a request names it, stays

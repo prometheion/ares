@@ -5,6 +5,28 @@ newest first. An item stands under the latest date it names (items that name non
 the end), below the section of `OPEN.md` it stood in. Branch names, commits and paths are as
 they were written then; an open remainder of an item is listed in `OPEN.md` again.
 
+## 2026-11-26
+
+Done on `feat/progress-logs` (2026-11-26), the owner's request of the day ("llama.cpp's server
+sends prefill progress; that should work as with llama.cpp. And the logs are not good:
+llama.cpp prints prefill and decode speed in its logs, and more errors by default"):
+
+- [x] Prompt progress as llama.cpp's server sends it (`return_progress`, `prompt_progress`
+      {total, cache, processed, time_ms}, taken from its server at d92ea9b, MIT) on streamed
+      chat, completions and Responses (`response.in_progress`); the first when the request starts,
+      one per step of the prompt, the last with `processed == total` before the first text.
+      Ares counts the work: replayed rows move the count, and Flash-Next's pass says how far it
+      has got (`StepContext::share`, read about once a second while the step runs). Messages has
+      none, as llama.cpp. See "Prompt progress" in `dev/architecture/server.md`.
+- [x] The default log for a person: a request's lines (taken, started, the progress of a long
+      prompt, the end with `prompt eval time` over the rows run in the engine's own prompt time,
+      `eval time`, `total time`, `draft acceptance` with the mean length and chain, from the
+      request's own counts), every refusal and failure with its route, status, code and message,
+      an unload after an engine failure as an error, the load's repeated line of a prompt's steps
+      gone. The prompt rate no longer counts the queue and the cache restore into the time (0.6
+      tokens/s for one token computed of 55 before). `timings.prompt_ms` is the engine's prompt
+      time and the draft counts are each request's own.
+
 ## 2026-11-25
 
 Done on `chore/leftovers` (2026-11-25), each item verbatim and then what was done:

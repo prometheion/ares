@@ -57,6 +57,7 @@ prompt and those marked "chat".
 | `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; of several, `n_predict` holds, then `max_completion_tokens` |
 | `stop` | stop strings | a string or an array; not empty |
 | `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
+| `return_progress` | a stream says how far the prompt has got (llama.cpp's member) | see [Prompt progress](#prompt-progress); changes nothing without `stream` |
 | `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
 | `priority` | the request's priority | see [Priorities](#priorities) |
@@ -84,8 +85,9 @@ no chat template.
 The answer has OpenAI's shape and more: `usage.prompt_tokens_details.cached_tokens`
 (the part of the prompt the prompt cache gave), `usage.completion_tokens_details.reasoning_tokens`,
 `timings` (`prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, their rates,
-`draft_n` and `draft_n_accepted` for a request that ran alone, and `token_hash`, a
-hash of the reply's token ids), and `stop_reason` with the stop string that ended
+`draft_n` and `draft_n_accepted`, the request's own drafts, and `token_hash`, a
+hash of the reply's token ids; `prompt_ms` runs from the request's start in the
+engine, after its wait in line, to its first token, as llama.cpp's does), and `stop_reason` with the stop string that ended
 the reply. A request that asked for more tokens than `--max-tokens-limit` gets the
 limit, and its response the header `x-ares-max-tokens-limit` with it.
 
@@ -122,7 +124,7 @@ state: every response says `"store": false`.
 
 | Field | Notes |
 | --- | --- |
-| `model`, `temperature`, `top_p`, `stream`, `priority` | as on the chat route; other sampling fields are refused |
+| `model`, `temperature`, `top_p`, `stream`, `priority`, `return_progress` | as on the chat route; other sampling fields are refused |
 | `instructions` | a system message |
 | `input` | a string, or items: messages (`user`, `assistant`, `system`, `developer`; parts `input_text`, `output_text`, `input_image`), `function_call`, `function_call_output`, `reasoning` |
 | `tools`, `tool_choice`, `parallel_tool_calls` | functions only; `tool_choice` `auto`, `none`, `required`, `{"type": "function", "name"}` |
@@ -248,6 +250,35 @@ a body. Remote URLs are not fetched. One image becomes at most
 
 A stream starts after the engine's first step, so a refused request still gets
 an HTTP status, or after 10 seconds without it. A failure later is an error event.
+
+### Prompt progress
+
+`return_progress: true` on a streamed `/v1/chat/completions`, `/v1/completions` or
+`/v1/responses` request asks for llama.cpp's `prompt_progress` before the first
+text: `{"total", "cache", "processed", "time_ms"}`, all tokens of the prompt, those
+the prompt cache gave, those done with the cached ones, and the milliseconds since
+the request started in the engine (its wait in line not counted). A client shows
+`(processed - cache) / (total - cache)`, as llama.cpp's web UI does.
+
+| API | Where it is |
+| --- | --- |
+| chat | a chunk with the role and no text (`delta: {"role": "assistant", "content": ""}`) |
+| completions | a chunk with `text: ""` |
+| Responses | a `response.in_progress` event |
+
+The first comes when the request starts in the engine (`processed` is `cache`),
+one after every step that read rows of the prompt, and the last, with
+`processed` equal to `total`, just before the first text; `processed` rises with
+every one. That is when llama.cpp's server sends them, per batch of the prompt.
+What Ares adds: the count of what is done follows the work, not the finished
+rows. The rows a prompt that the cache holds runs again to rebuild the model's
+state from a checkpoint are work too, so `processed` moves during them; and
+Flash-Next, which reads a long prompt layer by layer as one step (a pass), says
+how far the pass has got, by its layers and the pieces of each, about once a
+second while it runs: `processed` is then `cache` plus that share of the
+prompt's tokens, and moves through the pass where a count of finished tokens
+would jump from nothing to all at its end. `/v1/messages` has no progress, as in
+llama.cpp (Anthropic's API has no such member; it is refused there).
 
 ## Other routes
 
