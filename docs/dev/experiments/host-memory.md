@@ -128,4 +128,27 @@ from other agents' builds.
 | --- | --- | --- |
 | Two chat requests 8 ms apart (one of 17.6k tokens with 13 tools, one of 3.4k without; also 56k and 6k) | the engine failed at once ("a step of 6112 rows in 2 segments"), the model went down | both answer |
 | A prompt of 32 034 tokens, then the same again | the second: 17 920 tokens from the cache, all of them replayed, first token after 107 s | 32 033 from the cache, 33 rows replayed, first token after 6.5 s |
-| A prompt of 93 425 tokens, then the same again | the second was read again; its tier's growth before a step was refused by the books ("no room for 62.8 MiB more of the tier of experts") and the engine failed | |
+| A prompt of 93 425 tokens, then the same again | the second was read again; its tier's growth before a step was refused by the books ("no room for 62.8 MiB more of the tier of experts") and the engine failed | (not run again: the 32k case shows the reuse) |
+
+The repro on the branch (b251c819), five runs of both cases with new texts each (two
+servers of two runs and one of one): 5 of 5 answered; the short request of the pair had its
+first token after 14 to 37 s, the long one after 45 to 92 s; the repeat came from the cache
+with all but one token every time (32 021 to 32 035), its first token after 1.4 to 5.0 s.
+Main failed the pair again in the same run (05:16, "a step of 17586 rows in 2 segments").
+Before the place of a checkpoint was kept free of the far pages (an intermediate build), the
+repeat of a second text came from the cache all the same but replayed every row (110 s): the
+one place held the first text's anchor and the second found no room for its own.
+
+No loss beside it (the same, alternating main, branch, main, branch, each server from a copy
+of the same usage profile of the experts; a prompt of 8266 tokens, one of 8271 with 640 from
+the cache, a reply of 256 tokens after each; load average 2.5 to 10):
+
+| Run | Prompt 1 | Prompt 2 | Decode 1 | Decode 2 |
+| --- | --- | --- | --- | --- |
+| main | 14.93 s | 46.44 s | 6.6 tok/s | 6.9 tok/s |
+| branch | 14.34 s | 15.89 s | 11.3 tok/s | 14.1 tok/s |
+| main | 13.96 s | 15.69 s | 10.7 tok/s | 14.0 tok/s |
+| branch | 14.48 s | 16.51 s | 11.1 tok/s | 9.9 tok/s |
+
+The first run of main was disturbed (all four numbers far from the other three runs); the
+other three agree within the spread of one build's own runs.
