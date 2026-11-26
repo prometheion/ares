@@ -1400,7 +1400,9 @@ fn a_paused_pass_reports_the_share_it_has_done() {
 }
 
 /// A step of a prompt that runs long reports how far it has got while it runs, about
-/// once a second, from a model that says so ([`ares_runtime::Executor::step_share`]).
+/// once a second, from a model that says so ([`ares_runtime::Executor::step_share`]),
+/// also when the model says nothing for its first second (Flash-Next's first piece of
+/// a pass after a load waits for the drive).
 #[test]
 fn a_long_step_reports_its_share_while_it_runs() {
     let mut rng = Rng(43);
@@ -1408,19 +1410,19 @@ fn a_long_step_reports_its_share_while_it_runs() {
     let model = model(Some(CHECKPOINT), |_| {});
     let config = RuntimeConfig { checkpoint_prompt_interval: 64 * PAGE, ..config(256, 16) };
     let e = engine_with(&model, config, |host| {
-        host.with_step_cost(|rows| Duration::from_millis(if rows > 8 { 2600 } else { 1 }))
-            .with_shares()
+        host.with_step_cost(|rows| Duration::from_millis(if rows > 8 { 3600 } else { 1 }))
+            .with_shares_after(Duration::from_millis(1500))
     });
     let (_, progress) = start(&e.rt, request(&prompt, Some(4))).unwrap().finish_with_progress();
     let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
     // The long step is the first 32 rows (it ends at the last page before the
-    // prompt's end): the start, two reports inside it (after one second and after
-    // two, as far as the share of its time), its end, and the end of the step of
-    // the last rows.
+    // prompt's end): the start, nothing after one second (the model says nothing
+    // yet), two reports after two and three (as far as the share of its time), its
+    // end, and the end of the step of the last rows.
     assert_eq!(said.len(), 5, "{said:?}");
     assert_eq!((said[0], said[3], said[4]), (0, 32, 40), "{said:?}");
-    assert!((10..=15).contains(&said[1]) && (22..=28).contains(&said[2]), "{said:?}");
+    assert!((15..=21).contains(&said[1]) && (24..=30).contains(&said[2]), "{said:?}");
     let elapsed: Vec<u128> = progress.iter().map(|p| p.elapsed.as_millis()).collect();
-    assert!(elapsed[1] >= 1000 && elapsed[2] >= 2000 && elapsed[3] >= 2600, "{elapsed:?}");
+    assert!(elapsed[1] >= 2000 && elapsed[2] >= 3000 && elapsed[3] >= 3600, "{elapsed:?}");
     e.consistent();
 }

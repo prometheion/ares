@@ -180,8 +180,9 @@ pub struct HostExecutor {
     paused_inner: Vec<crate::InnerSave>,
     paused: bool,
     /// Whether the executor says how far a step has got ([`HostExecutor::with_shares`]),
-    /// and the piece the step that was dispatched is of the step the model runs in pieces.
-    shares: bool,
+    /// from how long into the step on, and the piece the step that was dispatched is of
+    /// the step the model runs in pieces.
+    shares: Option<Duration>,
     piece: Option<(u32, u32)>,
 }
 
@@ -286,7 +287,7 @@ impl HostExecutor {
             pauses: None,
             paused_inner: Vec::new(),
             paused: false,
-            shares: false,
+            shares: None,
             piece: None,
         }
     }
@@ -404,8 +405,14 @@ impl HostExecutor {
     /// and of a step run in pieces ([`HostExecutor::with_pauses`]) the pieces before
     /// it and that share of its own. A step that sleeps ends its waits within a limit
     /// ([`Executor::wait_for_step`]) when it is over or the limit is.
-    pub fn with_shares(mut self) -> Self {
-        self.shares = true;
+    pub fn with_shares(self) -> Self {
+        self.with_shares_after(Duration::ZERO)
+    }
+
+    /// [`HostExecutor::with_shares`] from `silent` into a step on: before, the model
+    /// says nothing, as one whose first piece waits for the drive.
+    pub fn with_shares_after(mut self, silent: Duration) -> Self {
+        self.shares = Some(silent);
         self
     }
 
@@ -643,7 +650,7 @@ impl Executor for HostExecutor {
     }
 
     fn step_share(&self) -> Option<f64> {
-        if !self.shares {
+        if self.shares.is_none_or(|silent| self.dispatched_at.elapsed() < silent) {
             return None;
         }
         let passed = if self.step_delay.is_zero() {

@@ -131,13 +131,12 @@ impl Conductor {
     }
 
     /// Tells the request of the step in flight how far the step has got, by the
-    /// model's share of it; `false` when the model says nothing of it.
-    pub(super) fn report_step_share(&mut self, slot: u32, rows: u32) -> bool {
-        let Some(share) = self.exec.step_share() else { return false };
+    /// model's share of it, if the model says.
+    pub(super) fn report_step_share(&mut self, slot: u32, rows: u32) {
+        let Some(share) = self.exec.step_share() else { return };
         if let Some(a) = self.slots[slot as usize].as_mut() {
             // A sink that refuses is found when the step's events go out.
             let _ = a.report_progress(share.clamp(0.0, 1.0) * f64::from(rows));
         }
-        true
     }
 }

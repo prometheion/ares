@@ -22,14 +22,14 @@ impl Conductor {
         let dispatched = self.exec.dispatch(&meta);
         let t_wait = Instant::now();
         // A step of one prompt that runs long: its request hears how far the
-        // step has got while it runs, from a model that says so.
+        // step has got while it runs, from a model that says so. A model may say
+        // nothing for the first seconds of a step (its first piece waits for the
+        // drive), so the conductor looks as long as the step runs.
         if dispatched.is_ok()
             && let Some((slot, rows)) = self.reporting_step()
         {
             while !self.exec.wait_for_step(self.config.conductor_spin, progress::LOOK) {
-                if !self.report_step_share(slot, rows) {
-                    break;
-                }
+                self.report_step_share(slot, rows);
             }
         }
         let collected = dispatched
