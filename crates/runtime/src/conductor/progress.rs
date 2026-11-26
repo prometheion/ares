@@ -93,7 +93,7 @@ impl Active {
         } else {
             let done = f64::from((self.replayed + self.computed).saturating_sub(p.ran)) + in_flight;
             let share = if p.work == 0 { 1.0 } else { (done / f64::from(p.work)).min(1.0) };
-            let counted = p.base + (f64::from(total.saturating_sub(p.base)) * share) as u32;
+            let counted = p.base + (f64::from(total.saturating_sub(p.base)) * share).round() as u32;
             // The last token is done when the prompt is read, not before.
             counted.min(total.saturating_sub(1))
         };
