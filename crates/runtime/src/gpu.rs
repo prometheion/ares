@@ -19,7 +19,7 @@
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -209,6 +209,8 @@ struct Shared {
     clock: Clock,
     /// What the engine was asked so far ([`StepContext::asks`]).
     asks: Arc<AtomicU64>,
+    /// How far the step in flight has got, by the model ([`StepContext::share`]).
+    share: AtomicU32,
 }
 
 struct Handle {
@@ -337,6 +339,7 @@ impl GpuExecutor {
             remaining: AtomicUsize::new(0),
             clock: Clock::new(),
             asks: Arc::new(AtomicU64::new(0)),
+            share: AtomicU32::new(0),
         });
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -497,6 +500,7 @@ impl Executor for GpuExecutor {
         }
         self.steps = Some(ares_cuda::gate::Steps::begin());
         self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
+        self.shared.share.store(0, Ordering::Relaxed);
         let dispatched_ns = self.shared.clock.now_ns();
         for handle in &self.handles {
             *handle.mailbox.job.lock().expect("job slot") =
@@ -505,6 +509,19 @@ impl Executor for GpuExecutor {
         }
         self.in_flight = true;
         Ok(())
+    }
+
+    fn wait_for_step(&mut self, spin: Duration, limit: Duration) -> bool {
+        assert!(self.in_flight, "no step is running");
+        self.shared.done.bind();
+        self.shared.done.wait_past_within(self.seen, spin, limit).is_some()
+    }
+
+    fn step_share(&self) -> Option<f64> {
+        match self.shared.share.load(Ordering::Relaxed) {
+            0 => None,
+            share => Some(f64::from(share - 1) / 1e6),
+        }
     }
 
     fn collect(&mut self, spin: Duration, out: &mut StepOutput) -> Result<Woke, ExecError> {
@@ -1120,6 +1137,7 @@ impl Worker {
                 std::ptr::null()
             },
             asks: &self.shared.asks,
+            share: &self.shared.share,
         })?;
 
         // The picks of the rows whose logits are wanted, made on the device,

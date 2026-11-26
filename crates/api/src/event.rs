@@ -6,11 +6,15 @@ use crate::EngineError;
 
 /// One step of a request's life, as seen by the front end.
 ///
-/// A request produces any number of [`Event::Text`] and [`Event::Logprobs`] events followed by exactly
-/// one terminal event, [`Event::Done`] or [`Event::Error`]. Nothing follows the
-/// terminal event.
+/// A request produces any number of [`Event::Progress`], [`Event::Text`] and
+/// [`Event::Logprobs`] events followed by exactly one terminal event,
+/// [`Event::Done`] or [`Event::Error`]. Nothing follows the terminal event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// How far the prompt has got: when the request starts, and after every
+    /// step that ran rows of its prompt, up to the step that ends it, whose
+    /// progress comes before its text. Never after the first text.
+    Progress(Progress),
     /// A piece of output text.
     ///
     /// It is valid UTF-8 by construction (a `String`) and must never split a
@@ -33,8 +37,40 @@ pub enum Event {
 impl Event {
     /// Whether this event ends the request.
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, Event::Text(_) | Event::Logprobs(_))
+        !matches!(self, Event::Text(_) | Event::Logprobs(_) | Event::Progress(_))
     }
+}
+
+/// How far the prompt of a request has got ([`Event::Progress`]), in the
+/// terms of llama.cpp's `prompt_progress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// All tokens of the prompt.
+    pub total: u32,
+    /// The tokens the prompt cache gave when the request started
+    /// ([`Usage::cached_prompt_tokens`]).
+    pub cached: u32,
+    /// The tokens done, the cached ones included: from `cached` when the
+    /// request starts to `total` when its prompt is read, rising with every
+    /// report. What is left is counted in the rows the engine still runs for
+    /// the prompt, the rows that rebuild the state from a checkpoint
+    /// included, spread over the tokens the cache did not give; a step that
+    /// runs its rows layer by layer (a pass) counts them by the share of its
+    /// work done.
+    pub processed: u32,
+    /// Since the request started in the engine: its wait in line is not in it.
+    pub elapsed: std::time::Duration,
+}
+
+/// The drafts of one request ([`Usage::drafts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drafts {
+    /// Draft tokens the request's windows carried to be verified.
+    pub proposed: u32,
+    /// Those the model's picks confirmed.
+    pub accepted: u32,
+    /// The windows that carried drafts: the steps that verified some.
+    pub windows: u32,
 }
 
 /// The probability of a generated token and of the alternatives it had.
@@ -77,9 +113,11 @@ pub enum FinishReason {
 
 /// What a finished request took: its tokens, and how long it waited.
 ///
-/// Two usages are equal when their counts are: the wait in line is a
-/// measurement of the moment, which two runs of the same request never
-/// share, and is left out of the comparison.
+/// Two usages are equal when their counts of tokens are: the wait in line and
+/// the time of the prompt are measurements of the moment, which two runs of
+/// the same request never share, and the replayed rows and the drafts depend
+/// on what else ran and on the drafts that were allowed; they are left out of
+/// the comparison.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
     /// All tokens of the prompt, including the cached ones.
@@ -105,6 +143,20 @@ pub struct Usage {
     /// that ended before it started.
     #[serde(default)]
     pub queued: Option<std::time::Duration>,
+    /// The rows of the cached part of the prompt that were run again to
+    /// rebuild the recurrent state from a checkpoint before it (part of
+    /// `cached_prompt_tokens`: their cells came from the cache).
+    #[serde(default)]
+    pub replayed_prompt_tokens: u32,
+    /// From the request's start in the engine (after its wait in line) to
+    /// the step that ended its prompt and gave its first token; `None` from
+    /// an engine that does not say, or for a request that ended before.
+    #[serde(default)]
+    pub prompt_time: Option<std::time::Duration>,
+    /// The request's own drafts; `None` from an engine that does not count
+    /// them per request.
+    #[serde(default)]
+    pub drafts: Option<Drafts>,
 }
 
 impl PartialEq for Usage {
@@ -126,6 +178,9 @@ mod tests {
     fn only_text_and_probabilities_are_non_terminal() {
         assert!(!Event::Text("a".into()).is_terminal());
         assert!(!Event::Logprobs(Vec::new()).is_terminal());
+        let progress =
+            Progress { total: 8, cached: 2, processed: 2, elapsed: std::time::Duration::ZERO };
+        assert!(!Event::Progress(progress).is_terminal());
         assert!(Event::Done { finish: FinishReason::Stop, usage: Usage::default() }.is_terminal());
         assert!(Event::Error(EngineError::Overloaded).is_terminal());
     }

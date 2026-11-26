@@ -132,7 +132,7 @@ struct Marks {
 impl Marks {
     fn note(&self, event: &Event) {
         let now = (self.started.elapsed().as_nanos() as u64).max(1);
-        if !matches!(event, Event::Error(_)) {
+        if !matches!(event, Event::Error(_) | Event::Progress(_)) {
             let _ = self.first.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
         }
         if event.is_terminal() {
@@ -389,7 +389,13 @@ impl Run {
         let event = loop {
             tokio::select! {
                 biased;
-                event = self.rx.recv() => break event,
+                event = self.rx.recv() => {
+                    // How far the prompt has got is not told yet.
+                    if matches!(event, Some(Event::Progress(_))) {
+                        continue;
+                    }
+                    break event;
+                }
                 () = self.overflow.wake.notified() => return Err(self.slow()),
                 () = self.stop.raised() => {
                     tracing::info!(id = %self.guard.id, "the server is stopping: ending the request");
@@ -426,6 +432,7 @@ impl Run {
                 Ok(Item::Text(text))
             }
             Event::Logprobs(probs) => Ok(Item::Probs(probs)),
+            Event::Progress(_) => unreachable!("the progress is passed over where it arrives"),
             Event::Done { finish, usage } => {
                 self.guard.disarm();
                 let timings = self.timings(usage).await;

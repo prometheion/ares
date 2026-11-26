@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ares_api::{
-    Engine, EngineError, Event, EventSink, FinishReason, GenerateRequest, Prompt, RequestId,
-    Sampling, TokenProbs, ToolFormat, Usage,
+    Engine, EngineError, Event, EventSink, FinishReason, GenerateRequest, Progress, Prompt,
+    RequestId, Sampling, TokenProbs, ToolFormat, Usage,
 };
 use ares_runtime::testing::HostExecutor;
 use ares_runtime::{
@@ -135,19 +135,40 @@ pub struct Run {
 pub struct Handle {
     pub id: RequestId,
     rx: Receiver<Event>,
+    /// Events were read before [`Handle::finish`] ([`Handle::wait_for_text`]).
+    begun: std::cell::Cell<bool>,
 }
 
 impl Handle {
     /// Reads events until the terminal one, checking the contract on the
     /// way: text is never empty, exactly one terminal event ends the stream,
-    /// and nothing follows it.
+    /// and nothing follows it; the progress of the prompt comes before the
+    /// text, begins at the cached tokens and rises to all of them.
     pub fn finish(self) -> Run {
+        self.finish_with_progress().0
+    }
+
+    /// [`Handle::finish`], with the progress events the request got.
+    pub fn finish_with_progress(self) -> (Run, Vec<Progress>) {
         let deadline = Instant::now() + LIMIT;
         let mut text = String::new();
         let mut probs = Vec::new();
+        let mut progress: Vec<Progress> = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
+                Ok(Event::Progress(now)) => {
+                    assert!(
+                        text.is_empty() && probs.is_empty(),
+                        "progress after the text: {now:?}"
+                    );
+                    if let Some(last) = progress.last() {
+                        assert!(now.processed > last.processed, "{last:?} then {now:?}");
+                        assert_eq!((now.total, now.cached), (last.total, last.cached));
+                    }
+                    assert!(now.cached <= now.processed && now.processed <= now.total, "{now:?}");
+                    progress.push(now);
+                }
                 Ok(Event::Text(piece)) => {
                     assert!(!piece.is_empty(), "an empty text event");
                     text.push_str(&piece);
@@ -163,7 +184,20 @@ impl Handle {
                         self.rx.recv_timeout(Duration::from_millis(50)).is_err(),
                         "events after the terminal one"
                     );
-                    return Run { text, finish, usage, probs };
+                    if usage.completion_tokens > 0 && !self.begun.get() {
+                        let (first, last) = (progress.first(), progress.last());
+                        assert_eq!(
+                            first.map(|p| (p.total, p.cached, p.processed)),
+                            Some((
+                                usage.prompt_tokens,
+                                usage.cached_prompt_tokens,
+                                usage.cached_prompt_tokens
+                            )),
+                            "the first progress: {progress:?}"
+                        );
+                        assert_eq!(last.map(|p| p.processed), Some(usage.prompt_tokens));
+                    }
+                    return (Run { text, finish, usage, probs }, progress);
                 }
                 Ok(Event::Error(error)) => panic!("request {} failed: {error}", self.id),
                 Err(_) => panic!("request {} did not end within {LIMIT:?}", self.id),
@@ -177,7 +211,7 @@ impl Handle {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
-                Ok(Event::Text(_) | Event::Logprobs(_)) => {}
+                Ok(Event::Text(_) | Event::Logprobs(_) | Event::Progress(_)) => {}
                 Ok(Event::Done { .. }) => panic!("request {} did not fail", self.id),
                 Ok(Event::Error(error)) => return error,
                 Err(_) => panic!("request {} did not end within {LIMIT:?}", self.id),
@@ -187,12 +221,14 @@ impl Handle {
 
     /// Waits for `n` characters of text without ending the request.
     pub fn wait_for_text(&self, n: usize) -> String {
+        self.begun.set(true);
         let deadline = Instant::now() + LIMIT;
         let mut text = String::new();
         while text.chars().count() < n {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
                 Ok(Event::Text(piece)) => text.push_str(&piece),
+                Ok(Event::Progress(_)) => {}
                 other => panic!("request {} gave {other:?} before {n} characters", self.id),
             }
         }
@@ -204,7 +240,7 @@ pub fn start(rt: &Runtime, request: GenerateRequest) -> Result<Handle, EngineErr
     let id = request.id;
     let (tx, rx) = mpsc::channel();
     rt.submit(request, EventSink::new(move |event| tx.send(event).is_ok()))?;
-    Ok(Handle { id, rx })
+    Ok(Handle { id, rx, begun: Default::default() })
 }
 
 /// Starts a request whose events `seen` looks at before the test gets them,
@@ -222,7 +258,7 @@ pub fn start_seen(
         tx.send(event).is_ok()
     });
     rt.submit(request, sink)?;
-    Ok(Handle { id, rx })
+    Ok(Handle { id, rx, begun: Default::default() })
 }
 
 /// Starts a request whose picks `filter` restricts.
@@ -238,7 +274,7 @@ pub fn start_filtered(
         EventSink::new(move |event| tx.send(event).is_ok()),
         Box::new(filter),
     )?;
-    Ok(Handle { id, rx })
+    Ok(Handle { id, rx, begun: Default::default() })
 }
 
 pub fn run_one(rt: &Runtime, request: GenerateRequest) -> Run {

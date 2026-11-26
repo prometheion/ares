@@ -157,6 +157,8 @@ impl Conductor {
             cached_prompt: 0,
             replayed: 0,
             computed: 0,
+            progress: Default::default(),
+            drafts: Default::default(),
             tokens,
             names,
             spans,
@@ -267,6 +269,9 @@ impl Conductor {
         }
         a.ran = true;
         a.waits_for = None;
+        // The work of its prompt is counted from here; at the first start the
+        // request hears where its prompt begins.
+        a.progress_starts();
         self.by_id.insert(a.id, Place::Slot(slot));
         self.slots[slot as usize] = Some(a);
         self.active += 1;

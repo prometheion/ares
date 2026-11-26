@@ -179,6 +179,10 @@ pub struct HostExecutor {
     pauses: Option<Pauses>,
     paused_inner: Vec<crate::InnerSave>,
     paused: bool,
+    /// Whether the executor says how far a step has got ([`HostExecutor::with_shares`]),
+    /// and the piece the step that was dispatched is of the step the model runs in pieces.
+    shares: bool,
+    piece: Option<(u32, u32)>,
 }
 
 /// Which steps a model that reads long prompts in pieces pauses: a step of one prompt
@@ -282,6 +286,8 @@ impl HostExecutor {
             pauses: None,
             paused_inner: Vec::new(),
             paused: false,
+            shares: false,
+            piece: None,
         }
     }
 
@@ -390,6 +396,16 @@ impl HostExecutor {
     pub fn with_pauses(mut self, rows: u32, pieces: u32) -> Self {
         assert!(pieces >= 1, "a step is at least one piece");
         self.pauses = Some(Pauses::new(rows, pieces));
+        self
+    }
+
+    /// Says how far the step in flight has got ([`Executor::step_share`]), as a model
+    /// that reads a long prompt in pieces does: the share of its time that has passed,
+    /// and of a step run in pieces ([`HostExecutor::with_pauses`]) the pieces before
+    /// it and that share of its own. A step that sleeps ends its waits within a limit
+    /// ([`Executor::wait_for_step`]) when it is over or the limit is.
+    pub fn with_shares(mut self) -> Self {
+        self.shares = true;
         self
     }
 
@@ -504,9 +520,11 @@ impl Executor for HostExecutor {
         let mut rows_run = true;
         let mut inner: Vec<crate::InnerSave> =
             (0..view.inner_saves()).map(|i| view.inner_save(i)).collect();
+        self.piece = None;
         if let Some(pauses) = &mut self.pauses
             && let Some(done) = pauses.step(&view)
         {
+            self.piece = Some((done, pauses.pieces()));
             self.paused = done < pauses.pieces();
             rows_run = !self.paused;
             if done == 1 {
@@ -609,6 +627,34 @@ impl Executor for HostExecutor {
         }
         self.dispatched_at = Instant::now();
         Ok(())
+    }
+
+    fn wait_for_step(&mut self, _spin: Duration, limit: Duration) -> bool {
+        if !self.sleeps || self.gate.is_some() {
+            return true;
+        }
+        match self.step_delay.checked_sub(self.dispatched_at.elapsed()) {
+            Some(left) if left > limit => {
+                std::thread::sleep(limit);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn step_share(&self) -> Option<f64> {
+        if !self.shares {
+            return None;
+        }
+        let passed = if self.step_delay.is_zero() {
+            1.0
+        } else {
+            (self.dispatched_at.elapsed().as_secs_f64() / self.step_delay.as_secs_f64()).min(1.0)
+        };
+        Some(match self.piece {
+            Some((done, of)) => (f64::from(done - 1) + passed) / f64::from(of),
+            None => passed,
+        })
     }
 
     fn collect(&mut self, _spin: Duration, out: &mut StepOutput) -> Result<Woke, ExecError> {

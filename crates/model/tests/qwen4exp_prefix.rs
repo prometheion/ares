@@ -290,7 +290,7 @@ impl Rig {
                 Event::Error(error) => {
                     let _ = tx.send(Err(error.to_string()));
                 }
-                Event::Logprobs(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) => {}
             }
             true
         });

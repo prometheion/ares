@@ -366,6 +366,19 @@ pub struct StepContext<'a> {
     /// ([`RecordView::asked`](crate::record::RecordView::asked)), so that the
     /// conductor can answer ([`DeviceModel::paused`]).
     pub asks: &'a std::sync::atomic::AtomicU64,
+    /// Where a model that runs a long step in pieces (a prompt read layer by
+    /// layer) says how far it has got, for the progress of the prompt the
+    /// conductor reports while the step runs ([`Executor::step_share`](crate::Executor)):
+    /// the share of the step's work done in millionths, plus one, raised with
+    /// `fetch_max` (so that the devices of a split can all write it); 0, as the
+    /// step begins, says nothing. A paused step that goes on counts from where
+    /// its rows began, not from where it was paused.
+    pub share: &'a std::sync::atomic::AtomicU32,
+}
+
+/// The value of [`StepContext::share`] for `done` of `of` pieces of a step.
+pub fn share_of(done: u64, of: u64) -> u32 {
+    if of == 0 { 0 } else { (done.min(of) * 1_000_000 / of) as u32 + 1 }
 }
 
 /// What a model that reads images tells the runtime ([`Model::vision`]).

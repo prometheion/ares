@@ -615,6 +615,11 @@ impl Qwen4ExpDevice {
                 self.flow.pump()?;
                 run.next += 1;
                 ran += 1;
+                // How far the pass has got, for the progress of its prompt: the
+                // micro-batches of the layers of the model done, on every part.
+                let done = layer_no as u64 * micro_n + m as u64 + 1;
+                let share = ares_runtime::share_of(done, self.model_layers as u64 * micro_n);
+                step.share.fetch_max(share, Ordering::Relaxed);
             }
             // Every micro-batch has routed: the picks of all rows go to the host, and the
             // layer's experts run for all of them.

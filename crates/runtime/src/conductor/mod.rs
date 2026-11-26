@@ -133,6 +133,7 @@ mod drafting;
 mod images;
 mod lifecycle;
 mod measure;
+mod progress;
 mod step_record;
 
 /// How long the conductor sleeps on its channel when requests wait and none
@@ -336,6 +337,10 @@ struct Active {
     cached_prompt: u32,
     replayed: u32,
     computed: u32,
+    /// How far the prompt has got, as its progress events said it.
+    progress: progress::PromptProgress,
+    /// The request's own drafts, for its usage.
+    drafts: ares_api::Drafts,
     /// The sequence's place in the corpus of all text. Its tokens enter the
     /// corpus when they are certain: prompt tokens when the step that
     /// computed their rows is back, generated tokens when they are accepted.
@@ -396,6 +401,9 @@ impl Active {
             output_hash: token_hash(&self.tokens[self.prompt_len as usize..]),
             reasoning_tokens: self.stop.reasoning_tokens(),
             queued: self.stop.queued(),
+            replayed_prompt_tokens: self.progress.replayed(self.replayed),
+            prompt_time: self.stop.prompt_time(),
+            drafts: Some(self.drafts),
         }
     }
 
@@ -479,6 +487,10 @@ impl Active {
     ) {
         for (i, &token) in picked.iter().enumerate() {
             self.completion += 1;
+            if self.completion == 1 {
+                self.stop.prompt_read();
+                self.progress.read(self.replayed);
+            }
             if model.ends(token) {
                 self.stop.token(&[]);
                 return self.end_reply(FinishReason::Stop);
