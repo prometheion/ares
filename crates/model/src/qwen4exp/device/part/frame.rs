@@ -654,13 +654,15 @@ impl Frame {
         // The most partial states a plan makes: the planner's bound for dense
         // rows (`PlanConfig::state_slots_bound`, as the 27B: a row that reads its
         // prefix with another sequence, or past its first tiles with a tile
-        // mean, has several pieces) and the pieces of device-made lists
-        // (`build_plan`).
+        // mean, has several pieces; no row more than its sequence has entries,
+        // which is the smaller bound for short sequences) and the pieces of
+        // device-made lists (`build_plan`).
         let alone = opts.window_rows.max(opts.max_slots);
         let mean = opts.kv.0.has_mean() || opts.kv.1.has_mean();
-        let state_slots = plan_config
+        let dense = plan_config
             .state_slots_bound(geo.kv_heads, geo.q_per_kv, rows as u32, alone, opts.max_slots, mean)
-            .max(list_state_slots(plan_config, geo.kv_heads, rows, alone));
+            .min((rows + u64::from(alone)) * PlanConfig::row_slots_bound(opts.cells));
+        let state_slots = dense.max(list_state_slots(plan_config, geo.kv_heads, rows, alone));
         // A state is, per query head, the weighted V and the log of the sum.
         let state = c.attention.n_head as u64 * (u64::from(geo.head_dim) + 1) * 4;
         let attn_state_bytes = att * state_slots * state;

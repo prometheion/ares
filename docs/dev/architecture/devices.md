@@ -342,7 +342,14 @@ more each with one), and a test checks it against random steps of prompts,
 shared prefixes and rows alone (`plan.rs`). It costs the devices tens of MiB
 of scratch (the 3060 of the owner's settings 62 MiB where it reserved 12); the
 server's estimate counts it (`attention_state_bytes`), and a device that is
-over gives up at least a whole head. `tests/real_devices.rs` loads the 27B three
+over gives up at least a whole head. Flash-Next's frame takes the same bound
+(2026-11-25), and for short sequences the smaller one of a slot per entry a row
+(`PlanConfig::row_slots_bound`): a piece is of whole entries of 128 cells, so a
+row of a sequence of at most `cells` cells has no more pieces than its entries
+and one (the cut of a shared prefix). At the contexts of real use the planner's
+bound is the smaller; at the 512 cells of the made-up model in the tests the
+per-entry bound keeps a lent step of 32 rows in what the expert slots lend
+(the planner's bound alone took 12 MB on the RTX 4070). `tests/real_devices.rs` loads the 27B three
 ways and compares the planned pages and the text: two sequences, K and V in
 `q8`, no drafters, 890 pages with the heads following the weights, 1770 with a
 quarter of them on the 4070, and 1946 (248 832 tokens: the model's 262 144 do
