@@ -1,0 +1,69 @@
+# Builds Ares on a machine that is not the author's.
+#
+# Both build scripts run under `cargo check`, so this compiles every CUDA kernel
+# and every GLSL shader without needing a GPU or the slow release link. That is
+# what catches the two things a local build cannot: a toolchain older or stricter
+# than the one it was written against.
+#
+# The shader compiler is LunarG's current shaderc, not the distribution's. The
+# distribution package named in the quickstart is from 2023 and does not know
+# GL_EXT_integer_dot_product, which the mmvq shaders require.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.0.3-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git pkg-config
+
+      - name: Shader compiler
+        run: |
+          curl -sS -o /etc/apt/trusted.gpg.d/lunarg.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc
+          curl -sS -o /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y shaderc
+          glslc --version
+
+      - name: Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Both GPU classes the engine is tested on, so the kernels are compiled
+      # the way a user's build compiles them.
+      - name: Check
+        env:
+          ARES_CUDA_ARCHS: "86,89"
+        run: cargo check --workspace --all-targets
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Compiled, not run: the runners have no GPU.
+      - name: Build the tests
+        env:
+          ARES_CUDA_ARCHS: "86,89"
+        run: cargo test --workspace --no-run
