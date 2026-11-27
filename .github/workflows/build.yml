@@ -30,13 +30,15 @@ jobs:
       # the model files with; its tests open a ring.
       options: --security-opt seccomp=unconfined
     steps:
-      - uses: actions/checkout@v4
-
+      # git first: without it in the container, checkout downloads an archive
+      # with no .git, and the doc-link check asks git for the tree.
       - name: System packages
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential curl ca-certificates git pkg-config python3
+
+      - uses: actions/checkout@v4
 
       - name: Shader compiler
         run: |
