@@ -25,9 +25,12 @@
 //!   RAM: copied out of its place into a buffer of its own first. One that
 //!   later requests have left behind at deeper page boundaries is not
 //!   written: a deeper one on its branch is where a prompt resumes.
-//! - **Never** a tail (the partly used last page of a sequence) and the state
-//!   at its end: a prompt that resumes from the drive restores the checkpoint
-//!   before them and replays the rows between.
+//! - **A tail** (a partly used page) with the state at its end, a prompt's
+//!   anchor at the end of its last message or a request's end, as a page and
+//!   its checkpoint are: a page record under the tail's name, one deeper than
+//!   the page it hangs under, and the state beside it. A tail without its
+//!   state is not written, and neither is a state whose save still waits for
+//!   a record when the engine ends.
 //!
 //! The writer syncs the drive a second after it has nothing left to write,
 //! and every ten seconds while records keep coming, so what was written is
@@ -36,7 +39,8 @@
 //! # A hit
 //!
 //! [`Cache::probe`] asks the store for the pages after the ones the index
-//! (and RAM) have. A run of them is announced in the index under an owner of
+//! (and RAM) have, and for a tail with its state they go on into when that
+//! state lies deepest. A run of them is announced in the index under an owner of
 //! its own, which holds the prompt back as a page that another sequence
 //! computes would. The readers bring the pages into buffers of RAM and the
 //! deepest checkpoint of the run into a buffer of its own; the cache gives
