@@ -454,8 +454,11 @@ impl Plan {
     }
 
     /// Uploads the plan into a buffer of its own (synchronously: an allocation and a
-    /// copy that waits for the device). A step loop avoids both with [`Plan::write`]
-    /// and [`Plan::on_device`].
+    /// copy that waits for the device). Not for a step: both can wait for a kernel of the
+    /// step that waits for another device's thread (the libcuda deadlock of
+    /// [`crate::gate`]). A step loop writes its plans into room of its own with
+    /// [`Plan::write`] and [`Plan::on_device`], sized by
+    /// [`PlanConfig::plan_bytes_bound`](crate::PlanConfig::plan_bytes_bound).
     pub fn upload(&self, device: &Device) -> Result<PlanBuffers> {
         let mut bytes = vec![0u8; self.layout().bytes as usize];
         self.write(&mut bytes);

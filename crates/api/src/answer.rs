@@ -1,4 +1,13 @@
 //! What the engine reports for a decision.
+//!
+//! The answers are made as Flide makes them for a chat model
+//! (<https://github.com/OmniJev/Flide>, Apache-2.0, commit
+//! caffe660df88db747d6da9f95f7d6759fea38698): the softmax of the labels'
+//! logits (`NextToken.finish` in `flide/formats/next_token.py`) and the typed
+//! answers of `flide/api/answers.py`, whose two confidence functions Flide
+//! ports from TypeSafe's `system-one-adapter-python` (MIT License, Copyright
+//! (c) 2026 TypeSafe AI; see THIRD-PARTY-NOTICES). Every number of an answer is
+//! rounded to six places, as Flide rounds it.
 
 use crate::{EngineError, Question, QuestionKind, Usage};
 
@@ -25,10 +34,16 @@ pub enum DecisionOutcome {
 pub struct DecisionResult {
     /// One per question, in the order the request listed them.
     pub answers: Vec<Answer>,
-    /// `prompt_tokens` counts every token the request put through the model
-    /// (the prompt, and the option tokens that were scored), cached ones
-    /// included. `completion_tokens` is 0: nothing is generated.
+    /// `prompt_tokens` counts the tokens the request put through the model as
+    /// Flide counts them: the shared start of the questions' prompts once and
+    /// the rest of every question's prompt, cached ones included;
+    /// `cached_prompt_tokens` the part of the shared start that came from the
+    /// prefix cache. `completion_tokens` is the number of questions: one
+    /// token read for each.
     pub usage: Usage,
+    /// The tokens the questions' prompts share, which the engine computed
+    /// once.
+    pub prefix_tokens: u32,
 }
 
 /// The answer to one [`Question`].
@@ -40,15 +55,14 @@ pub struct Answer {
 }
 
 /// What the model decided, with the numbers behind it. The fields are the
-/// ones the TypeSafe API returns.
+/// ones the System One API returns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     /// The answer to a [`QuestionKind::Choice`] question.
     Choice {
         /// The key of the most probable option; the first of equals.
         choice: String,
-        /// The probability of each option in the order of the request. They
-        /// sum to 1.
+        /// The probability of each option in the order of the request.
         probabilities: Vec<(String, f64)>,
         /// 0 when all options are equally likely, 1 when one is certain.
         confidence: f64,
@@ -58,7 +72,7 @@ pub enum Verdict {
         /// The expected level index, weighted by probability. It can lie
         /// between two levels.
         score: f64,
-        /// The probability of each level, lowest first. They sum to 1.
+        /// The probability of each level, lowest first.
         probabilities: Vec<f64>,
         /// From 0 to 1; high when the probability sits near one level.
         confidence: f64,
@@ -69,82 +83,92 @@ pub enum Verdict {
 }
 
 impl Question {
-    /// Makes the answer to this question from the score of each of its
-    /// options.
+    /// Makes the answer to this question from the logits of its labels at the
+    /// first token of the reply, in the order of
+    /// [`Rendered::tokens`](crate::Rendered::tokens) (`[yes, no]` for a noul).
     ///
-    /// This is the one place that turns scores into the numbers the API
-    /// returns, so that every engine answers the same way. `scores` holds one
-    /// natural-log likelihood per option, in the order of
-    /// [`option_texts`](Question::option_texts): the log-probability of the
-    /// option's text after the prompt, summed over its tokens. Only the
-    /// differences matter. `f64::NEG_INFINITY` is a valid score (an option
-    /// the model rules out); NaN, an infinity above all, or a question where
-    /// every option is ruled out is not, and is reported as an internal
-    /// error because it means the engine computed nonsense.
-    ///
-    /// The probabilities are the softmax of the scores at temperature 1.
-    /// Native decision models store a calibration temperature in their file;
-    /// a language model has none, so what comes out is the model's own
-    /// likelihood of the options, which is not calibrated for any data.
-    pub fn answer(&self, scores: &[f64]) -> Result<Answer, EngineError> {
+    /// This is the one place that turns logits into the numbers the API
+    /// returns, so that every engine answers the same way. The probabilities
+    /// are the softmax of the logits over the question's labels. A logit of
+    /// `-inf` is an option the model rules out; NaN, `+inf`, or a question
+    /// whose every label is ruled out means the engine computed nonsense and
+    /// is an internal error that names the question.
+    pub fn answer(&self, logits: &[f32]) -> Result<Answer, EngineError> {
         let id = &self.id;
-        if scores.len() != self.n_options() {
+        if logits.len() != self.n_options() {
             return Err(EngineError::Internal(format!(
-                "question '{id}' has {} options but the engine scored {}",
+                "question '{id}' has {} options but the engine read {} logits",
                 self.n_options(),
-                scores.len()
+                logits.len()
             )));
         }
-        let probabilities = softmax(scores).ok_or_else(|| {
+        let logits: Vec<f64> = logits.iter().map(|l| f64::from(*l)).collect();
+        let probabilities = softmax(&logits).ok_or_else(|| {
             EngineError::Internal(format!(
-                "the scores of question '{id}' cannot be turned into probabilities (NaN, an \
-                 infinite score, or every option ruled out): the model could not evaluate \
-                 the decision"
+                "the logits of question '{id}' cannot be turned into probabilities (NaN, an \
+                 infinite logit, or every option ruled out): the model could not evaluate the \
+                 decision"
             ))
         })?;
-
         let verdict = match &self.kind {
             QuestionKind::Choice { options } => {
-                let best = first_max(&probabilities);
+                let p = normalize(&probabilities);
                 Verdict::Choice {
-                    choice: options[best].key.clone(),
+                    choice: options[first_max(&p)].key.clone(),
                     probabilities: options
                         .iter()
                         .map(|o| o.key.clone())
-                        .zip(probabilities.iter().copied())
+                        .zip(p.iter().map(|p| round6(*p)))
                         .collect(),
-                    confidence: confidence_choice(&probabilities),
+                    confidence: round6(choice_confidence(&p)),
                 }
             }
-            QuestionKind::Score { .. } => Verdict::Score {
-                score: probabilities.iter().enumerate().map(|(i, p)| i as f64 * p).sum(),
-                confidence: confidence_score(&probabilities),
-                probabilities,
-            },
-            // The options are [false, true].
-            QuestionKind::Noul { .. } => Verdict::Noul { probability: probabilities[1] },
+            QuestionKind::Score { .. } => {
+                let p = normalize(&probabilities);
+                Verdict::Score {
+                    score: round6(p.iter().enumerate().map(|(i, p)| i as f64 * p).sum()),
+                    confidence: round6(score_confidence(&p)),
+                    probabilities: p.iter().map(|p| round6(*p)).collect(),
+                }
+            }
+            // The labels are [yes, no].
+            QuestionKind::Noul { .. } => {
+                Verdict::Noul { probability: round6(probabilities[0].clamp(0.0, 1.0)) }
+            }
         };
         Ok(Answer { question: id.clone(), verdict })
     }
 }
 
-/// `None` when no distribution follows from the scores.
-fn softmax(scores: &[f64]) -> Option<Vec<f64>> {
-    if scores.iter().any(|s| s.is_nan()) {
+/// The softmax as `NextToken.finish` computes it; `None` when no distribution
+/// follows from the logits.
+fn softmax(logits: &[f64]) -> Option<Vec<f64>> {
+    if logits.iter().any(|l| l.is_nan()) {
         return None;
     }
-    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max.is_finite() {
         return None;
     }
-    // Relative to the maximum, so a large score cannot overflow, and an
-    // option at -inf comes out as exactly 0.
-    let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+    // Relative to the maximum, so a large logit cannot overflow, and a label
+    // at -inf comes out as exactly 0.
+    let weights: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
     let sum: f64 = weights.iter().sum();
     Some(weights.into_iter().map(|w| w / sum).collect())
 }
 
-/// The index of the first largest value.
+/// `_normalize` of `answers.py`: the probabilities divided by their sum, or a
+/// uniform distribution when the sum is not positive.
+fn normalize(probs: &[f64]) -> Vec<f64> {
+    let total: f64 = probs.iter().sum();
+    if total <= 0.0 {
+        return vec![1.0 / probs.len() as f64; probs.len()];
+    }
+    probs.iter().map(|p| p / total).collect()
+}
+
+/// The index of the first largest value, as Python's `max(range(n),
+/// key=p.__getitem__)` finds it.
 fn first_max(values: &[f64]) -> usize {
     let mut best = 0;
     for (i, v) in values.iter().enumerate() {
@@ -155,50 +179,49 @@ fn first_max(values: &[f64]) -> usize {
     best
 }
 
-/// How far the most probable option is above a uniform guess, scaled so that
-/// certainty is 1. The formula TypeSafe publishes.
-fn confidence_choice(probs: &[f64]) -> f64 {
-    if probs.len() < 2 {
+/// TypeSafe's confidence of a choice: the peak probability rescaled from a
+/// uniform guess (0) to certainty (1).
+fn choice_confidence(p: &[f64]) -> f64 {
+    if p.len() == 1 {
         return 1.0;
     }
-    let uniform = 1.0 / probs.len() as f64;
-    let p_max = probs[first_max(probs)];
-    ((p_max - uniform) / (1.0 - uniform)).max(0.0)
+    let uniform = 1.0 / p.len() as f64;
+    (p[first_max(p)] - uniform) / (1.0 - uniform)
 }
 
-/// How tightly the probability sits around its mode, against a uniform
-/// distribution over the levels: the mean distance to the mode, relative to
-/// the one of a uniform distribution around its center. The formula TypeSafe
-/// publishes.
-fn confidence_score(probs: &[f64]) -> f64 {
-    if probs.len() < 2 {
+/// TypeSafe's confidence of a score: one minus the probability-weighted mean
+/// distance from the modal level, over the mean distance of a uniform
+/// distribution from its center.
+fn score_confidence(p: &[f64]) -> f64 {
+    if p.len() == 1 {
         return 1.0;
     }
-    let n = probs.len() as f64;
-    let mode = first_max(probs) as f64;
-    let mut dist = 0.0;
-    let mut dist_uniform = 0.0;
-    for (i, p) in probs.iter().enumerate() {
-        let i = i as f64;
-        dist += p * (i - mode).abs();
-        dist_uniform += (i - (n - 1.0) / 2.0).abs() / n;
-    }
-    (1.0 - dist / dist_uniform).max(0.0)
+    let k = p.len() as f64;
+    let mode = first_max(p) as f64;
+    let distance: f64 = p.iter().enumerate().map(|(i, p)| p * (i as f64 - mode).abs()).sum();
+    let center = (k - 1.0) / 2.0;
+    let uniform: f64 = (0..p.len()).map(|i| (i as f64 - center).abs()).sum::<f64>() / k;
+    (1.0 - distance / uniform).max(0.0)
+}
+
+/// Python's `round(x, 6)`: the nearest value with six decimal places.
+fn round6(x: f64) -> f64 {
+    format!("{x:.6}").parse().unwrap_or(x)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChoiceOption;
+    use crate::{ChoiceOption, Json};
 
     fn choice(keys: &[&str]) -> Question {
         Question {
             id: "route".into(),
-            instructions: "which?".into(),
+            instructions: Json::Null,
             kind: QuestionKind::Choice {
                 options: keys
                     .iter()
-                    .map(|k| ChoiceOption { key: (*k).into(), description: None })
+                    .map(|k| ChoiceOption { key: (*k).into(), description: Json::Null })
                     .collect(),
             },
         }
@@ -207,28 +230,31 @@ mod tests {
     fn score(levels: usize) -> Question {
         Question {
             id: "urgency".into(),
-            instructions: "how urgent?".into(),
-            kind: QuestionKind::Score { levels: vec![None; levels] },
+            instructions: Json::Null,
+            kind: QuestionKind::Score { levels: vec![Json::Null; levels] },
         }
     }
 
     fn noul() -> Question {
         Question {
             id: "angry".into(),
-            instructions: "angry?".into(),
-            kind: QuestionKind::Noul { when_false: None, when_true: None },
+            instructions: Json::Null,
+            kind: QuestionKind::Noul { when_true: Json::Null, when_false: Json::Null },
         }
     }
 
+    fn ln(p: f64) -> f32 {
+        p.ln() as f32
+    }
+
     fn close(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1e-12
+        (a - b).abs() < 2e-6
     }
 
     #[test]
     fn a_choice_names_the_most_probable_option_and_how_sure_that_is() {
-        // Log-likelihoods of 0.5, 0.25, 0.25.
-        let scores = [0.5f64.ln(), 0.25f64.ln(), 0.25f64.ln()];
-        let answer = choice(&["billing", "shipping", "technical"]).answer(&scores).unwrap();
+        let logits = [ln(0.5), ln(0.25), ln(0.25)];
+        let answer = choice(&["billing", "shipping", "technical"]).answer(&logits).unwrap();
         assert_eq!(answer.question, "route");
         let Verdict::Choice { choice: chosen, probabilities, confidence } = answer.verdict else {
             panic!("a choice answers with a choice");
@@ -238,20 +264,31 @@ mod tests {
         assert_eq!(keys, ["billing", "shipping", "technical"], "in the order of the request");
         let values: Vec<_> = probabilities.iter().map(|(_, p)| *p).collect();
         assert!(close(values[0], 0.5) && close(values[1], 0.25) && close(values[2], 0.25));
-        assert!(close(values.iter().sum::<f64>(), 1.0));
         // (0.5 - 1/3) / (1 - 1/3)
         assert!(close(confidence, 0.25), "{confidence}");
     }
 
     #[test]
-    fn equal_options_are_a_tie_that_goes_to_the_first_with_confidence_zero() {
-        let Verdict::Choice { choice: chosen, confidence, .. } =
+    fn numbers_are_rounded_to_six_places_as_flide_rounds_them() {
+        let Verdict::Choice { probabilities, confidence, .. } =
+            choice(&["a", "b", "c"]).answer(&[0.0, 0.0, 0.0]).unwrap().verdict
+        else {
+            panic!()
+        };
+        assert_eq!(probabilities[0].1, 0.333333);
+        assert_eq!(confidence, 0.0);
+        assert_eq!(round6(0.1234565), 0.123456, "0.1234565 is below the half in binary");
+        assert_eq!(round6(2.0 / 3.0), 0.666667);
+    }
+
+    #[test]
+    fn equal_options_are_a_tie_that_goes_to_the_first() {
+        let Verdict::Choice { choice: chosen, .. } =
             choice(&["a", "b", "c"]).answer(&[-3.0, -3.0, -3.0]).unwrap().verdict
         else {
             panic!()
         };
         assert_eq!(chosen, "a");
-        assert_eq!(confidence, 0.0);
     }
 
     #[test]
@@ -262,9 +299,8 @@ mod tests {
             panic!()
         };
         assert_eq!((chosen.as_str(), probabilities[0].1, confidence), ("only", 1.0, 1.0));
-
         let Verdict::Choice { choice: chosen, probabilities, confidence } =
-            choice(&["a", "b"]).answer(&[f64::NEG_INFINITY, -1.0]).unwrap().verdict
+            choice(&["a", "b"]).answer(&[f32::NEG_INFINITY, -1.0]).unwrap().verdict
         else {
             panic!()
         };
@@ -273,52 +309,36 @@ mod tests {
     }
 
     #[test]
-    fn only_the_differences_between_scores_matter() {
-        let near_zero = choice(&["a", "b"]).answer(&[-0.1, -1.3]).unwrap();
-        let far_below = choice(&["a", "b"]).answer(&[-900.1, -901.3]).unwrap();
-        let (Verdict::Choice { probabilities: p, .. }, Verdict::Choice { probabilities: q, .. }) =
-            (near_zero.verdict, far_below.verdict)
-        else {
-            panic!()
-        };
-        assert!(close(p[0].1, q[0].1) && close(p[1].1, q[1].1), "{p:?} vs {q:?}");
-        assert!(q[0].1.is_finite() && q[1].1.is_finite(), "no overflow and no underflow to NaN");
-    }
-
-    #[test]
     fn a_score_is_the_expected_level_and_its_confidence_follows_the_spread() {
         // Probabilities 0.1, 0.2, 0.6, 0.1: the mode is level 2.
-        let scores = [0.1f64.ln(), 0.2f64.ln(), 0.6f64.ln(), 0.1f64.ln()];
+        let logits = [ln(0.1), ln(0.2), ln(0.6), ln(0.1)];
         let Verdict::Score { score, probabilities, confidence } =
-            score(4).answer(&scores).unwrap().verdict
+            score(4).answer(&logits).unwrap().verdict
         else {
             panic!("a score answers with a score");
         };
         assert!(close(score, 0.2 + 1.2 + 0.3), "{score}");
         assert_eq!(probabilities.len(), 4);
-        // dist = 0.1*2 + 0.2*1 + 0.1*1 = 0.5; dist_uniform = (1.5+0.5+0.5+1.5)/4 = 1.
+        // distance = 0.1*2 + 0.2*1 + 0.1*1 = 0.5; uniform = (1.5+0.5+0.5+1.5)/4 = 1.
         assert!(close(confidence, 0.5), "{confidence}");
-
-        // All the probability on one level: certain; spread evenly: no confidence.
-        let Verdict::Score { score, confidence, .. } =
-            self::score(3).answer(&[f64::NEG_INFINITY, 0.0, f64::NEG_INFINITY]).unwrap().verdict
-        else {
-            panic!()
-        };
-        assert_eq!((score, confidence), (1.0, 1.0));
         let Verdict::Score { score, confidence, .. } =
             self::score(5).answer(&[0.0; 5]).unwrap().verdict
         else {
             panic!()
         };
         assert!(close(score, 2.0) && confidence == 0.0, "{score} {confidence}");
+        let Verdict::Score { score, confidence, .. } =
+            self::score(1).answer(&[4.0]).unwrap().verdict
+        else {
+            panic!()
+        };
+        assert_eq!((score, confidence), (0.0, 1.0));
     }
 
     #[test]
-    fn a_noul_answer_is_the_probability_of_true() {
-        // [false, true] with true three times as likely.
-        let Verdict::Noul { probability } =
-            noul().answer(&[0.25f64.ln(), 0.75f64.ln()]).unwrap().verdict
+    fn a_noul_answer_is_the_probability_of_yes() {
+        // [yes, no] with yes three times as likely.
+        let Verdict::Noul { probability } = noul().answer(&[ln(0.75), ln(0.25)]).unwrap().verdict
         else {
             panic!("a noul answers with a probability");
         };
@@ -326,17 +346,17 @@ mod tests {
     }
 
     #[test]
-    fn scores_that_mean_nothing_are_an_internal_error_that_names_the_question() {
-        let cases: [(Question, Vec<f64>, &str); 6] = [
-            (choice(&["a", "b"]), vec![0.0], "has 2 options but the engine scored 1"),
-            (choice(&["a", "b"]), vec![0.0, f64::NAN], "cannot be turned into probabilities"),
-            (choice(&["a", "b"]), vec![0.0, f64::INFINITY], "cannot be turned into probabilities"),
-            (choice(&["a", "b"]), vec![f64::NEG_INFINITY; 2], "every option ruled out"),
-            (score(3), vec![0.0; 4], "has 3 options but the engine scored 4"),
-            (noul(), vec![], "has 2 options but the engine scored 0"),
+    fn logits_that_mean_nothing_are_an_internal_error_that_names_the_question() {
+        let cases: [(Question, Vec<f32>, &str); 6] = [
+            (choice(&["a", "b"]), vec![0.0], "has 2 options but the engine read 1"),
+            (choice(&["a", "b"]), vec![0.0, f32::NAN], "cannot be turned into probabilities"),
+            (choice(&["a", "b"]), vec![0.0, f32::INFINITY], "cannot be turned into probabilities"),
+            (choice(&["a", "b"]), vec![f32::NEG_INFINITY; 2], "every option ruled out"),
+            (score(3), vec![0.0; 4], "has 3 options but the engine read 4"),
+            (noul(), vec![], "has 2 options but the engine read 0"),
         ];
-        for (question, scores, words) in cases {
-            let EngineError::Internal(message) = question.answer(&scores).unwrap_err() else {
+        for (question, logits, words) in cases {
+            let EngineError::Internal(message) = question.answer(&logits).unwrap_err() else {
                 panic!("nonsense from the engine is an internal error");
             };
             assert!(message.contains(&format!("'{}'", question.id)), "{message}");

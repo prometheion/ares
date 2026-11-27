@@ -28,30 +28,13 @@ use ares_cuda::{
 };
 use ares_gguf::Gguf;
 
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::{Rng, f32_bytes};
+
 /// Layers of a pass, and copies of the slots it cycles through.
 const LAYERS: u32 = 48;
 const COPIES: u32 = 4;
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn normal(&mut self) -> f32 {
-        let unit = |r: &mut Self| (r.next() >> 40) as f32 / (1u64 << 24) as f32;
-        let (u1, u2) = (unit(self) + 1e-7, unit(self));
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
 
 /// One layer on a device with the experts a set of rows picks, in `COPIES`
 /// copies of its slots.

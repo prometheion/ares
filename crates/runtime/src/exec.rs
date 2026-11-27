@@ -64,6 +64,10 @@ pub struct StepOutput {
     /// The probabilities those rows report, one record per pick, when any row
     /// asked for them; empty otherwise.
     pub logprobs: Vec<ares_sampler::LogprobOut>,
+    /// The logits the record's scores name ([`RecordView::scores`](crate::RecordView)),
+    /// in their order, as the model computed them: before the sampler's
+    /// corrections, masks and temperature. Empty when the record names none.
+    pub scores: Vec<f32>,
     /// The tokens the model drafted itself for the windows that asked for
     /// them, in the order of the record's segments, window after window.
     pub drafts: Vec<u32>,
@@ -162,6 +166,11 @@ pub struct Transfer {
     /// that stores a page in more than one form (exact while it is new,
     /// converted later) may otherwise bring it in in the later one.
     pub keep_form: bool,
+    /// For a page on the way in: it is a tail of the prefix cache, which holds
+    /// fewer cells than a page and keeps its form. A device must not take it
+    /// for a full page: a tail stays as it is until it is freed, since a
+    /// prompt that continues it copies its leading cells.
+    pub tail: bool,
     /// A part per device.
     pub parts: Vec<TransitPart>,
     /// Set by the executor: every device carried it out.

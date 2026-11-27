@@ -75,3 +75,28 @@ ARES_KERNEL ares_sample_invert(const uint32_t* tokens, uint32_t n_local, uint32_
         inverse[tokens[c]] = c;
     }
 }
+
+// Grid (ceil(n / ARES_SAMPLE_THREADS)), ARES_SAMPLE_THREADS threads. The logits
+// of chosen tokens at wanted rows, before the sampler's kernels change a row:
+// `pairs[2k]` is a wanted row (`logits + row * stride`), `pairs[2k + 1]` a
+// token; `out[k]` is its logit, or NaN when the token is not among this
+// device's columns (another device of a split holds it). The columns are
+// `first + c`, or the column of a token is `inverse[token]` for a device that
+// holds a token list.
+ARES_KERNEL ares_sample_scores(const float* logits, uint32_t stride, uint32_t first,
+                               uint32_t n_local, const uint32_t* inverse, uint32_t vocab,
+                               const uint32_t* pairs, uint32_t n, float* out) {
+    const uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) {
+        return;
+    }
+    const uint32_t row = pairs[2 * k];
+    const uint32_t token = pairs[2 * k + 1];
+    uint32_t column = 0xffffffffu;
+    if (inverse != nullptr) {
+        column = token < vocab ? inverse[token] : 0xffffffffu;
+    } else if (token >= first && token - first < n_local) {
+        column = token - first;
+    }
+    out[k] = column < n_local ? logits[(size_t)row * stride + column] : __uint_as_float(0x7fc00000u);
+}

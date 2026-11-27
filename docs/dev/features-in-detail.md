@@ -167,5 +167,5 @@ runs yet.
   models unload (`idle-unload`), aliases, `POST /models/load` and `/models/unload`,
   `GET /models/sse`.
 - Main options (all also preset keys; `ares --help` has the list): `--model`, `--devices`,
-  `--split`, `--shares`, `--context`, `--parallel`, `--kv`, `--precision`, `--ram`, `--cache`,
+  `--split`, `--shares`, `--context`, `--parallel`, `--kv`, `--ram`, `--cache`,
   `--cache-size`, `--drafters`, `--window`, `--draft-vocab`, `--reasoning`, `--mmproj`.

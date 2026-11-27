@@ -178,6 +178,9 @@ struct DeviceResult {
     picks: Vec<Pick>,
     /// The probabilities of the wanted rows, when any row asked for them.
     logprobs: Vec<LogprobOut>,
+    /// The logits the record's scores name, NaN for those this device does
+    /// not hold; empty for a device without an output head.
+    scores: Vec<f32>,
     has_picks: bool,
     /// The model paused the step ([`DeviceModel::paused`]).
     paused: bool,
@@ -538,6 +541,7 @@ impl Executor for GpuExecutor {
         drop(self.steps.take());
         out.picks.clear();
         out.logprobs.clear();
+        out.scores.clear();
         out.drafts.clear();
         out.draft_probs.clear();
         out.draft_ms = 0.0;
@@ -569,6 +573,19 @@ impl Executor for GpuExecutor {
                 out.picks.extend_from_slice(&result.picks);
                 out.logprobs.extend_from_slice(&result.logprobs);
                 have_picks = true;
+            }
+            // Each device of a split holds the logits of its slice of the
+            // vocabulary: a score is the one device's that has it.
+            if !result.scores.is_empty() {
+                if out.scores.is_empty() {
+                    out.scores.extend_from_slice(&result.scores);
+                } else {
+                    for (score, theirs) in out.scores.iter_mut().zip(&result.scores) {
+                        if score.is_nan() {
+                            *score = *theirs;
+                        }
+                    }
+                }
             }
             if !result.drafts.is_empty() {
                 out.draft_probs.extend_from_slice(&result.draft_probs);
@@ -614,6 +631,7 @@ impl Executor for GpuExecutor {
                     kind: transfer.kind,
                     object: transfer.object,
                     keep_form: transfer.keep_form,
+                    tail: transfer.tail,
                     ptr: part.mem.as_mut_ptr(),
                     room: part.mem.len(),
                     len: part.len,
@@ -696,12 +714,19 @@ impl Drop for GpuExecutor {
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The bytes a device brings back from a step at most: the pick of every
-/// wanted row, the tokens the model drafted itself, and the probabilities the
-/// wanted rows report.
+/// wanted row, the tokens the model drafted itself, the probabilities the
+/// wanted rows report, and the logits the record's scores name.
 fn read_back_bytes(logit_rows: u32, max_rows: u32) -> usize {
     logit_rows as usize * SamplePick::BYTES
         + max_rows as usize * 4
         + logit_rows as usize * LogprobOut::BYTES
+        + score_values(logit_rows) * 4
+}
+
+/// The most scores of one step: [`record::SCORES_PER_ROW`] for every wanted
+/// row.
+fn score_values(logit_rows: u32) -> usize {
+    logit_rows as usize * record::SCORES_PER_ROW
 }
 
 // --- the device thread ---------------------------------------------------
@@ -734,6 +759,8 @@ struct Worker {
     sample_out: DeviceBuffer,
     /// The probabilities the rows report.
     logprob_out: DeviceBuffer,
+    /// The logits the record's scores name.
+    score_out: DeviceBuffer,
     /// For a part whose logit columns are not in the order of the tokens:
     /// the column of every token.
     inverse: Option<DeviceBuffer>,
@@ -758,6 +785,7 @@ struct Worker {
     clock: Clock,
     picks: Vec<Pick>,
     logprobs: Vec<LogprobOut>,
+    scores: Vec<f32>,
     drafts: Vec<u32>,
     draft_probs: Vec<f32>,
     draft_ms: f64,
@@ -851,6 +879,7 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             result.paused = worker.model.paused();
                             std::mem::swap(&mut result.picks, &mut worker.picks);
                             std::mem::swap(&mut result.logprobs, &mut worker.logprobs);
+                            std::mem::swap(&mut result.scores, &mut worker.scores);
                             std::mem::swap(&mut result.drafts, &mut worker.drafts);
                             std::mem::swap(&mut result.draft_probs, &mut worker.draft_probs);
                             std::mem::swap(&mut result.inexact, &mut worker.inexact);
@@ -985,12 +1014,18 @@ impl Worker {
             u64::from(SamplerKernels::exchange_values(logit_rows, sample_devices)) * 4;
         let out_bytes = u64::from(logit_rows) * SamplePick::BYTES as u64;
         let logprob_bytes = u64::from(logit_rows) * LogprobOut::BYTES as u64;
+        let score_bytes = score_values(logit_rows) as u64 * 4;
         // A part whose columns are a list of tokens needs the column of each.
         let columns = part.logit_tokens();
         let inverse_bytes = if columns == DevicePtr::NULL { 0 } else { u64::from(vocab) * 4 };
         ledger.reserve(
             "sampler",
-            scratch_bytes + exchange_bytes + out_bytes + logprob_bytes + inverse_bytes,
+            scratch_bytes
+                + exchange_bytes
+                + out_bytes
+                + logprob_bytes
+                + score_bytes
+                + inverse_bytes,
         )?;
         let sampler = SamplerKernels::load(&device)?;
         let sample_scratch = DeviceBuffer::new(&device, scratch_bytes)?;
@@ -1023,6 +1058,7 @@ impl Worker {
             sample_exchange: DeviceBuffer::new(&device, exchange_bytes)?,
             sample_out: DeviceBuffer::new(&device, out_bytes)?,
             logprob_out: DeviceBuffer::new(&device, logprob_bytes)?,
+            score_out: DeviceBuffer::new(&device, score_bytes)?,
             inverse,
             vocab,
             sample_devices,
@@ -1038,6 +1074,7 @@ impl Worker {
             have_previous: false,
             picks: Vec::with_capacity(max_rows as usize),
             logprobs: Vec::with_capacity(logit_rows as usize),
+            scores: Vec::new(),
             drafts: Vec::with_capacity(max_rows as usize),
             draft_probs: Vec::with_capacity(max_rows as usize),
             draft_ms: 0.0,
@@ -1063,6 +1100,12 @@ impl Worker {
     /// and the model's own drafts.
     fn logprobs_at(&self) -> usize {
         self.logit_rows as usize * SamplePick::BYTES + self.max_rows as usize * 4
+    }
+
+    /// Where the scores start in the read-back buffer: after the
+    /// probabilities.
+    fn scores_at(&self) -> usize {
+        self.logprobs_at() + self.logit_rows as usize * LogprobOut::BYTES
     }
 
     /// Tells the conductor this device has finished the step; the last one to
@@ -1151,6 +1194,14 @@ impl Worker {
         }
         let produced = logits.is_some() && picked > 0;
         let mut wants_logprobs = false;
+        let scores = view.scores();
+        if scores as usize > score_values(picked) {
+            return Err(ModelError::Invalid(format!(
+                "the step names {scores} scores for {picked} wanted rows; a row has at most {}",
+                record::SCORES_PER_ROW
+            )));
+        }
+        let scored = produced && scores > 0;
         if let (Some(logits), true) = (logits, picked > 0) {
             self.sample_rows.clear();
             self.sample_rows.extend((0..picked).map(|i| view.sampler(i)));
@@ -1186,6 +1237,27 @@ impl Worker {
             };
             let (links, rank) = (&self.links, self.index);
             self.sample_start.record(stream)?;
+            if scored {
+                // SAFETY: the record on the device holds `scores` pairs at the
+                // offset (its layout), every row below `picked` (the
+                // conductor's); `score_out` holds a value per score (checked
+                // above); the logits are the model's rows, unchanged until the
+                // sampler below.
+                unsafe {
+                    self.sampler.scores(
+                        stream,
+                        &batch,
+                        record.offset(view.scores_offset() as u64),
+                        scores,
+                        self.score_out.ptr(),
+                    )?;
+                    stream.copy_to_host(
+                        self.back.as_mut_ptr().add(self.scores_at()),
+                        self.score_out.ptr(),
+                        scores as usize * 4,
+                    )?;
+                }
+            }
             // SAFETY: the model left a row of `stride` logits per wanted row
             // (and a token per column when it has a list); the record on the
             // device holds a sampler row per wanted row, and the corrections
@@ -1254,7 +1326,13 @@ impl Worker {
         let pick_begun = Instant::now();
         self.picks.clear();
         self.logprobs.clear();
+        self.scores.clear();
         self.drafts.clear();
+        if scored {
+            let at = self.scores_at();
+            let bytes = &self.back[at..at + scores as usize * 4];
+            self.scores.extend(bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)));
+        }
         if produced {
             for row in 0..picked as usize {
                 let pick = SamplePick::from_bytes(&self.back[row * SamplePick::BYTES..]);

@@ -793,8 +793,8 @@ that the first request does not find every slot empty. It has the prefix cache
 and the prompt cache on SSD as the 27B has them; it speculates only with a model
 drafter that `--drafters` names (its MTP block, from the model file or a file of
 its own, and a DFlash drafter), whose window is 4 rows by default and at most 8,
-and takes `--draft-vocab` with one. It has no `--shares` and no `--precision
-exact`; asking for either is an error that names it. Thinking is handled as for the
+and takes `--draft-vocab` with one. It has no `--shares`; asking for it is an
+error that names it. Thinking is handled as for the
 27B: the model declares what its chat template says (`Model::chat_format`), so
 the reasoning of a reply comes apart from the content, in streams too, and
 `--reasoning` and the controls of a request work the same way; a reply that

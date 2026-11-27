@@ -1,13 +1,12 @@
 //! The `ares` binary with drafts, over real sockets: a request can switch
-//! them off, the reply with drafts is the reply without them (exact products,
-//! the fast kernels, the DFlash drafter), and a server without drafters, or
-//! with a model without an MTP block, does not speculate.
+//! them off, the reply with drafts is the reply without them (the MTP block
+//! and the DFlash drafter), and a server without drafters, or with a model
+//! without an MTP block, does not speculate.
 //!
 //! These need a model with an MTP block: `ARES_TEST_DRAFT_MODEL`, a
 //! quantization of the 27B that fits one card, such as
-//! `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf` (served with the fast
-//! kernels: it has no exact prefill kernels), and for the tests on both cards
-//! `ARES_TEST_QWEN38_27B`, the Q4_K_S file; `ARES_TEST_DFLASH_27B` is the
+//! `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf`, and for the tests on both
+//! cards `ARES_TEST_QWEN38_27B`, the Q4_K_S file; `ARES_TEST_DFLASH_27B` is the
 //! 27B's DFlash2 file. The test of a model without an MTP block needs
 //! `ARES_TEST_QWEN35_0_8B` (Qwen3.5-0.8B). `ARES_TEST_PORT` is the port the
 //! servers listen on, one after the other (default 18960).
@@ -41,9 +40,8 @@ fn draft_model() -> Option<PathBuf> {
     model_file("ARES_TEST_DRAFT_MODEL", "a model file with an MTP block")
 }
 
-/// The 27B with its MTP block for the tests that need exact products and so
-/// a type of weights with a prefill kernel for them: `ARES_TEST_QWEN38_27B`
-/// (Qwen3.8-27B-UD-Q4_K_S.gguf), served on both cards.
+/// The 27B with its MTP block for the tests on both cards:
+/// `ARES_TEST_QWEN38_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf).
 fn two_card_model() -> Option<PathBuf> {
     model_file("ARES_TEST_QWEN38_27B", "the 27B Q4_K_S file (two GPUs)")
 }
@@ -88,7 +86,7 @@ fn reply_tokens_as(
 #[test]
 fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
     let Some(model) = draft_model() else { return };
-    let server = serve(&model, port(), &["--parallel", "1", "--precision", "fast"]);
+    let server = serve(&model, port(), &["--parallel", "1"]);
     let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
     assert!(drafted.unwrap_or(0) > 0, "the MTP block and the n-gram drafter: {drafted:?}");
     let (_, _, none) = reply_tokens(&server, ENGLISH, false);
@@ -106,15 +104,10 @@ fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
 const QUESTIONS: [&str; 3] =
     [GERMAN, ENGLISH, "Write a Rust function that reverses a string, with a test."];
 
-/// Asks every question with drafts and without, and says for each whether the
-/// replies are the same tokens: `None`, or where they part (the characters
-/// they share).
-fn replies_with_and_without_drafts(server: &Client) -> Vec<(&'static str, Option<usize>)> {
-    replies_with_and_without_drafts_as(server, &json!({"max_tokens": 160, "temperature": 0}))
-}
-
-/// [`replies_with_and_without_drafts`] with the settings of `extra`.
-fn replies_with_and_without_drafts_as(
+/// Asks every question with drafts and without, with the settings of `extra`
+/// (the tokens, the sampler), and says for each whether the replies are the
+/// same tokens: `None`, or where they part (the characters they share).
+fn replies_with_and_without_drafts(
     server: &Client,
     extra: &Value,
 ) -> Vec<(&'static str, Option<usize>)> {
@@ -133,39 +126,23 @@ fn replies_with_and_without_drafts_as(
         .collect()
 }
 
-/// With exact products, too, the tokens with drafts are the tokens without
-/// them, and the hash of the reply says so over HTTP.
-#[test]
-fn with_exact_products_the_reply_with_drafts_is_the_reply_without() {
-    // Exact products need a prefill kernel for every type of the weights, which
-    // the one-card file (IQ2_XXS) has none for: the 27B in Q4_K_S, on both cards.
-    let Some(model) = two_card_model() else { return };
-    let flags =
-        ["--devices", "0,1", "--split", "tensor", "--parallel", "1", "--precision", "exact"];
-    let server = serve(&model, port(), &flags);
-    for (question, parted) in replies_with_and_without_drafts(&server) {
-        assert_eq!(parted, None, "{question}: the replies part after this many characters");
-    }
-    server.stop();
-}
-
-/// With the fast kernels, which is how a model is served, the reply with
-/// drafts is the reply without them, token for token: a row of a draft window
-/// computes with the bits it has alone (the weight kernels, the recurrent
-/// blocks and attention all do; `crates/model/tests/qwen35_windows.rs` holds
-/// every block to it). Over replies of 300 tokens, so that a rare difference
+/// The reply with drafts is the reply without them, token for token, and the
+/// hash of the reply says so over HTTP: a row of a draft window computes with
+/// the bits it has alone (the weight kernels, the recurrent blocks and
+/// attention all do; `crates/model/tests/qwen35_windows.rs` holds every block
+/// to it). Over replies of 300 tokens, so that a rare difference
 /// would show, with the most probable token and sampled with a seed, on the
 /// one-card file; and on both cards in a tensor split when the larger file is
 /// there.
 #[test]
-fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
+fn the_reply_with_drafts_is_the_reply_without() {
     let Some(model) = draft_model() else { return };
     let greedy = json!({"max_tokens": 300, "temperature": 0});
     let sampled =
         json!({"max_tokens": 300, "temperature": 0.8, "top_k": 20, "top_p": 0.95, "seed": 4711});
-    let server = serve(&model, port(), &["--parallel", "1", "--precision", "fast"]);
+    let server = serve(&model, port(), &["--parallel", "1"]);
     for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
-        for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
+        for (question, parted) in replies_with_and_without_drafts(&server, extra) {
             assert_eq!(
                 parted, None,
                 "{how}, {question}: the replies part after this many characters"
@@ -174,10 +151,10 @@ fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
     }
     server.stop();
     let Some(model) = two_card_model() else { return };
-    let flags = ["--devices", "0,1", "--split", "tensor", "--parallel", "1", "--precision", "fast"];
+    let flags = ["--devices", "0,1", "--split", "tensor", "--parallel", "1"];
     let server = serve(&model, port(), &flags);
     for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
-        for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
+        for (question, parted) in replies_with_and_without_drafts(&server, extra) {
             assert_eq!(parted, None, "both cards, {how}, {question}: the replies part");
         }
     }
@@ -185,9 +162,9 @@ fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
 }
 
 /// The DFlash drafter (`ARES_TEST_DFLASH_27B`, the 27B's DFlash2 file) next
-/// to the MTP block and alone, on both cards with the fast kernels: the
-/// reply with drafts is the reply without them, token for token, greedy and
-/// sampled, and the drafter's drafts are verified.
+/// to the MTP block and alone, on both cards: the reply with drafts is the
+/// reply without them, token for token, greedy and sampled, and the drafter's
+/// drafts are verified.
 #[test]
 fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
     let Some(model) = two_card_model() else { return };
@@ -207,14 +184,12 @@ fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
             "tensor",
             "--parallel",
             "1",
-            "--precision",
-            "fast",
             "--drafters",
             drafters.as_str(),
         ];
         let server = serve(&model, port(), &flags);
         for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
-            for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
+            for (question, parted) in replies_with_and_without_drafts(&server, extra) {
                 assert_eq!(parted, None, "--drafters {drafters}, {how}, {question}: they part");
             }
         }
@@ -230,7 +205,7 @@ fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
 fn a_server_with_no_drafters_never_drafts_and_one_with_the_mtp_block_does() {
     let Some(model) = draft_model() else { return };
     let repeat = "Write the sentence 'The quick brown fox jumps over the lazy dog.' ten times.";
-    let flags = ["--parallel", "1", "--precision", "fast"];
+    let flags = ["--parallel", "1"];
     let mut none = Vec::from(flags);
     none.extend(["--drafters", "none"]);
     let mut server = serve(&model, port(), &none);

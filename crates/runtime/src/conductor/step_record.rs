@@ -228,6 +228,7 @@ impl Conductor {
         }
         self.runs.clear();
         self.samplers.clear();
+        self.score_pairs.clear();
         self.step_rows.clear();
         self.updates.clear();
         self.bars.clear();
@@ -330,9 +331,14 @@ impl Conductor {
                             &mut self.step_rows,
                         );
                         self.samplers.push(row);
+                        // A fork of a decision reads its labels' logits there.
+                        if let Role::Fork { labels, .. } = &a.role {
+                            let wanted = self.samplers.len() as u32 - 1;
+                            self.score_pairs.extend(labels.iter().map(|t| (wanted, *t)));
+                        }
                     }
                 }
-                PartKind::Window | PartKind::Score { .. } => {
+                PartKind::Window => {
                     has_generation = !drafts_only;
                     if !drafts_only {
                         counters.window_rows += 1;
@@ -443,6 +449,9 @@ impl Conductor {
         writer.corrections(&self.step_rows.entries).map_err(full)?;
         writer.masks(&self.step_rows.masks, self.mask_words).map_err(full)?;
         writer.samplers(self.samplers.iter().copied()).map_err(full)?;
+        if !self.score_pairs.is_empty() {
+            writer.scores(&self.score_pairs).map_err(full)?;
+        }
         writer.commits(&self.commits).map_err(full)?;
         if drafts_only {
             // The devices commit these with this record: the round's must not

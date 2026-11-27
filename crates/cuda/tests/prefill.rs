@@ -964,23 +964,28 @@ fn the_shapes_fit_the_device() {
     }
 }
 
-/// What `Kernels` says about the device is consistent: the path of the exact
-/// precision is always f16, the fast one is int8 exactly where the tensor cores
-/// are capped. The measurement is printed.
+/// What a type takes before it is measured: the path of the exact precision is
+/// always f16; the fast one is the rule kept from the development cards on every
+/// card, capped or not, whose f16 sums in f32 exactly where the tensor cores run
+/// that at full rate. The measurement of the rate is printed.
 #[test]
-fn the_path_follows_the_measured_tensor_core_rate() {
+fn an_unmeasured_type_takes_the_kept_rule_on_every_card() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
         let full = kernels.tensor_cores_full_rate();
         eprintln!("{}: f16 mma with f32 accumulation at full rate: {full}", device.info().name);
-        assert_eq!(kernels.prefill_path(Precision::Exact).unwrap(), PrefillPath::F16);
-        let fast = kernels.prefill_path(Precision::Fast).unwrap();
-        assert_eq!(fast, if full { PrefillPath::F16 } else { PrefillPath::Int8 });
-        for ty in [GgmlType::Q4_K, GgmlType::IQ2_S, GgmlType::IQ2_XS, GgmlType::Q6_K] {
-            let flush = !full && ty != GgmlType::Q6_K;
-            let expected = if flush { PrefillPath::F16Flush } else { fast };
-            assert_eq!(kernels.prefill_path_for(ty, Precision::Fast).unwrap(), expected, "{ty}");
+        let f16 = if full { PrefillPath::F16 } else { PrefillPath::F16Flush };
+        for (ty, kept) in [
+            (GgmlType::Q4_K, f16),
+            (GgmlType::IQ2_S, f16),
+            (GgmlType::IQ2_XS, f16),
+            (GgmlType::Q6_K, PrefillPath::Int8),
+            (GgmlType::IQ3_S, PrefillPath::Int8),
+            (GgmlType::Q4_0, f16),
+        ] {
+            assert_eq!(kernels.prefill_path_for(ty, Precision::Fast).unwrap(), kept, "{ty}");
+            assert!(!kernels.prefill_choice(ty).unwrap().measured, "{ty}");
             assert_eq!(kernels.prefill_path_for(ty, Precision::Exact).unwrap(), PrefillPath::F16);
         }
     }
@@ -1005,9 +1010,12 @@ fn the_measured_path_is_the_most_exact_of_the_fastest() {
             assert_eq!(kernels.prefill_path_for(ty, Precision::Exact).unwrap(), PrefillPath::F16);
             assert_eq!(kernels.measure_prefill_path(ty).unwrap(), choice, "measured once");
             assert_eq!(kernels.prefill_choice(ty).unwrap(), choice);
-            if full {
-                assert_eq!(kept, PrefillPath::F16, "{ty}: unmeasured, the exact path");
-            }
+            let unmeasured = match ty {
+                GgmlType::Q8_0 | GgmlType::IQ3_S => PrefillPath::Int8,
+                _ if full => PrefillPath::F16,
+                _ => PrefillPath::F16Flush,
+            };
+            assert_eq!(kept, unmeasured, "{ty}: unmeasured, the kept rule");
             let ms = |path: PrefillPath| match path {
                 PrefillPath::Int8 => choice.probe_ms[0],
                 PrefillPath::F16 => choice.probe_ms[1],

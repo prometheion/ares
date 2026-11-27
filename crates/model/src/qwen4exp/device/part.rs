@@ -141,7 +141,9 @@ pub struct Options {
     /// (`blocks/far.rs`, [`Part::open_far`]); the indexer's keys of every
     /// page stay in VRAM. `None`: every page is in VRAM.
     pub near_pages: Option<u32>,
-    /// The precision of the products with the dense weights in wide steps.
+    /// The precision of the products with the dense weights in wide steps. The
+    /// server always runs [`Precision::Fast`]; the exact products are a tool of
+    /// the tests.
     pub precision: Precision,
     /// Whether the logits of the wanted rows are copied to the host
     /// ([`Part::logits`]). A driver whose sampler reads them on the device
@@ -919,6 +921,18 @@ impl Part {
     /// How long the upload of the dense weights took.
     pub fn upload_time(&self) -> std::time::Duration {
         self.w.upload_time()
+    }
+
+    /// Whether the device's tensor cores add f16 products into f32 as fast as into
+    /// f16 (`Kernels::tensor_cores_full_rate`).
+    pub fn tensor_cores_full_rate(&self) -> bool {
+        self.kernels.tensor_cores_full_rate()
+    }
+
+    /// The path of the tile kernels each quantized dense type takes in wide steps,
+    /// measured on the device when the part was opened; none without wide steps.
+    pub fn prefill_paths(&self) -> Vec<ares_cuda::PrefillChoice> {
+        self.wide_state.as_ref().map_or_else(Vec::new, |wide| wide.paths(&self.kernels))
     }
 
     /// Bytes of recurrent state per sequence slot.

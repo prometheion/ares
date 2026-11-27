@@ -11,7 +11,18 @@ and Anthropic HTTP APIs. This page goes from the source to a first answer.
 | An Ampere (RTX 30) or Ada (RTX 40) card | running; other GPUs are refused, see [hardware.md](hardware.md) |
 | Rust 1.95 or newer (`rust-toolchain.toml` picks the stable channel) | building |
 | CUDA toolkit 13.0 or newer, for `nvcc` | building only, not running |
-| `glslc`, the shader compiler of the Vulkan SDK or of the shaderc package | building the Vulkan shaders |
+| `glslc` 2024 or newer, from the Vulkan SDK or from LunarG's `shaderc` package | building the Vulkan shaders |
+
+A distribution's `shaderc` may be too old: Ubuntu 24.04 ships 2023.8, which does
+not know `GL_EXT_integer_dot_product` and fails on the `mmvq` shaders. LunarG's
+package (2025.2 was used) carries a current `glslc` and replaces the
+distribution's `glslc`, which owns the same path:
+
+```sh
+curl -sS -o /etc/apt/trusted.gpg.d/lunarg.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc
+curl -sS -o /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+sudo apt update && sudo apt remove glslc && sudo apt install shaderc
+```
 
 ## Build
 
@@ -94,7 +105,7 @@ A preset file gives a model a short id and aliases. With `--api-key`, set
 | --- | --- |
 | The log | standard error; `--log-file <FILE>` appends to a file, `--log-format json` writes one JSON object a line |
 | Log level | the `RUST_LOG` environment variable, default `info` (for example `RUST_LOG=debug`) |
-| At start | the devices, the split, the context and why, the RAM limit, and what each device took |
+| At start | the devices, the split, the context and why, the RAM limit, what each device took, and per device whether its tensor cores are capped and which kernel path each weight type was measured to be fastest on |
 | Per request | lines for a person, laid out as llama.cpp's server writes its timings: when it is taken (API, model, the parameters it gives), when it starts in the engine (the prompt, what the cache gave, the wait), how far a long prompt has got (from 3 s on, every tenth or 10 s), how fast a long reply comes (`n_gen`, `tg` since its first token and `tg_3s` over the last 3 s, once in 3 s from its 100th token), and at its end the reason, `prompt eval time` (over the rows the engine ran for the prompt, the cached tokens named apart), `eval time`, `total time` and `draft acceptance` (accepted of proposed, mean length and mean chain); the same as fields at `RUST_LOG=ares_server=debug`; the prompt and the reply only with `--log-text` |
 | Errors | every refusal and failure a client gets, with its route, status, code and message: a warning, a 500 an error |
 

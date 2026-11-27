@@ -11,7 +11,7 @@ file's context length) as far as the VRAM that is left holds it (a tensor
 split moves attention heads with their K and V to the devices with room as
 far as that context needs: see "What the second card is for"); the start-up
 report says what was chosen, why, what context was wanted and how much of it
-is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, precision, the model
+is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, the model
 drafters that take part (`--drafters`) and the room for their windows
 (`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM limit defaults
 to all the machine has, and below any limit the engine holds what the machine
@@ -39,7 +39,7 @@ timings in every answer of the OpenAI routes
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
 and in the last event of a stream). A request can switch drafting off for itself
 with `"draft": false`; the two replies of one request, with and without drafts,
-are then compared by their hashes over HTTP (they are equal, with the fast kernels and with `--precision exact`: see
+are then compared by their hashes over HTTP (they are equal: see
 "The text with drafts is the text without" under [Speculation](speculation.md)).
 The prefix cache is on for both models without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages
@@ -277,8 +277,11 @@ generates, for a client that cannot add a member to a body (Claude Code's
 `ANTHROPIC_CUSTOM_HEADERS`, the `http_headers` of a provider of Codex); the
 Messages API has no such member, so there it is the header alone. Body and
 header that name two different ones are refused. It is always on: a server
-whose requests all say nothing behaves as before (the randomized test of
-admission, which plays one priority, still holds).
+whose requests all say nothing behaves as before. The randomized test of
+admission (`crates/sched/tests/admission.rs`) plays one priority in some runs
+and two or three in others, where it checks that a shortage spills the worst
+priority first, that a running request gives way only to a better one, and that
+a spilled request still in line holds back its own and every worse priority.
 
 What the others do. llama.cpp's server has no priority of requests (it puts
 only its own tasks, cancels and the like, at the front of its queue). vLLM
@@ -309,8 +312,11 @@ Here every place where the engine chooses between requests honours it:
   no threshold. The victims are spilled as for a shortage: their pages go to
   the prefix cache and their state becomes a checkpoint, so they come back as
   a prefix hit, and they do not come back in the pass that made them give
-  way. A shortage of pages spills the worst priority first (vLLM's victim),
-  then by the old rule. The sequence of a step the model paused (a prompt read
+  way. What they let go of is room for the newcomer except the pages of its
+  cached prefix that running sequences hold (it takes those again, and its
+  charge left them out; until 2026-11-25 they were counted twice). A shortage
+  of pages spills the worst priority first (vLLM's victim), then by the old
+  rule. The sequence of a step the model paused (a prompt read
   layer by layer) gives way to neither (`Claims::keep`): its state is neither
   before nor after its rows.
 - *The rows of a step* (`ares_sched::plan`): the newest tokens, the rows of

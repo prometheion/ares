@@ -15,8 +15,11 @@
 //!     cargo test -p ares-server --test real -- --test-threads=1
 //! ```
 //!
-//! The servers run with exact products, so that a text does not depend on
-//! what else is in a step and texts can be compared.
+//! The servers run as every server does, with the fast products: a row's
+//! rounding depends on the size of the step that computes it, so a reply
+//! computed next to another request, or with its prompt from the cache, is
+//! compared with the one it should be up to a near tie
+//! (`same_up_to_a_near_tie`), unless its tokens follow with a wide margin.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -25,7 +28,9 @@ use std::thread;
 use std::time::Duration;
 
 use common::model_file;
-use common::process::{Client, ENGLISH, GERMAN, LIMIT, Server, ares, eventually, serve};
+use common::process::{
+    Client, ENGLISH, GERMAN, LIMIT, Server, ares, eventually, same_up_to_a_near_tie, serve,
+};
 use common::socket::{Reply, read_events, streamed_text};
 use serde_json::{Value, json};
 
@@ -41,11 +46,19 @@ fn port(offset: u16) -> u16 {
 }
 
 /// Tokens and properties, the count of the thinking, the stop string that
-/// ended a reply and a prefill, with the model's own template.
+/// ended a reply and a prefill, with the model's own template; and the load
+/// log names what the weight kernels were measured to be on the device.
 #[test]
 fn the_basics_of_a_server_work_with_a_real_model() {
     let Some(model) = model() else { return };
-    let server = serve(&model, port(5), &[]);
+    let mut server = serve(&model, port(5), &[]);
+    let device = format!("device {}: the tensor cores add f16 products", common::test_device());
+    eventually("the line of the products", || server.logged().iter().any(|l| l.contains(&device)));
+    let line = server.logged().iter().find(|l| l.contains(&device)).cloned().unwrap_or_default();
+    eprintln!("RES {line}");
+    assert!(line.contains("tile kernels of the file's layout per weight type"), "{line}");
+    assert!(line.contains("q4_K int8 (") || line.contains("q4_K f16"), "{line}");
+    assert!(line.contains("kernels of the device layout above a decode step's rows"), "{line}");
     let props = server.get("/props").json();
     assert!(props["chat_template"].as_str().unwrap().contains("<|im_start|>"), "{props}");
     assert_eq!(props["chat_template_caps"]["supports_reasoning"], true, "{props}");
@@ -168,7 +181,9 @@ fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
         assert_eq!(reply.status, 200, "{}", reply.body);
         let (chunks, done) = reply.events();
         assert!(done, "the stream ends with [DONE]");
-        assert_eq!(streamed_text(&chunks), text, "streamed and plain, same seed");
+        // The stream's prompt came from the cache but for its last token, which
+        // a step of one row computed.
+        same_up_to_a_near_tie("streamed and plain, same seed", &streamed_text(&chunks), &text, 24);
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
         let finish = &chunks[chunks.len() - 2];
         assert_eq!(finish["choices"][0]["finish_reason"], "length");
@@ -191,7 +206,7 @@ fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
             let reply = server.post("/v1/chat/completions", &server.chat(question, greedy.clone()));
             reply.json()["choices"][0]["message"]["content"].as_str().unwrap().to_owned()
         };
-        assert_eq!(ask(), ask(), "the most probable token, twice");
+        same_up_to_a_near_tie("the most probable token, twice", &ask(), &ask(), 24);
     }
     server.stop();
 }
@@ -326,8 +341,11 @@ fn two_requests_run_at_once_and_each_gets_its_own_text() {
         (first.join().unwrap(), second.join().unwrap())
     });
     assert_eq!(most.into_inner(), 2, "both sequences were in the engine at the same time");
-    assert_eq!(german_together.0, german, "the same text next to another request");
-    assert_eq!(english_together.0, english);
+    // Alone, a request read all of its prompt but the template's start; next to
+    // the other one it reads the last token, the rest from the cache.
+    same_up_to_a_near_tie("German next to another request", &german_together.0, &german, 24);
+    same_up_to_a_near_tie("English next to another request", &english_together.0, &english, 24);
+    assert_ne!(german_together.0, english_together.0, "each its own text");
     assert_eq!(german_together.1, "length");
     for timings in [&german_together.2, &english_together.2] {
         assert_eq!(timings["predicted_n"], 160);
@@ -462,12 +480,17 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
     let error =
         refused("/v1/completions", json!({"model": server.model, "prompt": long}), 400, &["8192"]);
     assert_eq!(error["code"], "context_length_exceeded");
-    // Decisions need more of the runtime than it has.
+    // A decision whose state does not fit is told so in Flide's shape: a 422
+    // at the body, with both numbers.
     let decision = json!({
-        "model": server.model, "state": "s",
+        "model": server.model, "state": long,
         "questions": {"q": {"type": "noul", "instructions": "x"}},
     });
-    refused("/v1/systemone", decision, 501, &["decisions are not implemented"]);
+    let reply = server.post("/v1/systemone", &decision);
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    let detail = reply.json()["detail"][0].clone();
+    assert_eq!(detail["loc"], json!(["body"]), "{detail}");
+    assert!(detail["msg"].as_str().unwrap().contains("8192"), "{detail}");
     refused("/v1/embeddings", json!({"model": server.model, "input": "x"}), 404, &["no endpoint"]);
 
     // None of that reached the devices, and a neutral value is no refusal.
@@ -650,7 +673,7 @@ fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitSt
         .arg("--model")
         .arg(model)
         .args(["--port", &port.to_string(), "--devices", &device])
-        .args(["--precision", "exact", "--context", "8192", "--ram", ram])
+        .args(["--context", "8192", "--ram", ram])
         .args(flags);
     let mut server = Server::spawn(command, LIMIT);
     let status = server.wait_exit();
@@ -876,11 +899,16 @@ fn the_sampler_serves_what_a_request_sets_and_reports_the_probabilities() {
         one["seed"] = json!(40 + i as u64);
         // The text the seed gives, up to the model's rounding: the choices ran
         // side by side, so a sampled text can part from the one it has alone
-        // where two tokens are that close.
+        // where two tokens are that close. The first choice read the prompt in
+        // a step of its length, the others and the requests alone take it from
+        // the cache and compute its last row alone; with the fast products a
+        // row's rounding depends on the size of its step, so the first choice's
+        // sampled text may part from its request alone at the first token
+        // whose candidates are that close, and is only reported.
         let alone = first_choice(&server.post(chat_path, &one)).0;
         let same = text.chars().zip(alone.chars()).take_while(|(a, b)| a == b).count();
         eprintln!("RES n choice {i}: {same} of {} characters equal the request alone", text.len());
-        assert!(same >= 10, "choice {i}: {text:?} against {alone:?}");
+        assert!(i == 0 || same >= 10, "choice {i}: {text:?} against {alone:?}");
     }
     assert!(
         server.metric("prefix_hits_total") >= steps + 2,

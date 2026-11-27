@@ -367,6 +367,17 @@ impl Flow {
         }
     }
 
+    /// Forgets the loan of a pass that has read its rows, for its VRAM to go back; `false`
+    /// when a pass that has not read them holds the loan.
+    pub(in super::super) fn forget_done_pass(&self) -> bool {
+        let mut pass = self.pass.lock().unwrap_or_else(|e| e.into_inner());
+        if pass.as_ref().is_some_and(|loan| !loan.done) {
+            return false;
+        }
+        *pass = None;
+        true
+    }
+
     /// Whether a pass holds a loan.
     pub(in super::super) fn has_pass_loan(&self) -> bool {
         self.pass.lock().unwrap_or_else(|e| e.into_inner()).is_some()
