@@ -77,10 +77,10 @@
 //! per block, but what a half costs besides its weight products depends on
 //! the length of the context, so no device counts on another's lead there.)
 //!
-//! **Exact products** ([`Precision::Exact`]) are the engine's reference and
-//! are not chosen by a clock: every matrix that has a device layout takes it,
-//! with the kernels of the table that is kept, so that two loads of a model
-//! compute the same bits.
+//! **Exact products** ([`Precision::Exact`]), a tool of the tests that the
+//! server never runs, are the engine's reference and are not chosen by a
+//! clock: every matrix that has a device layout takes it, with the kernels of
+//! the table that is kept, so that two loads of a model compute the same bits.
 //!
 //! The probe takes as much of the device as the weights will, and about
 //! 150 MiB for activations and results, and frees all of it before the
@@ -92,8 +92,8 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    ActivationForm, Device, DeviceBuffer, DevicePtr, Event, Kernels, LayerKernels, MAX_BATCH,
-    OutputGate, Precision, PrefillChoice, PrefillPath, Stream, WeightLayout,
+    ActivationForm, Device, DeviceBuffer, DevicePtr, Event, Kernels, LayerKernels, LayoutTable,
+    MAX_BATCH, OutputGate, Precision, PrefillChoice, PrefillPath, Stream, WeightLayout,
 };
 use ares_quant::act;
 use ares_runtime::ModelError;
@@ -159,7 +159,7 @@ pub(crate) fn file_path(
     n: u32,
 ) -> Result<Option<PrefillPath>, ModelError> {
     match precision {
-        Precision::Exact => Ok(Some(kernels.prefill_path(Precision::Exact)?)),
+        Precision::Exact => Ok(Some(PrefillPath::F16)),
         Precision::Fast => {
             let decode = Kernels::decode_kernel_rows(ty)
                 .or_else(|| Kernels::has_fast_matvec(ty).then_some(MAX_BATCH));
@@ -252,9 +252,17 @@ pub struct LayoutReport {
     pub bytes: [u64; 2],
     /// The bytes the device layout added: rows rounded up to 16.
     pub padding: u64,
+    /// Whether the device's tensor cores add f16 products into f32 as fast as
+    /// into f16 (`Kernels::tensor_cores_full_rate`, measured when the kernels
+    /// were loaded): GeForce cards halve the first unless the cap is lifted.
+    pub full_rate: bool,
     /// The path of the tile kernels each type takes in the file's layout
     /// (`Kernels::measure_prefill_path`).
     pub paths: Vec<PrefillChoice>,
+    /// Which kernel of the device layout serves which number of rows above
+    /// those of a decode step, per type that has matrices in it
+    /// (`Kernels::measure_layout`).
+    pub layout_tables: Vec<LayoutTable>,
     /// How long the tables of the kernels and the probes took.
     pub tables: Duration,
     pub probes_time: Duration,
@@ -458,6 +466,10 @@ pub(crate) struct Chooser<'a> {
     /// The next group of the second pass.
     next: usize,
     probe: Option<Probe>,
+    /// The types of matrices that products read in the file's layout without
+    /// a group (a head that keeps the file's layout): their paths are
+    /// measured with the groups'.
+    loose_types: Vec<GgmlType>,
     measured_types: Vec<GgmlType>,
     timed: HashMap<(Shape, [u32; 2]), Timed>,
     /// Milliseconds of preparing rows of a width in each form
@@ -489,10 +501,22 @@ impl<'a> Chooser<'a> {
             decided: None,
             next: 0,
             probe: None,
+            loose_types: Vec::new(),
             measured_types: Vec::new(),
             timed: HashMap::new(),
             preps: HashMap::new(),
-            report: LayoutReport::default(),
+            report: LayoutReport {
+                full_rate: kernels.tensor_cores_full_rate(),
+                ..LayoutReport::default()
+            },
+        }
+    }
+
+    /// Notes that products read a matrix of `ty` in the file's layout outside
+    /// the groups (in the first pass), so that its path is measured too.
+    pub fn loose(&mut self, ty: GgmlType) {
+        if self.decided.is_none() && !self.loose_types.contains(&ty) {
+            self.loose_types.push(ty);
         }
     }
 
@@ -735,6 +759,7 @@ impl<'a> Chooser<'a> {
         let begun = Instant::now();
         let mut types: Vec<GgmlType> =
             self.groups.iter().flat_map(|g| g.shapes.iter().map(|s| s.0)).collect();
+        types.extend(&self.loose_types);
         types.sort_by_key(|t| t.name());
         types.dedup();
         for ty in types {
@@ -818,9 +843,11 @@ impl<'a> Chooser<'a> {
             // Which kernel of the device layout serves which number of rows
             // on this device: the products below are launched by that table.
             let begun = Instant::now();
-            if !self.kernels.layout_table(ty)?.measured {
-                self.kernels.measure_layout(ty)?;
-            }
+            let table = match self.kernels.layout_table(ty)? {
+                table if table.measured => table,
+                _ => self.kernels.measure_layout(ty)?,
+            };
+            self.report.layout_tables.push(table);
             self.measured_types.push(ty);
             self.report.tables += begun.elapsed();
         }

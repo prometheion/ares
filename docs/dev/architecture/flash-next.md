@@ -214,8 +214,7 @@ be larger than the model's own: four sequences of 131 072 cells are
 `--context 524288`; a request still holds at most the model's own) is placed
 the same way (the owner, 2026-11-24). The plan says what was wanted and how
 much of it is in VRAM (`plan::ContextPlan::overflowing`). Options that mean nothing for the
-model are errors that name them: `--shares`, `--precision exact`,
-`--draft-vocab`, more sequences than the eight rows of a
+model are errors that name them: `--shares`, `--draft-vocab`, more sequences than the eight rows of a
 generating step (`--parallel`), `--drafters mtp` (the model file carries no MTP block;
 `--drafters FILE` names the block's file), and `--window` without a drafter or beyond
 the eight rows of a step that verifies.

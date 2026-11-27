@@ -72,7 +72,8 @@ pub struct Options {
     /// [`Precision::Fast`] takes the decode kernels (8-bit activations) for
     /// steps of up to eight rows and each type's fastest tensor-core path
     /// above; [`Precision::Exact`] takes the f16 tensor-core path for every
-    /// product.
+    /// product. The server always runs [`Precision::Fast`]; the exact products
+    /// are a tool of the tests, which hold the device to the CPU reference.
     pub precision: Precision,
     /// How each matrix gets its layout on the device: by default measured
     /// per matrix when the model is loaded, decode steps first.

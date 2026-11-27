@@ -83,11 +83,10 @@ What is left out is decided from the devices and the model, and the log says how
 | `--cache <DIR>` | A directory where the engine keeps the state it computed (K and V, checkpoints of recurrent state), so that a prompt that starts with it resumes from there after the state left RAM, after an unload and after a restart. Texts of 2048 tokens and more are written when they leave RAM; what RAM and the devices hold is written at an unload or a stop. One directory may serve all models. Flash-Next keeps the usage profile of its experts there. | none: nothing is written; the usage profiles go to `$XDG_CACHE_HOME/ares`, else `~/.cache/ares` |
 | `--cache-size <SIZE>` | The most the directory may take, at least `1G`; what was used least recently goes first. | `32G` |
 
-## Speed against exactness
+## Drafts and steps
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--precision <KIND>` | `fast`: 8-bit activations where they are faster. `exact`: f16 products everywhere, the same text whatever else runs in a step. Flash-Next takes `fast` only. | `fast` |
 | `--drafters <LIST>` | The model drafters, separated by commas: `mtp` (the MTP block in the model file), a file (an MTP block or a DFlash2 drafter, told apart by the architecture the file names), or `none` (no speculation at all). The n-gram drafter takes part with them, never alone. See [models.md](models.md). | 27B: `mtp` if the model file has an MTP block. Flash-Next: none; name `mtp` or a file |
 | `-b`, `--batch-size <ROWS>` | Most rows of prompt in one step while a prompt is read alone. Above `--ubatch-size` only for Flash-Next, whose expert slots in VRAM lend the room for the step. At least 8. | 27B: `--ubatch-size`. Flash-Next: 32768 when a prompt is read layer by layer (K and V in `f16` or `q8`, no DFlash drafter), else 8192; as far as the slots can lend the room |
 | `-ub`, `--ubatch-size <ROWS>` | Most rows of a step in the memory the model keeps for good, and of a piece of prompt while another request waits. At least 8. | 27B: `512`. Flash-Next: the most rows, a power of two from 8 to 4096, whose step scratch fits in a thirty-second of the smaller device's memory |

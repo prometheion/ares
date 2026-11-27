@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use ares_core::units::Bytes;
-use ares_cuda::{CacheFormat, Precision, PruneRule};
+use ares_cuda::{CacheFormat, PruneRule};
 use ares_tokenizer::Json;
 
 /// The cells of a page of sequence state: what the attention kernels store
@@ -121,8 +121,6 @@ pub struct LoadOptions {
     /// The most bytes everything in that directory may take
     /// ([`DEFAULT_CACHE_SIZE`]).
     pub cache_size: Option<u64>,
-    /// How the matrix products round.
-    pub precision: Precision,
     /// The model drafters that take part. `None`: every one that is
     /// available (the model's MTP block, if the file has one). An empty
     /// list: none, and with none the engine does not speculate at all. The
@@ -198,7 +196,6 @@ impl LoadOptions {
             ram: None,
             cache: None,
             cache_size: None,
-            precision: Precision::Fast,
             drafters: None,
             window: None,
             batch: None,

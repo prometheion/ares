@@ -31,8 +31,9 @@
 //   values of K, at most 64 products of a weight and a value below 1) is added to
 //   f32 registers. GeForce cards run that at twice the rate of f32 accumulation.
 //   0.05 % rms, 0.12 % at worst on the test data.
-// Which one runs is the caller's choice (Kernels::prefill_path: int8 is the fast
-// one on a capped card, as the measurements below show).
+// Which one runs is measured per type on every card (Kernels::prefill_path_for and
+// src/kernels/paths.rs: int8 is the fast one for most types on a capped card, as the
+// measurements below show).
 //
 // Structure of a thread block
 // ---------------------------

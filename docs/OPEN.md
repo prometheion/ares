@@ -552,7 +552,7 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
 `/var/tmp/ares-survey/src/`. The settings and tables: [`dev/experiments/against-the-fork.md`](dev/experiments/against-the-fork.md).
 - [ ] Quality against the fork at equal settings (KL or top-1); VRAM was measured 2026-11-23
       (11.5 / 10.1 against 11.6 / 11.7 GiB).
-- [ ] Float matrices under the fast precision use f16 sums (0.04 to 0.06 % rms) where the
+- [ ] Float matrices on a capped card use f16 sums (0.04 to 0.06 % rms) where the
       F32 matrices of an IQ4_XS file were exact before: decide with a KL measurement (the 27B's
       chooser; Flash-Next's float products keep f32 sums).
 - [ ] A turn that continues at 17-23k read 576 tokens/s (fork 880; Ares 1020 from the start of a

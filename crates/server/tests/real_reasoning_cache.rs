@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role};
-use ares_cuda::{Device, Precision, Wait};
+use ares_cuda::{Device, Wait};
 use ares_gguf::Gguf;
 use ares_model::chat;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
@@ -285,7 +285,6 @@ impl Server {
     /// it with, or `None` for the model's own.
     async fn start(path: &PathBuf, template: Option<&str>) -> Self {
         let options = Options {
-            precision: Precision::Exact,
             max_rows: 128,
             logit_rows: 16,
             window_rows: 4,
