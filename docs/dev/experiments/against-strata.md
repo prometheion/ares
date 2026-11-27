@@ -136,11 +136,16 @@ Found:
   than a page of 128 cells (`cached` 3 tokens), Strata reuses all but 7 tokens of it.
 - *Cached agent turns stay Ares's weak point.* Asked again, Strata answers turns 2 and 3 in 0.35
   to 2.3 s on UD-Q4_K_XL; Ares takes 7.8 to 30.9 s (12.6 to 45.3 s on UD-Q5_K_XL), longer than
-  its own first round (4.0 to 15.8 s). In the turn of 30.9 s (6836 prompt tokens, 6784 of them
-  counted as cached) the store read 67 GB of experts, 8200 of them as guesses read ahead (the
-  wide steps' guesses of whole layers, whose class of more than 64 rows the records named 461 times
-  of 465): the turn computed thousands of rows, not 52. Why the cache did not serve it is open; the
-  prompt cache is the last user of `--ram`, and the tier of experts takes nearly all 40 GiB.
+  its own first round (4.0 to 15.8 s). The cache holds the turns' pages but not their checkpoints:
+  every turn saved its checkpoints and the cache dropped as many (`ares_checkpoints_saved_total`
+  and `_dropped_total`, 1 to 3 a turn), so in the second round turns 1 and 2 restored none and
+  replayed every cached row (`ares_replayed_rows_total`: 512 and 6784 rows; turn 3 restored the
+  checkpoint the turn before had left and replayed 140 to 164). In the turn of 30.9 s the store
+  read 67 GB of experts for that replay, 8200 of them as the guesses of whole layers that a pass
+  reads ahead. With `--ram 40G` the tier of experts takes the limit and the prompt cache keeps its
+  floor of one checkpoint place, which the newest turn takes; the `--cache` directory did not keep
+  the others either. The same on `main` at 29c277e0 (turn 2 asked again: 6837 rows replayed, 33.2
+  s).
 - *Ares fails a request after the 32k prompt.* Both UD-Q4_K_XL sessions, at the agent's first
   turn: "the RAM limit of 39.67 GiB has no room for 61.8 MiB more of the tier of experts: the step
   record and read-back hold 47.4 MiB, the K/V beyond VRAM 127.5 MiB, the tier of experts 39.23
