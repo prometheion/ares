@@ -377,6 +377,7 @@ pub struct SamplerKernels {
     pick_logit: Function,
     report: Function,
     invert: Function,
+    scores: Function,
     draft_put: Function,
     draft_rows: Function,
 }
@@ -410,6 +411,7 @@ impl SamplerKernels {
             pick_logit: module.function("ares_lp_pick_logit")?,
             report: module.function("ares_lp_finish")?,
             invert: module.function("ares_sample_invert")?,
+            scores: module.function("ares_sample_scores")?,
             draft_put: module.function("ares_draft_put")?,
             draft_rows: module.function("ares_draft_rows")?,
         })
@@ -478,6 +480,50 @@ impl SamplerKernels {
                 [THREADS, 1, 1],
                 0,
                 Args::new().ptr(tokens).u32(n_local).ptr(inverse).u32(vocab),
+            )
+        }
+    }
+
+    /// Enqueues reading the logits of chosen tokens at the wanted rows of
+    /// `batch`, before the picks change them: `pairs` holds `n` pairs of u32
+    /// (the wanted row, the token), and `out[k]` becomes the logit of pair `k`,
+    /// or NaN when the token is not among this device's columns.
+    ///
+    /// # Safety
+    ///
+    /// `batch.logits` must hold `batch.n_rows` rows of `batch.stride` values
+    /// (and `batch.inverse`, when it is not null, `batch.vocab` u32), `pairs`
+    /// `2 * n` u32 with every row below `batch.n_rows`, and `out` `n` f32, all
+    /// live memory of the stream's device.
+    pub unsafe fn scores(
+        &self,
+        stream: &Stream,
+        batch: &SampleBatch,
+        pairs: DevicePtr,
+        n: u32,
+        out: DevicePtr,
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let first = if batch.inverse == DevicePtr::NULL { batch.first } else { 0 };
+        // SAFETY: the arguments match ares_sample_scores; the memory is the caller's guarantee.
+        unsafe {
+            self.scores.launch(
+                stream,
+                [n.div_ceil(THREADS), 1, 1],
+                [THREADS, 1, 1],
+                0,
+                Args::new()
+                    .ptr(batch.logits)
+                    .u32(batch.stride)
+                    .u32(first)
+                    .u32(batch.n_local)
+                    .ptr(batch.inverse)
+                    .u32(batch.vocab)
+                    .ptr(pairs)
+                    .u32(n)
+                    .ptr(out),
             )
         }
     }

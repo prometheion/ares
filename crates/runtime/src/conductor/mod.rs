@@ -127,8 +127,11 @@ use crate::record::{self, Commit, ImageRun, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 use crate::watch::Watch;
+use decisions::Decision;
+pub(crate) use decisions::{DecisionSubmission, Role};
 
 mod commit;
+mod decisions;
 mod drafting;
 mod images;
 mod lifecycle;
@@ -173,6 +176,8 @@ impl Heartbeat {
 /// What other threads ask of the conductor.
 pub(crate) enum Command {
     Submit(Box<Submission>),
+    /// A decision ([`decisions`]).
+    Decide(Box<DecisionSubmission>),
     Cancel(RequestId),
     Stats {
         reset: bool,
@@ -248,6 +253,8 @@ pub(crate) struct Submission {
     /// is refused as overloaded, or is refused itself.
     pub displace: bool,
     pub sink: EventSink,
+    /// What the request is for: a client's, or a part of a decision.
+    pub role: Role,
 }
 
 /// What the conductor knows about a running sequence, for tests and logs.
@@ -381,9 +388,23 @@ struct Active {
     /// Text produced this step, not yet delivered.
     emitted: String,
     finished: Option<FinishReason>,
+    /// What the request is for: a client's, or a part of a decision
+    /// ([`decisions`]), which reads its prompt and generates nothing.
+    role: Role,
 }
 
 impl Active {
+    /// Whether what the sequence computes enters the prefix cache: its pages
+    /// as they fill, and checkpoints of its state where they are due. Not for
+    /// a fork of a decision: its state is its question's, a checkpoint would
+    /// cut its step and cost a copy of the state, and its pages without one
+    /// would shadow the parent's checkpoint for the same question asked again
+    /// (a lookup takes the longest path of pages, and then replays from the
+    /// last checkpoint on it).
+    fn enters_cache(&self) -> bool {
+        !matches!(self.role, Role::Fork { .. })
+    }
+
     fn generating(&self) -> bool {
         self.cells.len() >= u64::from(self.known)
     }
@@ -533,9 +554,18 @@ impl Drop for Conductor {
             let _ = a.sink.send(Event::Error(gone.clone()));
             a.cells.release(&mut self.pool);
         }
+        for (_, decision) in self.decisions.drain() {
+            decision.fail(gone.clone());
+        }
         while let Ok(command) = self.rx.try_recv() {
-            if let Command::Submit(submission) = command {
-                let _ = submission.sink.send(Event::Error(gone.clone()));
+            match command {
+                Command::Submit(submission) => {
+                    let _ = submission.sink.send(Event::Error(gone.clone()));
+                }
+                Command::Decide(submission) => {
+                    submission.sink.send(ares_api::DecisionOutcome::Failed(gone.clone()))
+                }
+                _ => {}
             }
         }
     }
@@ -797,6 +827,14 @@ pub(crate) struct Conductor {
     mask_words: usize,
     /// What requests share that takes a pass over the vocabulary to find.
     sampling_context: Context,
+    /// The decisions held, by their ids ([`decisions`]).
+    decisions: HashMap<RequestId, Decision>,
+    /// The errors the requests of decisions were ended with, by the
+    /// request's id, until the decision is ended with it.
+    part_errors: Arc<std::sync::Mutex<Vec<(RequestId, EngineError)>>>,
+    /// The logits the record's scores name, for the step being written:
+    /// `(wanted row, token)`.
+    score_pairs: Vec<(u32, u32)>,
 }
 
 impl Conductor {
@@ -859,6 +897,7 @@ impl Conductor {
                 paused: false,
                 picks: Vec::with_capacity(max_rows as usize),
                 logprobs: Vec::new(),
+                scores: Vec::new(),
                 drafts: Vec::with_capacity(max_rows as usize),
                 draft_probs: Vec::with_capacity(max_rows as usize),
                 draft_ms: 0.0,
@@ -870,6 +909,9 @@ impl Conductor {
             step_rows: StepRows::default(),
             mask_words: TokenMask::words_for(model.vocab()),
             sampling_context: Context::default(),
+            decisions: HashMap::new(),
+            part_errors: Arc::default(),
+            score_pairs: Vec::new(),
             requests: Vec::with_capacity(slots),
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
@@ -993,6 +1035,10 @@ impl Conductor {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Submit(submission) => self.enqueue(*submission),
+            Command::Decide(submission) => self.take_decision(*submission),
+            Command::Cancel(id) if self.decisions.contains_key(&id) => {
+                self.end_decision(id, ares_api::DecisionOutcome::Cancelled)
+            }
             Command::Cancel(id) => match self.by_id.get(&id) {
                 Some(Place::Slot(slot)) => self.retire(*slot, FinishReason::Cancelled),
                 Some(Place::Waiting) => {
@@ -1078,7 +1124,7 @@ impl Conductor {
             // rows are given up before anybody has to wait.
             let (must, prompt_rows) = match part.kind {
                 PartKind::Prefill { .. } => (writes, writes),
-                PartKind::Window | PartKind::Score { .. } => (1, 0),
+                PartKind::Window => (1, 0),
             };
             let required = a.cells.pages_to_append(&self.pool, u64::from(must));
             let all = a.cells.pages_to_append(&self.pool, u64::from(writes));
@@ -1297,7 +1343,20 @@ impl Conductor {
         if pass {
             limits = wide;
         }
-        let planned = plan(&self.requests, &limits);
+        let mut planned = plan(&self.requests, &limits);
+        // A step wider than the model's own rows borrows memory for its time,
+        // which only a prompt read alone gets (`Model::own_rows`): a step of
+        // several sequences (prompts that arrived together, the forks of a
+        // decision) is planned within them.
+        let own = self.model.own_rows();
+        if planned.parts.len() > 1 && planned.rows() > own {
+            let narrow = Limits {
+                max_rows: limits.max_rows.min(own),
+                prefill_rows_with_windows: limits.prefill_rows_with_windows.min(own),
+                ..limits
+            };
+            planned = plan(&self.requests, &narrow);
+        }
         for request in &self.requests {
             if let Some(a) = self.slots[request.seq.0 as usize].as_mut() {
                 a.waited_steps = a.waited_steps.saturating_add(1);
@@ -1339,7 +1398,7 @@ impl Conductor {
                 let margin = self.model.saves_inside_steps();
                 let inside = !step.replay && margin > 0 && step.rows > self.model.own_rows();
                 let named = self.inner_due.len();
-                if let Some(cache) = &self.cache {
+                if let Some(cache) = self.cache.as_ref().filter(|_| a.enters_cache()) {
                     let (mut last, mut from) = (a.checkpoint_at, step.from);
                     while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
                     {

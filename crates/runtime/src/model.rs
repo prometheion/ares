@@ -284,6 +284,8 @@ pub struct DeviceTransfer {
     /// The pool page, or the checkpoint place.
     pub object: u32,
     pub keep_form: bool,
+    /// A page on the way in is a tail ([`Transfer::tail`](crate::Transfer::tail)).
+    pub tail: bool,
     /// Host memory with `room` bytes, aligned to 4096.
     pub ptr: *mut u8,
     pub room: usize,
