@@ -56,7 +56,7 @@ pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Respons
 /// The counters and gauges of `GET /metrics`.
 fn stats_text(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 64] = [
+    let rows: [(&str, &str, &str, u64); 68] = [
         (
             "cache_transfer_nanoseconds_total",
             "counter",
@@ -308,6 +308,30 @@ fn stats_text(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Time layers waited for the experts they missed, summed over layers",
             stats.experts.wait_us,
+        ),
+        (
+            "expert_wait_cpu_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for the CPU's sums",
+            stats.experts.wait_last_us[0],
+        ),
+        (
+            "expert_wait_ram_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for an upload from RAM",
+            stats.experts.wait_last_us[1],
+        ),
+        (
+            "expert_wait_file_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for a read of the file",
+            stats.experts.wait_last_us[2],
+        ),
+        (
+            "expert_wait_on_its_way_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for an expert on its way",
+            stats.experts.wait_last_us[3],
         ),
         (
             "expert_predicted_total",
