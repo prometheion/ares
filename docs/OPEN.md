@@ -327,27 +327,6 @@ Wrong behaviour:
       4 more with the prompt cached, load 6 to 36. A pass opened beside generation is half as wide
       (the conductor), where it never stalled. What is left is the robustness the item names (the
       store bringing a step's experts whatever a loan holds), untested.
-- [ ] GPU. **Lent steps with the CPU's share** (found by `kvfix`, 2026-11-24; main's, not the far
-      pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
-      loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
-      -2.20..-2.25 in most runs and 58 -2.14, 22 -2.10 in the others, the same values every time
-      (the token after it follows: 39 at -1.89 or -1.74): two states, not a spread. Main 2340ca0
-      8 of 12 runs (7 answered 22), main acb2587 One 6 of 8 and by layers 1 of 8, alike with and
-      without far pages; with every miss uploaded (`Serve::Stream`) 0 of 16, in wide steps of the
-      own scratch (about 32 experts on the CPU a step, against 370 on a loan) 0 of 24, with every
-      miss the CPU can take on it (`Serve::Cpu`) 5 of 16. The rows' int8 input of the CPU against
-      the GPU's f16 moves the first token by a few hundredths, not by 0.3: something of the CPU's
-      share on lent VRAM is computed differently in some runs. The reading of `misses.rs`,
-      `hybrid/wide.rs`, `cpu/mod.rs` and `transit.rs` found no cause; a diagnostic that prints the
-      first tokens' log-probabilities per run (`zz_dbg_lent_gaps`, with the serve mode and a log
-      line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`).
-      *Classified on `fix/model-sweep` (2026-11-25): a defect, not a near tie.* The CPU reference
-      (the patch's `zz_dbg_reference_margins`, same file and prompt) puts 58 first with a gap of
-      0.433 to 22 (logits); the common state's log-probabilities (-1.80..-1.85 against
-      -2.20..-2.25, a gap of about 0.40) agree with it, the other state's (-2.14 against -2.10, 22
-      ahead by 0.04) is off by about 0.47. The cause is not found. Files:
-      `crates/model/src/qwen4exp/device/misses.rs`, `crates/runtime/src/expert_store/hybrid/wide.rs`,
-      `expert_store/cpu/mod.rs`, `expert_store/transit.rs`.
 - [ ] GPU. With both devices on every layer the MTP block's chains after a pass agree with the
       reference's for 1 to 3 links where after steps of the own rows 5 to 7 (the trunk's tokens
       are the reference's): cause not found. Files: `crates/model/src/qwen4exp/device/part/pass.rs`,

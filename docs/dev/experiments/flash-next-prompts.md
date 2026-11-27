@@ -270,3 +270,72 @@ of the reads on demand (the reads ahead of the next layer are not in that column
 uploads; the tokens right after it are 1.2 to 1.3 times as fast (the loan of a pass of 17 000
 rows is about 0.9 GiB where a lent step of 4096 rows took 2 GiB of slots), and a request that
 comes during the prompt gets its first token after 0.8 to 1.8 s instead of 21 to 49 s.
+
+## Two first tokens after lent steps with the CPU's share (2026-11-27)
+
+*The question* (issue #69): on the made-up model of `tests/qwen4exp_runtime.rs` (the file with
+BF16 gate and up and Q4_0 down), `prompt(300, 7)` read alone in lent steps of 32 rows (own
+scratch 8 rows), placement One, a fresh engine per run, the first token's log-probabilities are
+58 -1.80..-1.83 and 22 -2.21..-2.25 in most runs (the CPU reference: 58 -1.812, 22 -2.245) and
+58 -2.11..-2.16, 22 -2.10..-2.14 in the others (58 or 22 on top). It was classified as a defect
+on 2026-11-25 because the reference puts 58 0.433 logits ahead of 22. It is not one: the
+prompt's rows meet near ties upstream, of the routers and of the attention selection, which the
+CPU's share tips.
+
+*How often* (the local cards, a debug test of N fresh engines): on main 5e494226 1 of 16 runs
+(load 34), 0 of 192 (load 30 to 40; 64 each with the misses served as measured, by the CPU and
+uploaded), 0 of 96 (load 0.1 to 0.6, measured and CPU); on main 29c277e0 0 of 192 (load 34 to
+58), 3 of 250 with a read of every wide layer behind a wait for the device (load 34 to 48), 2 of
+400 with no wait (load 23 to 28). With every miss uploaded never. In those runs the CPU computed
+1 to 101 (row, expert) pairs of the lent steps (30 to 170 experts by the store's count with the
+token after); when the item was found (main 2340ca0 8 of 12 runs, acb2587 6 of 8) it computed
+230 to 450 experts of the prompt.
+
+*The CPU's share computes right.* In the 250 runs with the read of every layer (3 of them in
+the other state), for every job of a wide step: the RAM slots' bytes equal the file's before
+and after the job; the sums are within 5 % of an f64 computation from the file's weights and
+the job's int8 rows (the int8 hidden values of the CPU's down product make up the rest); the
+int8 rows the CPU read equal the device's after the layer; the device's copy of the sums
+equals the host's.
+
+*Where the other state comes from* (the router's picks of every row and layer, and its logits
+computed again on the host from the read MoE inputs, which the device's buffer does not keep:
+`pick_rows` overwrites it):
+- The first token follows the last row's layer 7: in the other state row 299 picks expert 37
+  instead of 13 (13 ahead by 0.15 to 0.18 logits in the common state).
+- All three runs in the other state part from the others at row 175 (step 5): its MoE input is
+  28.6 % off at layer 3 (of its largest value; 0.2864 to 0.2868 in all three), 17.7 % at layer
+  4 and 59.7 % at layer 5, where the layers before differ by the 0.5 % of expert 10 of layer 2,
+  which the CPU computed for that row (int8 rows against the f16 of the many-row kernels).
+- Layer 3 is attention with a budget of two blocks and three cells. The reference's selection
+  of row 175 takes block 25 at a score of 21.0321 before block 30 at 21.0262. With these two
+  turned, the reference's MoE input of row 175 changes by 28.5 % at layer 3, 17.7 % at layer 4
+  and 59.3 % at layer 5, its router gaps after it are those of the runs in the other state
+  (0.683 against 0.678 to 0.682 at layer 3, 0.218 against 0.203 to 0.215 at layer 4, where the
+  picks change): the runs in the other state took the other side of that near tie.
+- From there further near ties lead to row 299: the runs in the other state differ from run 0 in
+  40 to 51 routed rows, runs in the common state among themselves in 13 to 25. The CPU computed
+  expert 10 of row 175 at layer 2 in 147 of the 250 runs (144 in the common state): it tips
+  the selection only together with the rest of the step's rounding. The reference with the
+  selection turned, alone or with a run's CPU pairs in int8, ends in the common state; the
+  device's f16 sums differ from it at the later near ties.
+- The reference reaches the other state alone: with the inputs of a random half of its (row,
+  expert) pairs rounded to int8 as the CPU's share does, 5 of 100 seeds end there (58 -2.11 to
+  -2.15); of its 56 routed rows whose last pick leads the next expert by less than 0.01 logits
+  (the smallest 0.00037), turning one, layer 1 row 294 (0.0036), gives 58 -2.144, 22 -2.109.
+- Forcing the CPU's share of a run in the other state onto later runs (a list of step, layer
+  and expert) gave the common state in 72 of 72 runs, but a part of each list was not in RAM in
+  those runs, so the split was not the same: no conclusion either way.
+
+So the first token's margin says nothing of how near the answer is to turning on this prompt.
+The made-up model's routers and selections have near ties every few rows, and which of them
+tips depends on which experts the CPU computes (by the cost model, from run to run); the CPU's
+arithmetic is the decode steps' by design (int8 rows). The test
+`lent_steps_with_the_cpus_share_give_the_reference_token_run_after_run` reads `prompt(300, 8)`
+instead (16 first by 1.06 logits over 70; none of its 51 router decisions below 0.01 turns the token in
+the reference, nor do int8 rows on half the pairs in 40 seeds) on lent steps, the CPU taking
+every miss it can and as the costs say, six fresh engines each, in every placement: 3 rounds of
+36 runs gave the reference's token (load 1 to 2; 354 to 1936 experts on the CPU per placement and
+mode). The debug code of this search (the reads, the checks, the forced split, the reference's
+injected int8 rows and turned decisions) is not in the tree; `fix/lent-cpu-share`'s notes say
+where it was kept.
