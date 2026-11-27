@@ -62,3 +62,15 @@ as one pass got `processed` 0, 555, 1203, 2056, 2796, 3490, 4256, 5017, 5804, 63
 645 tokens per second); the prompt took 14.4 s. Before the fix of the first look (the pass's
 first micro-batch waited for the drive for more than a second, and the conductor stopped
 looking) the same request got only 0 and 8883, after 20.4 s.
+
+The same A/B again with the branch at f5db7b9e (2026-11-27, besides the above the event of the
+reply's tokens after every step, `Event::Generated`), on a quiet machine (load 1.9 to 2.6), three
+pairs:
+
+| Side | Decode, tokens/s | 8.5k prompt, s |
+| --- | --- | --- |
+| A main | 40.513, 40.470 · 40.412, 40.397 · 40.514, 40.500 | 7.062, 7.082 · 7.101, 7.119 · 7.098, 7.117 |
+| B branch | 40.527, 40.515 · 40.474, 40.459 · 40.405, 40.390 | 7.102, 7.125 · 7.087, 7.110 · 7.096, 7.125 |
+
+Decode 40.468 against 40.462 tokens/s (-0.015 %), the prompt 7.096 against 7.108 s (+0.17 %):
+no difference.
