@@ -315,11 +315,13 @@ The blocks so far:
 - **The arena of weights** (`blocks/arena.rs`): a stateless part both models
   use as it is: every tensor at a multiple of 64 bytes, the stored bytes, rows
   or columns gathered into a matrix of their own, or values the host made.
-  The bytes are uploaded from the file's mapping; on a machine short of
-  memory for a load (less than twice its bytes available), the pages that are
-  not in the page cache (one `mincore`) are read from the file with ordinary
-  reads a piece at a time and uploaded from there, because faulting in a
-  mapping that keeps missing the page cache is slow there.
+  The bytes are uploaded from the file's mapping where its pages are in the
+  page cache (one `mincore`); the others are read from the file with ordinary
+  reads a piece at a time and uploaded from there, because the kernel stops
+  reading around the faults of a mapping that keeps missing the page cache,
+  and every fault then reads one page (until 2026-11-27 only on a machine short
+  of memory for a load; a reload after the kernel had taken part of the file's
+  pages back read 5 to 20 MB per second, GitHub issue #66).
   The 27B keeps its layout chooser on top.
 
 What every model reads from its files the same way is in the module `files`:
