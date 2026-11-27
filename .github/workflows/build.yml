@@ -1,0 +1,131 @@
+# Builds and checks Ares on a machine that is not the author's.
+#
+# Both build scripts run here, so every CUDA kernel and every GLSL shader is
+# compiled without a GPU. That is what catches what a local build cannot: a
+# toolchain older or stricter than the one the code was written against.
+#
+# The shader compiler is LunarG's, not the distribution's: Ubuntu 24.04 ships
+# shaderc 2023.8, which does not know GL_EXT_integer_dot_product.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A check on a public repository needs no more, and a pull request from a fork
+# gets no more.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # No build is needed for these two, so they run on the runner itself and
+  # fail within a minute.
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml picks the version and brings rustfmt.
+      - name: Format
+        run: cargo fmt --all --check
+
+  doc-links:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Doc links
+        run: python3 tools/check-doc-links.py
+
+  # The three that build the kernels and shaders run side by side, each with a
+  # cache of its own, so the slowest of them sets the time of a run.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [clippy, test, docs]
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
+      # Docker's default seccomp profile refuses io_uring, which ares-io reads
+      # the model files with; its tests open a ring.
+      options: --security-opt seccomp=unconfined
+    steps:
+      # git first: without it in the container, checkout downloads an archive
+      # with no .git.
+      - name: System packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git pkg-config python3
+
+      - uses: actions/checkout@v4
+
+      # The workspace belongs to the runner's user, not the container's root,
+      # and git refuses a tree it does not own unless it is named safe.
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Shader compiler
+        run: |
+          curl -sS -o /etc/apt/trusted.gpg.d/lunarg.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc
+          curl -sS -o /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y shaderc
+          glslc --version
+
+      # rust-toolchain.toml picks the version and brings rustfmt and clippy.
+      - name: Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # One cache per task: clippy, the tests and the docs build different
+      # artefacts. The key ends in the commit, so every run saves its own and
+      # restores the newest through the prefix. It is saved also when the task
+      # fails, so a red run does not throw its build away.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.task }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.task }}-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-${{ matrix.task }}-
+
+      # ARES_CUDA_ARCHS is left unset on purpose: the build script compiles the
+      # tested classes, so CI compiles what a default build compiles and follows
+      # that list when it changes.
+      - name: Clippy
+        if: matrix.task == 'clippy'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The CUDA tests skip without ARES_TEST_CUDA, the model and server tests
+      # without their ARES_TEST_* model paths, so the host tests run here.
+      - name: Test
+        if: matrix.task == 'test'
+        run: cargo test --workspace
+
+      - name: Docs
+        if: matrix.task == 'docs'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.task }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+
+      - name: Disk
+        if: always()
+        run: df -h

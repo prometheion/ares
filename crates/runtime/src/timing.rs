@@ -292,6 +292,10 @@ pub struct Counters {
     pub tokens: u64,
     pub requests_finished: u64,
     pub requests_cancelled: u64,
+    /// Decisions answered: their parts (the shared start and the forks) are
+    /// requests the conductor makes, which the counts of requests leave out
+    /// when they end as they should.
+    pub decisions: u64,
     /// Requests that did not start in the first pass after they arrived.
     pub requests_waited: u64,
     /// Times a running request gave way to the others: it let go of its

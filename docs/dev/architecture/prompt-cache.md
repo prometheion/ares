@@ -196,12 +196,16 @@ and after a restart of the server. Nothing is written as it is computed.
   leaves behind its end are exact entries. A page that comes back exact takes
   an exact slot when it is the first tile or lies at the end of the run, and
   is converted on the way in otherwise, as the window of a sequence that went
-  on would have converted it.
+  on would have converted it. A tail comes back as the partly used page it
+  is: it keeps its exact slot until it is freed and is never converted for
+  room (a prompt that continues it copies its leading cells, which only an
+  exact entry holds).
 - **The fingerprint** covers everything besides the tokens that changes the
   stored bytes: the model's files (their size, their first 64 KiB and 16
   samples of 4 KiB spread over each), the formats of K and of V, the draft
   block and its formats when the model drafts, the format of the recurrent
-  state, how the products round (`--precision`), the page size, and which
+  state, how the products round (exact products, a tool of the tests, are
+  another store), the page size, and which
   heads of every block each device holds (the bytes are stored per device, so
   another split or other shares are another store). The names of the pages
   start from the fingerprint, not from the model's id, so a model keeps its

@@ -342,7 +342,14 @@ more each with one), and a test checks it against random steps of prompts,
 shared prefixes and rows alone (`plan.rs`). It costs the devices tens of MiB
 of scratch (the 3060 of the owner's settings 62 MiB where it reserved 12); the
 server's estimate counts it (`attention_state_bytes`), and a device that is
-over gives up at least a whole head. `tests/real_devices.rs` loads the 27B three
+over gives up at least a whole head. Flash-Next's frame takes the same bound
+(2026-11-25), and for short sequences the smaller one of a slot per entry a row
+(`PlanConfig::row_slots_bound`): a piece is of whole entries of 128 cells, so a
+row of a sequence of at most `cells` cells has no more pieces than its entries
+and one (the cut of a shared prefix). At the contexts of real use the planner's
+bound is the smaller; at the 512 cells of the made-up model in the tests the
+per-entry bound keeps a lent step of 32 rows in what the expert slots lend
+(the planner's bound alone took 12 MB on the RTX 4070). `tests/real_devices.rs` loads the 27B three
 ways and compares the planned pages and the text: two sequences, K and V in
 `q8`, no drafters, 890 pages with the heads following the weights, 1770 with a
 quarter of them on the 4070, and 1946 (248 832 tokens: the model's 262 144 do
@@ -387,7 +394,16 @@ roles hold about equally (experts only gives the worker the bytes of its dense
 share for slots, and the mixer as many fewer). The trial runs in the first
 placement of a load (`place`, `Session::open`); later placements of the same load
 pin its choice, and with `--cache` the server keeps it next to the stores as
-before. A worker that holds experts only holds no state that a draft window
+before. What a trial kept is remembered (the owner, 2026-11-25), in a file per
+model, cards, driver and binary (`<fingerprint>.roles`: the model files' identity,
+each card's name and UUID, the driver's version and the CUDA version it implements,
+the binary's size and time, the rows of the wide step) in the directory of the
+usage profiles (`ModelOptions::roles_dir`: `--cache`, else `$XDG_CACHE_HOME/ares`,
+else `~/.cache/ares`). A load that finds it takes the choice it kept when that fits
+the cards now and measures nothing; one of the five changed is another file, so the
+trial runs again. The load's log says which ("remembered from ..." or "timed at
+load ...; remembered in ..."). Without any directory the trial runs at every
+load. A worker that holds experts only holds no state that a draft window
 changes, so it keeps nothing for windows and their commit does nothing there (it
 had refused windows, which took Flash-Next down with its MTP block once the trial
 chose that role; `qwen4exp_runtime` `a_worker_of_experts_only_runs_draft_windows`). The server's log says what each role took and which was kept;

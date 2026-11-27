@@ -520,6 +520,11 @@ impl Cache {
     }
 
     /// The names of the full pages of `tokens`.
+    /// Whether the model has recurrent state, which a start restores.
+    pub(crate) fn recurrent(&self) -> bool {
+        self.recurrent
+    }
+
     pub(crate) fn chain(&self, tokens: &[u64]) -> Chain {
         let mut chain = Chain::new(self.root, self.cells_per_page);
         chain.name(tokens);

@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use ares_api::{Json, Usage};
+use ares_api::{Json, Progress, Usage};
 use serde::{Serialize, Serializer};
 
 use super::request::Echo;
@@ -19,7 +19,7 @@ use crate::answer::Written;
 use crate::answer::{Kind, Segment, Segments};
 use crate::bridge::Timings;
 use crate::error::ApiError;
-use crate::openai::reply::TimingsBody;
+use crate::openai::reply::{ProgressBody, TimingsBody};
 use crate::sorter::Piece;
 
 /// `[]`: a list this server never has anything for (the summary of a
@@ -369,6 +369,10 @@ enum Body<'a> {
     Response {
         response: &'a ResponseBody<'a>,
     },
+    Progress {
+        response: &'a ResponseBody<'a>,
+        prompt_progress: ProgressBody,
+    },
     Item {
         output_index: usize,
         item: &'a Item,
@@ -503,6 +507,15 @@ impl Head {
         let response = &self.body(&[], None);
         ["response.created", "response.in_progress"]
             .map(|kind| written(kind, sequence, Body::Response { response }))
+    }
+
+    /// How far the prompt has got, as llama.cpp's server streams it on this
+    /// route for `return_progress`: `response.in_progress` with
+    /// `prompt_progress`.
+    pub fn progress(&self, progress: &Progress, sequence: &mut u64) -> Written {
+        let response = &self.body(&[], None);
+        let prompt_progress = ProgressBody::from(progress);
+        written("response.in_progress", sequence, Body::Progress { response, prompt_progress })
     }
 
     /// The last event of a stream: the response as it is returned whole,

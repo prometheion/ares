@@ -14,8 +14,9 @@
 //! with many load instructions per item fall behind on it (an RTX 4060 Ti at 1024 rows:
 //! IQ3_S 23 %, IQ3_XXS 15 %, Q8_0 12 %, IQ4_NL 10 %, IQ4_XS 9 %), the others are as fast or
 //! faster (`kernels/mm.cuh`). Which is which depends on the type and the card, capped or
-//! not, so it is measured. A type that was not measured takes the rule kept from the cards
-//! the kernels were written on ([`Kernels::prefill_path_for`]).
+//! not, so it is measured on every card, and the faster path runs: there is no option for
+//! the more exact one (the owner, 2026-11-26). A type that was not measured takes the rule
+//! kept from the cards the kernels were written on ([`Kernels::prefill_path_for`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -260,20 +261,22 @@ impl Kernels {
     }
 
     /// The path of a type that was not measured, by the rule kept from the cards the kernels
-    /// were written on: f16 where the tensor cores run it at full rate, and on a capped card
-    /// f16 with f16 accumulation for the types where that was as fast as int8 there or that
-    /// have no int8 kernel, int8 for the others. A model's loader measures every type it
-    /// multiplies in the file's layout, so this serves tests and benches.
+    /// were written on, on every card, capped or not: f16 for the types where f16 with f16
+    /// accumulation was as fast as int8 there or that have no int8 kernel, int8 for the
+    /// others. The f16 path sums in f32 where the tensor cores run that at full rate (it
+    /// costs nothing more there) and in f16 where they do not. (On a card without the cap
+    /// the rule's int8 is within 5 % of f16 at the probe's 512 rows for every type measured
+    /// there, and up to 27 % faster: IQ3_S on an RTX 4060 Ti,
+    /// `docs/dev/architecture/kernels.md`.) A model's loader measures every
+    /// type it multiplies in the file's layout, so this serves tests and benches, and a type
+    /// whose probe found no memory.
     fn kept_path(&self, ty: GgmlType) -> Result<PrefillPath> {
-        if self.prefill.full_rate {
-            return Ok(PrefillPath::F16);
-        }
         let info = super::types::info(ty);
         let has_int8 = info.is_none_or(|t| t.tile.int8);
-        Ok(if info.is_some_and(|t| t.flush_as_fast) || !has_int8 {
-            PrefillPath::F16Flush
-        } else {
-            PrefillPath::Int8
+        Ok(match info.is_some_and(|t| t.flush_as_fast) || !has_int8 {
+            false => PrefillPath::Int8,
+            true if self.prefill.full_rate => PrefillPath::F16,
+            true => PrefillPath::F16Flush,
         })
     }
 }

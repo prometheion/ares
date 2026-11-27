@@ -9,10 +9,9 @@
 //! That model is loaded the way `ares --model <file>` loads it
 //! (`ares_server::load`), on the devices the server would take, under the id
 //! `q` that the requests of the suites name, with the flags of
-//! `ARES_TEST_API_FLAGS` as `ares` reads them (default: `--ram 8G`, and
-//! `--precision exact` for a model that has it). The usage profile of the
-//! experts stays with the tests' build (`--cache` under its temporary
-//! directory) unless the flags name another directory.
+//! `ARES_TEST_API_FLAGS` as `ares` reads them (default: `--ram 8G`). The usage
+//! profile of the experts stays with the tests' build (`--cache` under its
+//! temporary directory) unless the flags name another directory.
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_API_MODEL=Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
@@ -20,12 +19,22 @@
 //!     cargo test --release -p ares-server --test real_tools -- --test-threads=1 --nocapture
 //! ```
 //!
-//! Flash-Next's replies are not bit for bit the same from run to run (the CPU
-//! computes some of the experts a step misses, and which ones depends on what
-//! the tiers hold; the owner accepts that, `docs/OPEN.md`). Such a model is not
-//! `repeatable`: where a suite compares two replies to the same request, it
-//! compares them when they are the same tokens and checks each on its own
-//! otherwise.
+//! A model loaded as the server loads it is not `repeatable`: it runs the fast
+//! products, whose rounding of a row depends on the size of the step that
+//! computes it, and the prompt cache changes those steps, so two replies to
+//! the same request may part at a near tie. Flash-Next's are not bit for bit
+//! the same from run to run besides (the CPU computes some of the experts a
+//! step misses, and which ones depends on what the tiers hold; the owner
+//! accepts that, `docs/OPEN.md`). Where a suite compares two replies to the
+//! same request, it compares them when they are the same tokens and checks
+//! each on its own otherwise.
+//!
+//! The 0.8B and the 27B that the suites build here (`small_model`,
+//! `large_model`) run the exact products instead, which the server never
+//! does: a test's tool, so that a reply from the cache is the reply computed
+//! afresh up to a rounding far below a near tie, and the suites compare
+//! replies token for token and probabilities number for number. They are
+//! built through `ares_model`, not through the server's options.
 //!
 //! A suite that includes this module includes `common` as well.
 #![allow(dead_code)]
@@ -58,9 +67,8 @@ pub fn large() -> Option<PathBuf> {
     model_file("ARES_TEST_QWEN38_27B", "the 27B Q4_K_S file (two GPUs)")
 }
 
-/// The 0.8B on the test device as the suites run it: exact products, so that
-/// a text does not depend on what else is in a step, 4096 tokens for 4
-/// sequences, under the id `q`. `thinking` sets the template's
+/// The 0.8B on the test device as the suites run it: exact products (see the
+/// module), 4096 tokens for 4 sequences, under the id `q`. `thinking` sets the template's
 /// `enable_thinking`; `None` leaves it to the template.
 pub fn small_model(path: &Path, thinking: Option<bool>) -> (Arc<Runtime>, Arc<Qwen35>) {
     let options = Options {
@@ -81,8 +89,8 @@ pub fn small_model(path: &Path, thinking: Option<bool>) -> (Arc<Runtime>, Arc<Qw
 }
 
 /// The 27B over both cards with its MTP block and the n-gram drafter, with
-/// exact products so that a row computes the same in a window as alone, and a
-/// context of 1024 tokens, under the id `q`. `thinking` as for
+/// exact products (see the module) and a context of 1024 tokens, under the id
+/// `q`. `thinking` as for
 /// [`small_model`].
 pub fn large_model(path: &Path, thinking: Option<bool>) -> (Arc<Runtime>, Arc<Qwen35>) {
     let options = Options {
@@ -147,7 +155,8 @@ pub struct Served {
     /// server loads it).
     pub runtime: Option<Arc<Runtime>>,
     pub path: PathBuf,
-    /// Whether a request gives the same tokens every time.
+    /// Whether a request gives the same tokens every time: for a model built
+    /// here, not for one loaded as the server loads it (see the module).
     pub repeatable: bool,
     /// The model loaded as the server loads it, which this keeps loaded.
     _loaded: Option<ApiModel>,
@@ -166,7 +175,7 @@ impl Served {
                 engine,
                 runtime: None,
                 path,
-                repeatable: model.repeatable,
+                repeatable: false,
                 _loaded: Some(model),
             });
         }
@@ -199,8 +208,6 @@ pub fn api_path() -> Option<PathBuf> {
 pub struct ApiModel {
     pub loaded: Loaded,
     pub path: PathBuf,
-    /// Whether a request gives the same tokens every time.
-    pub repeatable: bool,
 }
 
 impl ApiModel {
@@ -210,10 +217,7 @@ impl ApiModel {
     pub fn load(path: &Path, thinking: Option<bool>) -> Self {
         let architecture =
             Gguf::open(path).expect("the model file opens").architecture().map(str::to_owned);
-        // Flash-Next has one kind of arithmetic and refuses `--precision exact`.
-        let exact = architecture.as_deref() != Some("qwen4exp");
-        let default = if exact { "--ram 8G --precision exact" } else { "--ram 8G" };
-        let flags = std::env::var("ARES_TEST_API_FLAGS").unwrap_or_else(|_| default.to_owned());
+        let flags = std::env::var("ARES_TEST_API_FLAGS").unwrap_or_else(|_| "--ram 8G".to_owned());
         let mut model = ModelOptions::default();
         model.load.model = path.to_owned();
         model.load.name = Some("q".to_owned());
@@ -237,15 +241,13 @@ impl ApiModel {
             let profile = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
             model.load.cache = Some(profile);
         }
-        let repeatable = model.load.precision == ares_cuda::Precision::Exact;
         let loaded = load::load(&model.load).expect("the model loads");
         eprintln!(
-            "RES loaded {} ({}) with {flags:?}: {}repeatable",
+            "RES loaded {} ({}) with {flags:?}",
             path.display(),
-            architecture.as_deref().unwrap_or("?"),
-            if repeatable { "" } else { "not " }
+            architecture.as_deref().unwrap_or("?")
         );
-        Self { loaded, path: path.to_owned(), repeatable }
+        Self { loaded, path: path.to_owned() }
     }
 
     pub fn engine(&self) -> Arc<dyn Engine> {

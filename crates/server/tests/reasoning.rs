@@ -256,7 +256,9 @@ async fn what_the_template_cannot_do_is_refused_by_name() {
     let (_, plain) = serve(reply(), None, ModelOptions::default()).await;
     let error = refused(&plain, json!({"reasoning_budget_tokens": 256})).await;
     assert!(error["message"].as_str().unwrap().contains("model that thinks"), "{error}");
-    let error = refused(&app, json!({"reasoning_control": true})).await;
+    // llama.cpp's arming of the route that ends the thinking: accepted (every
+    // reply can be ended by it), a boolean.
+    let error = refused(&app, json!({"reasoning_control": "yes"})).await;
     assert_eq!(error["param"], "reasoning_control");
     // No budget is not a refusal.
     let quiet = chat(json!({

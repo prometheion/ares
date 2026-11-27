@@ -97,6 +97,7 @@ use ares_weights::{
 };
 
 pub use device::{CudaSlots, SlotDevice};
+pub use elastic::RamShrink;
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
 pub use hybrid::{CostModel, ExpertTypes, Miss, Serve, WideCpu, WidePick};
@@ -574,6 +575,8 @@ pub struct ExpertStore<D: SlotDevice> {
     /// Per device, the VRAM its slots have lent (`scratch.rs`).
     scratch: Vec<Option<scratch::LentScratch>>,
     stats: StoreStats,
+    /// Told of every shrink of the RAM tier ([`ExpertStore::on_shrink`]).
+    on_shrink: Option<Box<dyn FnMut(RamShrink) + Send>>,
 }
 
 impl<D: SlotDevice> std::fmt::Debug for ExpertStore<D> {
@@ -966,6 +969,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             ahead: ahead::Ahead::new(&layers, &reader),
             scratch: devices.iter().map(|_| None).collect(),
             stats: StoreStats::default(),
+            on_shrink: None,
             block,
             config,
             map,

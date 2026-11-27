@@ -354,6 +354,7 @@ fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
 }
 
 #[test]
+#[ignore = "its guesses never start on CI runners: issue #88"]
 fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
     // so two reads ahead are on their way at a time, the one at the drive and one queued
@@ -1995,12 +1996,23 @@ fn the_tier_gives_pieces_back_keeps_what_is_hot_and_takes_the_pieces_again() {
     }
     rig.store.take_stats();
 
-    // Half of it must go.
+    // Half of it must go, and the owner hears of it.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let told = heard.clone();
+    rig.store.on_shrink(Box::new(move |shrink| told.lock().unwrap().push(shrink)));
     rig.store.set_ram_target(whole / 2);
     let given = rig.store.shrink_ram(Duration::ZERO).unwrap();
     assert!(given > 0);
     let (locked, _) = rig.store.ram_bytes();
     assert!(locked <= whole / 2, "{locked} of {whole}");
+    let want = ares_runtime::expert_store::RamShrink {
+        pieces: given,
+        bytes: whole - locked,
+        held: locked,
+        target: whole / 2,
+        at_floor: false,
+    };
+    assert_eq!(*heard.lock().unwrap(), [want]);
     let released = rig.store.take_released();
     assert_eq!(released.len(), given);
     assert_eq!(released.iter().map(|piece| piece.len() as u64).sum::<u64>(), whole - locked);

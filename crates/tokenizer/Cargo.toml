@@ -14,5 +14,14 @@ ares-gguf.workspace = true
 minijinja.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The fingerprint of a tokenizer in the files of the draft_vocab example.
+sha2 = "0.10"
+
+[[example]]
+name = "draft_vocab"
+# Its tests run with the crate's.
+test = true
+
 [lints]
 workspace = true

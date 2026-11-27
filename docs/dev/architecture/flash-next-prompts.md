@@ -11,10 +11,11 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   kernels were written for the 27B's prompts. The dense products go through the tile
   kernels (`Kernels::product`) in the activation form the device and the type ask for:
   the int8 rows the fused kernels already leave (`mix_quant`, `gated_norm_quant`,
-  `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) when the
-  device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. Each
-  quantized type takes its own form (its measured path at the options' precision, as the
-  27B's chooser takes per matrix; the owner's decision of 2026-11-22): where the types of a
+  `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) for a type
+  whose measured path is f16, and for every type with exact products (`Options::precision`
+  `Exact`, a tool of the tests). Each quantized type takes its own form (its path measured
+  on the device, capped or not, as the 27B's chooser takes per matrix; the owner's
+  decisions of 2026-11-22 and 2026-11-26): where the types of a
   part's dense matrices differ (a type with no int8 tile kernel, such as the Q2_0 of three
   shared-expert downs of the IQ2_XS file, or the measured paths of a full-rate card, Q6_K,
   Q3_K and Q5_K f16 against IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and Q8_0 int8 on the RTX 4060
@@ -198,7 +199,9 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   the moves and copies down have run, and only then does the step begin for the store.
 - *The way back.* The slots go back, empty, at the end of the first step that does not run
   on them: that step's start still reads what the last wide step left there (the MTP block
-  follows the rows of the step before from the part's residual). Empty slots fill the way
+  follows the rows of the step before from the part's residual). When the engine idles
+  first (`Model::idle`: nothing runs and nobody waits, a request that ended with its
+  prompt), they go back then, and so does the loan of a pass that has read its rows. Empty slots fill the way
   they always do: the hottest experts of RAM (`promote_hot`, every free slot at once, started
   as the slots come back and at the end of every step), the fill while idle, what steps
   upload.
@@ -294,6 +297,11 @@ wider than the parts' own scratch runs as a **pass**:
   nor after its rows), and when it is cancelled nothing of it is kept and the next record gives
   the step up (`RecordView::gives_up_paused`). A request that arrives therefore waits for at
   most a layer's experts of the pass in flight and a micro-batch, then runs its own steps.
+- *How far it has got.* After every micro-batch the part raises the step's share
+  (`StepContext::share`: the micro-batches of the model's layers done, of all of them, the
+  layers before a part's own counted), which the conductor reads about once a second while the
+  pass runs and at every pause, for the progress of the request's prompt (see "Prompt progress"
+  in [Server](server.md)); a count of finished rows would stand still until the last layer.
 - *Images.* A prompt with an image is read layer by layer as any other (see "Images in a
   prompt"): each micro-batch's record carries its rows' rotary positions (the span's record all
   of them), the part that embeds copies the staged rows of the micro-batch's image cells over

@@ -1,5 +1,6 @@
 //! What the tests of this crate share: the devices they open, a small generator, the copies
-//! of values to and from a device, and weight blocks of every type ([`blocks`]).
+//! of values to and from a device, and weight blocks of every type ([`blocks`]). The benches
+//! (`examples/`) include it too, for the generator and the copies.
 
 // Each test crate uses what it needs of this module.
 #![allow(dead_code)]
@@ -51,6 +52,14 @@ impl Rng {
         let u2 = self.unit();
         let normal = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::PI * u2).cos();
         if self.next().is_multiple_of(400) { normal * 30.0 } else { normal }
+    }
+
+    /// A value of a normal distribution (Box-Muller), without outliers: the data of the
+    /// benches (`examples/`), which include this module.
+    pub fn normal(&mut self) -> f32 {
+        let unit = |r: &mut Self| (r.next() >> 40) as f32 / (1u64 << 24) as f32;
+        let (u1, u2) = (unit(self) + 1e-7, unit(self));
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
     }
 
     /// A number below `n`.

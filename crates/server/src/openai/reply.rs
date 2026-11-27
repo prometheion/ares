@@ -4,7 +4,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ares_api::{RequestId, TokenProbs, Usage};
+use ares_api::{Progress, RequestId, TokenProbs, Usage};
 use serde::Serialize;
 
 use super::request::{Endpoint, LogprobFormat};
@@ -149,6 +149,31 @@ impl Head {
         self.render(true, vec![self.chunk_choice(Some(delta), None, None)], None, None)
     }
 
+    /// How far the prompt has got, as llama.cpp's server streams it for
+    /// `return_progress`: a chunk with no text (the role on a chat stream) and
+    /// `prompt_progress`.
+    pub fn progress_chunk(&self, progress: &Progress) -> String {
+        let choice = match self.endpoint {
+            Endpoint::Chat => {
+                let delta =
+                    Delta { role: Some("assistant"), content: Some(""), ..Delta::default() };
+                self.chunk_choice(Some(delta), None, None)
+            }
+            Endpoint::Completions => self.chunk_choice(None, Some(""), None),
+        };
+        let body = Completion {
+            id: &self.id,
+            object: self.object(true),
+            created: self.created,
+            model: &self.model,
+            choices: vec![choice],
+            usage: None,
+            timings: None,
+            prompt_progress: Some(ProgressBody::from(progress)),
+        };
+        serde_json::to_string(&body).expect("response objects serialize")
+    }
+
     /// A piece of output text.
     pub fn text_chunk(&self, text: &Split) -> String {
         let choice = match self.endpoint {
@@ -229,8 +254,20 @@ impl Head {
             choices,
             usage: usage.map(UsageBody::from),
             timings: timings.map(TimingsBody::from),
+            prompt_progress: None,
         };
         serde_json::to_string(&body).expect("response objects serialize")
+    }
+}
+
+/// `chunk`, a JSON object, with `timings` added: the timings of the reply so
+/// far on a chunk of a stream, for llama.cpp's `timings_per_token`.
+pub(crate) fn with_timings(chunk: &mut String, timings: Timings) {
+    if chunk.ends_with('}') {
+        chunk.pop();
+        chunk.push_str(r#","timings":"#);
+        chunk.push_str(&serde_json::to_string(&TimingsBody::from(timings)).expect("timings"));
+        chunk.push('}');
     }
 }
 
@@ -318,48 +355,89 @@ struct Completion<'a> {
     usage: Option<UsageBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timings: Option<TimingsBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_progress: Option<ProgressBody>,
 }
 
-/// The timings of a request under the names llama.cpp's server gives them,
-/// so that tools written for one read the other.
+/// How far a prompt has got, under the names of llama.cpp's server
+/// (`result_prompt_progress` in `tools/server/server-task.cpp` of
+/// <https://github.com/ggml-org/llama.cpp>, d92ea9b, MIT): all tokens of the
+/// prompt, those the cache gave, those done with the cached ones, and the
+/// milliseconds since the prompt began, its wait in line not counted. A client
+/// shows `(processed - cache) / (total - cache)`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgressBody {
+    total: u32,
+    cache: u32,
+    processed: u32,
+    time_ms: u64,
+}
+
+impl From<&Progress> for ProgressBody {
+    fn from(progress: &Progress) -> Self {
+        Self {
+            total: progress.total,
+            cache: progress.cached,
+            processed: progress.processed,
+            time_ms: progress.elapsed.as_millis() as u64,
+        }
+    }
+}
+
+/// The timings of a request under the names llama.cpp's server gives them
+/// (`server_slot_stats::to_json`), so that tools written for one read the other.
 ///
-/// `prompt_ms` runs from the arrival of the request to the first token and
-/// `predicted_ms` from the first token to the end. `predicted_per_second` is
-/// therefore the tokens after the first over `predicted_ms`: the first token
-/// comes out of the step that ends the prompt and is paid for there. The
-/// draft counts are left out for a request that did not run alone, because
-/// the engine counts drafts for all requests together.
+/// `prompt_ms` runs from the request's start in the engine (after its wait in
+/// line) to the first token, and `predicted_ms` from the first token to the
+/// end. `predicted_per_second` is therefore the tokens after the first over
+/// `predicted_ms`: the first token comes out of the step that ends the prompt
+/// and is paid for there. The draft counts are the request's own; from an
+/// engine that counts drafts only for all requests together they are left out
+/// for a request that did not run alone.
 #[derive(Serialize)]
 pub(crate) struct TimingsBody {
+    cache_n: u32,
     prompt_n: u32,
     prompt_ms: f64,
+    prompt_per_token_ms: Option<f64>,
     prompt_per_second: Option<f64>,
     predicted_n: u32,
     predicted_ms: f64,
+    predicted_per_token_ms: Option<f64>,
     predicted_per_second: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     draft_n: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     draft_n_accepted: Option<u64>,
     /// A hash of the reply's token ids, 16 hex digits: two replies are the
-    /// same tokens when it is the same.
-    token_hash: String,
+    /// same tokens when it is the same. Not in the timings of a reply that runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_hash: Option<String>,
 }
 
 impl From<Timings> for TimingsBody {
     fn from(timings: Timings) -> Self {
         // Microseconds are as fine as the times are meaningful.
         let round = |value: f64| (value * 1e3).round() / 1e3;
+        // The milliseconds of a token: of the prompt's, and of the tokens after
+        // the first, as llama.cpp's `t_prompt_per_token_ms` and `t_gen_per_token_ms`.
+        let per = |ms: f64, n: u32| (n > 0).then(|| round(ms / f64::from(n)));
         Self {
+            cache_n: timings.cached_tokens,
             prompt_n: timings.prompt_tokens,
             prompt_ms: round(timings.prompt_ms),
+            prompt_per_token_ms: per(timings.prompt_ms, timings.prompt_tokens),
             prompt_per_second: timings.prompt_per_second().map(round),
             predicted_n: timings.generated_tokens,
             predicted_ms: round(timings.generated_ms),
+            predicted_per_token_ms: per(
+                timings.generated_ms,
+                timings.generated_tokens.saturating_sub(1),
+            ),
             predicted_per_second: timings.generated_per_second().map(round),
             draft_n: timings.drafts.map(|drafts| drafts.0),
             draft_n_accepted: timings.drafts.map(|drafts| drafts.1),
-            token_hash: format!("{:016x}", timings.output_hash),
+            token_hash: timings.output_hash.map(|hash| format!("{hash:016x}")),
         }
     }
 }

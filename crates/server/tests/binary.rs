@@ -61,7 +61,6 @@ fn help_prints_every_option_and_exits_cleanly() {
         "--context",
         "--parallel",
         "--kv",
-        "--precision",
         "--drafters",
         "--window",
         "--draft-vocab",

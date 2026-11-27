@@ -347,11 +347,21 @@ engine that loads beside one that serves waits for its steps, and what an
 engine frees while another runs a step waits for that step's end. What the
 frees between steps cost is measured in
 [`../experiments/host-memory.md`](../experiments/host-memory.md) ("Page-locked
-memory between steps"). Device memory (`cuMemAlloc`, `cuMemFree`) is not
-behind the gate: an engine takes it when its model is opened and frees it when
-the model goes, but for one fallback inside a step (a plan of the 27B's
-attention larger than its buffer, `Plan::upload`) and an engine that unloads
-beside another that serves ([`OPEN.md`](../../OPEN.md), "Host memory").
+memory between steps"). Device memory is freed behind the gate as well (since
+2026-11-25): `cuMemFree` "may perform implicit synchronization" too, so a
+`DeviceBuffer` dropped inside a step or beside another engine's step is freed
+where no job runs (`gate::retire`). A step allocates no device memory and makes
+no blocking copy either (since 2026-11-26, GitHub issue #2): the 27B's part
+keeps room for the largest attention plans its steps can make
+(`PlanConfig::plan_bytes_bound`, per group of rows and number of KV heads),
+and a plan that does not fit fails the step instead of taking `Plan::upload`,
+whose allocation and synchronous copy can wait for a kernel that waits for
+the other device's thread. An engine takes most of it when its model opens, and
+the frees of one that unloads beside another that serves wait for that one's
+step; what looks at the free memory of a device (`Device::mem_info`, which a
+placement reads) or finds no room for an allocation (`DeviceBuffer::new`)
+first waits for the frees that are due (`gate::settle`), so that a model loaded
+after an unload sees the memory the unload gave back.
 
 Nothing that costs speed happens silently:
 
@@ -363,8 +373,9 @@ Nothing that costs speed happens silently:
 - **When the expert tier in RAM shrinks**, generation gets slower: experts
   that were in RAM now come from the SSD. The tier's bytes are a gauge, and
   the pieces given up and taken are counted (`StoreStats::pieces_released`,
-  `pieces_locked`, `piece_evictions`); a line in the log for it is not
-  written yet.
+  `pieces_locked`, `piece_evictions`), and the server writes a line in the
+  log for every shrink: what was given back, what the tier holds and may hold
+  (`ExpertStore::on_shrink`, `Qwen4Exp::with_log`).
 - **When the prompt cache in RAM shrinks**, that is routine and only counted
   (`ares_checkpoints_dropped_total`, `ares_cache_ram_pages`,
   `ares_cache_ram_bytes`). With `--cache` what only RAM holds goes to the

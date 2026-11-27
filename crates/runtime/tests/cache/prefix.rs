@@ -1434,3 +1434,81 @@ fn far_pages_of_a_finished_request_stay_when_the_tier_of_experts_wants_the_memor
     }
     assert_eq!(texts[0], texts[1]);
 }
+
+// --- the progress of a prompt ------------------------------------------------
+
+/// A prompt read in many steps hears how far it has got after each of them, from
+/// nothing to all of it, before its first text; a prompt the cache holds most of
+/// begins at the cached tokens, and the replay that rebuilds the state counts as
+/// work, so the count still rises step by step.
+#[test]
+fn a_prompt_hears_its_progress_step_by_step_from_what_the_cache_gave() {
+    let mut rng = Rng(41);
+    let prompt = rng.prompt(200);
+    let model = model(Some(CHECKPOINT), |_| {});
+    let e = engine(&model, config(256, 16));
+    let (first, progress) = start(&e.rt, request(&prompt, Some(8))).unwrap().finish_with_progress();
+    assert_eq!(first.usage.cached_prompt_tokens, 0);
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    // The steps end at the checkpoints, every page: a report after each.
+    assert!(said.len() >= 200 / PAGE as usize, "{said:?}");
+    assert_eq!((said[0], *said.last().unwrap()), (0, 200), "{said:?}");
+    assert!(progress.iter().all(|p| p.total == 200 && p.cached == 0));
+    let longer = format!("{prompt}{}", rng.prompt(60));
+    let (again, progress) = start(&e.rt, request(&longer, Some(8))).unwrap().finish_with_progress();
+    let cached = again.usage.cached_prompt_tokens;
+    assert!(cached >= 192, "{:?}", again.usage);
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    assert_eq!((said[0], *said.last().unwrap()), (cached, 260), "{said:?}");
+    assert!(said.len() >= 3, "the rest was read in steps of a page: {said:?}");
+    e.consistent();
+}
+
+/// A prompt the model reads in one step that pauses (a pass) hears the share of the
+/// pass done at every pause, where a count of rows done would not move until its end.
+#[test]
+fn a_paused_pass_reports_the_share_it_has_done() {
+    let mut rng = Rng(42);
+    let prompt = rng.prompt(60);
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let config = RuntimeConfig { checkpoint_prompt_interval: 64 * PAGE, ..paused_config() };
+    let e = engine_with(&model, config, |host| host.with_pauses(16, 4).with_shares());
+    let (run, progress) = start(&e.rt, request(&prompt, Some(8))).unwrap().finish_with_progress();
+    assert_eq!(run.text, fresh_run(shape, &prompt, 8).text, "as without pauses");
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    // The pass is the first 48 rows (the step ends at the last page before the
+    // prompt's end, where the cache keeps a checkpoint): the start, a report at
+    // each of its three pauses (a quarter of its rows more each), its end, and
+    // the end of the step of the last rows.
+    assert_eq!(said, [0, 12, 24, 36, 48, 60]);
+    e.consistent();
+}
+
+/// A step of a prompt that runs long reports how far it has got while it runs, about
+/// once a second, from a model that says so ([`ares_runtime::Executor::step_share`]),
+/// also when the model says nothing for its first second (Flash-Next's first piece of
+/// a pass after a load waits for the drive).
+#[test]
+fn a_long_step_reports_its_share_while_it_runs() {
+    let mut rng = Rng(43);
+    let prompt = rng.prompt(40);
+    let model = model(Some(CHECKPOINT), |_| {});
+    let config = RuntimeConfig { checkpoint_prompt_interval: 64 * PAGE, ..config(256, 16) };
+    let e = engine_with(&model, config, |host| {
+        host.with_step_cost(|rows| Duration::from_millis(if rows > 8 { 3600 } else { 1 }))
+            .with_shares_after(Duration::from_millis(1500))
+    });
+    let (_, progress) = start(&e.rt, request(&prompt, Some(4))).unwrap().finish_with_progress();
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    // The long step is the first 32 rows (it ends at the last page before the
+    // prompt's end): the start, nothing after one second (the model says nothing
+    // yet), two reports after two and three (as far as the share of its time), its
+    // end, and the end of the step of the last rows.
+    assert_eq!(said.len(), 5, "{said:?}");
+    assert_eq!((said[0], said[3], said[4]), (0, 32, 40), "{said:?}");
+    assert!((15..=21).contains(&said[1]) && (24..=30).contains(&said[2]), "{said:?}");
+    let elapsed: Vec<u128> = progress.iter().map(|p| p.elapsed.as_millis()).collect();
+    assert!(elapsed[1] >= 2000 && elapsed[2] >= 3000 && elapsed[3] >= 3600, "{elapsed:?}");
+    e.consistent();
+}

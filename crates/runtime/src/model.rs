@@ -284,6 +284,8 @@ pub struct DeviceTransfer {
     /// The pool page, or the checkpoint place.
     pub object: u32,
     pub keep_form: bool,
+    /// A page on the way in is a tail ([`Transfer::tail`](crate::Transfer::tail)).
+    pub tail: bool,
     /// Host memory with `room` bytes, aligned to 4096.
     pub ptr: *mut u8,
     pub room: usize,
@@ -366,6 +368,19 @@ pub struct StepContext<'a> {
     /// ([`RecordView::asked`](crate::record::RecordView::asked)), so that the
     /// conductor can answer ([`DeviceModel::paused`]).
     pub asks: &'a std::sync::atomic::AtomicU64,
+    /// Where a model that runs a long step in pieces (a prompt read layer by
+    /// layer) says how far it has got, for the progress of the prompt the
+    /// conductor reports while the step runs ([`Executor::step_share`](crate::Executor)):
+    /// the share of the step's work done in millionths, plus one, raised with
+    /// `fetch_max` (so that the devices of a split can all write it); 0, as the
+    /// step begins, says nothing. A paused step that goes on counts from where
+    /// its rows began, not from where it was paused.
+    pub share: &'a std::sync::atomic::AtomicU32,
+}
+
+/// The value of [`StepContext::share`] for `done` of `of` pieces of a step.
+pub fn share_of(done: u64, of: u64) -> u32 {
+    (done.min(of) * 1_000_000).checked_div(of).map_or(0, |share| share as u32 + 1)
 }
 
 /// What a model that reads images tells the runtime ([`Model::vision`]).
@@ -774,6 +789,20 @@ pub trait Model: Send + Sync + 'static {
         let _ = record;
         Ok(())
     }
+
+    /// The steps that measure what a step costs have run (the conductor's
+    /// warm-up, before the first request). They read a made-up text, token 0
+    /// at every position, so what a model learns from the text of its steps
+    /// (which experts a text picks) should forget them. Called once, on the
+    /// conductor's thread, while no step runs.
+    fn measured(&self) {}
+
+    /// Nothing runs and nobody waits: the conductor is about to sleep until a
+    /// request comes. A model gives back here what it holds only for the
+    /// steps of running requests (VRAM it borrowed for a prompt), instead of
+    /// at its next step. Called on the conductor's thread while no step runs,
+    /// each time the conductor finds nothing to do.
+    fn idle(&self) {}
 
     /// Builds device part `cx.index`. Called on that device's thread.
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError>;

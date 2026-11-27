@@ -565,21 +565,6 @@ fn a_failing_warm_up_step_reports_the_device_and_the_cause() {
 }
 
 #[test]
-fn decisions_are_not_implemented_and_say_so() {
-    use ares_api::{DecisionRequest, DecisionSink, Prompt};
-    let model = model(|_| {});
-    let rt = runtime(&model, false);
-    let request = DecisionRequest {
-        model: "synthetic".into(),
-        prompt: Prompt::Text("x".into()),
-        questions: Vec::new(),
-        id: fresh_id(),
-    };
-    let error = rt.decide(request, DecisionSink::new(|_| {})).unwrap_err();
-    assert!(matches!(error, EngineError::Unsupported(_)));
-}
-
-#[test]
 fn stats_can_be_taken_and_reset_while_running() {
     let model = model(|_| {});
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_micros(100)));
@@ -918,6 +903,17 @@ fn the_ngram_drafter_joins_the_model_drafter_when_there_is_one() {
     assert!(c.drafts_accepted_at[0].iter().sum::<u64>() > 150, "{c:?}");
     assert_eq!(c.drafts_accepted_at[1].iter().sum::<u64>(), 0, "{c:?}");
     assert!(c.steps - before.steps < 80, "{c:?}");
+}
+
+#[test]
+fn the_model_hears_once_that_the_steps_that_measure_are_done() {
+    // Their picks are no text's: Flash-Next forgets the heat they left.
+    let (rt, model) = drafting_runtime(&[0.5], 8, true, None);
+    alone(&rt, "a text", Some(20));
+    assert_eq!(model.measured_calls(), 1);
+    let (rt, model) = drafting_runtime(&[0.5], 8, false, None);
+    alone(&rt, "a text", Some(20));
+    assert_eq!(model.measured_calls(), 0);
 }
 
 #[test]

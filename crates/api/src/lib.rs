@@ -11,7 +11,9 @@
 //! request into a [`DecisionRequest`] and hands it to [`Engine::decide`]
 //! with a [`DecisionSink`], and the engine delivers one [`DecisionOutcome`].
 //! Any model can decide, and decisions run in the same engine steps as
-//! generation.
+//! generation. How a chat model is asked a question ([`Question::render`])
+//! and how its logits become an answer ([`Question::answer`]) are here, so
+//! that every engine asks and answers alike.
 //!
 //! The crate has no async-runtime and no HTTP dependency on purpose. The
 //! runtime side is a set of OS threads that step a GPU, and nothing in this
@@ -29,6 +31,7 @@ mod error;
 mod event;
 mod json;
 mod message;
+mod python;
 mod request;
 mod sampling;
 mod sink;
@@ -38,12 +41,13 @@ mod structure;
 pub use answer::{Answer, DecisionOutcome, DecisionResult, Verdict};
 pub use chat::{ChatFormat, ThinkingFormat, ToolFormat};
 pub use decision::{
-    ChoiceOption, DecisionError, DecisionRequest, MAX_SCORE_LEVELS, MIN_SCORE_LEVELS, Question,
-    QuestionKind,
+    ChoiceOption, DecisionError, DecisionRequest, Labels, MAX_BRANCH_TOKENS, MAX_OPTIONS,
+    MAX_REQUEST_TOKENS, Question, QuestionKind, Rendered, SINGLE_LABELS, question_prompt,
+    state_text, user_turn,
 };
 pub use engine::{Engine, ModelCard};
 pub use error::EngineError;
-pub use event::{Alternative, Event, FinishReason, TokenProbs, Usage};
+pub use event::{Alternative, Drafts, Event, FinishReason, Progress, TokenProbs, Usage};
 pub use json::Json;
 pub use message::{Image, Message, Role};
 pub use request::{GenerateRequest, Prompt, RequestId};

@@ -963,7 +963,7 @@ fn ask(
         let state = state.clone();
         EventSink::new(move |event| {
             match event {
-                Event::Logprobs(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
                 Event::Text(piece) => {
                     let mut state = state.lock().unwrap();
                     state.0.push_str(&piece);
@@ -1005,6 +1005,42 @@ fn ask(
     (text, first.map_or(0.0, |t| t.elapsed().as_secs_f64()), tokens)
 }
 
+/// The engine's pool: the pages of `context` tokens for its two sequences, at most what
+/// every device holds next to all else the model takes there (the drafters too), as the
+/// server's plan counts it ([`Estimate::footprint`]), with 256 MiB a device left free.
+fn pool_pages(
+    gguf: &Gguf,
+    spread: &Spread,
+    options: &Options,
+    devices: &[Device],
+    free: &[u64],
+    context: u32,
+) -> u32 {
+    use ares_model::qwen35::device::Estimate;
+    const SEQUENCES: u32 = 2;
+    let wanted = 2 * context.div_ceil(128) + 2;
+    let estimate = Estimate::for_options(gguf, options).expect("the model's plan");
+    let multiprocessors: Vec<u32> = devices.iter().map(|d| d.info().multiprocessors).collect();
+    let footprint = estimate.footprint_of(spread, options, SEQUENCES, &multiprocessors);
+    let Ok(footprint) = footprint else { return wanted };
+    let fit = footprint
+        .iter()
+        .zip(free)
+        .map(|(f, free)| {
+            let room = free.saturating_sub(256 << 20).saturating_sub(f.fixed(SEQUENCES));
+            (room / f.per_page.max(1)).min(u64::from(u32::MAX)) as u32
+        })
+        .min()
+        .unwrap_or(wanted);
+    if fit < wanted {
+        println!(
+            "RES engine: the pool holds {fit} pages, not the {wanted} of a context of {context}: \
+             the devices have no room for more next to the model"
+        );
+    }
+    wanted.min(fit)
+}
+
 /// `--engine`: chat requests through the conductor, with the picks made on
 /// the devices and, when the model has an MTP block, its own drafts.
 fn engine(args: &Args, spread: &Spread, window: u32) {
@@ -1040,6 +1076,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         devices.iter().map(|d| d.mem_info().expect("memory").free).collect();
     let begun = Instant::now();
     let gguf = Gguf::open(&args.model).expect("the model file");
+    let pages = pool_pages(&gguf, spread, &options, &devices, &free_before, args.context);
     let tokenizer = Tokenizer::from_gguf(&gguf).expect("the tokenizer");
     let chat = ChatOptions {
         variables: args
@@ -1055,7 +1092,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
             .with_chat_options(chat),
     );
     let config = RuntimeConfig {
-        pages: 2 * args.context.div_ceil(128) + 2,
+        pages,
         cells_per_page: 128,
         max_slots: 2,
         window_rows: window.max(1),
@@ -1338,7 +1375,7 @@ fn converse(
         let state = state.clone();
         EventSink::new(move |event| {
             match event {
-                Event::Logprobs(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
                 Event::Text(piece) => {
                     let mut state = state.lock().unwrap();
                     state.0.push_str(&piece);

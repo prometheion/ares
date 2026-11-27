@@ -85,7 +85,7 @@ fn two_small_models_share_a_card_and_an_idle_one_gives_its_memory_back() {
     std::fs::write(&garbage, b"this is not a model file at all").unwrap();
     let ini = dir.join("models.ini");
     let text = format!(
-        "[*]\ndevices = {ordinal}\ncontext = 8192\nprecision = exact\nram = 4G\n\n\
+        "[*]\ndevices = {ordinal}\ncontext = 8192\nram = 4G\n\n\
          [stays]\nmodel = {small}\naliases = first\nram = 1G\n\n\
          [idles]\nmodel = {small}\nram = 1G\nidle-unload = 3\n\n\
          [broken]\nmodel = {garbage}\n",

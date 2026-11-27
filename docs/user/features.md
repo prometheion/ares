@@ -10,7 +10,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 
 | | Qwen3.8 27B (`qwen35`, dense) | Qwen3.8 Flash-Next (`qwen4exp`, mixture of experts) |
 | --- | --- | --- |
-| Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer (the second card's role measured at load) |
+| Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer (the second card's role measured at the first load and remembered per model, cards, driver and binary) |
 | Weight types | all 28 GGUF types | all 28, in every tensor |
 | K and V | `f16`, `q8` to `q4`, K and V apart (`--kv`) | the same; the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and the SSD; the CPU computes missed ones |
@@ -26,6 +26,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | --- | --- |
 | Speculative decoding | model drafts and the n-gram drafter; a step verifies as many drafts as pay, by their probability and the measured price of a step |
 | Exact drafts | on the 27B the text with drafts is token for token the text without |
+| Draft vocabularies | `--draft-vocab` limits the tokens the model drafters propose; ready English lists (prose, code, shell) for the models' tokenizer, and an example that makes and checks one on your own text, in any language ([draft-vocab.md](draft-vocab.md)) |
 | Prompts beside generation | prompts are read in pieces between rounds; each generating request keeps `--generation-floor` tokens/s (20) |
 | Long prompts, Flash-Next | read layer by layer, each expert crosses the link once per prompt; a new request cuts in between micro-batches |
 | Prompt kernels | the path of each weight type measured at load on every card; the attention of long prompts has a kernel of its own |
@@ -60,6 +61,8 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Claude Code | works against `/v1/messages`, with `context_management` and `thinking.display` |
 | Reply length | `--max-tokens` and the cap `--max-tokens-limit` |
 | Continuing a message | a last assistant message is continued (prefill) |
+| Prompt progress | llama.cpp's `return_progress` on streams: `prompt_progress` as the prompt is read, also through a pass of Flash-Next ([api.md](api.md#prompt-progress)) |
+| Decisions (Jev mode) | `/v1/systemone` as Flide serves it: questions about a state answered from the labels' logits, the state computed once and forked into the questions, several requests in one body |
 
 ## Server
 
@@ -70,5 +73,5 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Several models | `--models-preset <file.ini>`: loaded on request, aliases, idle unload, load and unload routes |
 | The line | `--queue <N>` bounds it (503 with `Retry-After`); `--timeout` for slow clients |
 | Watchdog | a step that runs longer than 600 s fails its engine; its requests end with the reason |
-| Logs and metrics | a line per request, Prometheus metrics ([quickstart.md](quickstart.md#logs-and-metrics)) |
+| Logs and metrics | a request's timings as llama.cpp prints them, the progress of long prompts, every refusal with its reason; Prometheus metrics ([quickstart.md](quickstart.md#logs-and-metrics)) |
 | Version | `ares --version` names the version, the commit and the day of the build; so do the log's first line and `/props` |

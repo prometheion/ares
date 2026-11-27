@@ -125,7 +125,10 @@ ARES_KERNEL ares_lp_finish(const float* exchange, uint32_t devices, const AresSa
             const float d = __fsub_rn(s->raw_lmax, lp[r].logprob[c]);
             lp[r].logprob[c] = ares_log_probability(d > 0.0f ? d : 0.0f, s->raw_lnz);
         }
-        if (found) {
+        // A token without a finite logit has no probability: minus infinity
+        // stays (the distance from a row's best would be NaN when no token
+        // has one).
+        if (found && ares_sample_present(raw)) {
             const float d = __fsub_rn(s->raw_lmax, raw);
             lp[r].chosen = ares_log_probability(d > 0.0f ? d : 0.0f, s->raw_lnz);
         }
