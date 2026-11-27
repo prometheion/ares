@@ -838,6 +838,20 @@ mod tests {
     use super::*;
     use crate::common::{self, IM_END, TempDir};
 
+    /// The ready files of the repository.
+    fn ready_files() -> Vec<PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/user/draft-vocab");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        files.retain(|p| p.extension().is_some_and(|e| e == "txt"));
+        files.sort();
+        files
+    }
+
+    /// The ready files: what the server needs of them (ids of the vocabulary,
+    /// each once), ascending, with a header; with `ARES_TEST_QWEN35_0_8B`, the
+    /// tokenizer they name is that model's and they hold the kept tokens.
     #[test]
     fn the_pieces_of_a_text_have_the_tokens_of_the_whole() {
         let tokenizer = common::tiny_tokenizer("draft-vocab-pieces");
@@ -1023,5 +1037,32 @@ mod tests {
         assert_eq!(civil_date(0), "1970-01-01");
         assert_eq!(civil_date(11_016), "2000-02-29");
         assert_eq!(civil_date(20_784), "2026-11-27");
+    }
+
+    #[test]
+    fn the_ready_files_fit_their_tokenizer() {
+        let files = ready_files();
+        assert!(!files.is_empty(), "no ready files");
+        let model = std::env::var_os("ARES_TEST_QWEN35_0_8B")
+            .map(|path| Model::open(&path.to_string_lossy()).unwrap());
+        for file in files {
+            let name = file.display().to_string();
+            let list = read_list(&name).unwrap();
+            assert!(list.ids.windows(2).all(|w| w[0] < w[1]), "{name}: not ascending");
+            assert!(list.ids.last().is_some_and(|&id| id < 248_320), "{name}");
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(text.starts_with(FIRST_LINE), "{name}");
+            for key in ["# tokenizer:", "# made:", "# part:", "# coverage:", "# ids:"] {
+                assert!(text.contains(key), "{name}: no '{key}' line");
+            }
+            let Some(model) = &model else { continue };
+            assert_eq!(list.tokenizer.as_ref(), Some(&model.description), "{name}");
+            for kept in kept_tokens(&model.tokenizer) {
+                assert!(list.ids.binary_search(&kept.id).is_ok(), "{name}: lacks {kept:?}");
+            }
+        }
+        if model.is_none() {
+            eprintln!("the tokenizer not compared: set ARES_TEST_QWEN35_0_8B=<model.gguf>");
+        }
     }
 }
