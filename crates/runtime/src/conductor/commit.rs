@@ -214,11 +214,40 @@ impl Conductor {
                     }
                     let page = (at / cells) as usize;
                     let root = cache.at_root(&a.boundaries, at);
-                    let hash = a.chain.hashes()[page - 1];
+                    let hash = if at.is_multiple_of(cells) {
+                        a.chain.hashes()[page - 1]
+                    } else if self.pool.is_cached(a.cells.pages()[page]) {
+                        // The cells come from a page the index holds (a longer text's,
+                        // replayed): one page is one entry or one tail of the index,
+                        // so the state is not kept here.
+                        break;
+                    } else {
+                        // The anchor inside a page (the end of the last message): the
+                        // cells after the page boundary become a tail, which the state
+                        // hangs on (as at the request's end, `keep`). The sequence
+                        // writes on in a copy of the page; a lookup that goes on
+                        // through that page finds the state (`PrefixMatch::inside`).
+                        let prior = a.chain.before(page);
+                        let rest = &a.names[page * cells as usize..at as usize];
+                        let shared = a.cells.pages()[page];
+                        if let Some(evicted) = cache.index.insert_tail(
+                            &mut self.pool,
+                            prior,
+                            rest,
+                            shared,
+                            Priority::NORMAL,
+                        ) {
+                            let gone = cache.forget(evicted);
+                            self.stats.counters.checkpoints_dropped += u64::from(gone);
+                        }
+                        PrefixIndex::tail_hash(prior, rest)
+                    };
                     let saved = cache.save(part.slot, hash, a.owner, root);
                     self.stats.counters.checkpoints_saved += u64::from(saved.taken);
                     self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
-                    a.checkpoint_at = at;
+                    // The spacing of later checkpoints counts from the page
+                    // boundary at or before it, as from an anchor on a page.
+                    a.checkpoint_at = at / cells * cells;
                     break;
                 }
             }

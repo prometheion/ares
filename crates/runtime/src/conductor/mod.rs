@@ -860,6 +860,7 @@ impl Conductor {
                 let durable = model.durable(config.cells_per_page);
                 Cache::new(&model.card().id, &spec, durable.as_ref(), &config)
                     .with_reach(model.prompt_rows().min(max_rows))
+                    .with_exact_anchor(model.saves_inside_steps() == 0)
                     .with_ram(exec.ram())
                     .with_far(model.far_pages())
             }),
@@ -1361,7 +1362,10 @@ impl Conductor {
                     let (mut last, mut from) = (a.checkpoint_at, step.from);
                     while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
                     {
+                        // A save inside names a page; the prompt's end inside a page
+                        // hangs on a tail, which the commit publishes at a cut.
                         if inside
+                            && at.is_multiple_of(u64::from(self.config.cells_per_page))
                             && at >= step.from + u64::from(margin)
                             && at + u64::from(margin) <= to
                         {

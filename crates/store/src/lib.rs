@@ -369,6 +369,9 @@ pub struct PageStore {
     segments: BTreeMap<u32, Segment>,
     pages: HashMap<[u8; 16], Location>,
     states: HashMap<[u8; 16], Location>,
+    /// The pages stored under each parent: the next page of a chain, and the
+    /// partly used pages (tails) that go on from it.
+    children: HashMap<[u8; 16], Vec<[u8; 16]>>,
     /// The segments new records are appended to: pages, states.
     active: [Option<u32>; 2],
     foreign: Vec<Foreign>,
@@ -595,6 +598,7 @@ impl PageStore {
             segments: BTreeMap::new(),
             pages: HashMap::new(),
             states: HashMap::new(),
+            children: HashMap::new(),
             active: [None; 2],
             foreign: Vec::new(),
             clock: 0,
@@ -657,6 +661,35 @@ impl PageStore {
         }
     }
 
+    /// Makes the record under `hash` known at `location`.
+    fn known(&mut self, kind: Kind, hash: [u8; 16], location: Location) {
+        if let Some(before) = self.index(kind).insert(hash, location) {
+            self.unlink(kind, hash, &before);
+        }
+        if kind == Kind::Page {
+            self.children.entry(location.parent).or_default().push(hash);
+        }
+    }
+
+    /// The record under `hash` is not known any more.
+    fn unknown(&mut self, kind: Kind, hash: [u8; 16]) {
+        if let Some(location) = self.index(kind).remove(&hash) {
+            self.unlink(kind, hash, &location);
+        }
+    }
+
+    fn unlink(&mut self, kind: Kind, hash: [u8; 16], location: &Location) {
+        if kind != Kind::Page {
+            return;
+        }
+        if let Some(children) = self.children.get_mut(&location.parent) {
+            children.retain(|child| *child != hash);
+            if children.is_empty() {
+                self.children.remove(&location.parent);
+            }
+        }
+    }
+
     fn load_segment(&mut self, id: u32, kind: Kind, path: PathBuf) -> Result<()> {
         let file = SegFile::open(&path, false).map_err(io_error(&path))?;
         let file_len = file.buffered.metadata().map_err(io_error(&path))?.len();
@@ -671,7 +704,7 @@ impl PageStore {
                 break;
             }
             location.segment = id;
-            self.index(kind).insert(hash, location);
+            self.known(kind, hash, location);
             hashes.push(hash);
             offset = end;
         }
@@ -729,6 +762,13 @@ impl PageStore {
     /// Whether a record of `kind` is stored under `hash`.
     pub fn contains(&self, kind: Kind, hash: ChainHash) -> bool {
         self.index_of(kind).contains_key(&hash.to_bytes())
+    }
+
+    /// The pages stored whose parent is `parent`: the next page of each chain
+    /// that goes on from it, and the tails (partly used pages) under it.
+    pub fn children(&self, parent: ChainHash) -> impl Iterator<Item = ChainHash> + '_ {
+        let children = self.children.get(&parent.to_bytes());
+        children.into_iter().flatten().map(|hash| ChainHash::from_bytes(*hash))
     }
 
     /// What is stored under `hash`, without reading it or counting as a use.
@@ -872,7 +912,7 @@ impl PageStore {
         segment.hashes.push(hash);
         segment.dirty = true;
         self.bytes += record;
-        self.index(kind).insert(hash, location);
+        self.known(kind, hash, location);
         self.touch(location.segment);
         self.evict_to_fit();
         Some(record)
@@ -931,7 +971,7 @@ impl PageStore {
     /// Forgets the record of `kind` under `hash`: its bytes were read and are
     /// not what was written. Its space goes with its segment.
     pub fn forget(&mut self, kind: Kind, hash: ChainHash) {
-        self.index(kind).remove(&hash.to_bytes());
+        self.unknown(kind, hash.to_bytes());
     }
 
     /// Reads the record of `kind` under `hash` in one call, a vector per
@@ -984,10 +1024,9 @@ impl PageStore {
 
     fn remove_segment(&mut self, id: u32) {
         let Some(segment) = self.segments.remove(&id) else { return };
-        let index = self.index(segment.kind);
         for hash in &segment.hashes {
-            if index.get(hash).is_some_and(|l| l.segment == id) {
-                index.remove(hash);
+            if self.index_of(segment.kind).get(hash).is_some_and(|l| l.segment == id) {
+                self.unknown(segment.kind, *hash);
             }
         }
         self.bytes -= segment.len;

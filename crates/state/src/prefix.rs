@@ -113,6 +113,19 @@ impl ChainHash {
         let len = tokens.len() as u64;
         Self(u128::from(fold(a ^ len, K[4])) | u128::from(fold(b ^ len, K[5])) << 64)
     }
+
+    /// The hashes of the pages that follow `self` and hold the first one, two,
+    /// up to all of `tokens`: [`ChainHash::extend`] of every start of them, in
+    /// one pass. What a lookup tries to find a tail that a text goes on from.
+    pub fn extensions(self, tokens: &[u64]) -> impl Iterator<Item = Self> + '_ {
+        let (mut a, mut b) = (self.0 as u64 ^ K[0], (self.0 >> 64) as u64 ^ K[1]);
+        tokens.iter().enumerate().map(move |(i, &token)| {
+            a = fold(a ^ token ^ K[4], K[2]);
+            b = fold(b ^ token.rotate_left(32) ^ K[5], K[3]);
+            let len = i as u64 + 1;
+            Self(u128::from(fold(a ^ len, K[4])) | u128::from(fold(b ^ len, K[5])) << 64)
+        })
+    }
 }
 
 /// An opaque handle to a checkpoint of non-addressable state, owned by
@@ -220,6 +233,11 @@ pub struct PrefixMatch {
     pub checkpoints: Vec<Option<CheckpointId>>,
     /// A tail under the last matched page that the prompt continues.
     pub tail: Option<TailMatch>,
+    /// The deepest checkpoint at the end of a tail that one of the matched
+    /// pages goes on from (a prompt's end in the middle of a page, which the
+    /// page of the text that went on holds too), and its position in cells:
+    /// a state inside the match, between the checkpoints of its pages.
+    pub inside: Option<(u64, CheckpointId)>,
     /// The prompt's first page that is not cached is being computed by
     /// another sequence: its hash and who computes it. The prompt should
     /// wait for it ([`PrefixIndex::state`]) and look again.
@@ -502,13 +520,29 @@ impl PrefixIndex {
         let mut found = PrefixMatch::default();
         let mut hash = chain.root;
         for next in chain.hashes.iter().take(tokens.len() / per_page) {
-            let Some(entry) = self.entries.get(next) else {
+            let Some((page, checkpoint)) = self.entries.get(next).map(|e| (e.page, e.checkpoint))
+            else {
                 found.computing = self.computing.get(next).map(|owner| (*next, *owner));
                 break;
             };
-            found.pages.push(entry.page);
+            // A tail under the page before that this page goes on from, with
+            // the state at its end.
+            let start = found.pages.len() * per_page;
+            let page_tokens = &tokens[start..start + per_page];
+            let inside = self.tails.get(&hash).and_then(|tails| {
+                tails
+                    .iter()
+                    .filter(|t| t.checkpoint.is_some() && page_tokens.starts_with(&t.tokens))
+                    .max_by_key(|t| t.tokens.len())
+                    .map(|t| (t.hash, (start + t.tokens.len()) as u64, t.checkpoint))
+            });
+            if let Some((tail, at, Some(id))) = inside {
+                found.inside = Some((at, id));
+                self.touch_tail(tail);
+            }
+            found.pages.push(page);
             found.hashes.push(*next);
-            found.checkpoints.push(entry.checkpoint);
+            found.checkpoints.push(checkpoint);
             self.touch(*next);
             hash = *next;
         }
@@ -517,10 +551,21 @@ impl PrefixIndex {
     }
 
     /// The tail under `prior` that shares the most leading tokens with
-    /// `rest`, if any shares one.
+    /// `rest`, if any shares one; but the longest tail that `rest` shares
+    /// whole and that carries a checkpoint before any other. The state at its
+    /// end needs no row run again, where a tail shared in part gives the
+    /// state of a checkpoint before it, from which every row up to the end
+    /// of the shared cells runs again (a prompt's end in the middle of a
+    /// page, and the longer tail of the request's end beside it).
     fn match_tail(&mut self, prior: ChainHash, rest: &[u64]) -> Option<TailMatch> {
         let tails = self.tails.get(&prior)?;
-        let (best, cells, _) = best_tail(tails.iter().map(|tail| (tail, &tail.tokens[..])), rest)?;
+        let with_state = tails
+            .iter()
+            .filter(|tail| tail.checkpoint.is_some() && rest.starts_with(&tail.tokens))
+            .max_by_key(|tail| tail.tokens.len())
+            .map(|tail| (tail, tail.tokens.len(), true));
+        let (best, cells, _) = with_state
+            .or_else(|| best_tail(tails.iter().map(|tail| (tail, &tail.tokens[..])), rest))?;
         let found = TailMatch {
             page: best.page,
             cells: cells as u32,
@@ -1059,6 +1104,11 @@ mod tests {
         assert_ne!(ab, root.extend(&[1, 2, 3, 4]));
         assert_ne!(root.extend(&[0]), root.extend(&[0, 0]));
         assert_ne!(ab, ChainHash::root(b"model-b").extend(&[1, 2]).extend(&[3, 4]));
+        // Every start of a text in one pass, as one call each names it.
+        let tokens = [5, 1, 9, 9, 2];
+        let starts: Vec<ChainHash> = ab.extensions(&tokens).collect();
+        let each: Vec<ChainHash> = (1..=tokens.len()).map(|n| ab.extend(&tokens[..n])).collect();
+        assert_eq!(starts, each);
     }
 
     #[test]

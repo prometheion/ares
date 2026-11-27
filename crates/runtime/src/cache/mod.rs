@@ -401,6 +401,15 @@ impl Cache {
         self
     }
 
+    /// The anchor of a prompt is the end of its last message, for a model
+    /// whose steps are cut at an anchor either way; one that saves the state
+    /// inside its steps keeps the page boundary, which it saves without a
+    /// cut ([`CheckpointPolicy::exact_anchor`]).
+    pub(crate) fn with_exact_anchor(mut self, exact: bool) -> Self {
+        self.policy.exact_anchor = exact;
+        self
+    }
+
     /// The places and the pages in RAM lie in the page-locked memory of
     /// `books`: the cache keeps to its allowance and tells them which places
     /// are in use. Without books of the executor's, pages in RAM are booked
