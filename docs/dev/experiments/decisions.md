@@ -71,3 +71,20 @@ Decisions per second (questions answered), round 1 and round 2:
   for a full page) the chat completions after a batch of decisions took the engine down at
   `--parallel 2`, every time (`ab1.log`, `modes-2.log` of the first runs); the fixed build ran
   every run here without an error.
+
+## The port against the branch's head (2026-11-26)
+
+The improvements after the port (forks take no checkpoints and publish no pages, a decision
+whose state the cache holds has no parent, a step of several sequences within the model's own
+rows, the fix of the tail from RAM) against the port (f19d2e49, on main 1a28fb5c; the head
+6f4912e8 is on main 0c4fbb60, whose commits between changed no engine code). The 27B at the
+production settings above, 8 states of 8 questions of 4 options, decide then gen1 on the same
+states and the reverse on new ones, A B A B, load 2.3 to 4.8 (nothing else on the cards):
+
+| Build | decide, states new | decide, states the chat completions read | gen1 |
+| --- | --- | --- | --- |
+| port | 8.62, 8.71 | 11.39, 11.38 | 5.47, 6.07, 5.28, 6.09 |
+| head | 9.44, 9.28 | 11.76, 11.71 | 5.51, 6.10, 4.99, 6.08 |
+
+Decisions on new states are 6 to 10 % faster, on states read before 3 %; generation is the same.
+The replies started with the chosen label in 62 to 64 of 64 for both builds.
