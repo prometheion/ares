@@ -118,6 +118,22 @@ agent turns as the time to the first token:
 | MemAvailable while loaded | 20.0 GiB | 11.6 GiB | | |
 | The model's pages cached at the end | 5.2-5.7 GiB | 10.7 GiB | | |
 
+*Again with `main` at 29c277e0* (#56, the crash fixes, and the sweeps merged; the same day 17:32
+to 18:04, alternating Ares, Strata, Ares, then UD-Q5_K_XL; load 8.7 to 13.9):
+
+| 40 GiB, MTP drafts | Ares 29c277e0, UD-Q4_K_XL (2 sessions) | Strata 0.1.69, UD-Q4_K_XL | Ares 29c277e0, UD-Q5_K_XL |
+| --- | --- | --- | --- |
+| Decode German, 1st / 2nd ask | 12.8-13.0 / 19.3-21.8 | 4.8 / 7.1 | 9.1 / 14.3 |
+| Decode English | 16.5 / 21.9-22.4 | 6.8 / 9.6 | 11.8 / 15.0 |
+| Decode code | 12.3-12.5 / 18.4-20.8 | 7.0 / 10.0 | 8.4 / 13.0 |
+| Prompt 2k / 8k / 32k (tokens/s) | 169-173 / 479-481 / 830-834 | 85 / 251 / 511 | 124 / 369 / 764 |
+| Agent turns 1-3, first round | 13.1-13.4 / 16.0-16.1 / 6.0-6.5 s | 21.4 / 28.2 / 9.0 s | 18.8 / 21.9 / 8.4 s |
+| Agent turns 1-3, second round | 20.1-20.2 / 33.1-33.2 / 10.8-11.1 s | 3.9 / 1.0 / 2.0 s | 28.8 / 46.7 / 14.5 s |
+| Ready after | 53-54 s | 108 s | 58 s |
+
+No request failed: the full suite ran in every session, the agent's turns after the 32k prompt
+included. Decode and prompts are those of 83408e52 within the spread.
+
 Found:
 
 - *Decode: Ares leads.* On UD-Q4_K_XL 1.5 to 3.4 times Strata's tokens/s with drafts (13.0 to
@@ -146,7 +162,7 @@ Found:
   floor of one checkpoint place, which the newest turn takes; the `--cache` directory did not keep
   the others either. The same on `main` at 29c277e0 (turn 2 asked again: 6837 rows replayed, 33.2
   s).
-- *Ares fails a request after the 32k prompt.* Both UD-Q4_K_XL sessions, at the agent's first
+- *83408e52 fails a request after the 32k prompt* (29c277e0 does not). Both UD-Q4_K_XL sessions, at the agent's first
   turn: "the RAM limit of 39.67 GiB has no room for 61.8 MiB more of the tier of experts: the step
   record and read-back hold 47.4 MiB, the K/V beyond VRAM 127.5 MiB, the tier of experts 39.23
   GiB, the prompt cache 225.3 MiB"; both UD-Q5_K_XL sessions at the agent's third turn: "the RAM
