@@ -1513,14 +1513,15 @@ fn long_prompts_that_come_at_once_are_read_one_after_the_other() {
         let paused = runtime.snapshot().expect("the runtime is running").counters.steps_paused;
         runtime.shutdown();
         eprintln!("TOGETHER {placement:?}: {got:?} (alone {alone:?}), {paused} steps paused");
+        // Each answers as the reference does up to near ties (`assert_near_the_reference`).
         for i in 0..prompts.len() {
-            assert!(
-                leading(&got[i], &references[i]).max(leading(&got[i], &alone[i])) >= 2,
-                "{placement:?}: prompt {i}: {:?}, alone {:?}, reference {:?}",
-                got[i],
-                alone[i],
-                references[i]
+            eprintln!(
+                "TOGETHER {placement:?}: prompt {i}: {} tokens as the reference's, {} as alone",
+                leading(&got[i], &references[i]),
+                leading(&got[i], &alone[i]),
             );
+            let what = format!("{placement:?}, prompt {i}");
+            assert_near_the_reference(&what, &path, &prompts[i], &got[i]);
         }
     }
 }
