@@ -111,6 +111,20 @@ beside the CPU where that is sooner:
 - *At the start and while nothing runs* the fill makes VRAM the hottest of every layer
   without that margin (see the usage profile above): no step waits then.
 
+**Where the CPU workers run** (`expert_store/cpu/pool.rs`, `Placement::for_machine`). The
+store's CPU workers are bound one to a core: to the first thread of every performance core but
+those of the threads that drive the step (the conductor and one per device, which spin through
+a step), and to every efficiency core. A worker spins between the jobs of a step (20 ms before
+it sleeps), so through a step every core with a worker is busy. The second threads of the
+performance cores get none; on a CPU that has them, the I/O threads run there. On a CPU with
+one thread per core one core more is left free, an efficiency core where there are any (the
+cheapest a worker gives up), and the I/O threads of the expert store's reader and of the n-gram
+table's rows are bound to the cores without a worker (`ares_io::Reader::run_on`). Without it,
+on the test machine's Core Ultra 5 235HX (6 performance and 8 efficiency cores, one thread
+each), the I/O thread waited 0.2 ms for a core each time a completion woke it, a tenth of the
+time, and an expert's reads in decode took 3.6 to 5 ms against the drive's 2.0
+([`ssd-decode-profile.md`](../experiments/ssd-decode-profile.md), 2026-11-27).
+
 **Reading experts ahead of their router.** A pick that no tier holds is read from the file
 when its layer's record reaches the host, and the layer waits for it. The routers of the
 next layers applied to the rows the router of this layer reads name most of what those

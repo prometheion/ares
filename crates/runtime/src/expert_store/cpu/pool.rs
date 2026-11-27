@@ -98,43 +98,69 @@ impl Topology {
     }
 }
 
-/// Which logical CPU each worker is bound to.
+/// Which logical CPU each worker is bound to, and which are left to the other
+/// threads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
     /// One entry per worker; `None` leaves the worker to the scheduler.
     pub cpus: Vec<Option<usize>>,
+    /// The logical CPUs no worker is bound to, where the threads that drive
+    /// the step and the I/O threads run ([`CpuPool::free_cpus`]). Empty when
+    /// the placement sets none aside: the scheduler places those threads.
+    pub free: Vec<usize>,
 }
 
 impl Placement {
     /// A worker on each of `cpus`.
     pub fn pinned(cpus: &[usize]) -> Self {
-        Self { cpus: cpus.iter().map(|cpu| Some(*cpu)).collect() }
+        Self { cpus: cpus.iter().map(|cpu| Some(*cpu)).collect(), free: Vec::new() }
     }
 
     /// `workers` workers that the scheduler places.
     pub fn unpinned(workers: usize) -> Self {
-        Self { cpus: vec![None; workers] }
+        Self { cpus: vec![None; workers], free: Vec::new() }
     }
 
     /// The placement the engine uses on a machine with `topology`: one
     /// worker on the first thread of every performance core but `reserved`
-    /// of them, and one on every efficiency core.
+    /// of them, and one on every efficiency core; on a CPU without a second
+    /// thread per core, one core more is left to the I/O threads.
     ///
     /// The reserved cores are for the threads that must not wait behind a
-    /// worker: the conductor, which spins through a step. The second threads
-    /// of the performance cores get no worker: a second worker on a core
-    /// shares its vector units with the first, and those threads are where
-    /// the device threads and the I/O completions run. Nothing here is a
-    /// count of this or that CPU: what the system reports decides, and how
-    /// fast each worker's core is, the worker measures itself.
+    /// worker: the conductor and the device threads, which spin through a
+    /// step. The second threads of the performance cores get no worker: a
+    /// second worker on a core shares its vector units with the first, and
+    /// those threads are where the I/O threads run. A CPU without them has
+    /// no such place, and a worker spins between the jobs of a step, so
+    /// every core is busy through the step and a thread woken by each
+    /// completion of a read waited for one (on the test machine's 14 cores
+    /// 0.2 ms per wake-up, and an expert's reads took 3.6 to 5 ms against the
+    /// drive's 2.0). The core left to them is an efficiency core where there
+    /// are any, the cheapest a worker gives up: their work is microseconds
+    /// per completion. Nothing here is a count of this or that CPU: what the
+    /// system reports decides, and how fast each worker's core is, the
+    /// worker measures itself.
     pub fn for_machine(topology: &Topology, reserved: usize) -> Self {
-        let mut cpus: Vec<usize> = topology.performance.iter().skip(reserved).copied().collect();
-        cpus.extend(&topology.efficiency);
+        let mut efficiency = topology.efficiency.clone();
+        let mut skip = reserved;
+        let mut io = None;
+        if topology.siblings.is_empty() {
+            io = efficiency.pop();
+            if io.is_none() {
+                skip += 1;
+            }
+        }
+        let mut cpus: Vec<usize> = topology.performance.iter().skip(skip).copied().collect();
+        cpus.extend(&efficiency);
         if cpus.is_empty() {
             // A machine with nothing to spare still computes its misses.
             return Self::unpinned(1);
         }
-        Self::pinned(&cpus)
+        let mut free: Vec<usize> = topology.performance.iter().take(skip).copied().collect();
+        free.extend(&topology.siblings);
+        free.extend(io);
+        free.sort_unstable();
+        Self { free, ..Self::pinned(&cpus) }
     }
 }
 
@@ -214,6 +240,7 @@ pub struct CpuPool {
     features: Features,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    free: Vec<usize>,
 }
 
 impl std::fmt::Debug for CpuPool {
@@ -271,7 +298,7 @@ impl CpuPool {
             }
             std::thread::sleep(Duration::from_micros(200));
         }
-        Ok(Self { features, shared, threads })
+        Ok(Self { features, shared, threads, free: placement.free.clone() })
     }
 
     /// For each worker, in no particular order: per gate type with a kernel
@@ -291,6 +318,12 @@ impl CpuPool {
     /// The number of workers.
     pub fn workers(&self) -> usize {
         self.threads.len()
+    }
+
+    /// The logical CPUs the placement left free of workers, for the I/O
+    /// threads ([`Placement::free`]; empty when it set none aside).
+    pub fn free_cpus(&self) -> &[usize] {
+        &self.free
     }
 
     /// Hands `job` to the workers. The caller follows it with
@@ -353,9 +386,34 @@ mod tests {
         assert_eq!(topology.performance, vec![1, 2]);
         assert_eq!(topology.siblings, vec![3]);
         // One core is the conductor's; a machine with one core still gets a worker.
-        assert_eq!(Placement::for_machine(&topology, 1), Placement::pinned(&[2]));
+        let placement = Placement::for_machine(&topology, 1);
+        assert_eq!(placement.cpus, vec![Some(2)]);
+        assert_eq!(placement.free, vec![1, 3]);
         assert_eq!(Placement::for_machine(&topology, 2), Placement::unpinned(1));
         let hybrid = Topology::from_lists(&[0, 1, 2, 3, 4], &[4, 5], threads);
-        assert_eq!(Placement::for_machine(&hybrid, 1), Placement::pinned(&[2, 4]));
+        let placement = Placement::for_machine(&hybrid, 1);
+        assert_eq!(placement.cpus, vec![Some(2), Some(4)]);
+        assert_eq!(placement.free, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn a_cpu_without_second_threads_leaves_a_core_to_the_io_threads() {
+        // Four performance and four efficiency cores of one thread each: the
+        // last efficiency core is the I/O threads'.
+        let one = |cpu: usize| vec![cpu];
+        let hybrid = Topology::from_lists(&[0, 1, 2, 3, 4, 5, 6, 7], &[4, 5, 6, 7], one);
+        assert!(hybrid.siblings.is_empty());
+        let placement = Placement::for_machine(&hybrid, 2);
+        let workers: Vec<usize> = placement.cpus.iter().flatten().copied().collect();
+        assert_eq!(workers, vec![2, 3, 4, 5, 6]);
+        assert_eq!(placement.free, vec![0, 1, 7]);
+        // Without efficiency cores a performance core more stays free.
+        let uniform = Topology::from_lists(&[0, 1, 2, 3], &[], one);
+        let placement = Placement::for_machine(&uniform, 1);
+        assert_eq!(placement.cpus, vec![Some(2), Some(3)]);
+        assert_eq!(placement.free, vec![0, 1]);
+        // Two cores and one of them reserved: nothing to bind.
+        let small = Topology::from_lists(&[0, 1], &[], one);
+        assert_eq!(Placement::for_machine(&small, 1), Placement::unpinned(1));
     }
 }

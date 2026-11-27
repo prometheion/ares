@@ -338,7 +338,9 @@ pub(super) fn places(
 }
 
 /// The CPU workers of the store: all the cores the system reports but
-/// `reserved`, which belong to the threads that drive the step.
+/// `reserved`, which belong to the threads that drive the step, and on a CPU
+/// without a second thread per core one more, the I/O threads'
+/// ([`CpuPlacement::for_machine`]).
 pub(super) fn cpu_pool(workers: Option<usize>, reserved: usize) -> Result<CpuPool, Error> {
     let placement = match workers {
         Some(workers) => CpuPlacement::unpinned(workers.max(1)),
@@ -914,6 +916,10 @@ pub(super) fn build_store(
     region: HostRegion,
     cpu: Option<(CpuPool, Serve)>,
 ) -> Result<ExpertStore<CudaSlots>, Error> {
+    if let Some((pool, _)) = &cpu {
+        // The I/O thread runs where no worker spins.
+        reader.run_on(pool.free_cpus())?;
+    }
     let mut store = ExpertStore::new(plan, map, reader, slots, region)?;
     if let Some((pool, serve)) = cpu {
         store.enable_cpu(pool, layout.shapes.clone(), serve)?;

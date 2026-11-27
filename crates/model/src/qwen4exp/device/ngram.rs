@@ -59,14 +59,22 @@ pub(super) struct NgramFeed {
 }
 
 impl NgramFeed {
-    /// A feed for `slots` sequences with a cache of `cache` bytes of rows.
-    pub(super) fn open(gguf: &Gguf, c: &Config, cache: usize, slots: u32) -> Result<Self, Error> {
+    /// A feed for `slots` sequences with a cache of `cache` bytes of rows,
+    /// whose I/O thread runs on `io_cpus` (none: where the scheduler puts it).
+    pub(super) fn open(
+        gguf: &Gguf,
+        c: &Config,
+        cache: usize,
+        slots: u32,
+        io_cpus: &[usize],
+    ) -> Result<Self, Error> {
         let rows = match &c.ngram {
             Some(_) => {
                 let info = gguf
                     .tensor("per_layer_token_embd.weight")
                     .ok_or_else(|| Error::invalid("the model has no n-gram table"))?;
                 let reader = Reader::open_gguf(gguf, ares_io::Config::default())?;
+                reader.run_on(io_cpus)?;
                 let table = RowTable::for_reader(&reader, info)?;
                 let row_reader = RowReader::new(&reader, table, cache);
                 Some((reader, row_reader))

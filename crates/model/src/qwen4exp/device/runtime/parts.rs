@@ -480,7 +480,8 @@ impl Qwen4Exp {
             feed.fill_mtp(c.experts.count)?;
         }
         let o = &self.opts.part;
-        let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)?;
+        let io_cpus = feed.store.io_cpus().to_vec();
+        let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots, &io_cpus)?;
         let used = c.experts.used as u32;
         let flow = Arc::new(Flow {
             lent: build.lent_pieces.clone(),
