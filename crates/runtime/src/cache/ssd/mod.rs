@@ -599,6 +599,13 @@ impl Ssd {
             .any(|hash| store.contains(Kind::State, *hash))
     }
 
+    /// The store has a tail with the state at its end under `prior` that
+    /// `rest` goes on with (`next`, the full page of the text after `prior`,
+    /// is none): a run that ends at `prior` goes on from the drive.
+    pub(super) fn has_tail(&self, prior: ChainHash, next: Option<ChainHash>, rest: &[u64]) -> bool {
+        stored_tail(&self.shared.store(), prior, next, rest, |_| true).is_some()
+    }
+
     /// Hands a record whose bytes are in `parts` to the writer. Its parts
     /// come back when it is written ([`Cache::collect`]).
     pub(super) fn write(

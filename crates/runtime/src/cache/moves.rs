@@ -466,7 +466,15 @@ impl Cache {
             let deepest = deepest(names, run, |hash| {
                 ram.get(hash).is_some_and(|entry| entry.checkpoint.is_some())
             });
-            let drive = self.ssd.as_ref().is_some_and(|ssd| ssd.reaches_state(&names[run..]));
+            // The drive goes on: pages with a state after the run, or a tail
+            // with the state at its end where the run ends (an anchor whose
+            // state RAM no longer has): RAM gives its pages, the drive the rest.
+            let after = &rest[..rest.len().min(per_page - 1)];
+            let next = chain.hashes().get(have + run).copied();
+            let drive = self.ssd.as_ref().is_some_and(|ssd| {
+                ssd.reaches_state(&names[run..])
+                    || ssd.has_tail(chain.before(have + run), next, after)
+            });
             match tail {
                 Some((_, true, true, hash)) => (run, Some(hash)),
                 _ if drive => (run, None),
