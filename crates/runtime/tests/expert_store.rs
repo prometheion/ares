@@ -354,6 +354,7 @@ fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
 }
 
 #[test]
+#[ignore = "its guesses never start on CI runners: issue #88"]
 fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
     // so two reads ahead are on their way at a time, the one at the drive and one queued
@@ -1995,12 +1996,23 @@ fn the_tier_gives_pieces_back_keeps_what_is_hot_and_takes_the_pieces_again() {
     }
     rig.store.take_stats();
 
-    // Half of it must go.
+    // Half of it must go, and the owner hears of it.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let told = heard.clone();
+    rig.store.on_shrink(Box::new(move |shrink| told.lock().unwrap().push(shrink)));
     rig.store.set_ram_target(whole / 2);
     let given = rig.store.shrink_ram(Duration::ZERO).unwrap();
     assert!(given > 0);
     let (locked, _) = rig.store.ram_bytes();
     assert!(locked <= whole / 2, "{locked} of {whole}");
+    let want = ares_runtime::expert_store::RamShrink {
+        pieces: given,
+        bytes: whole - locked,
+        held: locked,
+        target: whole / 2,
+        at_floor: false,
+    };
+    assert_eq!(*heard.lock().unwrap(), [want]);
     let released = rig.store.take_released();
     assert_eq!(released.len(), given);
     assert_eq!(released.iter().map(|piece| piece.len() as u64).sum::<u64>(), whole - locked);
@@ -2077,6 +2089,55 @@ fn a_tier_keeps_two_slots_for_every_layer_whatever_it_is_told() {
     for pair in [[2, 3], [4, 5], [0, 1]] {
         rig.step(&[&pair[..], &pair[..], &pair[..]]);
     }
+}
+
+/// Refuses every lock while it is full, as the books of the RAM limit refuse a piece of the
+/// tier that the limit has no room for.
+#[derive(Clone, Default)]
+struct Books(Arc<std::sync::atomic::AtomicBool>);
+
+impl Books {
+    fn full(&self, full: bool) {
+        self.0.store(full, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Locker for Books {
+    unsafe fn lock(&mut self, _: *mut u8, len: usize) -> Result<Box<dyn Any + Send>, StoreError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::NoRoom(format!("no room for {len} bytes more")));
+        }
+        Ok(Box::new(()))
+    }
+}
+
+/// A piece of the tier that the RAM limit has no room for is no error: the tier stays as it
+/// is, serves on, and takes the piece once there is room (2026-11-25, `fix/model-sweep`:
+/// `Flow::before_step` grows the tier by a piece, and the books' refusal became the step's
+/// error, which took Flash-Next down).
+#[test]
+fn a_piece_the_ram_limit_has_no_room_for_leaves_the_tier_as_it_is() {
+    let books = Books::default();
+    let mut rig = rig_locked(3, 8, (3, 8), Box::new(books.clone()), recent_first);
+    rig.step(&[&[0, 1][..], &[0, 1][..], &[0, 1][..]]);
+    let whole = rig.store.ram_bytes().0;
+    rig.store.set_ram_target(whole / 2);
+    let given = rig.store.shrink_ram(Duration::ZERO).unwrap();
+    assert!(given > 0);
+    drop(rig.store.take_released());
+    let held = rig.store.ram_bytes().0;
+    // The tier may hold all again, but the limit has no room now.
+    rig.store.set_ram_target(u64::MAX);
+    books.full(true);
+    assert_eq!(rig.store.grow_ram(1).unwrap(), 0, "the refusal is no error");
+    assert_eq!(rig.store.ram_bytes().0, held, "the tier stays as it is");
+    for pair in [[2, 3], [4, 5]] {
+        rig.step(&[&pair[..], &pair[..], &pair[..]]);
+    }
+    books.full(false);
+    assert_eq!(rig.store.grow_ram(usize::MAX).unwrap(), given, "and takes them with room");
+    assert_eq!(rig.store.ram_bytes().0, whole);
+    rig.step(&[&[6, 7][..], &[6, 7][..], &[6, 7][..]]);
 }
 
 // --- pools whose pieces differ in size, locked as the driver locks -----------

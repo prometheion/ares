@@ -122,7 +122,8 @@ impl Part {
         let tokens = self.head_tokens();
         let Some(d) = &mut self.dflash else { return Err(invalid("no DFlash drafter")) };
         let (h, rows) = d.pass_layers(&self.kernels, stream, seqs, embed)?;
-        d.head_product(&self.kernels, stream, head.output.ty, output, h, rows)?;
+        let (ty, range) = (head.output.ty, head.output.range);
+        d.head_product(&self.kernels, stream, ty, range, output, h, rows)?;
         let list = list.unwrap_or_else(|| d.own_list());
         d.pass_select(&self.kernels, stream, tokens, record_tokens, list)
     }

@@ -690,7 +690,16 @@ pub(super) fn choose(
             let trial = match (core_share, shared_on_mixer) {
                 (None, None) => {
                     let alone = TensorChoice { mixer, core_share: 1.0, shared_on_mixer: true };
-                    Some(roles::trial(gguf, c, w, devices, part, &memory, &[share, alone])?)
+                    Some(roles::remembered_or_trial(
+                        gguf,
+                        c,
+                        w,
+                        devices,
+                        part,
+                        &memory,
+                        &[share, alone],
+                        opts.roles_dir.as_deref(),
+                    )?)
                 }
                 _ => None,
             };

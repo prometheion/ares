@@ -17,7 +17,9 @@ pump's rounds.
   (`GenerateRequest::cache`): such a sequence asks the cache nothing when it
   arrives or starts, publishes no pages, tails or checkpoints, and its pages go
   back to the pool with it; the conductor skips the cache for it wherever it
-  would look at its chain (`Active::cache`).
+  would look at its chain (`Active::cache`). The parts of a decision use the
+  cache; what a fork computes does not enter it (`Active::enters_cache`, see
+  "Decisions" in [sequence-state.md](sequence-state.md)).
 - **What it holds.** A page or tail that the index gives up is copied out of
   the pool into RAM before anything writes its page of the pool again
   (`Cache::settle_leaving`, which runs before every record and at the front
@@ -49,7 +51,13 @@ pump's rounds.
   the rest, which is written first. A page is
   the most recently used of what left the devices when it arrives, and the
   devices give a text up from its end, so a text goes from its end here too.
-  A checkpoint goes on its own or with its page.
+  A checkpoint goes on its own or with its page. When the cache gives memory
+  back down to its floor, the index's checkpoint used last (the deepest of
+  them) goes last, whatever the ranking says (`give_up_toward_floor`,
+  2026-11-25): the floor of one place is there so
+  that a conversation goes on from its last checkpoint, and the ranking, which
+  keeps roots longest, kept the root of a long prompt and gave up its anchor,
+  so the same prompt sent again replayed every row the cache held.
 - **Memory.** The pages and the checkpoints are the prompt cache's share of
   the engine's page-locked RAM, its lowest user ("Host memory"): the cache
   takes what the allowance leaves and gives back what it does not hold any
@@ -212,12 +220,16 @@ and after a restart of the server. Nothing is written as it is computed.
   leaves behind its end are exact entries. A page that comes back exact takes
   an exact slot when it is the first tile or lies at the end of the run, and
   is converted on the way in otherwise, as the window of a sequence that went
-  on would have converted it.
+  on would have converted it. A tail comes back as the partly used page it
+  is: it keeps its exact slot until it is freed and is never converted for
+  room (a prompt that continues it copies its leading cells, which only an
+  exact entry holds).
 - **The fingerprint** covers everything besides the tokens that changes the
   stored bytes: the model's files (their size, their first 64 KiB and 16
   samples of 4 KiB spread over each), the formats of K and of V, the draft
   block and its formats when the model drafts, the format of the recurrent
-  state, how the products round (`--precision`), the page size, and which
+  state, how the products round (exact products, a tool of the tests, are
+  another store), the page size, and which
   heads of every block each device holds (the bytes are stored per device, so
   another split or other shares are another store). The names of the pages
   start from the fingerprint, not from the model's id, so a model keeps its

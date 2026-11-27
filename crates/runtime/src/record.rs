@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 36 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), what the engine had been asked when the conductor last took its commands (the low 32 bits), the count and the offset of the saves inside the step |
+//! | runtime header | 40 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), what the engine had been asked when the conductor last took its commands (the low 32 bits), the count and the offset of the saves inside the step, the count and the offset of the scores, two words unused |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), the drafter of a window whose drafts the model makes, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | the rotary position: time, height, width, extra; `(p, p, p, 0)` for text at rotary position `p` (see [Images](#images)) |
@@ -37,6 +37,7 @@
 //! | draft bars | 16 + 1 each | for the windows whose drafts the model makes: the chance of a draft by its probability (16 ranges, `f32`), then for every draft row of those windows, in the order of the segments, the reach its chain needs for that link to be made (`f32`) |
 //! | row worth | 1 per row | what each row is worth in milliseconds (`f32`): for a row of a window past its first, the chance that the window's drafts up to the row's own are all accepted times the milliseconds a token costs; 0 for every other row |
 //! | image runs | 3 each | first row, rows, first row of the image stage: the rows whose values the host staged, in order |
+//! | scores | 2 each | a wanted row (its place among the wanted rows) and a token: the logits the step reads back besides the picks, in order ([`StepOutput::scores`](crate::StepOutput)) |
 //!
 //! A segment is **direct** when all of its rows are certain to be accepted (a
 //! slice of a prompt, a generation row without drafts): the recurrent kernels
@@ -115,6 +116,12 @@
 //! ([`StepOutput::drafts`](crate::StepOutput)). A record without the section,
 //! and a drafter that cannot stop, make every link.
 //!
+//! **Scores** name logits a step hands back as they are: the logit of a token
+//! at a wanted row, before the sampler touches it. A decision reads the labels
+//! of its options this way at the last row of each question's prompt (see
+//! "Decisions" in `docs/dev/architecture/sequence-state.md`). A wanted row
+//! names at most 256 tokens, the most options of a question.
+//!
 //! **Row worth** says what each draft row of a step is worth, for a model that
 //! may leave such a row without something it would have to wait for (an expert
 //! in no tier but the file): row `k` of a window counts only when the drafts
@@ -155,7 +162,7 @@ const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
 const KERNEL_HEADER: usize = 32;
 /// Words of both headers, a multiple of four so the segments start at a multiple of 16 bytes.
-const HEADER_WORDS: usize = 44;
+const HEADER_WORDS: usize = 48;
 /// Bytes of both headers.
 const HEADERS: usize = HEADER_WORDS * 4;
 const SEG_BYTES: usize = 32;
@@ -202,6 +209,8 @@ const H_PAUSE_MS: usize = 40;
 const H_ASKED: usize = 41;
 const H_INNER: usize = 42;
 const H_OFF_INNER: usize = 43;
+const H_SCORES: usize = 44;
+const H_OFF_SCORES: usize = 45;
 /// The record's step makes the chains of its own-draft windows and nothing
 /// else.
 const RECORD_DRAFTS_ONLY: u32 = 1;
@@ -212,6 +221,10 @@ const BAR_CHANCES: usize = ares_sched::CONFIDENCE_BINS;
 
 /// The most freed pages one record names.
 pub const FREED_PER_RECORD: usize = 1024;
+
+/// The most tokens whose logits one wanted row hands back
+/// ([`RecordWriter::scores`]): the most options a question has.
+pub const SCORES_PER_ROW: usize = ares_api::MAX_OPTIONS;
 
 /// One row of a step: a token of a sequence at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,7 +338,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
         + (BAR_CHANCES + rows) * 4
         + rows * 4
         + rows * 12
-        + (rows / 16 + slots) * 12;
+        + (rows / 16 + slots) * 12
+        + wanted * SCORES_PER_ROW * 8;
     bytes.next_multiple_of(256)
 }
 
@@ -526,6 +540,20 @@ impl<'a> RecordWriter<'a> {
         self.put(off, &words)?;
         self.header[H_IMAGES] = runs.len() as u32;
         self.header[H_OFF_IMAGES] = off as u32;
+        self.end = align(off + words.len() * 4);
+        Ok(())
+    }
+
+    /// The logits the step hands back besides the picks: `(wanted row,
+    /// token)`, the wanted row by its place among the wanted rows, in the
+    /// order they come back. At most 256 for one wanted row (the most options of a
+    /// question).
+    pub fn scores(&mut self, scores: &[(u32, u32)]) -> Result<(), RecordFull> {
+        let off = self.end;
+        let words: Vec<u32> = scores.iter().flat_map(|&(row, token)| [row, token]).collect();
+        self.put(off, &words)?;
+        self.header[H_SCORES] = scores.len() as u32;
+        self.header[H_OFF_SCORES] = off as u32;
         self.end = align(off + words.len() * 4);
         Ok(())
     }
@@ -1051,6 +1079,27 @@ impl<'a> RecordView<'a> {
         assert!(i < self.image_runs(), "image run {i} of {}", self.image_runs());
         let at = self.header[H_OFF_IMAGES] as usize + i as usize * 12;
         ImageRun { row: self.word(at), rows: self.word(at + 4), stage: self.word(at + 8) }
+    }
+
+    /// The logits the step hands back besides the picks
+    /// ([`RecordWriter::scores`]).
+    pub fn scores(&self) -> u32 {
+        self.header[H_SCORES]
+    }
+
+    /// Score `i`: the wanted row (its place among the wanted rows) and the
+    /// token.
+    pub fn score(&self, i: u32) -> (u32, u32) {
+        assert!(i < self.scores(), "score {i} of {}", self.scores());
+        let at = self.header[H_OFF_SCORES] as usize + i as usize * 8;
+        (self.word(at), self.word(at + 4))
+    }
+
+    /// The byte offset of the scores in the record: pairs of words, the
+    /// wanted row and the token, for a kernel that reads them from the
+    /// device's copy.
+    pub fn scores_offset(&self) -> usize {
+        self.header[H_OFF_SCORES] as usize
     }
 
     /// `(first row, rows)` of run `i`.

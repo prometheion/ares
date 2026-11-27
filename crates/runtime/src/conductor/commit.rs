@@ -8,6 +8,10 @@ impl Conductor {
     /// sequence.
     pub(super) fn commit(&mut self) {
         let mut cursor = 0usize;
+        // The scores of the step, in the order the record named them: the
+        // labels of the forks whose last row ran.
+        let mut score_at = 0usize;
+        let mut reads: Vec<(RequestId, usize, Vec<f32>)> = Vec::new();
         let mut row0 = 0u32;
         self.commits.clear();
         self.round_tokens = 0;
@@ -33,20 +37,43 @@ impl Conductor {
                         a.drafter.push(&mut self.corpus, a.tokens[at]);
                     }
                     if completes {
-                        let pick = self.output.picks[cursor];
-                        let probs = self.output.logprobs.get(cursor..=cursor).unwrap_or(&[]);
-                        a.sampler.picked(&[pick], probs);
-                        cursor += 1;
-                        a.accept(
-                            &*self.model,
-                            &self.spec,
-                            self.context_length,
-                            &mut self.corpus,
-                            &[pick.token],
-                        );
+                        match &a.role {
+                            // A part of a decision reads its prompt and ends:
+                            // the parent with its state in the cache, a fork
+                            // with the logits of its labels.
+                            Role::Parent { .. } => {
+                                cursor += 1;
+                                a.finished = Some(FinishReason::Stop);
+                            }
+                            Role::Fork { decision, question, labels } => {
+                                cursor += 1;
+                                let end = (score_at + labels.len()).min(self.output.scores.len());
+                                reads.push((
+                                    *decision,
+                                    *question,
+                                    self.output.scores[score_at.min(end)..end].to_vec(),
+                                ));
+                                score_at += labels.len();
+                                a.finished = Some(FinishReason::Stop);
+                            }
+                            Role::Request => {
+                                let pick = self.output.picks[cursor];
+                                let probs =
+                                    self.output.logprobs.get(cursor..=cursor).unwrap_or(&[]);
+                                a.sampler.picked(&[pick], probs);
+                                cursor += 1;
+                                a.accept(
+                                    &*self.model,
+                                    &self.spec,
+                                    self.context_length,
+                                    &mut self.corpus,
+                                    &[pick.token],
+                                );
+                            }
+                        }
                     }
                 }
-                PartKind::Window | PartKind::Score { .. } => {
+                PartKind::Window => {
                     let picks = &self.output.picks[cursor..cursor + part.rows as usize];
                     let probs_at = cursor;
                     cursor += part.rows as usize;
@@ -102,6 +129,11 @@ impl Conductor {
                             // are worth.
                             a.drafter.observe(&mut self.corpus, made, right);
                         }
+                        // The request's own, counted as the engine's totals are:
+                        // the rows of drafts its windows carried.
+                        a.drafts.proposed += drafts as u32;
+                        a.drafts.accepted += accepted as u32;
+                        a.drafts.windows += 1;
                         let counters = &mut self.stats.counters;
                         counters.draft_lengths[source][made.min(DRAFT_POSITIONS)] += 1;
                         counters.drafts_accepted += accepted as u64;
@@ -167,7 +199,7 @@ impl Conductor {
             // The cache: the pages that are full now enter the index, and a
             // checkpoint is taken where the rows ended on a position that is
             // due one (the rows were cut to end there).
-            if let Some(cache) = self.cache.as_mut().filter(|_| a.cache) {
+            if let Some(cache) = self.cache.as_mut().filter(|_| a.enters_cache()) {
                 let settled = a.cells.len();
                 cache.index.publish(
                     &mut self.pool,
@@ -255,14 +287,21 @@ impl Conductor {
         // A place taken for a checkpoint inside the rows that the commit did not name.
         let left = std::mem::take(&mut self.inner);
         self.release_inner(left);
+        for (decision, question, logits) in reads {
+            self.fork_read(decision, question, &logits);
+        }
     }
 
     /// Sends the text of the step to the sinks, ends the requests that are
     /// done and the ones whose sink gave up.
     pub(super) fn deliver(&mut self) {
         for i in 0..self.parts.len() {
-            let slot = self.parts[i].slot;
-            let a = self.slots[slot as usize].as_mut().expect("running");
+            let (slot, seq) = (self.parts[i].slot, self.parts[i].seq);
+            // A part of a decision that ended with its decision, earlier in
+            // this loop, has left its slot.
+            let Some(a) = self.slots[slot as usize].as_mut().filter(|a| a.seq == seq) else {
+                continue;
+            };
             // A rule that failed in the middle of the reply: the picks of
             // this step were made without it, and the text is not sent.
             if let Some(message) = a.sampler.failure() {
@@ -271,11 +310,18 @@ impl Conductor {
                 self.retire(slot, FinishReason::Cancelled);
                 continue;
             }
-            let mut listening = true;
+            // How far the prompt has got comes first: the step that ends it
+            // reports it whole before its first text.
+            let mut listening = match self.parts[i].kind {
+                PartKind::Prefill { .. } => a.report_progress(0.0),
+                _ => true,
+            };
+            // Then how many tokens the reply has, before its text.
+            listening = listening && a.report_generated();
             // The probabilities of the tokens whose text goes out now go out
             // first (a token that prints nothing goes out with the text
             // before it).
-            if a.sampler.wants_probs() {
+            if listening && a.sampler.wants_probs() {
                 let probs = a.sampler.text_sent(a.emitted.len());
                 if !probs.is_empty() {
                     listening = a.sink.send(Event::Logprobs(probs));

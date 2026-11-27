@@ -83,16 +83,15 @@ What is left out is decided from the devices and the model, and the log says how
 | `--cache <DIR>` | A directory where the engine keeps the state it computed (K and V, checkpoints of recurrent state), so that a prompt that starts with it resumes from there after the state left RAM, after an unload and after a restart. Texts of 2048 tokens and more are written when they leave RAM; what RAM and the devices hold is written at an unload or a stop. One directory may serve all models. Flash-Next keeps the usage profile of its experts there. | none: nothing is written; the usage profiles go to `$XDG_CACHE_HOME/ares`, else `~/.cache/ares` |
 | `--cache-size <SIZE>` | The most the directory may take, at least `1G`; what was used least recently goes first. | `32G` |
 
-## Speed against exactness
+## Drafts and steps
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--precision <KIND>` | `fast`: 8-bit activations where they are faster. `exact`: f16 products everywhere, the same text whatever else runs in a step. Flash-Next takes `fast` only. | `fast` |
 | `--drafters <LIST>` | The model drafters, separated by commas: `mtp` (the MTP block in the model file), a file (an MTP block or a DFlash2 drafter, told apart by the architecture the file names), or `none` (no speculation at all). The n-gram drafter takes part with them, never alone. See [models.md](models.md). | 27B: `mtp` if the model file has an MTP block. Flash-Next: none; name `mtp` or a file |
 | `-b`, `--batch-size <ROWS>` | Most rows of prompt in one step while a prompt is read alone. Above `--ubatch-size` only for Flash-Next, whose expert slots in VRAM lend the room for the step. At least 8. | 27B: `--ubatch-size`. Flash-Next: 32768 when a prompt is read layer by layer (K and V in `f16` or `q8`, no DFlash drafter), else 8192; as far as the slots can lend the room |
 | `-ub`, `--ubatch-size <ROWS>` | Most rows of a step in the memory the model keeps for good, and of a piece of prompt while another request waits. At least 8. | 27B: `512`. Flash-Next: the most rows, a power of two from 8 to 4096, whose step scratch fits in a thirty-second of the smaller device's memory |
 | `--window <ROWS>` | Most rows of one sequence's window: its newest token and the drafts verified with it. The rows take VRAM (about 5 MiB a row for the 27B, for every sequence). At least 2; Flash-Next at most 8. Only with a model drafter. | 27B: `8`. Flash-Next: `4` |
-| `--draft-vocab <FILE>` | Token ids the model drafters may propose, one per line (lines that begin with `#` are comments; an empty list is an error); a shorter list makes a draft cheaper. Only with a model drafter, and on the 27B not under a layer split. | every token whose row of the output head is on the drafters' device |
+| `--draft-vocab <FILE>` | Token ids the model drafters may propose, one per line (lines that begin with `#` are comments; an empty list is an error); a shorter list makes a draft cheaper. Only with a model drafter, and on the 27B not under a layer split. Ready lists, and how to make one: [draft-vocab.md](draft-vocab.md). | every token whose row of the output head is on the drafters' device |
 | `--expert-prune <RULE:RANK>` | Flash-Next only. What a step does with a pick whose expert only the SSD holds, from the RANK-th pick of a row on (1 is the strongest), instead of waiting for the drive: `skip` leaves it out, `router` takes the router's next best expert that VRAM or RAM holds, `similar` the one most like it there, from a table of similar experts for the model file in the directory of the usage profile (the `qwen4exp_prune` example of `ares-model` writes it; without it the load is refused). `similar:8` touches the 8th to 10th of ten picks; a RANK above the picks of a row is refused. Changes the output. `off` turns it off. | `off` |
 
 ## Images
@@ -181,7 +180,7 @@ All three are server options.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--log-format <text\|json>` | `text`: a line for people. `json`: one JSON object a line, for collectors. | `text` |
+| `--log-format <text\|json>` | `text`: a line for people. `json`: one JSON object a line, for collectors (the fields of a request's lines are at debug level). | `text` |
 | `--log-file <FILE>` | Append the log to this file. | standard error |
 | `--log-text` | The prompt and the reply of every request go into the log as well; without it the log holds neither. | off |
 

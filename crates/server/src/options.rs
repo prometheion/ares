@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use ares_cuda::Precision;
 use ares_tokenizer::Json;
 
 use crate::ReasoningFormat;
@@ -350,14 +349,6 @@ pub const OPTIONS: &[Opt] = &[
          first [default: 32G]",
     ),
     Opt::model(
-        "--precision",
-        "<KIND>",
-        "fast: 8-bit activations where they are faster\n\
-         exact: f16 products everywhere, the same text whatever else runs in a step\n\
-         [default: fast]",
-    )
-    .heading("Speed against exactness."),
-    Opt::model(
         "--drafters",
         "<LIST>",
         "The model drafters that take part, such as mtp (the MTP block in the model file) \
@@ -367,7 +358,8 @@ pub const OPTIONS: &[Opt] = &[
          draft and whose it is are chosen for every step from the price of a step and the \
          acceptance measured [default: for the 27B all it has, mtp if its file has an MTP \
          block; for Qwen3.8-Flash-Next none, it speculates only with a drafter named here]",
-    ),
+    )
+    .heading("Drafts and steps."),
     Opt::model(
         "--batch-size",
         "<ROWS>",
@@ -1063,13 +1055,6 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
             let expected = "a size such as 64G, at least 1G";
             let size = plan::parse_size(value).filter(|size| *size >= 1 << 30);
             load.cache_size = Some(size.ok_or_else(|| invalid("--cache-size", value, expected))?);
-        }
-        "--precision" => {
-            load.precision = match value {
-                "fast" => Precision::Fast,
-                "exact" => Precision::Exact,
-                _ => return Err(invalid("--precision", value, "fast or exact")),
-            };
         }
         "--drafters" => load.drafters = Some(drafters(value)?),
         "--window" => {

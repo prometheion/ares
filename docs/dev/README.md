@@ -50,6 +50,8 @@ repository and are not needed to build, run or test Ares.
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
 | [`host-memory.md`](experiments/host-memory.md) | the expert tier's worth, giving memory back |
 | [`server.md`](experiments/server.md) | priorities of requests |
+| [`draft-vocab.md`](experiments/draft-vocab.md) | the ready draft vocabularies against the fork's list and none |
+| [`decisions.md`](experiments/decisions.md) | decisions (Jev mode): the answers against the CPU reference and greedy generation, decisions per second on the 27B |
 
 ## Studies
 
@@ -133,6 +135,11 @@ need model files and a llama.cpp tree, a fresh clone built on the CPU (the
 commands are in `crates/model/tools/capture/README.md`), which the scripts take
 as an argument or as `LLAMA_CPP_DIR`, with no default; they are not part of the
 cargo build.
+
+`crates/tokenizer/examples/draft_vocab.rs` makes and checks the draft
+vocabularies of `--draft-vocab` from a corpus, with the model's own tokenizer,
+and `tools/draft-vocab.py` fetches the corpus of the ready lists and makes them
+again (the guide is [`../user/draft-vocab.md`](../user/draft-vocab.md)).
 
 `python3 tools/check-doc-links.py` checks the links between the documents, every
 mention of a document and every citation of a paragraph in the code

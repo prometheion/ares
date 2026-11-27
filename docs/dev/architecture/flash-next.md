@@ -151,7 +151,11 @@ running. What was chosen:
   while the conductor still decides.
 - The first part to reach a step begins it for the store, the last to end it
   ends it. A part that fails makes the others give up, and a step that stands
-  still for 30 s ends with an error that says what it waited for.
+  still for 30 s ends with an error that says what it waited for (`Flow::check`:
+  30 s since its wait began and since anything of the steps last moved, a layer
+  enqueued or followed, an upload or a read the store finished, a pass's rows
+  handed on, rows of the n-gram table read; the lend waits hold the store and
+  count from their start).
 - The conductor sees none of this. It dispatches a step and collects it when
   every device has ended; a step that misses experts is a longer step, and
   cancellation and new requests are handled between steps as for any model.
@@ -214,8 +218,7 @@ be larger than the model's own: four sequences of 131 072 cells are
 `--context 524288`; a request still holds at most the model's own) is placed
 the same way (the owner, 2026-11-24). The plan says what was wanted and how
 much of it is in VRAM (`plan::ContextPlan::overflowing`). Options that mean nothing for the
-model are errors that name them: `--shares`, `--precision exact`,
-`--draft-vocab`, more sequences than the eight rows of a
+model are errors that name them: `--shares`, `--draft-vocab`, more sequences than the eight rows of a
 generating step (`--parallel`), `--drafters mtp` (the model file carries no MTP block;
 `--drafters FILE` names the block's file), and `--window` without a drafter or beyond
 the eight rows of a step that verifies.
@@ -275,7 +278,12 @@ so nothing idle in VRAM needs lending.
   with far pools that was not prepared so fails. When the
   limit has no room the tier's allowance already leaves it
   (`PinnedRam::set_context_target`) and the tier gives pieces up then, with no
-  step running.
+  step running. Since 2026-11-25 the conductor has the pieces locked before it
+  writes a step, from the pool pages in use (`Model::make_room`), so that the
+  prompt cache can give way after the tier and a request ends when nothing
+  more can go, instead of the step failing ("Room before a step" in
+  [`host-memory.md`](host-memory.md)); and the prompt cache's floor keeps the far
+  pages one request can hold, so that a conversation's next turn finds them.
 - *Prompts.* Every row of a prompt reads the cells of its own pick, so a wide
   step that read the far pool in place would cross the link once per row. A
   step on lent VRAM (a prompt read alone, "Large prompt steps on lent VRAM")

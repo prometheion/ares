@@ -28,8 +28,8 @@ use ares_cuda::{
 };
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    LayerOut, ModelOptions, Options, PHASES, Phase, Probe, Profile, PruneSetup, Rows, Session,
-    SessionOptions, Spread, Wanted,
+    LayerOut, ModelOptions, Options, PHASES, Phase, Probe, Profile, PruneSetup, RoleMemory, Rows,
+    Session, SessionOptions, Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
@@ -552,6 +552,49 @@ fn the_second_devices_role_is_timed_at_load() {
     }
     eprintln!("  the logits of the last rows differ by at most {worst:.2e} (relative RMS)");
     assert!(worst < 0.15, "logits {worst:.2e}");
+}
+
+/// With a directory to keep it in, the first load times the roles and writes what it
+/// kept; the next load of the same model on the same cards takes it from there and
+/// times nothing; a file that is not whole is measured again. (Two devices only.)
+#[test]
+fn the_second_devices_role_is_remembered_between_loads() {
+    let Some(devices) = devices() else { return };
+    let peers = devices.len() == 2
+        && peer_access(devices[0].ordinal(), devices[1].ordinal()).unwrap().0
+        && peer_access(devices[1].ordinal(), devices[0].ordinal()).unwrap().0;
+    if !peers {
+        eprintln!("skipped: two devices that can write each other's memory");
+        return;
+    }
+    let synthetic = model(5);
+    let gguf = open("roles-kept", &synthetic.bytes_with_experts(GgmlType::IQ2_XXS, GgmlType::Q2_0));
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let dir = common::TempDir::new("roles");
+    let mut opts = options(2, c.n_layer, CacheFormat::Q8);
+    opts.model.spread = Spread::Tensor { mixer: None, core_share: None, shared_on_mixer: None };
+    opts.model.bounds = None;
+    opts.model.part.max_rows = 64;
+    opts.model.roles_dir = Some(dir.path().to_owned());
+    let trial_of = |opts: &SessionOptions| {
+        let session = Session::open(&gguf, &c, &w, devices.clone(), opts.clone()).unwrap();
+        let tensor = session.placement().tensor.clone().expect("both devices on every layer");
+        assert_eq!(Some(tensor.choice), tensor.trial.as_ref().map(|t| t.kept));
+        tensor.trial.expect("the roles were timed or remembered")
+    };
+    let first = trial_of(&opts);
+    let RoleMemory::Written(path) = &first.memory else { panic!("{:?}", first.memory) };
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("roles"));
+    let second = trial_of(&opts);
+    assert_eq!(second.memory, RoleMemory::Remembered(path.clone()));
+    assert_eq!((second.kept, &second.times), (first.kept, &first.times));
+    std::fs::write(path, "ares roles 1\nkept 0\n").unwrap();
+    let third = trial_of(&opts);
+    assert_eq!(third.memory, RoleMemory::Written(path.clone()), "measured again");
+    // Without a directory it is timed at every load.
+    opts.model.roles_dir = None;
+    assert_eq!(trial_of(&opts).memory, RoleMemory::None);
 }
 
 /// The slices of a prompt of 9, 64 and 256 rows run on the many-row kernels, with half of

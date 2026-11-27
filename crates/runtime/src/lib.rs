@@ -91,7 +91,7 @@ pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
     EncodedPrompt, FarPages, LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split,
-    StepContext, TowerJob, TransferContext, Vision,
+    StepContext, TowerJob, TransferContext, Vision, share_of,
 };
 pub use ram::{
     CacheBuffer, ContextLock, ContextRegion, ContextShort, LockedChunk, Look, Machine, Meminfo,

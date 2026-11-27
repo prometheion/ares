@@ -34,6 +34,7 @@ const SERVED: &[&str] = &[
     "output_config",
     "cache_control",
     "context_management",
+    "sse_ping_interval",
 ];
 
 /// Bookkeeping of the client or of Anthropic's service: accepted, and by
@@ -79,7 +80,8 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<(Json, Asked), Ap
     }
 
     let mut chat = Chat::new();
-    for name in ["model", "temperature", "top_p", "top_k"] {
+    // llama.cpp's `sse_ping_interval` sets the interval of the stream's pings.
+    for name in ["model", "temperature", "top_p", "top_k", "sse_ping_interval"] {
         if let Some(value) = fields.get(name) {
             chat.push((name, value.clone()));
         }

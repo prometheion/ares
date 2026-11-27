@@ -11,7 +11,8 @@
 //! - **When the engine begins to serve** ([`Usage::serving`], where the
 //!   server reads its warm-up text when there is no profile, after the
 //!   runtime measured what a step costs): the heat becomes the profile's (the
-//!   measurement's steps route a made-up text and are no use) and the tiers
+//!   measurement's steps route a made-up text; their heat was forgotten when
+//!   they ended, [`Model::measured`](ares_runtime::Model::measured)) and the tiers
 //!   are filled from it in one sweep through the file, VRAM with the hottest
 //!   experts of every layer and the RAM tier with the next, into what is
 //!   empty or worth nothing. A thread keeps the profile from then on.

@@ -12,13 +12,6 @@ pub enum Want {
     /// It is generating: it needs one row for its newest token and would like
     /// `drafts` more rows to verify proposed tokens in the same step.
     Window { drafts: u32 },
-    /// A decision whose prompt is computed. It needs `rows` more rows scored:
-    /// the rows of the forks of its options, which read the prompt's pages
-    /// and whose logits give each option its score. Every row needs its
-    /// logits and none is optional: without all of them the decision has no
-    /// answer. `seq` is the decision's, not a fork's; the runtime lays out
-    /// the forks.
-    Score { rows: u32 },
 }
 
 /// One sequence's request for the next step.
@@ -38,8 +31,14 @@ pub struct Request {
 pub struct Limits {
     /// The most rows a step can hold (the size of the step's scratch memory).
     pub max_rows: u32,
+    /// The most rows of a step that holds the rows of more than one
+    /// sequence. A model whose step wider than its own memory borrows memory
+    /// for its time (Flash-Next's expert slots lend VRAM, and a prompt is
+    /// read layer by layer there) runs such a step for one prompt alone; the
+    /// model's own rows ([`Limits::max_rows`] for any other model).
+    pub shared_rows: u32,
     /// The most prompt rows in a step that also carries generating
-    /// sequences or decisions: a piece of prompt (see [`Share`](crate::Share)).
+    /// sequences: a piece of prompt (see [`Share`](crate::Share)).
     pub prefill_rows_with_windows: u32,
     /// A prompt that waited this many steps goes before shorter prompts.
     pub starvation_steps: u32,
@@ -54,11 +53,6 @@ pub enum PartKind {
     /// The newest token and `rows - 1` drafts of a generating sequence. Every
     /// row's logits are needed.
     Window,
-    /// Option rows of a decision. Every row's logits are needed. `completes`
-    /// is set when these are the last rows the decision asked for, so its
-    /// answer can be made from this step; otherwise the rest is asked for
-    /// again ([`Want::Score`] with the rows that are left) in a later step.
-    Score { completes: bool },
 }
 
 /// The rows one sequence gets in a step. They are consecutive positions of
@@ -70,8 +64,7 @@ pub struct Part {
     pub kind: PartKind,
 }
 
-/// A step: its parts in row order (generating sequences, then decisions, then
-/// prompts). Sequences that asked and are not in the plan wait for the next
+/// A step: its parts in row order (generating sequences, then prompts). Sequences that asked and are not in the plan wait for the next
 /// step.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -91,22 +84,31 @@ impl Plan {
 ///
 /// 1. The newest token of every generating sequence: a person is reading
 ///    their output, and a row of theirs is cheap.
-/// 2. The rows of decisions ([`Want::Score`]), the longest wait first. A
-///    decision is answered once, when all its rows have run, so its rows are
-///    not like drafts that merely speed something up: they come before drafts.
-///    A decision whose rows do not all fit gets as many as fit, and asks for
-///    the rest in the next step.
-/// 3. Drafts, to the generating sequences that asked, in the same order as 1.
-/// 4. Prompts, capped while anyone is generating or deciding, shortest first
-///    so short requests are not stuck behind a long document, except that a
-///    prompt that has starved goes first.
+/// 2. Drafts, to the generating sequences that asked, in the same order as 1.
+/// 3. Prompts, capped while anyone is generating, shortest first so short
+///    requests are not stuck behind a long document, except that a prompt
+///    that has starved goes first. The forks of a decision are prompts too
+///    (short ones, which go early).
 ///
 /// The parts of the plan are in row order, which differs from the order of
 /// the grants because the drafts of a sequence follow its newest token:
-/// generating sequences (with their drafts), then decisions, then prompts.
+/// generating sequences (with their drafts), then prompts.
+///
+/// A step wider than [`Limits::shared_rows`] holds one sequence's rows: when
+/// the grants above give more than one sequence rows beyond it, the step is
+/// planned again within it.
 pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
+    let plan = plan_within(requests, limits, limits.max_rows);
+    if plan.parts.len() > 1 && plan.rows() > limits.shared_rows {
+        return plan_within(requests, limits, limits.shared_rows.min(limits.max_rows));
+    }
+    plan
+}
+
+/// [`plan`] for a step of at most `max_rows` rows.
+fn plan_within(requests: &[Request], limits: &Limits, max_rows: u32) -> Plan {
     let mut parts = Vec::new();
-    let mut left = limits.max_rows;
+    let mut left = max_rows;
 
     // Generating sequences, longest wait first; the order is stable so equal
     // waits keep the caller's order.
@@ -114,7 +116,7 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
         .iter()
         .filter_map(|r| match r.want {
             Want::Window { drafts } => Some((r, drafts)),
-            Want::Prefill { .. } | Want::Score { .. } => None,
+            Want::Prefill { .. } => None,
         })
         .enumerate()
         .map(|(i, (r, drafts))| (i, r, drafts))
@@ -130,29 +132,6 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
         left -= 1;
     }
     let after_windows = parts.len();
-
-    // Decisions, before any draft is granted. `sort_by_key` is stable, so
-    // equal waits keep the caller's order.
-    let mut decisions: Vec<(&Request, u32)> = requests
-        .iter()
-        .filter_map(|r| match r.want {
-            Want::Score { rows } if rows > 0 => Some((r, rows)),
-            _ => None,
-        })
-        .collect();
-    decisions.sort_by_key(|(r, _)| (r.priority, std::cmp::Reverse(r.waited_steps)));
-    for (request, rows) in decisions {
-        if left == 0 {
-            break;
-        }
-        let granted = rows.min(left);
-        left -= granted;
-        parts.push(Part {
-            seq: request.seq,
-            rows: granted,
-            kind: PartKind::Score { completes: granted == rows },
-        });
-    }
 
     for (part, (_, _, drafts)) in parts[first_window..after_windows].iter_mut().zip(&windows) {
         let extra = (*drafts).min(left);
@@ -195,8 +174,12 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
 mod tests {
     use super::*;
 
-    const LIMITS: Limits =
-        Limits { max_rows: 64, prefill_rows_with_windows: 24, starvation_steps: 8 };
+    const LIMITS: Limits = Limits {
+        max_rows: 64,
+        shared_rows: 64,
+        prefill_rows_with_windows: 24,
+        starvation_steps: 8,
+    };
 
     fn window(seq: u32, drafts: u32) -> Request {
         Request { seq: SeqId(seq), want: Want::Window { drafts }, waited_steps: 0, priority: 0 }
@@ -204,10 +187,6 @@ mod tests {
 
     fn prefill(seq: u32, tokens: u32, waited_steps: u32) -> Request {
         Request { seq: SeqId(seq), want: Want::Prefill { tokens }, waited_steps, priority: 0 }
-    }
-
-    fn score(seq: u32, rows: u32, waited_steps: u32) -> Request {
-        Request { seq: SeqId(seq), want: Want::Score { rows }, waited_steps, priority: 0 }
     }
 
     fn part(seq: u32, rows: u32, kind: PartKind) -> Part {
@@ -279,108 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn a_step_can_mix_drafts_a_decision_and_a_prompt() {
-        // Two generating sequences (one with drafts), a decision of 6 option
-        // rows and a long prompt: every kind of demand in one step.
-        let requests = [prefill(9, 5000, 0), window(1, 2), score(5, 6, 0), window(2, 0)];
-        let plan = plan(&requests, &LIMITS);
-        assert_eq!(
-            plan.parts,
-            [
-                part(1, 3, PartKind::Window),
-                part(2, 1, PartKind::Window),
-                part(5, 6, PartKind::Score { completes: true }),
-                part(9, 24, PartKind::Prefill { completes: false }),
-            ]
-        );
-        assert_eq!(plan.rows(), 34);
-    }
-
-    #[test]
-    fn decision_rows_come_before_drafts_but_after_every_newest_token() {
-        // 6 rows: the two newest tokens first, then the decision's 3 rows,
-        // and only the single row that is left goes to drafts.
-        let limits = Limits { max_rows: 6, ..LIMITS };
-        let requests = [window(1, 4), score(5, 3, 0), window(2, 4)];
-        let plan = plan(&requests, &limits);
-        assert_eq!(
-            plan.parts,
-            [
-                part(1, 2, PartKind::Window),
-                part(2, 1, PartKind::Window),
-                part(5, 3, PartKind::Score { completes: true }),
-            ]
-        );
-        assert_eq!(plan.rows(), 6);
-
-        // Not even one decision row is granted before everyone's newest token.
-        let limits = Limits { max_rows: 2, ..LIMITS };
-        let plan = super::plan(&[score(5, 3, 9), window(1, 0), window(2, 0)], &limits);
-        assert_eq!(plan.parts, [part(1, 1, PartKind::Window), part(2, 1, PartKind::Window)]);
-    }
-
-    #[test]
-    fn a_decision_that_does_not_fit_is_split_over_two_steps() {
-        let limits = Limits { max_rows: 10, ..LIMITS };
-        // Step 1: one generating sequence takes 1 row, so 9 of the 12 option
-        // rows fit. The decision is not complete.
-        let first = plan(&[window(1, 0), score(7, 12, 0)], &limits);
-        assert_eq!(
-            first.parts,
-            [part(1, 1, PartKind::Window), part(7, 9, PartKind::Score { completes: false })]
-        );
-
-        // Step 2: the caller asks for the 3 rows that are left. They fit
-        // with room to spare, and the decision completes.
-        let second = super::plan(&[window(1, 0), score(7, 3, 0)], &limits);
-        assert_eq!(
-            second.parts,
-            [part(1, 1, PartKind::Window), part(7, 3, PartKind::Score { completes: true })]
-        );
-    }
-
-    #[test]
-    fn the_decision_that_waited_longest_gets_rows_first() {
-        let limits = Limits { max_rows: 8, ..LIMITS };
-        let requests = [score(1, 5, 0), score(2, 5, 3), score(3, 5, 1)];
-        let plan = plan(&requests, &limits);
-        assert_eq!(
-            plan.parts,
-            [
-                part(2, 5, PartKind::Score { completes: true }),
-                part(3, 3, PartKind::Score { completes: false }),
-            ],
-            "the one that waited longest is whole, the next takes what is left, the last waits"
-        );
-
-        // Equal waits keep the caller's order.
-        let plan = super::plan(&[score(4, 5, 2), score(3, 5, 2)], &limits);
-        assert_eq!(plan.parts[0].seq, SeqId(4));
-    }
-
-    #[test]
-    fn decisions_cap_the_prompt_share_like_generation_does() {
-        // No generating sequence at all: a decision alone still limits the
-        // prompt to the share, where a prompt alone would get the whole step.
-        let plan = plan(&[score(5, 4, 0), prefill(9, 5000, 0)], &LIMITS);
-        assert_eq!(
-            plan.parts,
-            [
-                part(5, 4, PartKind::Score { completes: true }),
-                part(9, 24, PartKind::Prefill { completes: false }),
-            ]
-        );
-        let alone = super::plan(&[prefill(9, 5000, 0)], &LIMITS);
-        assert_eq!(alone.parts, [part(9, 64, PartKind::Prefill { completes: false })]);
-    }
-
-    #[test]
-    fn a_decision_asking_for_no_rows_is_not_in_the_plan() {
-        let plan = plan(&[score(5, 0, 0), prefill(9, 10, 0)], &LIMITS);
-        assert_eq!(plan.parts, [part(9, 10, PartKind::Prefill { completes: true })]);
-    }
-
-    #[test]
     fn a_better_priority_goes_first_in_every_kind_of_row() {
         let urgent = |mut r: Request| {
             r.priority = -1;
@@ -397,19 +274,39 @@ mod tests {
         let limits = Limits { max_rows: 3, ..LIMITS };
         let mut waited = window(1, 4);
         waited.waited_steps = 5;
-        let requests = [waited, urgent(window(2, 4)), urgent(score(3, 1, 0))];
-        let plan = super::plan(&requests, &limits);
-        assert_eq!(
-            plan.parts,
-            [
-                part(2, 1, PartKind::Window),
-                part(1, 1, PartKind::Window),
-                part(3, 1, PartKind::Score { completes: true }),
-            ]
-        );
+        let requests = [waited, urgent(window(2, 4)), window(3, 0)];
+        let plan = super::plan(&requests, &Limits { max_rows: 2, ..limits });
+        assert_eq!(plan.parts, [part(2, 1, PartKind::Window), part(1, 1, PartKind::Window)]);
         let limits = Limits { max_rows: 4, ..LIMITS };
         let plan = super::plan(&[window(1, 4), urgent(window(2, 4))], &limits);
         assert_eq!(plan.parts, [part(2, 3, PartKind::Window), part(1, 1, PartKind::Window)]);
+    }
+
+    #[test]
+    fn a_step_wider_than_the_shared_rows_holds_one_sequence() {
+        // A model that borrows memory for a step wider than 16 rows: a prompt
+        // alone takes the widest step; two prompts, or a prompt beside a
+        // generating sequence, share a step of 16 rows at most, the shortest
+        // prompt first.
+        let limits = Limits { shared_rows: 16, ..LIMITS };
+        let alone = plan(&[prefill(1, 500, 0)], &limits);
+        assert_eq!(alone.parts, [part(1, 64, PartKind::Prefill { completes: false })]);
+        let two = plan(&[prefill(1, 500, 0), prefill(2, 10, 0)], &limits);
+        assert_eq!(
+            two.parts,
+            [
+                part(2, 10, PartKind::Prefill { completes: true }),
+                part(1, 6, PartKind::Prefill { completes: false }),
+            ]
+        );
+        assert!(two.rows() <= 16);
+        let short = plan(&[prefill(1, 5, 0), prefill(2, 10, 0)], &limits);
+        assert_eq!(short.rows(), 15, "steps within the shared rows are as before");
+        let mixed = plan(&[prefill(5, 40, 0), window(1, 0)], &limits);
+        assert_eq!(
+            mixed.parts,
+            [part(1, 1, PartKind::Window), part(5, 15, PartKind::Prefill { completes: false })]
+        );
     }
 
     #[test]

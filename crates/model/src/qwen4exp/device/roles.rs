@@ -25,7 +25,14 @@
 //! each counted by how much faster it is (the product of the two times), is
 //! kept: a decode step is some fifty times a prompt row, so milliseconds alone
 //! would let the decode step decide what the prompts pay for.
+//!
+//! The trial takes 3 to 4 s of a load. What it kept is remembered in a file per
+//! model, cards, driver and binary (the owner, 2026-11-25), in the directory of
+//! the usage profiles ([`ModelOptions::roles_dir`](super::ModelOptions::roles_dir)),
+//! and measured again when one of them changes, or when what it kept does not
+//! fit the devices now; without a directory it is measured at every load.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +103,184 @@ pub struct RoleTrial {
     pub kept: TensorChoice,
     /// How long the trial took, parts opened and closed.
     pub took: Duration,
+    /// Whether it was measured now or remembered, and where it is kept.
+    pub memory: RoleMemory,
+}
+
+/// Where a trial of the worker's role is kept between loads.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RoleMemory {
+    /// Measured now; no directory to keep it in.
+    None,
+    /// Read from this file: measured at an earlier load of the same model on the
+    /// same cards, driver and binary.
+    Remembered(PathBuf),
+    /// Measured now and kept in this file.
+    Written(PathBuf),
+    /// Measured now; it could not be kept (why).
+    NotWritten(String),
+}
+
+/// What the format of a file of a remembered trial starts with.
+const MEMORY_FORMAT: &str = "ares roles 1";
+
+/// Times the worker's roles as [`trial`] does, or reads what a trial of the
+/// same model, cards, driver and binary kept in `dir` when the choice it kept
+/// fits the devices now; a trial measured now is written there.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn remembered_or_trial(
+    gguf: &Gguf,
+    c: &Config,
+    w: &Weights<'_>,
+    devices: &[Device],
+    part: &Options,
+    memory: &[DeviceMemory],
+    choices: &[TensorChoice],
+    dir: Option<&Path>,
+) -> Result<RoleTrial, Error> {
+    let Some(dir) = dir else { return trial(gguf, c, w, devices, part, memory, choices) };
+    let path = dir.join(memory_name(gguf, devices, wide_rows(part)));
+    if let Some(mut kept) = std::fs::read_to_string(&path).ok().and_then(|text| parse(&text))
+        && Placement::tensor(c, w, part, memory, &kept.kept).is_ok()
+    {
+        kept.memory = RoleMemory::Remembered(path);
+        return Ok(kept);
+    }
+    let mut trial = trial(gguf, c, w, devices, part, memory, choices)?;
+    if !trial.times.is_empty() {
+        let written = std::fs::create_dir_all(dir).and_then(|()| {
+            let tmp = path.with_extension("roles.tmp");
+            std::fs::write(&tmp, unparse(&trial))?;
+            std::fs::rename(&tmp, &path)
+        });
+        trial.memory = match written {
+            Ok(()) => RoleMemory::Written(path),
+            Err(e) => RoleMemory::NotWritten(format!("{}: {e}", path.display())),
+        };
+    }
+    Ok(trial)
+}
+
+/// The rows of the trial's wide step for a model with `part`'s options (0 for none).
+fn wide_rows(part: &Options) -> u32 {
+    if part.own_rows() > MAX_BATCH { part.own_rows().min(WIDE_ROWS) } else { 0 }
+}
+
+/// The name of the file that keeps the trial of `devices` for the model in `gguf`:
+/// a fingerprint of the model's files, of the cards (name and UUID, in order), of the
+/// driver (its version and the CUDA version it implements), of this binary (its size and
+/// when it was written) and of the rows of the wide step.
+fn memory_name(gguf: &Gguf, devices: &[Device], wide_rows: u32) -> String {
+    let mut key = MEMORY_FORMAT.as_bytes().to_vec();
+    for part in 0..gguf.n_parts() {
+        crate::files::identity(gguf.path(part as u16), &mut key);
+    }
+    for device in devices {
+        let info = device.info();
+        key.extend_from_slice(info.name.as_bytes());
+        key.extend_from_slice(&info.uuid);
+    }
+    let driver = std::fs::read_to_string("/proc/driver/nvidia/version").unwrap_or_default();
+    key.extend_from_slice(driver.lines().next().unwrap_or_default().as_bytes());
+    key.extend_from_slice(format!("{:?}", ares_cuda::driver_version().ok()).as_bytes());
+    if let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) {
+        key.extend_from_slice(&meta.len().to_le_bytes());
+        let written =
+            meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        key.extend_from_slice(&written.unwrap_or_default().as_nanos().to_le_bytes());
+    }
+    key.extend_from_slice(&wide_rows.to_le_bytes());
+    memory_file_name(&key)
+}
+
+/// The file name for `key`: two hashes of it in hex. The binary is part of every key,
+/// so the hash need not stay the same from one build to the next.
+fn memory_file_name(key: &[u8]) -> String {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let hash = |salt: u8| {
+        let mut bytes = vec![salt];
+        bytes.extend_from_slice(key);
+        BuildHasherDefault::<DefaultHasher>::default().hash_one(&bytes)
+    };
+    format!("{:016x}{:016x}.roles", hash(0), hash(1))
+}
+
+/// A choice as one line's words: the mixer, the core share's bits, the shared
+/// expert on the mixer.
+fn choice_words(c: &TensorChoice) -> String {
+    format!("{} {:016x} {}", c.mixer, c.core_share.to_bits(), u8::from(c.shared_on_mixer))
+}
+
+fn parse_choice(words: &[&str]) -> Option<TensorChoice> {
+    let [mixer, core, shared] = words else { return None };
+    Some(TensorChoice {
+        mixer: mixer.parse().ok()?,
+        core_share: f64::from_bits(u64::from_str_radix(core, 16).ok()?),
+        shared_on_mixer: match *shared {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        },
+    })
+}
+
+/// The file of a remembered trial: a line per choice timed or refused, then what
+/// was kept; times in nanoseconds.
+fn unparse(t: &RoleTrial) -> String {
+    let ns = |d: Duration| d.as_nanos().to_string();
+    let mut out = format!("{MEMORY_FORMAT}\nwide_rows {}\ntook {}\n", t.wide_rows, ns(t.took));
+    for time in &t.times {
+        out += &format!(
+            "time {} {} {} {} {}\n",
+            choice_words(&time.choice),
+            ns(time.decode),
+            time.wide.map_or("-".to_owned(), ns),
+            ns(time.opened),
+            ns(time.took)
+        );
+    }
+    for (choice, why) in &t.refused {
+        out += &format!("refused {} {}\n", choice_words(choice), why.replace('\n', " "));
+    }
+    out + &format!("kept {}\n", choice_words(&t.kept))
+}
+
+/// A remembered trial; `None` for a file that is not one, whole.
+fn parse(text: &str) -> Option<RoleTrial> {
+    let mut lines = text.lines();
+    if lines.next()? != MEMORY_FORMAT {
+        return None;
+    }
+    let ns = |s: &str| s.parse::<u64>().ok().map(Duration::from_nanos);
+    let (mut wide_rows, mut took, mut kept) = (None, None, None);
+    let (mut times, mut refused) = (Vec::new(), Vec::new());
+    for line in lines {
+        let words: Vec<&str> = line.split(' ').collect();
+        match words.as_slice() {
+            ["wide_rows", n] => wide_rows = Some(n.parse().ok()?),
+            ["took", n] => took = Some(ns(n)?),
+            ["time", rest @ ..] if rest.len() == 7 => times.push(RoleTime {
+                choice: parse_choice(&rest[..3])?,
+                decode: ns(rest[3])?,
+                wide: if rest[4] == "-" { None } else { Some(ns(rest[4])?) },
+                opened: ns(rest[5])?,
+                took: ns(rest[6])?,
+            }),
+            ["refused", rest @ ..] if rest.len() >= 3 => {
+                refused.push((parse_choice(&rest[..3])?, rest[3..].join(" ")));
+            }
+            ["kept", rest @ ..] => kept = Some(parse_choice(rest)?),
+            _ => return None,
+        }
+    }
+    Some(RoleTrial {
+        times,
+        refused,
+        wide_rows: wide_rows?,
+        kept: kept?,
+        took: took?,
+        memory: RoleMemory::None,
+    })
 }
 
 /// Times every choice of `choices` on `devices` (two, the first choice's
@@ -112,7 +297,7 @@ pub(super) fn trial(
     choices: &[TensorChoice],
 ) -> Result<RoleTrial, Error> {
     let started = Instant::now();
-    let wide_rows = if part.own_rows() > MAX_BATCH { part.own_rows().min(WIDE_ROWS) } else { 0 };
+    let wide_rows = wide_rows(part);
     // A sequence of a short wide step and the decode steps, then the timed
     // wide steps after them.
     let cells = (WIDE_WARM_ROWS + wide_rows * WIDE_TIMED + DECODE_WARM + DECODE_TIMED + 1).max(256);
@@ -152,7 +337,14 @@ pub(super) fn trial(
         }
     }
     let kept = faster(&times).unwrap_or(choices[0]);
-    Ok(RoleTrial { times, refused, wide_rows, kept, took: started.elapsed() })
+    Ok(RoleTrial {
+        times,
+        refused,
+        wide_rows,
+        kept,
+        took: started.elapsed(),
+        memory: RoleMemory::None,
+    })
 }
 
 /// The choice of `times` that costs the least ([`RoleTime::cost`]); the first
@@ -416,5 +608,35 @@ mod tests {
         assert_eq!(kept(share(17.4, None), alone(18.0, None)), 0.75);
         assert_eq!(kept(share(18.4, None), alone(18.0, None)), 1.0);
         assert_eq!(faster(&[]), None);
+    }
+
+    /// A trial written to its file reads back as it was, bit for bit; a file that is
+    /// not whole is no trial; the name changes with every part of the key.
+    #[test]
+    fn a_remembered_trial_reads_back_as_it_was_kept() {
+        let mut share = time(0.6180339887, 17.4, Some(1020.5));
+        share.opened = Duration::from_millis(1600);
+        share.took = Duration::from_millis(2100);
+        let alone = time(1.0, 18.0, None);
+        let trial = RoleTrial {
+            kept: share.choice,
+            times: vec![share, alone.clone()],
+            refused: vec![(alone.choice, "does not fit:\nCUDA1 short".to_owned())],
+            wide_rows: 512,
+            took: Duration::from_millis(4150),
+            memory: RoleMemory::None,
+        };
+        let text = unparse(&trial);
+        let mut back = parse(&text).expect("a whole file");
+        assert_eq!(back.refused[0].1, "does not fit: CUDA1 short");
+        back.refused[0].1 = trial.refused[0].1.clone();
+        assert_eq!(back, trial);
+        let cut = &text[..text.rfind("kept").unwrap()];
+        assert_eq!(parse(cut), None, "without what it kept");
+        assert_eq!(parse(&text.replace(MEMORY_FORMAT, "ares roles 0")), None);
+        let name = memory_file_name(b"model cards driver binary 512");
+        assert_eq!(name, memory_file_name(b"model cards driver binary 512"));
+        assert_ne!(name, memory_file_name(b"model cards driver binary 256"));
+        assert!(name.ends_with(".roles") && name.len() == 32 + 6, "{name}");
     }
 }

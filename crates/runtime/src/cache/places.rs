@@ -91,6 +91,46 @@ impl Cache {
         self.saves.iter().map(|copy| copy.place).chain(self.reserved.iter().copied()).collect()
     }
 
+    /// Keeps the saves of the next record and the saves inside its step
+    /// (`inner`, the conductor's, whose places are reserved here) within the
+    /// room the limit leaves for the memory their places lock as the step is
+    /// handed over. The room was free when the places were taken, and only
+    /// what outranks the prompt cache takes it before the step: the K and V
+    /// beyond VRAM of running sequences, locked just before the record is
+    /// written. When they did, what goes for nothing goes first, then the
+    /// saves whose places need memory, those inside the step first and the
+    /// last of each first: their checkpoints are not taken, and no step fails
+    /// for the lock of a place. Returns the checkpoints given up.
+    pub(crate) fn fit_saves(&mut self, inner: &mut Vec<crate::InnerSave>) -> u32 {
+        let Some(books) = self.books.clone() else { return 0 };
+        let mut dropped = 0;
+        while books.unbooked() < self.pending_locks() {
+            if self.give_up_free(&mut dropped) {
+                continue;
+            }
+            if let Some(at) = inner.iter().rposition(|save| books.place_lock(save.place) > 0) {
+                self.unreserve(inner.remove(at).place);
+                dropped += 1;
+                continue;
+            }
+            let restores = &self.restores;
+            let save = self.saves.iter().rposition(|copy| {
+                books.place_lock(copy.place) > 0
+                    && !restores.iter().any(|restore| restore.place == copy.place)
+            });
+            let Some(at) = save else { break };
+            let place = self.saves[at].place;
+            if let Some(hash) = self.placed.get(&place).copied()
+                && self.index.checkpoint(hash) == Some(CheckpointId(u64::from(place)))
+            {
+                let _ = self.index.set_checkpoint(hash, None);
+            }
+            self.give_up(place, None);
+            dropped += 1;
+        }
+        dropped
+    }
+
     /// A place never used so far, if there is one.
     pub(super) fn unused_place(&mut self) -> Option<u32> {
         (self.next_place < self.capacity).then(|| {
@@ -169,12 +209,32 @@ impl Cache {
     /// goes to the drive unless later requests left it behind at deeper page
     /// boundaries ([`Cache::left_behind`]). `false` when there is none.
     pub(super) fn give_up_index_checkpoint(&mut self, left_behind: bool) -> bool {
+        self.give_up_ranked(left_behind, false)
+    }
+
+    /// [`Cache::give_up_index_checkpoint`] when the memory goes down to the floor
+    /// ([`Cache::trim`], [`Cache::give_way`]): the checkpoint used last (the deepest
+    /// of those) goes last, whatever the ranking says. The floor of one place is
+    /// there so that a conversation goes on from its last checkpoint, and the
+    /// ranking, which keeps roots longest, would keep a long prompt's root and give
+    /// up its anchor: the same prompt sent again then replayed all the cache held.
+    pub(super) fn give_up_toward_floor(&mut self) -> bool {
+        self.give_up_ranked(false, true)
+    }
+
+    fn give_up_ranked(&mut self, left_behind: bool, keep_newest: bool) -> bool {
         if self.index.checkpoints() == 0 {
             return false;
         }
-        let Some(first) = self.index.checkpoint_ranks(&self.policy).first().copied() else {
+        let ranks = self.index.checkpoint_ranks(&self.policy);
+        let newest = (ranks.iter().max_by_key(|rank| (rank.last_used, rank.position)))
+            .filter(|_| keep_newest)
+            .map(|rank| rank.hash);
+        let Some(first) = ranks.iter().find(|rank| Some(rank.hash) != newest).or(ranks.first())
+        else {
             return false;
         };
+        let first = *first;
         if left_behind && !first.aged {
             return false;
         }
