@@ -1094,6 +1094,9 @@ fn a_paused_step_runs_again_until_its_rows_are_done() {
     e.consistent();
 }
 
+/// The steps an executor ran: per step, the slot and the rows of each of its segments.
+type Steps = Vec<Vec<(u32, u32)>>;
+
 /// A request that comes while a step of another prompt is paused runs before that step
 /// is done: the paused step waits for its turn, the new request's prompt is read in pieces
 /// of its own, and both answer as they do alone.
@@ -1110,11 +1113,10 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
     let config = RuntimeConfig { generation_floor: 1e6, ..paused_config() };
     // The first piece of the long prompt is held until the short request has been asked,
     // so that it comes while the step is paused however busy the machine is; and the steps
-    // are counted as the executor runs them, not when the test thread gets to look. Per
-    // step: the slot and the rows of each of its segments.
+    // are counted as the executor runs them, not when the test thread gets to look.
     let gate = Gate::new();
     let (held, first_piece) = std::sync::mpsc::channel();
-    let seen: Arc<Mutex<Vec<Vec<(u32, u32)>>>> = Arc::default();
+    let seen: Arc<Mutex<Steps>> = Arc::default();
     let observed = seen.clone();
     let closer = gate.clone();
     let e = engine_with(&model, config, |host| {
