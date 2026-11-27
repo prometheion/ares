@@ -194,6 +194,17 @@ async fn run(
                         match result {
                             Ok(()) => break,
                             Err(AcquireError::Failed { reason, .. }) => return Err(reason),
+                            // A first step that did not come back: a new image
+                            // would load again what may stick again, so the
+                            // supervisor decides.
+                            Err(AcquireError::Restarting { reason }) => {
+                                tracing::error!(
+                                    "{reason}: before the server served anything; exiting with \
+                                     {} for the supervisor to start it again",
+                                    restart::EXIT_RESTART
+                                );
+                                exit_now(restart::EXIT_RESTART);
+                            }
                             Err(other) => return Err(format!("loading the model failed: {other:?}")),
                         }
                     }

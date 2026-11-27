@@ -383,7 +383,10 @@ and loads the model as at any start, while connections wait in the socket's
 backlog: the PID and the port stay, and a supervisor sees a short outage.
 When the exec cannot be done, or a thread sits in the kernel without a way
 out (state D) for 5 s, the process exits with 75 for its supervisor to start
-it again (a thread in state D holds an exit as it holds an exec). Test hooks:
+it again (a thread in state D holds an exit as it holds an exec); so does a
+server of one model whose engine is stuck before it served anything (the
+first steps after the load), as a new image would only load again what may
+stick again. Test hooks:
 `ARES_TEST_HOLD_STEPS_WHILE` names a file while which the conductor holds every
 step between its dispatch and its collect, and a model file of architecture
 `ares-host` makes the binary serve the host executor's synthetic model, so
