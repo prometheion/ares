@@ -75,7 +75,8 @@ pump's rounds.
 - **Counted** in `/metrics`: `ares_cache_ram_pages`, `ares_cache_ram_bytes`,
   `ares_cache_ram_pages_in_total`, `ares_cache_ram_pages_read_total`,
   `ares_cache_ram_pages_dropped_total` (pages worth keeping that went
-  unwritten: no room, or no level on SSD) and
+  unwritten: no room, or no level on SSD; a page the drive has, or that the
+  writer has been given, is not one of them) and
   `ares_cache_ram_transfer_nanoseconds_total`.
 - **Measured** 2026-11-16 with the server: Qwen3.8-27B Q4_K_S on the RTX 4070
   and the RTX 3060, tensor split 0.625 / 0.375, two sequence slots, the

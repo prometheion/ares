@@ -1108,23 +1108,51 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
     // A floor of generation that the rounds cannot reach: the short request gets half of
     // the time, a round for each piece of the long prompt.
     let config = RuntimeConfig { generation_floor: 1e6, ..paused_config() };
+    // The first piece of the long prompt is held until the short request has been asked,
+    // so that it comes while the step is paused however busy the machine is; and the steps
+    // are counted as the executor runs them, not when the test thread gets to look. Per
+    // step: the slot and the rows of each of its segments.
+    let gate = Gate::new();
+    let (held, first_piece) = std::sync::mpsc::channel();
+    let seen: Arc<Mutex<Vec<Vec<(u32, u32)>>>> = Arc::default();
+    let observed = seen.clone();
+    let closer = gate.clone();
     let e = engine_with(&model, config, |host| {
-        host.with_pauses(16, pieces).with_delay(Duration::from_millis(2))
+        host.with_pauses(16, pieces)
+            .with_delay(Duration::from_millis(2))
+            .with_gate(gate.clone())
+            .with_observer(move |view| {
+                let segments: Vec<(u32, u32)> = (0..view.segments())
+                    .map(|i| view.segment(i))
+                    .map(|s| (s.slot, s.n_rows))
+                    .collect();
+                let mut steps = observed.lock().unwrap();
+                if steps.is_empty() {
+                    closer.close();
+                    let _ = held.send(());
+                }
+                steps.push(segments);
+            })
     });
     let long_run = start(&e.rt, request(&long, Some(20))).unwrap();
-    let deadline = Instant::now() + LIMIT;
-    while e.snapshot().counters.steps_paused < 1 {
-        assert!(Instant::now() < deadline, "the step never paused");
-        std::thread::sleep(Duration::from_micros(200));
-    }
-    let at_start = e.snapshot().counters.steps_paused;
+    first_piece.recv_timeout(LIMIT).expect("the long prompt never ran");
     let short_run = start(&e.rt, request(&short, Some(5))).unwrap();
+    gate.open();
     let short_done = short_run.finish();
-    // A step of the long prompt pauses `pieces - 1` times before its rows are done; the
-    // short request ran between its pieces, a round of its own for a piece of the long one.
-    let paused = e.snapshot().counters.steps_paused - at_start;
     let long_done = long_run.finish();
-    assert!(paused < u64::from(pieces) / 2, "{paused} pauses while the short request ran");
+    // A step of the long prompt runs in `pieces` pieces; the short request ran between
+    // them, a round of its own for a piece of the long one.
+    let steps = seen.lock().unwrap().clone();
+    let first = steps[0][0];
+    assert!(first.1 > 16, "the first step is the long prompt's, which pauses: {first:?}");
+    let piece = |step: &Vec<(u32, u32)>| step.len() == 1 && step[0] == first;
+    let short_steps: Vec<usize> =
+        (0..steps.len()).filter(|&i| steps[i].iter().any(|s| s.0 != first.0)).collect();
+    let (begun, ended) = (short_steps[0], *short_steps.last().unwrap());
+    let paused = steps[begun..ended].iter().filter(|step| piece(step)).count();
+    assert!(paused < pieces as usize / 2, "{paused} pieces ran beside the short request");
+    let after = steps[ended..].iter().filter(|step| piece(step)).count();
+    assert!(after > 0, "the long prompt's step was done before the short request: {steps:?}");
     assert_eq!(short_done.text, fresh_run(shape, &short, 5).text);
     assert_eq!(long_done.text, fresh_run(shape, &long, 20).text);
     e.consistent();

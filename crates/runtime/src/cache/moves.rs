@@ -178,10 +178,14 @@ impl Cache {
     }
 
     /// A page that left the devices found no room in RAM: it is gone, and so
-    /// is its checkpoint, which goes to the drive when it is due there.
+    /// is its checkpoint, which goes to the drive when it is due there. A
+    /// page the drive has, or has been given, is not dropped: it is there.
     pub(super) fn lost(&mut self, leaving: Leaving) {
+        let on_drive =
+            self.ssd.as_ref().is_some_and(|ssd| ssd.has_or_queued(Kind::Page, leaving.hash));
         if let Some(ram) = &mut self.in_ram
             && leaving.tail.is_none()
+            && !on_drive
         {
             ram.counters.pages_dropped += 1;
         }
