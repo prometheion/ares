@@ -23,26 +23,13 @@ use ares_cuda::{
     DevicePtr, Event, FAR_ENTRY, PinnedBuffer, PlanConfig, Planner, Result, Stream, Wait, devices,
 };
 
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::Rng;
+
 const TILE: usize = 128;
 const CONVERTED: u32 = 0x8000_0000;
 const D: usize = 256;
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn gaussian(&mut self) -> f32 {
-        let u1 = (self.next() >> 40) as f32 / (1u64 << 24) as f32 + 1e-7;
-        let u2 = (self.next() >> 40) as f32 / (1u64 << 24) as f32;
-        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-    }
-}
 
 fn bytes_of<T: Copy>(values: &[T], f: impl Fn(T) -> [u8; 4]) -> Vec<u8> {
     values.iter().flat_map(|v| f(*v)).collect()
@@ -70,8 +57,8 @@ fn build(
     let kv = geo.kv_heads as usize;
     let step = 4096usize.min(len);
     let mut rng = Rng(99);
-    let k: Vec<f32> = (0..step * kv * D).map(|_| rng.gaussian()).collect();
-    let v: Vec<f32> = (0..step * kv * D).map(|_| rng.gaussian()).collect();
+    let k: Vec<f32> = (0..step * kv * D).map(|_| rng.normal()).collect();
+    let v: Vec<f32> = (0..step * kv * D).map(|_| rng.normal()).collect();
     let (k, v) = (
         upload(device, &bytes_of(&k, f32::to_le_bytes))?,
         upload(device, &bytes_of(&v, f32::to_le_bytes))?,
@@ -198,7 +185,7 @@ fn main() -> Result<()> {
                 let plan = planner.finish();
                 let buffers = plan.upload(&device)?;
                 let q_len = (kv * g) as usize * D;
-                let q: Vec<f32> = (0..q_len).map(|_| rng.gaussian()).collect();
+                let q: Vec<f32> = (0..q_len).map(|_| rng.normal()).collect();
                 let q = upload(&device, &bytes_of(&q, f32::to_le_bytes))?;
                 let out = DeviceBuffer::new(&device, (q_len * 4) as u64)?;
                 let scratch = DeviceBuffer::new(&device, plan.state_bytes(&geo).max(16))?;

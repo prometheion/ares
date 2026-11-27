@@ -309,6 +309,18 @@ impl Admission {
             + self.output_pages(r.max_new_tokens.saturating_sub(r.generated), self.ratio)
     }
 
+    /// The whole pages of new request `w`'s cached prefix that running
+    /// sequences hold now (none for a spilled one, whose charge counts what
+    /// it computes again).
+    fn held_cached(&self, w: &Waiting) -> u64 {
+        if w.spilled.is_some() {
+            return 0;
+        }
+        let a = &w.arrival;
+        let whole = a.cached_cells.min(a.prompt_cells) / self.config.cells_per_page;
+        u64::from(whole.saturating_sub(a.idle_cached_pages))
+    }
+
     /// What admitting `w` adds to the demand on the pool.
     fn charge(&self, w: &Waiting) -> u32 {
         match &w.spilled {
@@ -460,8 +472,23 @@ impl Admission {
     /// The pages free and evictable for the waiting request `w` in this
     /// pass, past what the requests admitted before it take: the evictable
     /// pages are asked for only when `need` is more than the free ones.
-    fn room(&self, w: &Waiting, need: u64, tally: &mut Tally, view: &mut dyn PoolView) -> u64 {
-        let mut room = u64::from(tally.free) + u64::from(tally.released);
+    /// What the requests made to give way let go of (in this pass, and
+    /// `released` more) counts, but for the pages of the cached prefixes of
+    /// `w` and of the requests admitted before it that running sequences
+    /// hold: those are taken again, and the charges left them out already.
+    /// Which of them a request that gave way held is not known here, so all
+    /// of them are taken off.
+    fn room(
+        &self,
+        w: &Waiting,
+        need: u64,
+        released: u64,
+        tally: &mut Tally,
+        view: &mut dyn PoolView,
+    ) -> u64 {
+        let released = u64::from(tally.released) + released;
+        let held = tally.held + self.held_cached(w);
+        let mut room = u64::from(tally.free) + released.saturating_sub(held);
         if need > room {
             let n = *tally.evictable.get_or_insert_with(|| view.evictable());
             let usable = n.saturating_sub(tally.taken).saturating_sub(w.arrival.idle_cached_pages);
@@ -488,7 +515,7 @@ impl Admission {
         let mut fits = self.running.is_empty();
         if !fits {
             let need = u64::from(tally.granted) + u64::from(tally.held_back) + u64::from(charge);
-            fits = need <= self.room(&w, need, tally, view);
+            fits = need <= self.room(&w, need, 0, tally, view);
         }
         if !fits {
             self.waiting[i].passed = w.passed.saturating_add(1);
@@ -502,6 +529,7 @@ impl Admission {
     fn seat(&mut self, i: usize, charge: u32, tally: &mut Tally, out: &mut Outcome) {
         let w = self.waiting[i];
         tally.taken = tally.taken.saturating_add(w.arrival.idle_cached_pages);
+        tally.held = tally.held.saturating_add(self.held_cached(&w));
         match w.spilled {
             Some(was) => {
                 self.running.push(was);
@@ -561,7 +589,7 @@ impl Admission {
         let mut released = 0u64;
         let mut chosen: Vec<(usize, u32, u32, u32)> = Vec::new();
         for r in victims {
-            let room = self.room(&w, need, tally, view) + released;
+            let room = self.room(&w, need, released, tally, view);
             if places > 0 && need <= room {
                 break;
             }
@@ -580,7 +608,7 @@ impl Admission {
             released += u64::from(freed);
             chosen.push((r, freed, granted, reserve));
         }
-        let room = self.room(&w, need, tally, view) + released;
+        let room = self.room(&w, need, released, tally, view);
         if places == 0 || need > room {
             return false;
         }
@@ -709,6 +737,10 @@ struct Tally {
     held_back: u32,
     /// Idle cached pages that the requests admitted in this pass take.
     taken: u32,
+    /// Pages of the cached prefixes of the requests admitted in this pass
+    /// that running sequences held: of what a request made to give way lets
+    /// go, these are taken again.
+    held: u64,
     /// The evictable pages, once they were asked for.
     evictable: Option<u32>,
     /// Pages that requests made to give way in this pass let go of.
@@ -737,7 +769,7 @@ impl Claims<'_> {
     }
 
     /// A running sequence's claim for this step: `required` pages for the
-    /// rows it must get (its newest token, decision rows, prompt rows) and
+    /// rows it must get (its newest token, prompt rows) and
     /// `optional` pages more for rows it can do without (drafts), of which
     /// `prompt_rows` rows are rows of its prompt. Claims of sequences that do
     /// not run are ignored.
@@ -847,6 +879,7 @@ impl Claims<'_> {
                 granted,
                 held_back: a.reserved_pages(),
                 taken: 0,
+                held: 0,
                 evictable,
                 released: 0,
                 kept,

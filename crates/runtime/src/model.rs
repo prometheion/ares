@@ -284,6 +284,8 @@ pub struct DeviceTransfer {
     /// The pool page, or the checkpoint place.
     pub object: u32,
     pub keep_form: bool,
+    /// A page on the way in is a tail ([`Transfer::tail`](crate::Transfer::tail)).
+    pub tail: bool,
     /// Host memory with `room` bytes, aligned to 4096.
     pub ptr: *mut u8,
     pub room: usize,
@@ -758,6 +760,20 @@ pub trait Model: Send + Sync + 'static {
         let _ = record;
         Ok(())
     }
+
+    /// The steps that measure what a step costs have run (the conductor's
+    /// warm-up, before the first request). They read a made-up text, token 0
+    /// at every position, so what a model learns from the text of its steps
+    /// (which experts a text picks) should forget them. Called once, on the
+    /// conductor's thread, while no step runs.
+    fn measured(&self) {}
+
+    /// Nothing runs and nobody waits: the conductor is about to sleep until a
+    /// request comes. A model gives back here what it holds only for the
+    /// steps of running requests (VRAM it borrowed for a prompt), instead of
+    /// at its next step. Called on the conductor's thread while no step runs,
+    /// each time the conductor finds nothing to do.
+    fn idle(&self) {}
 
     /// Builds device part `cx.index`. Called on that device's thread.
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError>;

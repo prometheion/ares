@@ -11,8 +11,8 @@
 //! device and no model in sight:
 //!
 //! - [`plan`] composes a step from what the sequences want ([`Want`]), giving
-//!   generating sequences their newest token first, then the option rows of
-//!   decisions, then drafts, and prompts the rest.
+//!   generating sequences their newest token first, then drafts, and prompts
+//!   the rest.
 //! - [`Share`] decides whether the next step is a round of generation or a
 //!   piece of prompt, so that generation keeps a chosen rate while a long
 //!   prompt is read and the prompt gets the rest of the time, and a short one

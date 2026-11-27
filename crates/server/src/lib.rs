@@ -35,13 +35,12 @@
 //! ([`ares_api::Engine::chat_format`]); the `reasoning` module sorts the text
 //! by it and has the controls of llama-server for thinking.
 //!
-//! `/v1/systemone` has the request and response of llama.cpp's endpoint of
-//! that name (the TypeSafe System One API): typed questions about a `state`,
-//! answered by choosing among options. It is meant for every model ("Jev
-//! mode"); the runtime does not decide yet, so it answers 501 today. The
-//! `systemone` module says how the options that only a native decision model
-//! has are handled. Decisions and generation requests run at the same time
-//! and neither waits for the other.
+//! `/v1/systemone` has the request, the response and the errors of Flide's
+//! endpoint of that name (the TypeSafe System One API): typed questions about
+//! a `state`, answered by choosing among options, one request or several in
+//! one body. Every model answers there ("Jev mode"); the `systemone` module
+//! has the wire format. Decisions and generation requests run at the same
+//! time and neither waits for the other.
 //!
 //! The one non-obvious piece is the hand-over between the engine's threads
 //! and the async handlers, documented in the `bridge` module: what happens

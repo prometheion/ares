@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use ares_core::Ledger;
 use ares_cuda::{ENTRY_CELLS, MAX_BATCH};
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertStore, HostRegion, PIECE, Serve, StoreError, StorePlan,
+    CudaSlots, ExpertStore, HostRegion, PIECE, RamShrink, Serve, StoreError, StorePlan,
 };
 use ares_runtime::{DeviceContext, DeviceModel, Model, ModelError, PinnedRam};
 
@@ -472,6 +472,9 @@ impl Qwen4Exp {
         let (mut feed, mask) =
             open::open_feed(store, boards, &self.placement, layout, c, &self.opts, device)?;
         build.prune_mask = mask;
+        if let Some(log) = self.log.clone() {
+            feed.store.on_shrink(Box::new(move |shrink| log(&shrink_line(&shrink))));
+        }
         if build.mtp {
             feed.set_mtp();
             feed.fill_mtp(c.experts.count)?;
@@ -593,6 +596,20 @@ impl Qwen4Exp {
         }
         Ok(())
     }
+}
+
+/// The log line of a shrink of the tier of experts in RAM.
+fn shrink_line(shrink: &RamShrink) -> String {
+    use ares_core::units::Bytes;
+    let RamShrink { pieces, bytes, held, target, at_floor } = *shrink;
+    let floor = if at_floor { "; it is at its floor and keeps the rest" } else { "" };
+    format!(
+        "the tier of experts in RAM gave {pieces} piece(s), {}, back to the machine: it holds {} \
+         and may hold {}{floor}",
+        Bytes(bytes),
+        Bytes(held),
+        Bytes(target),
+    )
 }
 
 /// The meeting of the parts of `n` devices while they open.

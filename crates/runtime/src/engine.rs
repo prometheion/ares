@@ -8,11 +8,13 @@ use std::time::Duration;
 
 use ares_api::{
     ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
-    GenerateRequest, ModelCard, Prompt, RequestId, ThinkingFormat,
+    GenerateRequest, Json, Labels, ModelCard, Prompt, RequestId, SINGLE_LABELS, ThinkingFormat,
 };
 use ares_cuda::Device;
 
-use crate::conductor::{Command, Conductor, SequenceInfo, StatsCopy, Submission};
+use crate::conductor::{
+    Command, Conductor, DecisionSubmission, Role, SequenceInfo, StatsCopy, Submission,
+};
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::exec::{ExecError, Executor};
@@ -68,6 +70,9 @@ pub struct Runtime {
     slots: u32,
     /// The text of the chat template conversations are rendered with.
     template: Option<String>,
+    /// The labels a decision reads its options by, found in the model's
+    /// tokenizer at the first decision.
+    labels: OnceLock<Result<Labels, String>>,
 }
 
 /// One request the engine holds; gives its place up when the sink that
@@ -201,6 +206,7 @@ impl Runtime {
             queue,
             slots,
             template: None,
+            labels: OnceLock::new(),
         })
     }
 
@@ -349,9 +355,92 @@ impl Runtime {
             priority: request.priority,
             displace,
             sink: events,
+            role: Role::Request,
         });
         let sent = match self.commands.lock().expect("commands").as_ref() {
             Some(sender) => sender.send(Command::Submit(submission)).is_ok(),
+            None => false,
+        };
+        self.asked();
+        if !sent {
+            return Err(EngineError::Internal("the engine has shut down".into()));
+        }
+        Ok(())
+    }
+
+    /// The labels a decision reads the options of the model by, found in its
+    /// tokenizer (see [`ares_api::Labels`]): what [`Engine::decide`] uses, for
+    /// whoever needs to ask a question as the engine does.
+    pub fn labels(&self) -> Result<Labels, EngineError> {
+        self.labels
+            .get_or_init(|| labels_of(&*self.model))
+            .clone()
+            .map_err(EngineError::Unsupported)
+    }
+
+    /// [`Engine::decide`] with `labels` for the labels of the options in place
+    /// of the ones found in the model's tokenizer: for a model whose tokenizer
+    /// has none (the synthetic model of the tests reads a byte per token).
+    pub fn decide_with(
+        &self,
+        request: DecisionRequest,
+        outcome: DecisionSink,
+        labels: &Labels,
+    ) -> Result<(), EngineError> {
+        if request.model != self.card.id {
+            return Err(EngineError::ModelNotFound(request.model));
+        }
+        request.validate()?;
+        // Each question as a prompt of its own, thinking off, as Flide's
+        // next_token format asks a chat model.
+        let mut prompts = Vec::with_capacity(request.questions.len());
+        let mut tokens = Vec::with_capacity(request.questions.len());
+        for question in &request.questions {
+            let rendered = question.render(labels)?;
+            prompts.push(
+                self.model.encode(&ares_api::question_prompt(&request.state, &rendered.text))?,
+            );
+            tokens.push(rendered.tokens);
+        }
+        // The start every prompt shares: each keeps at least its last token,
+        // whose logits are read.
+        let shortest = prompts.iter().map(Vec::len).min().unwrap_or(0);
+        let mut shared = 0;
+        while shared + 1 < shortest && prompts.iter().all(|p| p[shared] == prompts[0][shared]) {
+            shared += 1;
+        }
+        let longest = prompts.iter().map(Vec::len).max().unwrap_or(0);
+        let total = shared + prompts.iter().map(|p| p.len() - shared).sum::<usize>();
+        // Flide's limits, then what the model's context and the pool hold.
+        if longest > ares_api::MAX_BRANCH_TOKENS {
+            return Err(EngineError::InvalidRequest(format!(
+                "state plus longest question is {longest} tokens, limit is {}",
+                ares_api::MAX_BRANCH_TOKENS
+            )));
+        }
+        if total > ares_api::MAX_REQUEST_TOKENS {
+            return Err(EngineError::InvalidRequest(format!(
+                "request is {total} tokens, limit is {}",
+                ares_api::MAX_REQUEST_TOKENS
+            )));
+        }
+        if longest >= self.limit as usize {
+            return Err(EngineError::ContextOverflow {
+                prompt_tokens: u32::try_from(longest).unwrap_or(u32::MAX),
+                limit: self.limit,
+            });
+        }
+        let submission = Box::new(DecisionSubmission {
+            id: request.id,
+            questions: request.questions,
+            prompts,
+            labels: tokens,
+            shared,
+            priority: request.priority,
+            sink: outcome,
+        });
+        let sent = match self.commands.lock().expect("commands").as_ref() {
+            Some(sender) => sender.send(Command::Decide(submission)).is_ok(),
             None => false,
         };
         self.asked();
@@ -508,12 +597,16 @@ impl Engine for Runtime {
         self.start_request(request, events, None)
     }
 
-    fn decide(&self, _: DecisionRequest, _: DecisionSink) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported(
-            "decisions are not implemented by the runtime skeleton: scoring option rows needs \
-             the model's logits for forked sequences"
-                .into(),
-        ))
+    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
+        if request.model != self.card.id {
+            return Err(EngineError::ModelNotFound(request.model));
+        }
+        let labels = self
+            .labels
+            .get_or_init(|| labels_of(&*self.model))
+            .as_ref()
+            .map_err(|why| EngineError::Unsupported(why.clone()))?;
+        self.decide_with(request, outcome, labels)
     }
 
     fn cancel(&self, id: RequestId) {
@@ -579,6 +672,70 @@ impl Engine for Runtime {
             },
         })
     }
+}
+
+/// The labels a decision reads the options of `model` by: each label's token
+/// where the reply starts, after the chat template's generation prompt.
+///
+/// Ported from Flide's `NextToken._reply_token` and `NextToken._pairs`
+/// (`flide/formats/next_token.py`, <https://github.com/OmniJev/Flide>,
+/// commit caffe660df88db747d6da9f95f7d6759fea38698): the prompt of a question
+/// is cut after its last control token (the start of the reply, which the
+/// template writes after it, is what is left), and a label is the one token
+/// that text and the label add to the text alone. Every one of
+/// [`SINGLE_LABELS`] must be such a token, and no two the same; the two-letter
+/// labels are those that are and differ from every label before them, up to
+/// [`Labels::MAX_PAIRS`].
+fn labels_of(model: &dyn crate::model::Model) -> Result<Labels, String> {
+    let unusable = |why: String| format!("this model cannot answer decisions: {why}");
+    let probe = model
+        .encode(&ares_api::question_prompt(&Json::Null, "x"))
+        .map_err(|e| unusable(e.to_string()))?;
+    let mut piece = Vec::new();
+    let cut = probe
+        .iter()
+        .rposition(|&token| {
+            piece.clear();
+            model.piece(token, &mut piece);
+            piece.is_empty()
+        })
+        .map_or(0, |at| at + 1);
+    let mut reply = Vec::new();
+    for &token in &probe[cut..] {
+        model.piece(token, &mut reply);
+    }
+    let reply = String::from_utf8_lossy(&reply).into_owned();
+    let encode = |text: String| model.encode(&Prompt::Text(text)).unwrap_or_default();
+    let base = encode(reply.clone());
+    let token_of = |label: &str| -> Option<u32> {
+        let tokens = encode(format!("{reply}{label}"));
+        (tokens.len() == base.len() + 1 && tokens[..base.len()] == base[..])
+            .then(|| tokens[base.len()])
+    };
+    let mut singles = Vec::with_capacity(SINGLE_LABELS.len());
+    for label in SINGLE_LABELS {
+        match token_of(label) {
+            Some(token) if !singles.contains(&token) => singles.push(token),
+            _ => {
+                return Err(unusable(format!(
+                    "label {label:?} is not one distinct token after this model's chat prompt"
+                )));
+            }
+        }
+    }
+    let mut pairs = Vec::new();
+    for label in Labels::pair_candidates() {
+        if pairs.len() == Labels::MAX_PAIRS {
+            break;
+        }
+        if let Some(token) = token_of(&label)
+            && !singles.contains(&token)
+            && !pairs.iter().any(|(_, t)| *t == token)
+        {
+            pairs.push((label, token));
+        }
+    }
+    Ok(Labels { singles, pairs })
 }
 
 /// Where the thinking of a reply to `prompt` is: inside, when the last tag of

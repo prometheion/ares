@@ -137,6 +137,21 @@ impl Layout {
 }
 
 /// Which pieces of the region the tier holds and what it may hold.
+/// What one shrink of the RAM tier gave back ([`ExpertStore::on_shrink`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RamShrink {
+    /// The pieces given up.
+    pub pieces: usize,
+    /// Their bytes.
+    pub bytes: u64,
+    /// The bytes the tier holds after it.
+    pub held: u64,
+    /// The bytes it may hold.
+    pub target: u64,
+    /// It holds more than it may and has nothing left to give.
+    pub at_floor: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct Pieces {
     pub layout: Layout,
@@ -227,6 +242,13 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.pieces.at_floor
     }
 
+    /// Tells `f` of every shrink of the RAM tier that gave up a piece, where
+    /// it gave it up (with the store held: `f` only reports). The runtime
+    /// writes no log; the owner of the store does.
+    pub fn on_shrink(&mut self, f: Box<dyn FnMut(RamShrink) + Send>) {
+        self.on_shrink = Some(f);
+    }
+
     /// Says how many bytes the tier may hold from now on. It follows between
     /// steps ([`ExpertStore::shrink_ram`], [`ExpertStore::grow_ram`]).
     pub fn set_ram_target(&mut self, bytes: u64) {
@@ -273,6 +295,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         let mut given = 0;
         let mut kept = HashSet::new();
+        let before = self.region.locked_bytes() as u64;
         while self.region.locked_bytes() as u64 > self.pieces.target {
             let Some(piece) = self.piece_to_release(&kept) else {
                 self.pieces.at_floor = true;
@@ -289,6 +312,18 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
         }
         self.pieces.shrinking = false;
+        if given > 0
+            && let Some(f) = &mut self.on_shrink
+        {
+            let held = self.region.locked_bytes() as u64;
+            f(RamShrink {
+                pieces: given,
+                bytes: before - held,
+                held,
+                target: self.pieces.target,
+                at_floor: self.pieces.at_floor,
+            });
+        }
         Ok(given)
     }
 

@@ -11,7 +11,18 @@ and Anthropic HTTP APIs. This page goes from the source to a first answer.
 | An Ampere (RTX 30) or Ada (RTX 40) card | running; other GPUs are refused, see [hardware.md](hardware.md) |
 | Rust 1.95 or newer (`rust-toolchain.toml` picks the stable channel) | building |
 | CUDA toolkit 13.0 or newer, for `nvcc` | building only, not running |
-| `glslc`, the shader compiler of the Vulkan SDK or of the shaderc package | building the Vulkan shaders |
+| `glslc` 2024 or newer, from the Vulkan SDK or from LunarG's `shaderc` package | building the Vulkan shaders |
+
+A distribution's `shaderc` may be too old: Ubuntu 24.04 ships 2023.8, which does
+not know `GL_EXT_integer_dot_product` and fails on the `mmvq` shaders. LunarG's
+package (2025.2 was used) carries a current `glslc` and replaces the
+distribution's `glslc`, which owns the same path:
+
+```sh
+curl -sS -o /etc/apt/trusted.gpg.d/lunarg.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc
+curl -sS -o /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+sudo apt update && sudo apt remove glslc && sudo apt install shaderc
+```
 
 ## Build
 
@@ -94,7 +105,7 @@ A preset file gives a model a short id and aliases. With `--api-key`, set
 | --- | --- |
 | The log | standard error; `--log-file <FILE>` appends to a file, `--log-format json` writes one JSON object a line |
 | Log level | the `RUST_LOG` environment variable, default `info` (for example `RUST_LOG=debug`) |
-| At start | the devices, the split, the context and why, the RAM limit, and what each device took |
+| At start | the devices, the split, the context and why, the RAM limit, what each device took, and per device whether its tensor cores are capped and which kernel path each weight type was measured to be fastest on |
 | Per request | a line `request` when it is taken (model, API, `max_tokens`, sampling fields, tools, priority) and a line `request finished` (finish reason, `prompt_tokens`, `cached_prompt_tokens`, `queued_ms`, `prompt_ms`, `completion_tokens`, `reasoning_tokens`, `tokens_per_s`, `drafts`, `drafts_accepted`); the prompt and the reply only with `--log-text` |
 
 `GET /metrics` returns the counters of the loaded model in the Prometheus text

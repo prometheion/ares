@@ -31,8 +31,8 @@
 use ares_cuda as backend;
 use ares_quant::act;
 use backend::{
-    Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, Precision,
-    PrefillPath, StateFormat, StepDims, Stream,
+    Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, PrefillPath,
+    StateFormat, StepDims, Stream,
 };
 use common::gpu::gpus;
 use layers::DeviceMatrix;
@@ -130,7 +130,7 @@ impl<'a> Chain<'a> {
     fn new(gpu: &'a Gpu, mode: Mode) -> Self {
         let path = match mode {
             Mode::Fast => PrefillPath::Int8,
-            Mode::Exact => gpu.kernels.prefill_path(Precision::Exact).unwrap(),
+            Mode::Exact => PrefillPath::F16,
         };
         Self { gpu, mode, path }
     }

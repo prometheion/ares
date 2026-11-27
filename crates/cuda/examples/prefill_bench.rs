@@ -166,9 +166,8 @@ fn main() -> Result<()> {
         let device = Device::open(info.ordinal, Wait::Spin)?;
         let kernels = Kernels::load(&device)?;
         let stream = Stream::new(&device, 0)?;
-        let fast = kernels.prefill_path(Precision::Fast)?;
         println!(
-            "CUDA{} {}: {} x {}; f16 mma with f32 accumulation at full rate: {} (fast path {fast:?})",
+            "CUDA{} {}: {} x {}; f16 mma with f32 accumulation at full rate: {}",
             info.ordinal,
             info.name,
             n_out(),
@@ -209,7 +208,7 @@ fn main() -> Result<()> {
                 }
                 choice.path
             } else {
-                fast
+                kernels.prefill_path_for(ty, Precision::Fast)?
             };
             time_type(&device, &kernels, &stream, ty, &rows, &paths, fast, decode_rows)?;
         }

@@ -68,7 +68,9 @@ const uint GROUPS = D / 32u;
 const uint DPT = D / 128u;
 // Cells per chunk: one per invocation.
 const uint CH = 128u;
-const float NEG_INF = uintBitsToFloat(0xff800000u);
+// A built-in call is not a constant expression, so this cannot be a global
+// const: strict glslang rejects it. A macro is evaluated where it is used.
+#define NEG_INF uintBitsToFloat(0xff800000u)
 
 const uint ITEM_CONVERTED = 1u;
 const uint ITEM_CAUSAL = 2u;

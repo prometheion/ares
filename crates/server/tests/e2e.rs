@@ -333,11 +333,11 @@ fn ties(request: &DecisionRequest) -> DecisionOutcome {
         request.questions.iter().map(|q| q.answer(&vec![0.0; q.n_options()]).unwrap()).collect();
     let usage = Usage {
         prompt_tokens: 12,
-        completion_tokens: 0,
+        completion_tokens: request.questions.len() as u32,
         cached_prompt_tokens: 0,
         ..Usage::default()
     };
-    DecisionOutcome::Decided(DecisionResult { answers, usage })
+    DecisionOutcome::Decided(DecisionResult { answers, usage, prefix_tokens: 4 })
 }
 
 #[tokio::test]
@@ -375,7 +375,7 @@ async fn a_decision_is_answered_on_its_own_connection_while_a_stream_is_open() {
     assert_eq!(answer["model"], "mock");
     assert_eq!(answer["answers"]["route"]["choice"], "billing", "a tie goes to the first option");
     assert_eq!(answer["answers"]["angry"]["noul"], 0.5);
-    assert_eq!(answer["usage"], json!({"input_tokens": 12, "output_tokens": 0}));
+    assert_eq!(answer["usage"], json!({"input_tokens": 12, "output_tokens": 2}));
     assert_eq!(engine.sends(), [true], "the stream was still stuck when the decision was answered");
 
     // The stream then finishes with everything in it.

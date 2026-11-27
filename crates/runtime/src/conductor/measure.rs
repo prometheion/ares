@@ -75,6 +75,7 @@ impl Conductor {
             chain_ms: self.drafting.chains.iter().map(|c| c.points().collect()).collect(),
         });
         self.stats.reset();
+        self.model.measured();
         Ok(())
     }
 

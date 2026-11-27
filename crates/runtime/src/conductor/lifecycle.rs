@@ -33,6 +33,7 @@ impl Conductor {
             priority,
             displace,
             sink,
+            role,
         } = submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
@@ -184,6 +185,7 @@ impl Conductor {
             pending: Vec::new(),
             emitted: String::new(),
             finished: None,
+            role,
         });
         self.by_id.insert(id, Place::Waiting);
     }
@@ -247,8 +249,11 @@ impl Conductor {
             let Resume { cached_cells: cached, restore, replay, .. } = probe.resume;
             a.cells = Sequence::from_shared(&mut self.pool, &probe.found.table(), cached);
             a.chain = cache.chain_after(&probe.found, &a.names[..a.known as usize]);
-            // The pages this sequence will fill are its to announce.
-            cache.index.announce(a.owner, a.chain.unpublished());
+            // The pages this sequence will fill are its to announce; a fork's
+            // stay its own.
+            if a.enters_cache() {
+                cache.index.announce(a.owner, a.chain.unpublished());
+            }
             a.replay_end = cached as u32;
             a.replay_left = (replay.end - replay.start) as u32;
             a.checkpoint_at = 0;
@@ -397,6 +402,10 @@ impl Conductor {
             }
             a.sink.send(Event::Done { finish, usage: a.usage() });
         }
+        // A fork of a decision leaves the pages it published and nothing
+        // else: its state is its question's, which no later prompt starts from
+        // (and a copy of it costs what a checkpoint costs).
+        let keep = keep && !matches!(a.role, Role::Fork { .. });
         if keep {
             self.keep(&mut a, slot);
         } else if let Some(cache) = &mut self.cache {
@@ -412,11 +421,14 @@ impl Conductor {
         a.cells.release(&mut self.pool);
         self.free_slots.push(slot);
         self.active -= 1;
-        match finish {
-            FinishReason::Cancelled => {
+        match (finish, &a.role) {
+            (FinishReason::Cancelled, _) => {
                 self.admission.remove(a.seq);
                 self.stats.counters.requests_cancelled += 1;
             }
+            // A part of a decision produces nothing by design: it teaches the
+            // accounting nothing about what requests produce.
+            (_, Role::Parent { .. } | Role::Fork { .. }) => self.admission.remove(a.seq),
             _ => {
                 // What it produced of what it was allowed teaches the
                 // accounting what to expect of the others.
@@ -424,6 +436,10 @@ impl Conductor {
                 self.stats.counters.requests_finished += 1;
             }
         }
+        if let Role::Parent { decision } = a.role {
+            self.parent_cached(decision, a.cached_prompt);
+        }
+        self.part_ended(a.id, &a.role, finish);
     }
 
     /// Ends the waiting request at index `i` of the line.
@@ -439,6 +455,7 @@ impl Conductor {
         }
         a.cells.release(&mut self.pool);
         self.stats.counters.requests_cancelled += 1;
+        self.part_ended(a.id, &a.role, finish);
     }
 
     pub(super) fn finish_everything(&mut self, finish: FinishReason) {
@@ -448,12 +465,16 @@ impl Conductor {
         while !self.waiting.is_empty() {
             self.dismiss(self.waiting.len() - 1, finish);
         }
+        self.end_decisions();
     }
 
     /// Ends every request with an error, after the devices failed. The
     /// engine accepts no more requests.
     pub(super) fn fail(&mut self, message: String) {
         let error = EngineError::Internal(message.clone());
+        // Before the requests end: a decision whose parts end now fails with
+        // the reason.
+        self.failed = Some(message.clone());
         for slot in 0..self.slots.len() as u32 {
             if let Some(a) = &self.slots[slot as usize] {
                 let _ = a.sink.send(Event::Error(error.clone()));
@@ -466,5 +487,6 @@ impl Conductor {
         }
         let _ = self.failure.set(message.clone());
         self.failed = Some(message);
+        self.end_decisions();
     }
 }

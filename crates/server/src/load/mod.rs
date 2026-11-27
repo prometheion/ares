@@ -25,6 +25,7 @@
 
 mod devices;
 mod files;
+mod products;
 mod qwen35;
 mod qwen4exp;
 mod ram;

@@ -5,7 +5,52 @@ newest first. An item stands under the latest date it names (items that name non
 the end), below the section of `OPEN.md` it stood in. Branch names, commits and paths are as
 they were written then; an open remainder of an item is listed in `OPEN.md` again.
 
+## 2026-11-26
+
+Found and fixed on `feat/jev` (2026-11-26):
+
+- [x] A tail of the prompt cache that went to RAM and came back was settled as a full page on
+      the devices (`Group::adopt_exact`), so with K/V in `q7` to `q4` the exact pool converted
+      it for room when it was short, and the next prompt that continued the tail failed with
+      "page N is copied while it is a converted entry" and took the model down. Met every time
+      on the 27B at the owner's production settings by decisions followed by the chat
+      completions of their questions. Done: a transfer says whether a page on its way in is a
+      tail (`Transfer::tail`), and the exact pool takes it without settling it
+      (`Forms::adopt`).
+
 ## 2026-11-25
+
+Done on `feat/jev` (2026-11-25 to 2026-11-26), the item verbatim and then what was done:
+
+### From "Features / Jev mode"
+
+- [x] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime. Later.
+      Reference (2026-11-18): Flide, https://github.com/OmniJev/Flide (Apache-2.0, Python and
+      Triton, a server for the Jev `/v1/systemone` API, paper arXiv:2610.42148): "exact state
+      forking", one state forked into the questions, each answered in one forward pass, the
+      answer the one the model gives the question alone; a gated delta-rule kernel (from
+      flash-linear-attention), so recurrent state is forked as in our models; Qwen3.5 and Gemma 4
+      chat models and the OneJev / Open-Jev decision models; several requests in one body, up
+      to 256 options a question, a session cache (`--session-cache-gb`), `--batch-invariant`.
+      Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
+      in 28 s; "up to 9.5 times faster than vLLM and SGLang".
+      Its groundwork in the runtime, kept by the cleanup for it (2026-11-24): the decisions of
+      `ares-sched` (`Want::Score`, `PartKind::Score`, the option rows first in `plan`), the
+      conductor's arms for them, and `Engine::decide`, which answers Unsupported today.
+      Done: `/v1/systemone` served for every model with Flide's API (commit caffe660: its
+      request, answers, limits of 256 options, errors, several requests in one body) and its
+      way of asking a chat model (`next_token`, style `vllm`); `Engine::decide` on the runtime:
+      the shared start of the questions' prompts is a parent request, every question a fork
+      that starts from the parent's pages and checkpoint in the prefix cache (Flide's exact
+      state forking), its last row's label logits read back (the record's scores). A fork
+      leaves nothing in the cache; a decision whose shared start and state the cache holds
+      needs no parent. The groundwork of `ares-sched` (`Want::Score`, `PartKind::Score`) went:
+      the forks are prompts. Checked: the 0.8B against the CPU reference (largest difference
+      of a probability 0.0064) and greedy generation alone (4 of 4), the 27B and Flash-Next
+      against greedy generation alone (4 of 4, 3 of 3). How it works: "Decisions" in
+      [`architecture/sequence-state.md`](architecture/sequence-state.md); the numbers in
+      [`experiments/decisions.md`](experiments/decisions.md). What is left stays in `OPEN.md`
+      ("Features", "Jev mode").
 
 Done on `chore/leftovers` (2026-11-25), each item verbatim and then what was done:
 
@@ -42,6 +87,121 @@ From the item "Push day done 2026-11-25 ... Left from it" (its other lines stay 
       Done: the four were format strings continued over a line without `\` and continue with
       `\` now. A scan of every string literal found no others (`expert_bench`'s
       `file {i}     {}`, named with them before, lines up with the labels around it).
+
+Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim, then what fixed it.
+
+### From "Defects", "Model, runtime, kernels"
+
+- [x] GitHub issue #2 (the owner, 2026-11-25): the production 27B (tensor split 0.625 / 0.375,
+      P2P, context 262144, parallel 4, MTP, binary 406cfe99) hangs at the prefill of a new large
+      request after two parallel requests ended; both GPUs at 0 %, the two device threads parked
+      in libcuda, the conductor on `GpuExecutor::collect`'s done bell. Suspects: `cuMemFree` of
+      a `DeviceBuffer` inside a step, and `Plan::upload` (`cuMemAlloc` and a blocking copy) when
+      a step's attention plan does not fit the plan buffer (`qwen35/device/part.rs`).
+
+  *Fixed on `fix/model-sweep`, 2026-11-26:* the first suspect by b08d7b4e (device memory freed
+  behind the gate). The second: the 27B's part sizes its room for plans by
+  `PlanConfig::plan_bytes_bound` (per group of rows and number of KV heads: the budget, the
+  tiles and chunks with their runs of kinds, the rows alone with theirs, 48 bytes an item and
+  12 a range), and a step writes its plans there (`stage_plan`) or fails with an error; it no
+  longer calls `Plan::upload`. Tests: `the_state_slots_stay_in_their_bound` checks every random
+  plan against the bound (worst 25 to 52 KB of 87 to 187 KB at 512 rows),
+  `a_plan_larger_than_the_room_is_refused_not_uploaded` (`qwen35/device/part.rs`). Commit
+  "ares-model: a 27B step never allocates or waits for the device for its attention plans".
+  The room costs 869 KiB of VRAM on the RTX 4070 and 808 KiB on the RTX 3060 at the owner's
+  settings (352 KiB each before), and as much page-locked RAM. The plans of these settings stay
+  far below the old room as well (random steps of 512 rows: at most 52 KB), so the fallback
+  was likely never taken; which of the suspects (or something else) hung production is not
+  known. The repro on the two local cards at the owner's settings (`--parallel 4`, P2P through
+  the patched libcuda, the server under gdb for the stacks; `/var/tmp/ares-fixmodel/repro2/`:
+  two agent requests at once with a shared prompt of 22.8k tokens and 16 tools to their end,
+  then a new conversation of 42k tokens with 14 tools) did not hang: main 0c4fbb60 (the engine
+  code of 406cfe99) 9 cycles of 9, the branch 9 of 9, the first token after 38.5 to 49.3 s.
+
+- [x] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
+      the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
+      another sequence, or past its first tiles with K and V in `q7` to `q4`, can take more (the
+      27B failed so on 2026-11-23, fixed there by 5d5aee5f). To size it with
+      `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs. Files:
+      `crates/model/src/qwen4exp/device/part/frame.rs`, `qwen4exp/device/part.rs` (`check_states`).
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the frame sizes the partial states with `PlanConfig::state_slots_bound` (the 27B's; `alone` = draft window rows or sequences, a tile mean with `q7` to `q4`) and, for steps past the dense limit, with the bound of device-made lists (`list_state_slots`: the step's pieces and one of exact entries a row, which the old bound left out). Cost of the step scratch the parts keep (24 query heads of 256, 24.7 KB a state slot; computed): with `q8` -1 to +17 MB a card at 256 to 512 own rows (the 4070 at 512 rows 1444 -> 1921 slots, +11 MB), with a tile mean +18 to +53 MB; on lent VRAM the wide steps reserve more of the loan. Unit test `device_made_lists_stay_in_their_bound_of_states` (the dense bound is the 27B's, tested in `ares-cuda`). Commit "ares-model: Flash-Next reserves the partial states its plans take".
+  *Followed up 2026-11-26:* the planner's bound took 2912 slots (12 MB) on the RTX 4070 for the made-up model's lent steps of 32 rows (four query heads a KV head: prompt tiles of 32 rows, each with the whole budget), which left the test model 24 rows on the loan under a layer split (`qwen4exp_runtime`: `a_prompt_read_alone_runs_on_vram_the_expert_slots_lend`, `k_and_v_beyond_vram_change_no_token`). The frame now also bounds every row by its sequence's entries (`PlanConfig::row_slots_bound`: a piece is of whole entries, at most `cells / 128 + 1` a row), which is the smaller bound at short contexts only; checked by `the_state_slots_stay_in_their_bound` with sequences of up to a thousand cells as well. Commit "ares-cuda: a row's partial states are bounded by the entries of its sequence".
+
+- [x] Device memory is not behind the gate of page-locked memory: `cuMemFree` "may perform
+      implicit synchronization" too (the libcuda deadlock's class). An engine allocates it when its
+      model opens and frees it when the model goes, but for the 27B's attention plan larger than
+      its buffer (`Plan::upload` inside a step) and an engine that unloads beside another that
+      serves. Files: `crates/cuda/src/memory.rs` (`DeviceBuffer::drop`), `crates/cuda/src/gate.rs`,
+      `crates/model/src/qwen35/device/part.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `DeviceBuffer` is freed through `gate::retire` (`DeviceFree`): at once when no job runs, otherwise when the last job ends; `Device::mem_info` and an allocation that finds no room first free what is due (`gate::settle`, which waits for the running jobs like `gate::change`), so a placement after an unload sees the freed memory. Unit test `settling_frees_what_a_step_gave_back_once_the_step_ends` (`crates/cuda/src/gate.rs`). Commit "ares-cuda: device memory is freed where no job runs".
+
+- [x] The 30-s checks of a step that waits count from the start of the wait, not from the last
+      progress, and then fail the step (`Flow::check`): seen 2026-11-24 as "a step stood still for
+      30s while rows of the n-gram table were read" at load 27 to 34 (main as well), beside the
+      hang after a long far request (the libcuda deadlock, fixed 2026-11-24). Timed from the start:
+      the n-gram wait, the throttle, `follow`, the lend waits and the pass's waits; only `wait_for`
+      and `complete` restart on progress. Files: `crates/model/src/qwen4exp/device/flow.rs`,
+      `qwen4exp/device/runtime/pass.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `Flow::check` counts 30 s from the later of the wait's start and the last time anything of the steps moved (`Flow::moved`: what `Flow::progress` counts, a pass's rows handed on, taken or let run, rows of the n-gram table read; `NgramFeed::completed`), looked at once a wait passes a second, so every wait (the n-gram wait, the throttle, `follow`, the pass's waits) restarts on progress; the lend waits hold the store and still count from their start. Unit test `a_wait_stands_still_from_its_start_or_the_last_move_whichever_is_later`. Commit "ares-model: a step that waits stands still only when nothing has moved for 30 s".
+
+### From "Small fixes", "Model, runtime, kernels"
+
+- [x] The examples' own copies of `Rng` (attention, expert layer, expert rows, expert types,
+      sampler steps, far attention benches) and `f32_bytes` (attention, expert layer, expert
+      rows), where `crates/cuda/tests/common` has them. Left as it is on purpose: the runtime's
+      `store_hidden` (a hot CPU path); optional: the kernel side's type lists per module as an
+      X-macro list. Files: `crates/cuda/examples/`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the six benches include `tests/common` (`#[path]`) and take its `Rng` (with `normal()`, the benches' Box-Muller, same sequence) and `f32_bytes`; their own copies are gone. Left as the item says: the runtime's `store_hidden`, and the kernel side's type lists. Commit "ares-cuda: the benches take the tests' generator and copies".
+
+- [x] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
+      its pool from the context alone and the device's ledger refuses the drafter (the server's
+      plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `--engine` sizes its pool as the server's plan does: the pages of the context, at most what every device holds beside the model's footprint (`Estimate::footprint_of`, the drafters included) with 256 MiB left free, and says when it holds fewer. A dev tool: no test. Commit "ares-model: qwen35_run sizes its pool by what the devices hold".
+
+- [x] The DFlash drafter's float matrices take the f16 tile path above eight rows without the
+      range check of Flash-Next's (`WeightRange`). File: `crates/model/src/dflash/device.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* every matrix of the drafter keeps its `WeightRange` (read when it is uploaded), and a product of more than eight rows takes the tiles only where `WeightRange::path` leaves them; a float matrix beyond f16 runs the decode kernels eight rows at a time; the model's head passes its own range (`head_product`). No test of its own: the drafter's device test needs the real drafter files, whose matrices are quantized; the rule is `WeightRange::path`, tested in `ares-cuda`. Commit "ares-model: the DFlash drafter keeps float weights beyond f16 off the tiles".
+
+- [x] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
+      server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
+      `crates/runtime/src/ram.rs`, the server's loader.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the store tells a callback of every shrink of the RAM tier (`ExpertStore::on_shrink`, `RamShrink`: pieces, bytes, what it holds and may hold, at its floor), Flash-Next turns it into a line (`Qwen4Exp::with_log`), and the server logs it at info. Test in `crates/runtime/tests/expert_store.rs` (the shrink to half). Commit "ares-runtime: a log line when the tier of experts in RAM shrinks".
+
+- [x] A loan of VRAM stays while the engine is idle after a request that ended with its prompt
+      (it goes back at the next step only). Files: `crates/model/src/qwen4exp/device/flow.rs`,
+      `qwen4exp/device/runtime/pass.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the conductor tells the model when nothing runs and nobody waits (`Model::idle`), and Flash-Next gives back the VRAM lent for wide steps and the loan of a pass that has read its rows there (`Flow::idle`); a pass that has not read all its rows keeps its loan. GPU test `a_loan_goes_back_when_the_engine_idles` (`crates/model/tests/qwen4exp_runtime.rs`); the test wrappers of a model pass `measured` and `idle` on. Commit "ares-runtime: Flash-Next gives lent VRAM back when the engine idles".
+
+- [x] The heat counts the steps that measure the price of a step at the start (token 0, about a
+      thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
+      still counts it for a model without a profile. Files:
+      `crates/runtime/src/conductor/measure.rs`, `crates/model/src/qwen4exp/device/usage.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the conductor tells the model when the steps that measure are done (`Model::measured`, at the end of the warm-up), and Flash-Next forgets the heat they left (`ExpertStore::forget_heat`), with a usage profile or without. Test `the_model_hears_once_that_the_steps_that_measure_are_done` (`crates/runtime/tests/conductor.rs`). Commit "ares-runtime: Flash-Next forgets the heat of the steps that measure".
+
+- [x] Sampler: a row with no finite logit reports `-0.0` where the reference says minus infinity
+      (the test leaves such rows out). Files: `crates/cuda/kernels/sampler*.cuh`,
+      `crates/cuda/src/sampler.rs`, `crates/cuda/tests/sampler.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the finishing kernel leaves minus infinity for a pick without a finite logit (`ares_lp_finish`, the model's own probabilities: the distance from the row's best was NaN and became 0); `crates/cuda/tests/sampler.rs` checks such rows now. Commit "ares-cuda: a pick without a finite logit has the probability minus infinity".
+
+- [x] Flash-Next's step scratch starts its buffers on a 64-byte line, not the 128-byte line fixed
+      for the 27B (`Kernels::ACTIVATION_LINE`). File: `crates/model/src/qwen4exp/device/part/frame.rs`
+      (`PieceCarve`).
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* `PieceCarve` starts every buffer on `Kernels::ACTIVATION_LINE` (128 bytes), as the 27B's carve; a piece of a loan starts at an expert slot, and a real file's slots are multiples of 256 bytes. Unit test `the_carve_starts_every_buffer_on_a_line_and_in_one_piece`. Commit "ares-model: Flash-Next's step scratch starts its buffers on 128-byte lines".
+
+- [x] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
+
+  *Fixed on `fix/model-sweep`, 2026-11-25:* the test plays one priority in nine runs and two or three in four (shortage victims by priority, a running request outranked only by a better newcomer, a spilled one in line holds back its own and every worse priority, overtaking counted by the same or a worse priority). It found a defect of admission: a newcomer that made worse ones give way counted what they let go of as room, the pages of its own cached prefix among them, which its charge had left out already (`Admission::room` takes those of the prefixes that running sequences hold off now). Commit "ares-sched: the admission test plays several priorities, and a newcomer's prefix is not counted twice".
 
 Found done or stale by the triage of 2026-11-25 (branch `docs/triage`, every open item checked
 against `main` 4c834979): each item verbatim, then what did it or what changed. Items that only

@@ -24,7 +24,7 @@ does not read are passed over. `null` counts as "not set".
 | `GET` | `/metrics` | counters and histograms in the Prometheus text format; `?model=<id>` with several models |
 | `POST` | `/models/load`, `/models/unload` | `{"model": "<id>"}`: load or unload a model; answers `{"success": true}` at once |
 | `GET` | `/models/sse` | Server-Sent Events: the state of every model, then every change (`{"model", "event": "model_status", "data": {"status", "reason"}}`) |
-| `POST` | `/v1/systemone` | the decision route of Jev mode; answers 501 until it is built |
+| `POST` | `/v1/systemone` | decisions (Jev mode): questions about a state answered by choosing among options, see [Decisions](#decisions) |
 
 Every generating request names its `model`: an id or an alias. An unknown model
 is a 404 `model_not_found` that lists the ids. A model that is not loaded is
@@ -237,6 +237,41 @@ dropped, and no EXIF orientation or color profile is applied, as in llama.cpp.
 An image has at most 16384 pixels a side and 64 megapixels, within the 64 MiB of
 a body. Remote URLs are not fetched. One image becomes at most
 `--image-max-tokens` tokens; a larger one is shrunk.
+
+## Decisions
+
+`POST /v1/systemone` answers typed questions about a `state` by choosing among
+options, with no text generated ("Jev mode"), for every model. The request, the
+answer and the errors are Flide's (TypeSafe's System One API), so a client of
+Flide works unchanged.
+
+| Field | Meaning |
+| --- | --- |
+| `state` | what the questions are about: text, or any JSON (written into the prompt as Python's `json.dumps` writes it); null when left out |
+| `model` | the model's id or an alias; `jev-latest` or none: the one model the server serves |
+| `questions` | a map of question id to `{"type", "instructions", "criteria"}`: `choice` with `criteria` a map of option to description (1 to 256 options), `score` with a list of levels (1 to 256), `noul` with `{"true", "false"}` descriptions (optional); `instructions` (any JSON) optional |
+| `requests` | instead of `state` and `questions`: a list of up to 1024 such requests, answered together; one that fails fails them all |
+
+The answer is `{"model", "answers", "usage", "meta"}`: a `choice` has the chosen
+key, the `probabilities` of all options and a `confidence`; a `score` the
+expected level (`score`), the `legend` as sent, the `probabilities` and a
+`confidence`; a `noul` the probability of yes (`noul`). Numbers have six
+places. `usage` counts `input_tokens` (the shared state once and every
+question's rest) and one `output_tokens` a question; `meta` says how the model
+read it (`prefix_tokens` shared, `branches`, `cached_tokens` of the state from
+the prompt cache). Several requests answer `{"model", "results": [...]}`.
+
+Every question is a prompt of its own: the state, a blank line, the question
+with its options labeled (A to Z and two-letter labels, `yes`/`no`, 0 to 9),
+thinking off, read at the first token of the reply as vLLM's and Flide's
+`/v1/systemone` read a chat model. The questions share the state: it is
+computed once (or found in the prompt cache) and forked into the questions.
+Errors are Flide's: 422 with `{"detail": [{"loc", "msg", "type"}]}` for a
+request that cannot be served as written, 404 for a model that is not served,
+429 with `Retry-After` when the line is full, else `{"detail": "..."}`. The
+query takes `debias` and `debug`, which a chat model has no use for. Images
+are refused (422); there is no streaming. Every answer carries
+`x-typesafe-request-id` (the client's, or one of the server's).
 
 ## Streaming
 
