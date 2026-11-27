@@ -658,6 +658,36 @@ async fn a_shutdown_unloads_everything_and_tells_the_requests_that_wait() {
     assert_eq!(w.models.acquire("a").await.unwrap_err(), AcquireError::Stopping);
 }
 
+/// The first signal drains: the loader is told to end what it loads early, a
+/// request that waits for a load is told that the server stops instead of
+/// waiting for it, and a loaded model serves the requests that run (and those
+/// that come on connections that are open) until the shutdown.
+#[tokio::test]
+async fn a_drain_tells_the_requests_that_wait_for_a_load_and_serves_the_others() {
+    let w = world(THREE, &[10, 10]);
+    let running = w.models.acquire("a").await.unwrap();
+    let weights = w.machine.latch("b");
+    let waiting = w.request("b");
+    w.until_logged("load b").await;
+
+    w.models.drain();
+    assert_eq!(waiting.await.unwrap().unwrap_err(), AcquireError::Stopping);
+    assert!(w.machine.log().iter().any(|line| line == "stop"), "the loader was told");
+    assert_eq!(w.models.acquire("c").await.unwrap_err(), AcquireError::Stopping, "no new load");
+    drop(w.models.acquire("a").await.expect("a loaded model serves on"));
+    assert!(w.is("a", "loaded"), "not unloaded under its request");
+    weights.open();
+    w.until("b", "loaded").await;
+    drop(running);
+
+    w.models.shutdown().await;
+    let mut log = w.machine.log();
+    assert_eq!(log[..3], ["load a", "load b", "stop"]);
+    log[3..].sort();
+    assert_eq!(log[3..], ["stop", "unload a", "unload b"]);
+    assert_eq!(w.machine.free(), [10, 10], "everything is given back");
+}
+
 // --- the routes ---------------------------------------------------------------------
 
 #[tokio::test]

@@ -275,6 +275,10 @@ struct State {
     entries: Vec<Entry>,
     tickets: u64,
     stopping: bool,
+    /// The server takes no more requests and lets those that run finish
+    /// ([`Models::drain`]): nothing more is loaded, and a request that waits
+    /// for a model that is not loaded is told that the server stops.
+    draining: bool,
 }
 
 struct Shared {
@@ -333,10 +337,11 @@ impl Shared {
         let now = self.clock.now();
         let mut state = self.lock();
         let stopping = state.stopping;
+        let ending = stopping || state.draining;
         let mut changed = false;
         for entry in &mut state.entries {
             // A load that nobody waits for any more is not done.
-            if entry.wanted.is_some() && (stopping || (entry.waiters == 0 && !entry.asked)) {
+            if entry.wanted.is_some() && (ending || (entry.waiters == 0 && !entry.asked)) {
                 (entry.wanted, entry.asked, entry.blocked) = (None, false, None);
                 self.say(entry, None);
                 changed = true;
@@ -748,7 +753,12 @@ impl Models {
             })
             .collect();
         let shared = Arc::new(Shared {
-            state: Mutex::new(State { tickets: entries.len() as u64, entries, stopping: false }),
+            state: Mutex::new(State {
+                tickets: entries.len() as u64,
+                entries,
+                stopping: false,
+                draining: false,
+            }),
             loader,
             clock,
             wake: Notify::new(),
@@ -804,6 +814,7 @@ impl Models {
                 if state.stopping {
                     return Err(AcquireError::Stopping);
                 }
+                let draining = state.draining;
                 let index = shared.resolve(&state, name)?;
                 let now = shared.clock.now();
                 let entry = &mut state.entries[index];
@@ -833,6 +844,10 @@ impl Models {
                 }
                 if !load {
                     return Err(AcquireError::NotLoaded { model: entry.preset.id.clone() });
+                }
+                // The server stops: what is not loaded is loaded for nobody.
+                if draining {
+                    return Err(AcquireError::Stopping);
                 }
                 let attempts = entry.attempts;
                 match &mut waiting {
@@ -953,6 +968,18 @@ impl Models {
     /// waited for.
     pub fn stop_loads(&self) {
         self.shared.loader.stop();
+    }
+
+    /// The server takes no more requests and lets those that run finish (the
+    /// first signal): a load that runs ends as soon as it can
+    /// ([`Models::stop_loads`]), nothing more is loaded, and a request that
+    /// waits for a model that is not loaded is told now that the server
+    /// stops, instead of waiting for the load and running into the end of
+    /// the drain. A loaded model serves on until [`Models::shutdown`].
+    pub fn drain(&self) {
+        self.stop_loads();
+        self.shared.lock().draining = true;
+        self.shared.changed();
     }
 
     /// Unloads every model and ends the manager. Requests that wait for a

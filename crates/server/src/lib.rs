@@ -211,8 +211,9 @@ pub async fn serve_models(
     let serving =
         listen::listen(listener, routes_over(models, config, stop), timeout, async move {
             shutdown.await;
-            // A load that runs ends as soon as it can.
-            loads.stop_loads();
+            // A load that runs ends as soon as it can, and requests that wait
+            // for one are told that the server stops.
+            loads.drain();
             tracing::info!("shutting down: no new connections, waiting for running requests");
             begin_drain.notify_one();
         });
