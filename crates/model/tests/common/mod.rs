@@ -361,6 +361,10 @@ impl TempDir {
         Self(dir)
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
     pub fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let path = self.0.join(name);
         std::fs::write(&path, bytes).unwrap();

@@ -761,6 +761,20 @@ pub trait Model: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The steps that measure what a step costs have run (the conductor's
+    /// warm-up, before the first request). They read a made-up text, token 0
+    /// at every position, so what a model learns from the text of its steps
+    /// (which experts a text picks) should forget them. Called once, on the
+    /// conductor's thread, while no step runs.
+    fn measured(&self) {}
+
+    /// Nothing runs and nobody waits: the conductor is about to sleep until a
+    /// request comes. A model gives back here what it holds only for the
+    /// steps of running requests (VRAM it borrowed for a prompt), instead of
+    /// at its next step. Called on the conductor's thread while no step runs,
+    /// each time the conductor finds nothing to do.
+    fn idle(&self) {}
+
     /// Builds device part `cx.index`. Called on that device's thread.
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError>;
 }

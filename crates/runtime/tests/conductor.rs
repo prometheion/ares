@@ -906,6 +906,17 @@ fn the_ngram_drafter_joins_the_model_drafter_when_there_is_one() {
 }
 
 #[test]
+fn the_model_hears_once_that_the_steps_that_measure_are_done() {
+    // Their picks are no text's: Flash-Next forgets the heat they left.
+    let (rt, model) = drafting_runtime(&[0.5], 8, true, None);
+    alone(&rt, "a text", Some(20));
+    assert_eq!(model.measured_calls(), 1);
+    let (rt, model) = drafting_runtime(&[0.5], 8, false, None);
+    alone(&rt, "a text", Some(20));
+    assert_eq!(model.measured_calls(), 0);
+}
+
+#[test]
 fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
     // An MTP block that is right nearly always: seven links fill the eight
     // rows of a launch, and a second launch costs more than the rows after it

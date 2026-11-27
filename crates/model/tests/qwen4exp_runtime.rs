@@ -732,6 +732,36 @@ fn start_near_serving(
     (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
 }
 
+/// A request that ends with its prompt read on lent VRAM leaves the engine idle: the loan goes
+/// back then, not at the next step (`Model::idle`), so that the tiers have their slots.
+#[test]
+fn a_loan_goes_back_when_the_engine_idles() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(300, 7);
+    let lending = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    for placement in placements() {
+        let (runtime, model) = start_near_serving(
+            &lending,
+            placement,
+            (LENT_ROWS, MAX_ROWS),
+            CacheFormat::Q8,
+            None,
+            Serve::Stream,
+        );
+        ask(&runtime, 1, &prompt, 1);
+        let begun = std::time::Instant::now();
+        while model.holds_loan() == Some(true) && begun.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let stats = model.take_store_stats().expect("the parts are open");
+        assert!(stats.scratch_loans > 0, "{placement:?}: the prompt ran on no loan");
+        assert_eq!(model.holds_loan(), Some(false), "{placement:?}: the loan stayed while idle");
+        runtime.shutdown();
+    }
+}
+
 /// The K and V of the pages beyond the first lie in page-locked host memory, which the
 /// device reads and writes over its link (`blocks/far.rs`): a prompt of three pages answers
 /// with the same tokens as with every page in VRAM, in steps of the decode kernels and in

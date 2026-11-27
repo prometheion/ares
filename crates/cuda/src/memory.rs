@@ -54,10 +54,20 @@ impl DeviceBuffer {
                 detail: "a buffer of 0 bytes was requested".into(),
             });
         }
-        let driver = device.bind()?;
-        let mut ptr: CUdeviceptr = 0;
-        // SAFETY: the pointer is valid for the write of one address.
-        driver.check("cuMemAlloc", unsafe { (driver.api.mem_alloc)(&mut ptr, len as usize) })?;
+        let alloc = || -> Result<CUdeviceptr> {
+            let driver = device.bind()?;
+            let mut ptr: CUdeviceptr = 0;
+            // SAFETY: the pointer is valid for the write of one address.
+            let code = unsafe { (driver.api.mem_alloc)(&mut ptr, len as usize) };
+            driver.check("cuMemAlloc", code)?;
+            Ok(ptr)
+        };
+        let ptr = match alloc() {
+            // Buffers given back during a job are freed when it ends: once
+            // they are, the room may be there.
+            Err(e) if e.is_out_of_memory() && gate::settle() => alloc()?,
+            other => other?,
+        };
         Ok(Self { device: device.clone(), ptr: DevicePtr(ptr), len })
     }
 
@@ -130,9 +140,23 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
+        // `cuMemFree` may synchronize with the devices as `cuMemFreeHost` does:
+        // it goes behind the gate of page-locked memory, where no job runs.
+        gate::retire(DeviceFree { device: self.device.clone(), ptr: self.ptr.0 });
+    }
+}
+
+/// The free of a [`DeviceBuffer`], done when it is dropped: where no job runs.
+struct DeviceFree {
+    device: Device,
+    ptr: CUdeviceptr,
+}
+
+impl Drop for DeviceFree {
+    fn drop(&mut self) {
         if let Ok(driver) = self.device.bind() {
             // SAFETY: the address came from cuMemAlloc and is freed once.
-            unsafe { (driver.api.mem_free)(self.ptr.0) };
+            unsafe { (driver.api.mem_free)(self.ptr) };
         }
     }
 }

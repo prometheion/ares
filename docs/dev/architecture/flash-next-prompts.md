@@ -199,7 +199,9 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   the moves and copies down have run, and only then does the step begin for the store.
 - *The way back.* The slots go back, empty, at the end of the first step that does not run
   on them: that step's start still reads what the last wide step left there (the MTP block
-  follows the rows of the step before from the part's residual). Empty slots fill the way
+  follows the rows of the step before from the part's residual). When the engine idles
+  first (`Model::idle`: nothing runs and nobody waits, a request that ended with its
+  prompt), they go back then, and so does the loan of a pass that has read its rows. Empty slots fill the way
   they always do: the hottest experts of RAM (`promote_hot`, every free slot at once, started
   as the slots come back and at the end of every step), the fill while idle, what steps
   upload.

@@ -128,6 +128,14 @@ impl<M: Model> Model for Faulty<M> {
         self.inner.abandon(part);
     }
 
+    fn measured(&self) {
+        self.inner.measured();
+    }
+
+    fn idle(&self) {
+        self.inner.idle();
+    }
+
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
         let fails = cx.index == self.fault.device;
         let inner = self.inner.open(cx)?;

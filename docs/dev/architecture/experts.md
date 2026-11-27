@@ -34,10 +34,13 @@ model, as Strata's `expert_profile_save` and Run My AI's table of usage do
   minute while steps run (a thread of the model, `ares-expert-usage`, compares the
   store's count of steps with the one of the last write); and when the model is
   dropped, at an unload and at a clean stop.
+- *The measurement* (`Model::measured`, when the runtime has measured the price of a
+  step, with a profile or without): the heat is forgotten, so that the steps of the
+  measurement, which route token 0 a thousand times, enter neither the profile nor
+  what the tiers fill from.
 - *The start* (`Qwen4Exp::serving`, which the server calls where it read the
   warm-up text, after the runtime measured the price of a step): the heat becomes
-  the profile's, so that the steps of the measurement, which route token 0 a
-  thousand times, do not enter it, and the tiers are filled from it
+  the profile's, and the tiers are filled from it
   (`ExpertStore::plan_fill`, `advance_fill`). For every layer VRAM is made to hold
   the hottest experts: every free slot is filled, and a member gives way to an expert
   hotter than itself (the measurement's steps leave their experts in the slots, and

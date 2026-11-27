@@ -29,6 +29,13 @@
 //!   the last job that runs ends, on the thread that ends it. A free never
 //!   waits for a job, and a job never waits for a free in its middle.
 //!
+//! Device memory goes the same way: `cuMemFree` "may perform implicit
+//! synchronization" too (the driver's API reference), so a
+//! [`crate::DeviceBuffer`] dropped during a job (a plan's buffer that grows
+//! inside a step) or beside another engine's step is freed where no job runs.
+//! Before a caller looks at what a device has free ([`crate::Device::mem_info`])
+//! or when an allocation finds no room, [`settle`] frees what waits.
+//!
 //! [`crate::PinnedBuffer`] and [`crate::HostRegistration`] go through these
 //! themselves, so no owner of page-locked memory can break the rule; an owner
 //! that books the bytes elsewhere retires the memory together with its booking,
@@ -173,6 +180,13 @@ impl Gate {
         Some(self.run_changing(f))
     }
 
+    fn settle(&self) -> bool {
+        if CHANGING.get() || in_step() || self.state().later.is_empty() {
+            return false;
+        }
+        self.change("memory given back during a job", || ()).is_ok()
+    }
+
     fn retire(&self, item: impl Send + 'static) {
         if CHANGING.get() {
             drop(item);
@@ -285,6 +299,14 @@ pub fn retire(item: impl Send + 'static) {
     GATE.retire(item)
 }
 
+/// Frees what was given back during a job and waits to go ([`retire`]): waits
+/// until no job runs, as [`change`] does. Does nothing, and returns false,
+/// inside a job or when nothing waits. For a thread that is about to
+/// look at what is free, or found no room, and holds nothing a job waits for.
+pub fn settle() -> bool {
+    GATE.settle()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -328,6 +350,24 @@ mod tests {
         // Without a step it goes at once.
         GATE.retire(Counted(dropped.clone()));
         assert_eq!(dropped.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn settling_frees_what_a_step_gave_back_once_the_step_ends() {
+        static GATE: Gate = Gate::new();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        assert!(!GATE.settle(), "nothing waits");
+        let step = Steps::begin_on(&GATE);
+        GATE.retire(Counted(dropped.clone()));
+        assert!(!GATE.settle(), "no settling inside a step");
+        let settler = std::thread::spawn(|| GATE.settle());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "the step still runs");
+        // The step's end frees it, or the settler right after.
+        drop(step);
+        settler.join().unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(!GATE.settle(), "nothing waits any more");
     }
 
     #[test]
