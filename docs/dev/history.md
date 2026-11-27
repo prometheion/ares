@@ -63,6 +63,15 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
   plan against the bound (worst 25 to 52 KB of 87 to 187 KB at 512 rows),
   `a_plan_larger_than_the_room_is_refused_not_uploaded` (`qwen35/device/part.rs`). Commit
   "ares-model: a 27B step never allocates or waits for the device for its attention plans".
+  The room costs 869 KiB of VRAM on the RTX 4070 and 808 KiB on the RTX 3060 at the owner's
+  settings (352 KiB each before), and as much page-locked RAM. The plans of these settings stay
+  far below the old room as well (random steps of 512 rows: at most 52 KB), so the fallback
+  was likely never taken; which of the suspects (or something else) hung production is not
+  known. The repro on the two local cards at the owner's settings (`--parallel 4`, P2P through
+  the patched libcuda, the server under gdb for the stacks; `/var/tmp/ares-fixmodel/repro2/`:
+  two agent requests at once with a shared prompt of 22.8k tokens and 16 tools to their end,
+  then a new conversation of 42k tokens with 14 tools) did not hang: main 0c4fbb60 (the engine
+  code of 406cfe99) 9 cycles of 9, the branch 9 of 9, the first token after 38.5 to 49.3 s.
 
 - [x] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
       the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
