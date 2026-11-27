@@ -54,7 +54,7 @@ Fixed on `fix/model-sweep` (2026-11-25), one commit per item; each item verbatim
       a `DeviceBuffer` inside a step, and `Plan::upload` (`cuMemAlloc` and a blocking copy) when
       a step's attention plan does not fit the plan buffer (`qwen35/device/part.rs`).
 
-  *Fixed on `fix/model-sweep`, 2026-11-26:* the first suspect by 415d99ed (device memory freed
+  *Fixed on `fix/model-sweep`, 2026-11-26:* the first suspect by b08d7b4e (device memory freed
   behind the gate). The second: the 27B's part sizes its room for plans by
   `PlanConfig::plan_bytes_bound` (per group of rows and number of KV heads: the budget, the
   tiles and chunks with their runs of kinds, the rows alone with theirs, 48 bytes an item and
