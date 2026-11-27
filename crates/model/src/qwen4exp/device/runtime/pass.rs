@@ -507,6 +507,18 @@ impl Qwen4ExpDevice {
         self.flow.pass_done();
     }
 
+    /// Waits until the device has read the inbox buffer the next micro-batch takes, serving
+    /// the store meanwhile, and gives up when another part failed or the step stood still
+    /// ([`Flow::wait_for`]). The kernels before that copy can wait for the other device, and
+    /// a part whose peer failed waited in the driver for them, its device at 100 % and the
+    /// test after it waiting too (#67).
+    fn wait_for_the_inbox(&self) -> Result<(), ModelError> {
+        match self.part.pass_inbox_read() {
+            Some(read) => self.flow.wait_for(read, "the device read a micro-batch's inbox"),
+            None => Ok(()),
+        }
+    }
+
     /// Runs the step as the pass `key` (the step's segments, tokens and wanted rows are in
     /// `self`), after everything a step does before its rows: from its start, or where it
     /// was paused. Pauses it between two micro-batches when the engine is asked something
@@ -623,6 +635,7 @@ impl Qwen4ExpDevice {
                     pools: step.pages,
                     replay: &micro.replay,
                 };
+                self.wait_for_the_inbox()?;
                 self.part.pass_layer(&env, i, m, &mut micro.plan)?;
                 // A checkpoint where this micro-batch ends: the layer's state there.
                 let end = micro.first + micro.rows;
@@ -701,6 +714,7 @@ impl Qwen4ExpDevice {
                 pools: step.pages,
                 replay: &micro.replay,
             };
+            self.wait_for_the_inbox()?;
             n_out += self.part.pass_end(&env, m, &mut micro.plan)?;
         }
         // The MTP block follows the rows micro-batch by micro-batch, as it follows steps;

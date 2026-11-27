@@ -1534,6 +1534,139 @@ fn submit_timed(
     (rx, first)
 }
 
+/// A test that fails while its engine is in the middle of a prompt read layer by layer leaves
+/// the devices to the tests after it: its thread unwinds, the engine goes with it and stops
+/// its work on the devices, and the next engine on the same devices answers in its usual
+/// time, in every placement. The failure comes where the pass is surely in its middle: a
+/// short request has cut in, so the pass has paused between two micro-batches with its rows
+/// on loan (`a_request_cuts_in_between_the_pieces_of_a_long_prompt`), and the short answer
+/// is being written.
+#[test]
+fn a_test_that_fails_in_the_middle_of_a_pass_leaves_the_devices_to_the_next() {
+    if !enabled() {
+        return;
+    }
+    let long = prompt(480, 7);
+    let short = prompt(12, 8);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    for placement in placements() {
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let begun = std::time::Instant::now();
+        let alone = ask(&runtime, 1, &short, 8);
+        let usual = begun.elapsed();
+        runtime.shutdown();
+        let failed = std::thread::spawn({
+            let (path, long, short) = (path.clone(), long.clone(), short.clone());
+            move || {
+                let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+                let (long_rx, _) = submit_timed(&runtime, 2, &long, 8);
+                std::thread::sleep(Duration::from_millis(5));
+                let (_short_rx, short_first) = submit_timed(&runtime, 3, &short, 8);
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while short_first.lock().unwrap().is_none() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the short request wrote nothing"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // The long prompt's pass has paused and has not ended.
+                let paused = runtime.snapshot().map_or(0, |s| s.counters.steps_paused) >= 1
+                    && long_rx.try_recv().is_err();
+                panic!("a failure on purpose, with the long prompt's pass paused: {paused}");
+            }
+        })
+        .join();
+        let message = failed.expect_err("the test on the thread failed");
+        let message = message.downcast_ref::<String>().cloned().unwrap_or_default();
+        // The next engine on the same devices.
+        let begun = std::time::Instant::now();
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let started = begun.elapsed();
+        let begun = std::time::Instant::now();
+        let after = submit(&runtime, 4, &short, 8).recv_timeout(Duration::from_secs(60));
+        let took = begun.elapsed();
+        runtime.shutdown();
+        eprintln!(
+            "AFTER {placement:?}: {message}; the next engine started in {started:?} and answered \
+             in {took:?} (alone before: {usual:?})"
+        );
+        let after = after.expect("the next engine answers within a minute").unwrap();
+        assert!(message.ends_with("paused: true"), "{placement:?}: the failure came too late");
+        assert_eq!(after.len(), alone.len(), "{placement:?}: {after:?} after the failed test");
+        assert_near_the_reference(&format!("{placement:?}, after"), &path, &short, &after);
+    }
+}
+
+/// An engine whose device fails in the step of a prompt read layer by layer ends the request
+/// with an error, and the test that asked fails; the next engine on the same devices answers
+/// in its usual time, in every placement. The last device fails as the step begins
+/// (`ares_runtime::testing::Faulty`), so that in a split the other device has enqueued its
+/// part of the pass and waits for this one's: those waits are given up, and nothing of the
+/// failed engine stays on the devices. (With both devices on every layer the other device's
+/// thread waited in the driver for the inbox of its next micro-batch behind kernels that
+/// waited for the failed device, its device at 100 % for good, and the request, the engine's
+/// end and the next test with it: the hang of #67. In the split by layers it gave up after 30
+/// s.)
+#[test]
+fn an_engine_whose_device_fails_in_a_pass_leaves_the_devices_to_the_next() {
+    use ares_runtime::testing::{Failure, Fault, Faulty};
+    if !enabled() {
+        return;
+    }
+    let long = prompt(480, 7);
+    let short = prompt(12, 8);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    for placement in placements() {
+        let devices = open_devices(placement);
+        // The steps are numbered from the first request's: no warm-up.
+        let fault = Fault { device: devices.len() - 1, step: 1, how: Failure::Error };
+        let gguf = Gguf::open(&path).unwrap();
+        let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+        let mut opts = options(placement, n_layer, 16, MAX_ROWS, 16);
+        opts.pass_rows = 512;
+        let inner = Arc::new(
+            Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap(),
+        );
+        let config = RuntimeConfig {
+            pages: 16,
+            cells_per_page: 128,
+            max_slots: SLOTS,
+            warm_up: false,
+            ..RuntimeConfig::default()
+        };
+        let model: Arc<dyn Model> = Arc::new(Faulty::new(made(&inner, Cache::On), fault));
+        let mut gpu = GpuConfig::new(&config, &*model);
+        gpu.ram_limit += 256 << 20;
+        gpu.vram_headroom = 512 << 20;
+        let runtime = Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts");
+        let begun = std::time::Instant::now();
+        let failed = submit(&runtime, 1, &long, 8).recv_timeout(Duration::from_secs(60));
+        let ended = begun.elapsed();
+        let failure = runtime.failure();
+        drop(runtime);
+        drop(inner);
+        let failed = failed.expect("the request ends within a minute");
+        assert!(failed.is_err(), "{placement:?}: the pass did not fail: {failed:?}");
+        // The next engine on the same devices.
+        let begun = std::time::Instant::now();
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let started = begun.elapsed();
+        let begun = std::time::Instant::now();
+        let after = submit(&runtime, 2, &short, 8).recv_timeout(Duration::from_secs(60));
+        let took = begun.elapsed();
+        runtime.shutdown();
+        eprintln!(
+            "AFTER-ERROR {placement:?}: {failed:?} after {ended:?} (the engine: {failure:?}); \
+             the next engine started in {started:?} and answered in {took:?}"
+        );
+        // The other device gives up at once, not when its step has stood still for 30 s.
+        assert!(ended < Duration::from_secs(20), "{placement:?}: the failure took {ended:?}");
+        let after = after.expect("the next engine answers within a minute").unwrap();
+        assert_near_the_reference(&format!("{placement:?}, after an error"), &path, &short, &after);
+    }
+}
+
 /// A prompt read layer by layer with few enough rows has the CPU compute the experts it misses
 /// that are in RAM (`Serve::Cpu`: every one it can): the micro-batches' mixed input reaches the
 /// host in the layout of all the pass's rows, and the CPU's sums go into their chunks' rows.
