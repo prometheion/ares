@@ -271,7 +271,10 @@ Tests that fail:
       minutes (device 0 at 100 %, its device thread spinning, device 1 idle), as if a kernel the
       failed test left behind still waited. Alone both passed (10 s and 3 s), and the suite again
       31 of 31 at load 8 to 15. A test that fails should not leave the cards waiting for the
-      next.
+      next. The same day `qwen4exp_device`
+      `experts_of_every_weight_type_on_the_cpu_change_nothing_3` failed once at load 16 to 20 on
+      "every expert has a slot" (353 of 384 experts got one, so the device had less room than at
+      other times) and passed alone at load 5 to 10.
 - [ ] GPU (two cards). `qwen4exp_device` with both cards on every layer
       (`ARES_TEST_SPREAD=tensor`, the share 0.5 and experts only alike), 2026-11-23 on main a36d379:
       `every_layer_of_wide_steps_matches_the_reference` (attention core 5.16e-2 against a bound of
