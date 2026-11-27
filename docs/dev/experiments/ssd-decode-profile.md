@@ -165,7 +165,7 @@ against 68.79 and 67.01 (means 72.56 and 72.57 against 72.30 and 72.28); at 16 G
 ## Through the server
 
 The server sessions of the comparison with Strata (`--ram 40G`, the bench's German, English and
-code questions, 300 tokens each, asked twice; see `against-strata.md`, 2026-11-27) count the
+code questions, 300 tokens each, asked twice; see [`against-strata.md`](against-strata.md), 2026-11-27) count the
 same per request in `/metrics`. Per generated token (the request's short prompt included):
 
 | UD-Q4_K_XL, 40G | Tokens/s | Waits a token: all / CPU / file | Reads of the file a token | An expert's reads | Picks in VRAM |
@@ -174,6 +174,9 @@ same per request in `/metrics`. Per generated token (the request's short prompt 
 | MTP drafts, asked again | 19.4 to 29.7 | 27 to 35 / 6.5 to 10.6 / 13 to 22 ms | 6 to 13 | 3.8 to 4.7 ms | 44 to 61 % |
 | No drafts, first asks | 11.7 to 15.4 | 39 to 61 / 10 to 15 / 22 to 41 ms | 9 to 20 | 3.5 to 3.9 ms | 42 to 60 % |
 | No drafts, asked again | 17.1 to 19.2 | 25 to 32 / 10 to 12 / 11 to 18 ms | 5 to 8 | 3.7 to 4.1 ms | 63 to 69 % |
+| `--ram 16G`, MTP drafts, first asks | 5.2 to 7.4 | 135 to 195 / 2 to 3 / 115 to 175 ms | 71 to 110 | 5.6 to 8.0 ms | 21 to 44 % |
+| `--ram 16G`, MTP drafts, asked again | 7.1 to 11.1 | 93 to 141 / 2 to 4 / 73 to 124 ms | 60 to 77 | 6.3 to 7.5 ms | 42 to 56 % |
+| `--ram 16G`, no drafts, first asks | 5.1 to 7.2 | 130 to 186 / 4 to 5 / 108 to 164 ms | 57 to 89 | 4.5 to 5.0 ms | 42 to 57 % |
 
 - A token waits for misses 60 to 80 % of its time on a first ask, more than the tool's 52 %:
   a new question finds 28 to 60 % of its picks in VRAM, where the tool's steps after a context of
@@ -186,7 +189,8 @@ same per request in `/metrics`. Per generated token (the request's short prompt 
   experts of its own and every distinct miss is paid. So drafts pay little on first asks (13.0 to
   17.3 against 11.7 to 15.4 tokens/s) and more when the tiers hold the text (19.4 to 29.7 against
   17.1 to 19.2).
-
+- At `--ram 16G` the server waits for the file 75 to 90 % of a token, as the tool does, and its
+  reads take 4.5 to 8 ms an expert.
 
 ## The levers of #16, ranked by this profile
 
