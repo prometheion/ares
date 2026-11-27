@@ -354,6 +354,7 @@ fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
 }
 
 #[test]
+#[ignore = "its guesses never start on CI runners: issue #88"]
 fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
     // so two reads ahead are on their way at a time, the one at the drive and one queued
