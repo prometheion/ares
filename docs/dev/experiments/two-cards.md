@@ -309,3 +309,45 @@ with 262 144 cells (one round, load average 8 to 16): FT 10 800 slots, a
 decode step of 27.7 ms (median; mean 32.7), prompts 263 tokens/s; FX 10 896
 slots, 24.9 ms (31.5), 333; FL 10 573 slots, 33.1 ms (35.4), 310. Decode is 11
 to 22 % slower and a warm prompt half as fast as with 4096 cells.
+
+## The model sweep against main, measured (2026-11-25 to 2026-11-27)
+
+Branch `fix/model-sweep` against `main`, in alternating sessions (main, branch, main,
+branch), each under the GPU lock on the local RTX 4070 and RTX 3060, the load average at a
+session's start in brackets. Scripts: `/var/tmp/ares-fixmodel/ab/` (`flash-session.sh`,
+`session27.sh`, `campaign*.sh`). The client (`bench.py`) puts the session's name into every
+prompt, so the first replies of two sessions are different texts that accept different drafts.
+
+Flash-Next IQ2_XS with its MTP block on both cards, `--ram 8G --context 40960`: the 8k prompt
+(8065 tokens) in s, and the first replies' decode in tokens/s (German, English, code):
+
+| Rounds | Main | Branch |
+|---|---|---|
+| 1, 2: main a8920d61, branch at 9895dcef | 12.32 [8.2], 12.34 [8.7]; 10.1 / 23.6 / 30.9, 24.4 / 36.6 / 30.8 | 12.75 [8.5], 12.91 [2.9]; 23.3 / 36.3 / 31.2, 22.2 / 36.5 / 30.8 |
+| 3, 4: main a8920d61, branch aa038486 | 13.38 [10.9], 12.32 [9.2]; 21.6 / 38.7 / 31.0, 16.5 / 35.8 / 29.2 | 12.26 [5.1], 12.42 [3.6]; 24.4 / 36.1 / 31.4, 22.3 / 40.0 / 29.9 |
+| 5, 6: main 0c4fbb60, branch 68614b13 | 25.70* [8.8], 12.37 [1.7]; 22.2 / 32.1 / 29.4, 24.1 / 36.5 / 32.5 | 12.22 [2.4], 23.03* [2.4]; 15.9 / 37.9 / 28.9, 24.4 / 36.6 / 29.7 |
+
+\* The prompt's experts waited 33.9 s and 28.5 s for their uploads, against 8.2 to 8.5 s in
+every other session, with as many uploads (about 11 500) and picks: the copies were slow, once
+in each build, which is the machine's and not the engine's.
+
+The first branch build read the 8k prompt 3.5 to 4.6 % slower: `Flow::check` then looked at
+what the steps had moved on every spin of a wait past a second, which takes the store's lock
+that the waits' pumps need. With a look every 10 ms at most (aa038486) the prompt is main's:
+12.22 to 12.42 s against 12.32 to 12.37 s (the outliers left out). Decode per step of the trunk
+(the reply's time over its tokens less the accepted drafts), means over the six sessions: main
+61.0 / 57.1 / 86.5 ms (code / English / German), branch 57.1 / 51.9 / 77.9 ms. VRAM: the
+partial states that the plans can take (793ad0aa) cost device 0 8.2 MiB of step buffers
+(273.4 to 281.6 MiB, its expert slots unchanged at 4128, free after the load 266.6 and 270.6
+MiB); device 1 the same 92.0 MiB. Load: 8.6 to 15.1 s against 8.2 to 13.9 s, the role of the
+second card timed in 3.5 to 5.7 s against 3.5 to 6.9 s (every session started with an empty
+`--cache`, so the branch remembered nothing yet), the warm-up 20.9 to 39.2 s against 20.8 to 25.9 s (the long ones right
+after a session of the 27B, whose file had pushed Flash-Next's out of the page cache, and with
+a fill from the profile of 4.5 to 6.9 s against 1.7 to 2.0 s).
+
+The 27B Q4_K_S at the owner's settings (tensor split 0.625 / 0.375, context 262 144,
+`--parallel 2`, `q5`, the MTP block with the draft vocabulary, `--ram 16G`): the second replies
+(the same text again, 261 of 261 drafts accepted) main a8920d61 250.9 to 251.6 tokens/s, the
+branch at 9895dcef 251.4 to 252.2; main 0c4fbb60 250.0 to 251.5, the branch 68614b13 250.3 to
+251.5 (load 2.1 to 8.1). VRAM after the runs the same (11 457 and 10 095 MiB). The room for the
+attention plans (68614b13) takes 869 and 808 KiB where it took 352 KiB on each card.
