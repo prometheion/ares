@@ -61,7 +61,8 @@ the text without.
 | (always) | the n-gram drafter | takes part next to a model drafter, never alone |
 
 One MTP block and one DFlash drafter may take part together, separated by a
-comma. `--draft-vocab` limits the tokens a model drafter proposes, and
+comma. `--draft-vocab` limits the tokens a model drafter proposes (the ready
+lists and how to make one are in [draft-vocab.md](draft-vocab.md)), and
 `--window` the rows of a sequence's window; both need a model drafter.
 
 Refused drafter files, by what they are: DSpark drafters (all their variants),
@@ -90,13 +91,15 @@ one setup on the date given, not general claims.
 
 ## Recommended settings
 
-The 27B on two 12 GiB cards, the first row above:
+The 27B on two 12 GiB cards, the first row above, with the general draft
+vocabulary of this repository, for English prose, code and shell
+([draft-vocab.md](draft-vocab.md) says how to make one for another language):
 
 ```sh
 ares --model ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf --devices 0,1 \
   --split tensor --shares 0.625,0.375 \
   --context 262144 --parallel 2 --kv q5 \
-  --drafters mtp --draft-vocab draft-vocab.txt \
+  --drafters mtp --draft-vocab docs/user/draft-vocab/qwen35-general.txt \
   --ram 16G --cache ~/.cache/ares-prompts --cache-size 48G \
   --reasoning-effort medium
 ```
