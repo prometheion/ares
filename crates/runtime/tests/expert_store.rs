@@ -354,12 +354,16 @@ fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
 }
 
 #[test]
-#[ignore = "its guesses never start on CI runners: issue #88"]
 fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
     // so two reads ahead are on their way at a time, the one at the drive and one queued
-    // behind it.
-    let reader = Config { prefetch_depth: 1, prefetch_chunk: 256, ..Config::default() };
+    // behind it. It takes one chunk of any kind at a time, so the drive is never measured
+    // under load, and the read-ahead has no bound of bytes per step, only its bound in
+    // flight (`ahead.rs`). With such a bound the third would follow only on a drive that
+    // is idle for much of a step: on a slow one (a CI runner's) the steps before spent
+    // their time on their own reads, and the bound let two reads start at most.
+    let reader =
+        Config { queue_depth: 1, prefetch_depth: 1, prefetch_chunk: 256, ..Config::default() };
     let mut rig = rig_reading(4, 8, None, reader, recent_first);
     rig.predict_steps(2, 17, 3, 3);
     rig.store.take_stats();
