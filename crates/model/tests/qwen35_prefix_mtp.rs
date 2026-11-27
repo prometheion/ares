@@ -33,6 +33,8 @@ use ares_model::qwen35::{Config, Weights};
 use ares_runtime::PinnedRam;
 use ares_sampler::SampleParams;
 
+mod common;
+
 const PAGE: u32 = ENTRY_CELLS;
 
 /// The MTP block on a device, with the buffers the runtime would own: two
@@ -260,8 +262,7 @@ struct Setup {
 }
 
 fn setup() -> Option<Setup> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return None;
     }
     let Some(path) = std::env::var_os("ARES_TEST_QWEN38_27B").map(PathBuf::from) else {

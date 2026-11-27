@@ -22,17 +22,10 @@ use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
 use ares_tokenizer::ChatOptions;
+use common::gpu::enabled;
 use common::helpers::env_path;
 
 mod common;
-
-fn enabled() -> bool {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return false;
-    }
-    true
-}
 
 /// What a request came to.
 struct Answer {

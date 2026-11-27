@@ -19,20 +19,13 @@ use ares_model::qwen35::device::{Options, Qwen35, Rows, Session, Spread, Wanted}
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, TokenFilter};
 use ares_sampler::TokenMask;
+use common::gpu::enabled;
 use common::helpers::{argmax_lead, env_path};
 
 mod common;
 
 #[path = "common/kv_env.rs"]
 mod kv_env;
-
-fn enabled() -> bool {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return false;
-    }
-    true
-}
 
 fn read_ids(path: &Path) -> Vec<u32> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

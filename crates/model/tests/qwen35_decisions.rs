@@ -25,20 +25,13 @@ use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
+use common::gpu::enabled;
 use common::helpers::env_path;
 
 mod common;
 
 #[path = "common/kv_env.rs"]
 mod kv_env;
-
-fn enabled() -> bool {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return false;
-    }
-    true
-}
 
 fn string(s: &str) -> Json {
     Json::String(s.into())

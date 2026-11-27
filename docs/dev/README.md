@@ -83,6 +83,10 @@ ARES_TEST_CUDA=1 cargo test -p ares-cuda --test gpu -- --test-threads=1
 ARES_TEST_VULKAN=1 cargo test -p ares-vulkan --test gpu -- --test-threads=1
 ```
 
+The CUDA tests of `ares-model`'s test binaries take the cards one test at a time
+(`crates/model/tests/common/gpu.rs`), so they run with the default test threads
+as well; the other crates' GPU tests still need `--test-threads=1`.
+
 Tests against real models skip with a message unless their model files are
 named, one variable for each file, the same in every crate:
 

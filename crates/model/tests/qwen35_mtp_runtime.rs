@@ -164,8 +164,7 @@ fn answers_with(
 
 #[test]
 fn the_text_with_the_models_own_drafts_is_the_text_without() {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return;
     }
     let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
@@ -208,8 +207,7 @@ fn the_text_with_the_models_own_drafts_is_the_text_without() {
 
 #[test]
 fn the_text_with_dflash_drafts_is_the_text_without() {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return;
     }
     let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
@@ -263,8 +261,7 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
 /// drafts). The texts with drafts are the texts without in each placement.
 #[test]
 fn the_text_with_mtp_drafts_is_the_text_without_under_a_layer_split_and_from_a_file() {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return;
     }
     let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };
