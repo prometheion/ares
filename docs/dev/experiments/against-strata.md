@@ -65,3 +65,96 @@ ahead (de 12.9/21.9, en 16.5/26.8, code 11.1/17.5 tokens/s first/second ask agai
 behind (334 against 588 tokens/s), the second ask of a short prompt 3.2 s against 0.5-0.8.
 Strata 0.2.19 (engine 0.1.65, decode +47-59 %, prefill +42 % on this quant by its notes) is
 owed a measurement. Found:
+
+## UD-Q4_K_XL and UD-Q5_K_XL against Strata 0.2.22 (2026-11-27)
+
+**Setup.** The test machine (see [`ssd-decode-profile.md`](ssd-decode-profile.md)), nothing else
+running on it. Ares: `main` at 83408e52 with the wait counters of `measure/ssd-moe` (fc9e2a26,
+otherwise the same code; they cost nothing, see the profile), `--ram 40G`, a fresh `--cache`
+directory and no usage profile (the warm-up fills the tiers), its defaults otherwise (the model's
+own context of 262 144 cells, K and V beyond VRAM in RAM), the MTP block of q2
+(`--drafters mtp-q2_0.gguf`) or `--drafters none`. Strata 0.2.22 (engine and control 0.1.69,
+updated with its own updater the same morning) from a copy of the owner's run config with the
+pack, the file and `--resident-budget-gib 40`, no picture reader, its MTP drafts (`--spec 4`) or
+`"drafting": "off"`, its shipped expert profile and the owner's switches (`STRATA_HC_Q8_TC=0`,
+`STRATA_HC_Q8_BF16TC=0`, `STRATA_NV_CHUNK=1`). Strata's packs: UD-Q4_K_XL's of 2026-11-22,
+UD-Q5_K_XL's made the same way (`tools/iq_pack.py --compat-bf16`). UD-Q5_K_XL (147.4 GiB)
+was downloaded from `unsloth/Qwen3.8-Flash-Next-GGUF` at f5d175de, every part's sha256 checked.
+Every session starts with the model's pages dropped from the page cache. The bench of the
+earlier comparisons: German, English and code questions of 54 to 72 tokens, 300 tokens greedy,
+each asked twice; fresh prompts of about 2k, 8k and 32k tokens, 8 tokens out; a conversation of
+three turns with four tools, then the same conversation again. The sessions alternate (Ares,
+Strata, Ares, Strata with drafts, then one each without); load average 6.5 to 13 at their starts,
+from the engines' own CPU workers.
+
+Tokens per second by the client; prompts in prompt tokens over the time to the first token;
+agent turns as the time to the first token:
+
+| UD-Q4_K_XL, 40 GiB | Ares, MTP (2 sessions) | Strata, MTP (2) | Ares, no drafts | Strata, no drafts |
+| --- | --- | --- | --- | --- |
+| Decode German, 1st / 2nd ask | 13.0-13.3 / 19.4-25.3 | 4.6-5.1 / 7.5-9.7 | 12.1 / 17.1 | 4.9 / 7.1 |
+| Decode English | 14.7-17.3 / 23.0-23.3 | 6.6-7.4 / 10.5-11.9 | 15.4 / 19.2 | 5.4 / 6.7 |
+| Decode code | 13.0-14.2 / 21.1-29.7 | 6.8-8.5 / 10.9-13.3 | 11.7 / 17.1 | 6.2 / 6.3 |
+| Drafts accepted | 1620 of 2290 | 1888 of 3291 | | |
+| First token of a question, 1st / 2nd ask | 1.7-3.5 / 1.4-1.9 s | 6.4-8.6 / 0.8-1.4 s | 1.5-3.7 / 1.1-1.6 s | 6.7-8.4 / 0.5-1.3 s |
+| Prompt 2k / 8k / 32k (tokens/s) | 175-182 / 486-490 / 836-837 | 86-87 / 255-265 / 516-527 | | |
+| Agent turns 1-3, first round | 12.1 / 15.8 / 4.0 s (a session of its own) | 21.4-21.5 / 29.1-31.7 / 5.2-9.8 s; 26.8 / 33.8 / 5.6 s alone | | |
+| Agent turns 1-3, second round (cached) | 16.7 / 30.9 / 7.8 s | 3.5-5.0 / 1.1-1.6 / 1.3-2.3 s; 1.5 / 0.35 / 1.7 s alone | | |
+| Ready after | 51-53 s | 102-107 s | 48 s | 107 s |
+| MemAvailable while loaded | 20.1 GiB | 12.0-12.4 GiB | 20.1 GiB | 12.0 GiB |
+| The model's pages cached at the end | 5.7 GiB | 10.8-11.9 GiB | 5.4 GiB | 13.1 GiB |
+
+| UD-Q5_K_XL, 40 GiB | Ares, MTP (2 sessions) | Strata, MTP (2) | Ares, no drafts | Strata, no drafts |
+| --- | --- | --- | --- | --- |
+| Decode German, 1st / 2nd ask | 9.7-9.8 / 14.4-14.8 | 1.9 / 2.2 | 8.5 / 12.3 | 2.0 / 2.2 |
+| Decode English | 11.8-12.1 / 15.0-15.2 | 2.6 / 2.7 | 10.9 / 13.8 | 2.4 / 2.5 |
+| Decode code | 7.9-8.5 / 13.5-14.8 | 2.3-2.4 / 2.4-2.6 | 7.8 / 12.1 | 2.1 / 2.1 |
+| Drafts accepted | 1491 of 2340 | 1865 of 3230 | | |
+| First token of a question, 1st / 2nd ask | 3.8-5.4 / 3.6-4.1 s | 12.0-33.9 / 4.4-7.5 s | 4.0-5.4 / 3.7-3.8 s | 13.4-31.5 / 4.4-6.5 s |
+| Prompt 2k / 8k / 32k (tokens/s) | 121 / 355-359 / 763-766 | 53-55 / 157-161 / 341-349 | | |
+| Agent turns 1-3, first round | 17.3 / 21.6 / 6.0 s (a session of its own) | 40.1-42.5 / 47.6-48.4 / 33.2-34.2 s | | |
+| Agent turns 1-3, second round (cached) | 26.2 / 45.3 / 12.6 s | 9.6-9.9 / 2.9-3.3 / 8.4 s | | |
+| Ready after | 51-57 s | 96-99 s | 55 s | 96 s |
+| MemAvailable while loaded | 20.0 GiB | 11.6 GiB | | |
+| The model's pages cached at the end | 5.2-5.7 GiB | 10.7 GiB | | |
+
+Found:
+
+- *Decode: Ares leads.* On UD-Q4_K_XL 1.5 to 3.4 times Strata's tokens/s with drafts (13.0 to
+  17.3 first asks and 19.4 to 29.7 asked again, against 4.6 to 8.5 and 7.5 to 13.3), 1.9 to 2.9
+  times without; on UD-Q5_K_XL 4 to 7 times (Strata decodes it at 1.9 to 2.7 tokens/s). Strata
+  0.1.69 decodes UD-Q4_K_XL slower here than 0.1.60 did on 2026-11-22 (9.0 to 11.6 on first asks);
+  without the owner's switches (`STRATA_HC_Q8_TC`, `STRATA_HC_Q8_BF16TC`, `STRATA_NV_CHUNK`) one
+  session gave the same (5.1 to 7.1 and 7.0 to 11.9). With `--ram 16G` Ares decodes UD-Q4_K_XL at
+  5.2 to 7.4 and 7.1 to 11.1 tokens/s with drafts, 5.1 to 7.2 and 7.5 to 8.5 without (one session
+  each). Where its time goes: [`ssd-decode-profile.md`](ssd-decode-profile.md).
+- *Prompts: Ares leads now.* 1.6 to 2.3 times Strata's rate at 2k, 8k and 32k on both files (the
+  passes layer by layer of 2026-11-23); before them Ares read prompts 1.4 to 4 times slower
+  (UD-Q3_K_XL, 2026-11-23).
+- *A short question's first token.* Ares 1.5 to 3.7 s on UD-Q4_K_XL, Strata 6.4 to 8.6 s; asked
+  again, Ares 1.1 to 1.9 s against Strata's 0.5 to 1.4 s: Ares computes again a prompt shorter
+  than a page of 128 cells (`cached` 3 tokens), Strata reuses all but 7 tokens of it.
+- *Cached agent turns stay Ares's weak point.* Asked again, Strata answers turns 2 and 3 in 0.35
+  to 2.3 s on UD-Q4_K_XL; Ares takes 7.8 to 30.9 s (12.6 to 45.3 s on UD-Q5_K_XL), longer than
+  its own first round (4.0 to 15.8 s). In the turn of 30.9 s (6836 prompt tokens, 6784 of them
+  counted as cached) the store read 67 GB of experts, 8200 of them as guesses read ahead (the
+  wide steps' guesses of whole layers, whose class of more than 64 rows the records named 461 times
+  of 465): the turn computed thousands of rows, not 52. Why the cache did not serve it is open; the
+  prompt cache is the last user of `--ram`, and the tier of experts takes nearly all 40 GiB.
+- *Ares fails a request after the 32k prompt.* Both UD-Q4_K_XL sessions, at the agent's first
+  turn: "the RAM limit of 39.67 GiB has no room for 61.8 MiB more of the tier of experts: the step
+  record and read-back hold 47.4 MiB, the K/V beyond VRAM 127.5 MiB, the tier of experts 39.23
+  GiB, the prompt cache 225.3 MiB"; both UD-Q5_K_XL sessions at the agent's third turn: "the RAM
+  limit has no room for 649.1 KiB more of K and V beyond VRAM: the tier of experts is at its floor
+  and the prompt cache holds the rest". The engine is taken down and loads again on the next
+  request (30 to 34 s). The agent rows above are therefore from sessions of their own (warm-up and
+  the agent only).
+- *Memory.* Strata uses the page cache beyond its budget: 11.6 to 12.4 GiB available while it was
+  loaded, 10.7 to 13.1 GiB of the model's pages cached at the end; Ares leaves 20 GiB available
+  (its reads are direct; the 5.2 to 5.7 GiB cached are the load's).
+- *Cores.* Strata takes 9 workers on this CPU (the performance cores but one and half of the
+  efficiency cores) on cores 1 to 9, its host thread on core 0, and its eight I/O threads beside
+  the rest on cores 10 to 13; Ares pins 12 workers to every core but the conductor's and the
+  device thread's, and its reads wait for a core (the profile's "The drive, and the cores the
+  reads wait for").
+- *Ready after* 48 to 57 s (Ares) against 96 to 108 s (Strata).
