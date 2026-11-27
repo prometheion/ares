@@ -438,8 +438,9 @@ mod tests {
     #[test]
     fn a_step_wider_than_the_shared_rows_holds_one_sequence() {
         // A model that borrows memory for a step wider than 16 rows: a prompt
-        // alone takes the widest step; two prompts, or a prompt and a decision,
-        // share a step of 16 rows at most, the shortest prompt first.
+        // alone takes the widest step; two prompts, or a prompt beside a
+        // generating sequence, share a step of 16 rows at most, the shortest
+        // prompt first.
         let limits = Limits { shared_rows: 16, ..LIMITS };
         let alone = plan(&[prefill(1, 500, 0)], &limits);
         assert_eq!(alone.parts, [part(1, 64, PartKind::Prefill { completes: false })]);
@@ -454,12 +455,10 @@ mod tests {
         assert!(two.rows() <= 16);
         let short = plan(&[prefill(1, 5, 0), prefill(2, 10, 0)], &limits);
         assert_eq!(short.rows(), 15, "steps within the shared rows are as before");
-        let decision = plan(&[score(5, 40, 0)], &limits);
-        assert_eq!(decision.parts, [part(5, 40, PartKind::Score { completes: true })]);
-        let mixed = plan(&[score(5, 40, 0), window(1, 0)], &limits);
+        let mixed = plan(&[prefill(5, 40, 0), window(1, 0)], &limits);
         assert_eq!(
             mixed.parts,
-            [part(1, 1, PartKind::Window), part(5, 15, PartKind::Score { completes: false })]
+            [part(1, 1, PartKind::Window), part(5, 15, PartKind::Prefill { completes: false })]
         );
     }
 
