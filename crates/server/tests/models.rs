@@ -186,6 +186,10 @@ impl Loader for Loads {
         let ram = site.ram.unwrap_or(0);
         Ok(Box::new(Running { machine: machine.clone(), id, engine, taken, ram }))
     }
+
+    fn stop(&self) {
+        self.0.log.lock().unwrap().push("stop".into());
+    }
 }
 
 /// A server over the presets of `ini` on a machine with `devices`.
@@ -640,14 +644,16 @@ async fn a_shutdown_unloads_everything_and_tells_the_requests_that_wait() {
         *flag.lock().unwrap() = true;
     });
     assert_eq!(waiting.await.unwrap().unwrap_err(), AcquireError::Stopping);
+    // The loader is told, so that it ends what it can end early.
+    w.until_logged("stop").await;
     assert!(!*stopped.lock().unwrap(), "the load that runs is finished first");
     weights.open();
     shutdown.await.unwrap();
 
     let mut log = w.machine.log();
-    assert_eq!(log[..3], ["load a", "load d", "load b"]);
-    log.sort();
-    assert_eq!(log[3..], ["unload a", "unload b", "unload d"]);
+    assert_eq!(log[..4], ["load a", "load d", "load b", "stop"]);
+    log[4..].sort();
+    assert_eq!(log[4..], ["unload a", "unload b", "unload d"]);
     assert_eq!(w.machine.free(), [10, 10], "everything is given back");
     assert_eq!(w.models.acquire("a").await.unwrap_err(), AcquireError::Stopping);
 }

@@ -83,6 +83,11 @@ pub trait Loader: Send + Sync + 'static {
     /// Plans and loads the model of `preset`. Takes as long as the weights
     /// take; called from a thread that may block, one call at a time.
     fn load(&self, preset: &Preset, site: &Site) -> Result<Box<dyn Unit>, LoadFailure>;
+
+    /// The server stops: a load that runs now or later ends as soon as it
+    /// can, with what it has (the weights reach the devices; what fills a
+    /// model's caches afterwards is cut short). Called from any thread.
+    fn stop(&self) {}
 }
 
 /// A loaded model.
@@ -942,11 +947,21 @@ impl Models {
         self.acquire(name).await.map(drop)
     }
 
+    /// The server is going to stop: a load that runs ends as soon as it can
+    /// ([`Loader::stop`]), so that the stop does not wait for what fills its
+    /// caches. Called at the first signal, before the running requests are
+    /// waited for.
+    pub fn stop_loads(&self) {
+        self.shared.loader.stop();
+    }
+
     /// Unloads every model and ends the manager. Requests that wait for a
     /// model are told that the server is stopping; a load that runs is
     /// finished first, since the weights' way to the devices is not
-    /// interrupted. Returns when everything is released.
+    /// interrupted, but what fills its caches afterwards is cut short
+    /// ([`Models::stop_loads`]). Returns when everything is released.
     pub async fn shutdown(&self) {
+        self.stop_loads();
         self.shared.lock().stopping = true;
         self.shared.changed();
         let manager = self.manager.lock().unwrap_or_else(|p| p.into_inner()).take();

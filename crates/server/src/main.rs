@@ -140,8 +140,8 @@ async fn run(
     for preset in &presets.models {
         tracing::info!(model = preset.id.as_str(), "{}", preset.options.defaults);
     }
-    let models =
-        Arc::new(Models::start(presets, Arc::new(DeviceLoader), Arc::new(SystemClock::default())));
+    let loader = Arc::new(DeviceLoader::default());
+    let models = Arc::new(Models::start(presets, loader, Arc::new(SystemClock::default())));
 
     match &single {
         // One model on the command line is loaded before the server listens,
@@ -166,8 +166,10 @@ async fn run(
                         }
                         tracing::warn!(
                             "stopping as soon as the model is loaded: the upload of the weights \
-                             cannot be interrupted. A second signal exits at once"
+                             cannot be interrupted, what fills the caches after it is cut short. \
+                             A second signal exits at once"
                         );
+                        models.stop_loads();
                         stop_after_load = true;
                     }
                 }

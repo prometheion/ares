@@ -636,7 +636,11 @@ device): its model gets no new requests, is unloaded when the requests the
 failure ended have let go, and is listed as `failed` with the engine's reason
 until a request loads it again; models on other devices serve on. On the
 first signal the server stops as before, and then unloads every model before
-the process exits; a load that runs then is finished first.
+the process exits; a load that runs then is finished first, but only as far
+as the weights: the loader is told at the first signal (`Loader::stop`,
+`Models::stop_loads`), and the fill of the tiers of experts that follows them
+(from the usage profile, or the warm-up text) ends at its next turn, so that a
+stop does not wait half a minute for the drive (`Qwen4Exp::with_stop`).
 
 *What is not there.* The plan of a load cannot be asked without the load
 (the mixture-of-experts model's placement reads the devices itself), so the
