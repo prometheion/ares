@@ -28,6 +28,7 @@ use super::devices::{
     Held, bandwidth, describe_links, free_of, hold_devices, multiprocessors_of, ordinals, tower_of,
 };
 use super::files::{chat_options, drafter_files, mtp_takes_part, open_projector, read_vocabulary};
+use super::products::products_line;
 use super::ram::{Budget, Rest};
 use super::start::{self, Engine, log_started};
 use super::{
@@ -755,6 +756,12 @@ fn log_taken(
             Bytes(VRAM_HEADROOM),
             (free.saturating_sub(VRAM_HEADROOM) / report.page_bytes.max(1))
                 .saturating_mul(u64::from(CELLS_PER_PAGE)),
+        );
+        let layouts = &report.layouts;
+        tracing::info!(
+            "device {}: {}",
+            h.device.ordinal(),
+            products_line(layouts.full_rate, &layouts.paths, &layouts.layout_tables)
         );
     }
     Ok(())

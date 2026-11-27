@@ -121,9 +121,10 @@ which `Kernels::prefill_path_for(ty, precision)` chooses per type and device:
 On a capped card (below) the f16 path runs at half the rate, and F16Flush is as
 fast as int8 for some types and 20 times more exact: on the two development
 cards at 1024 rows for Q4_K, IQ2_S and IQ2_XS (1.02 to 1.18 times), not for the
-others (0.74 to 0.91 times). `Precision::Fast` takes the path measured per type
-on the device at load (below), on every card; `Precision::Exact` is always
-f16. A row gives the same bits alone and inside a batch within a path.
+others (0.74 to 0.91 times). The engine takes the path measured per type on the
+device at load (below), on every card, capped or not (`Precision::Fast`);
+`Precision::Exact`, a tool of the tests, is always f16. A row gives the same bits
+alone and inside a batch within a path.
 
 On a card without the cap the f16 path costs the tensor cores no more than int8's
 work, and whether the tile kernels run it as fast depends on the type; on a capped
@@ -137,9 +138,17 @@ int8). 50 to 150 ms per type, once per device and process: kernels of a device l
 again (Flash-Next's parts opened for the trial of the second card's role and then for
 good, a model loaded again) take the first measurement and the same path. The qwen35
 chooser measures every type of its groups before its probes (so they time the path that
-will run), Flash-Next's wide steps its quantized dense types. A type that was not measured (in tests and benches) takes f16
-on a card without the cap and on a capped card the rule kept from the development
-cards (F16Flush for Q4_K, IQ2_S and IQ2_XS, int8 else). Measured on the two capped
+will run) and the type of a head that keeps the file's layout beside them, Flash-Next's
+wide steps its quantized dense types. A type that was not measured (in tests and
+benches, and a type of Flash-Next whose probe found no memory) takes the rule kept from
+the development cards, on every card: f16 for Q4_K, IQ2_S, IQ2_XS and the types without
+an int8 kernel, summed in f32 where the tensor cores run that at full rate and in f16
+(F16Flush) where they are capped, int8 else. (On the RTX 4060 Ti with gpu-unlock that
+rule's int8 is within 5 % of f16 at 512 rows for every type of the table below and up
+to 27 % faster, IQ3_S; f16 for every type, the rule for such a card before 2026-11-27,
+was up to 21 % slower.) The load log names, per device, whether its tensor cores are
+capped, the path each type takes with the probe's time of each path, and the kernels
+the device layout's table took for each type (`ares-server`, `load/products.rs`). Measured on the two capped
 development cards (2026-11-22, Qwen3.8-27B UD-Q4_K_S, tensor split 0.625 / 0.375,
 three alternating pairs at a load average of 26 to 13): the RTX 4070 takes F16Flush for
 IQ2_S, IQ2_XS, Q4_K and Q5_K and int8 for IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q3_K, Q6_K and
@@ -1108,16 +1117,16 @@ exact one; whether it is as fast in the tile kernels of the file's layout depend
 on the type (below), so there it is measured per type.
 
 There is no build option for this. Each device is probed for a few
-milliseconds when the kernels are loaded and the result is reported at start:
+milliseconds when the kernels are loaded and the result is in the load log
+(`ares-server`, `load/products.rs`):
 
 - **Tensor cores at full rate:** the direct path (f16, f32 accumulation) is
   used wherever it is as fast; the tile kernels of the file's layout take, per
   type, the path a probe at load found fastest (`Kernels::measure_prefill_path`,
   "Prefill weight kernels" above), the exact one on ties.
-- **Capped:** the workaround is the default, because it is faster there, and
-  the report says so and names the remedy: per type, the path a probe at load
-  found fastest of int8 and f16 with f16 accumulation (the more exact on ties).
-  The exact path can be chosen instead.
+- **Capped:** the workaround runs, because it is faster there, and the log
+  says so and names the remedy: per type, the path a probe at load found
+  fastest of int8 and f16 with f16 accumulation (the more exact on ties).
 
 The development machine's cards are capped, and the probe shows it exactly:
 f16 `mma` with f32 accumulation runs at 58.6 TFLOPS on the RTX 4070 and 25.6

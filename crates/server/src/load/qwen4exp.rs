@@ -37,6 +37,7 @@ use ares_tokenizer::Tokenizer;
 
 use super::devices::{Held, describe_links, hold_devices, ordinals, tower_of};
 use super::files::{chat_options, drafter_files, open_projector, read_vocabulary};
+use super::products::products_line;
 use super::ram::{Budget, Rest};
 use super::start::{self, Engine, log_started};
 use super::{LoadError, Loaded, VRAM_HEADROOM, join, log_context, model_error, refuse, short};
@@ -801,6 +802,11 @@ fn log_taken(model: &Arc<Qwen4Exp>, config: &Config, held: &[Held]) -> Result<()
             Bytes(report.scratch),
             Bytes(h.free.saturating_sub(free)),
             Bytes(free),
+        );
+        tracing::info!(
+            "device {}: {}",
+            h.device.ordinal(),
+            products_line(report.full_rate, &report.paths, &[])
         );
     }
     if let Some((vram, ram_slots, ram_bytes)) = model.expert_slots() {

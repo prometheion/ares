@@ -28,7 +28,7 @@
 //!   brings the experts that were missing and gives a table of just those for the next
 //!   round, which adds to the same output. The plan is made once per layer.
 
-use ares_cuda::{ExpertShape, PrefillPath};
+use ares_cuda::{ExpertShape, PrefillChoice, PrefillPath};
 use ares_quant::act;
 
 use super::{
@@ -236,6 +236,17 @@ impl State {
             fork: Event::new(device)?,
             joins: (0..HELPERS).map(|_| Event::new(device)).collect::<Result<_, _>>()?,
         })
+    }
+
+    /// The path of the tile kernels each quantized dense type of the part takes in wide
+    /// steps, as measured when the state was opened (or the kept rule, where the probe
+    /// found no room).
+    pub(super) fn paths(&self, kernels: &Kernels) -> Vec<PrefillChoice> {
+        self.forms
+            .iter()
+            .filter(|(ty, _)| !is_float(*ty) && kernels.has_prefill_path(*ty, PrefillPath::F16))
+            .filter_map(|(ty, _)| kernels.prefill_choice(*ty).ok())
+            .collect()
     }
 }
 
