@@ -46,11 +46,19 @@ fn port(offset: u16) -> u16 {
 }
 
 /// Tokens and properties, the count of the thinking, the stop string that
-/// ended a reply and a prefill, with the model's own template.
+/// ended a reply and a prefill, with the model's own template; and the load
+/// log names what the weight kernels were measured to be on the device.
 #[test]
 fn the_basics_of_a_server_work_with_a_real_model() {
     let Some(model) = model() else { return };
-    let server = serve(&model, port(5), &[]);
+    let mut server = serve(&model, port(5), &[]);
+    let device = format!("device {}: the tensor cores add f16 products", common::test_device());
+    eventually("the line of the products", || server.logged().iter().any(|l| l.contains(&device)));
+    let line = server.logged().iter().find(|l| l.contains(&device)).cloned().unwrap_or_default();
+    eprintln!("RES {line}");
+    assert!(line.contains("tile kernels of the file's layout per weight type"), "{line}");
+    assert!(line.contains("q4_K int8 (") || line.contains("q4_K f16"), "{line}");
+    assert!(line.contains("kernels of the device layout above a decode step's rows"), "{line}");
     let props = server.get("/props").json();
     assert!(props["chat_template"].as_str().unwrap().contains("<|im_start|>"), "{props}");
     assert_eq!(props["chat_template_caps"]["supports_reasoning"], true, "{props}");
