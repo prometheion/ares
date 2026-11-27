@@ -278,6 +278,12 @@ pub(crate) struct Cache {
     /// [`Model::far_pages`]: crate::Model::far_pages
     far: Option<FarPages>,
     far_held: u64,
+    /// The bytes of those far pages that are part of the cache's floor
+    /// ([`PinnedRam::keep_context_cached`]).
+    far_keep: u64,
+    /// The cache gives way to running sequences ([`Cache::give_way`]): what
+    /// leaves the devices finds no buffer in RAM.
+    giving_way: bool,
 }
 
 impl Cache {
@@ -369,14 +375,26 @@ impl Cache {
             evictions: 0,
             far: None,
             far_held: 0,
+            far_keep: 0,
+            giving_way: false,
         }
     }
 
     /// The model keeps the pool pages from `far.first` on in host memory:
     /// those only the index holds count as the prompt cache's and leave the
-    /// devices first when it must give memory back ([`Cache::trim`]).
-    pub(crate) fn with_far(mut self, far: Option<FarPages>) -> Self {
+    /// devices first when it must give memory back ([`Cache::trim`]). As many
+    /// of them as one request of `cells` cells holds beyond VRAM are part of
+    /// the cache's floor, which the tier of experts leaves it: the next turn of
+    /// a conversation finds them, and its last checkpoint is of use.
+    pub(crate) fn with_far(mut self, far: Option<FarPages>, cells: u32) -> Self {
         self.far = far;
+        if let Some(far) = far {
+            let pages = cells.div_ceil(self.cells_per_page.max(1));
+            self.far_keep = u64::from(pages.saturating_sub(far.first)) * far.page_bytes;
+        }
+        if let Some(books) = &self.books {
+            books.keep_context_cached(self.far_keep);
+        }
         self
     }
 
@@ -475,11 +493,13 @@ impl Cache {
     }
 
     /// The policy with the budget the checkpoints have now: what the books
-    /// allow but the floor of pages, and never more than the budget the
-    /// places were counted for. Pages in RAM above their floor make room for
-    /// checkpoints, not the other way round.
+    /// allow but the floor of pages and the far pages the cache holds on the
+    /// devices (the floor keeps them: they are no room for a place), and never
+    /// more than the budget the places were counted for. Pages in RAM above
+    /// their floor make room for checkpoints, not the other way round.
     fn policy_now(&self) -> CheckpointPolicy {
-        let allowed = self.allowance().saturating_sub(self.page_floor);
+        let allowed =
+            self.allowance().saturating_sub(self.page_floor).saturating_sub(self.far_held);
         CheckpointPolicy { budget_bytes: self.policy.budget_bytes.min(allowed), ..self.policy }
     }
 

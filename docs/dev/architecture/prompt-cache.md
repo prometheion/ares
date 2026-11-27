@@ -44,7 +44,13 @@ pump's rounds.
   which is written first. A page is
   the most recently used of what left the devices when it arrives, and the
   devices give a text up from its end, so a text goes from its end here too.
-  A checkpoint goes on its own or with its page.
+  A checkpoint goes on its own or with its page. When the cache gives memory
+  back down to its floor, the index's checkpoint used last (the deepest of
+  them) goes last, whatever the ranking says (`give_up_toward_floor`,
+  2026-11-25): the floor of one place is there so
+  that a conversation goes on from its last checkpoint, and the ranking, which
+  keeps roots longest, kept the root of a long prompt and gave up its anchor,
+  so the same prompt sent again replayed every row the cache held.
 - **Memory.** The pages and the checkpoints are the prompt cache's share of
   the engine's page-locked RAM, its lowest user ("Host memory"): the cache
   takes what the allowance leaves and gives back what it does not hold any

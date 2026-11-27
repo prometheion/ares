@@ -198,19 +198,6 @@ marks a line that only a GPU run can settle or check.
 | Model, runtime, kernels | 13 | 12 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
-- [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
-      Flash-Next's layer pass refuses ("a step wider than 512 rows reads one prompt",
-      `qwen4exp/device/runtime/pass.rs` `pass_of`): both requests get 500 and the model is unloaded.
-      In work: `fix/flash-crashes`.
-- [ ] Far K/V finds no RAM room ("the tier of experts is at its floor and the prompt cache holds the
-      rest", `qwen4exp/device/flow.rs` `FAR_WAIT`) at `--ram 40G` beside a 39,810-token request and at
-      `--ram 52G` repeating a 50k prompt: the prompt cache (lowest rank) does not give way, the tier's
-      floor latches for good (`runtime/src/ram.rs` `experts_floor`), and the engine takes the model
-      down instead of ending one request. In work: `fix/flash-crashes`.
-- [ ] The same 49,965-token prompt sent again (one sequence, `--ram 52G`) was read again from the
-      start instead of taken from the prompt cache, while the first request's far pages still held
-      RAM as prompt cache; the second read's new far pages then hit the RAM failure above. A repeat
-      must reuse the finished sequence's pages and checkpoints. In work: `fix/flash-crashes`.
 - [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
       hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
 
@@ -314,6 +301,13 @@ Tests that fail:
       `crates/sched/src/confidence.rs`, the test.
 
 Wrong behaviour:
+- [ ] GPU. The step price the server measures at load is not monotonic in the rows (Flash-Next on
+      the local cards, 2026-11-25: 1 row 22.9 ms, 2 rows 118.7, 3 rows 166.4, 8 rows 80.9; the
+      report on an RTX 4080: 1 row 17.4, 2 rows 126.9, 8 rows 55.5). It is measured before the
+      warm-up fills the tiers, so the steps of few rows wait for experts from the drive; the
+      share and the piece size price steps by it until real steps teach the prices. Seen by
+      `fix/flash-crashes`, not the cause of its defects. Files: `crates/server/src/load/start.rs`,
+      `crates/runtime/src/conductor/measure.rs`.
 - [ ] GPU. Flash-Next: rounds between the pieces of a paused pass can stall the expert store when
       the pass borrows all the slots can lend ("a step stood still for 30s while the host held
       back the next layer ... the store waits for 7 to 9 experts and is not settled": a 21k-row
@@ -333,17 +327,6 @@ Wrong behaviour:
       4 more with the prompt cached, load 6 to 36. A pass opened beside generation is half as wide
       (the conductor), where it never stalled. What is left is the robustness the item names (the
       store bringing a step's experts whatever a loan holds), untested.
-- [ ] GPU. A step fails when the tier of experts cannot grow by a piece (found 2026-11-25 on
-      `fix/model-sweep`, 1 of 8 runs of the check above on the branch, none of 4 on main, not tied
-      to a change of the branch): `Flow::before_step` grows the RAM tier by a piece
-      (`grow_ram(1)`) and passes a refused booking on as the step's error, so the engine fails and
-      the model is taken down ("the RAM limit of 8.00 GiB has no room for 50.2 MiB more of the tier
-      of experts: the step record and read-back hold 41.2 MiB, the K/V beyond VRAM 285.3 MiB, the
-      tier of experts 7.54 GiB, the prompt cache 112.6 MiB"; a request generating beside a 31k
-      prompt's pass). The grow is optional; its refusal should leave the tier as it is (as
-      `Flow::follow_ram` does). Near `fix/flash-crashes`' far K/V item. Files:
-      `crates/model/src/qwen4exp/device/flow.rs` (`before_step`),
-      `crates/runtime/src/expert_store/elastic.rs` (`grow_ram`), `crates/runtime/src/ram.rs`.
 - [ ] GPU. **Lent steps with the CPU's share** (found by `kvfix`, 2026-11-24; main's, not the far
       pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
       loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
@@ -602,7 +585,14 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
       VRAM, quality.
 
 ## Questions to the owner
-- None open (the seven of the triage answered 2026-11-25, under "Decided by the owner").
+- The far pages a finished request leaves (`fix/flash-crashes`, 2026-11-25): the prompt cache's
+  floor now keeps as many as one request can hold beyond VRAM from the tier of experts, so that
+  the same long prompt sent again comes from the cache (asked by the coordinator after the
+  report of 2026-11-25; the decision of 2026-11-22 above had them give way before the tier).
+  They still give way to running sequences' K and V first. Open: whether the machine's memory
+  pressure (another program growing) should take them before the tier too; today it does not
+  (they are in the floor). Files: `crates/runtime/src/ram.rs` (`Books::cache_floor`,
+  `keep_context_cached`), `crates/runtime/src/cache/moves.rs` (`trim`).
 
 ## Features
 Pieces of real work, days each, in the order of work where the owner placed them.

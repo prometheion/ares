@@ -188,6 +188,12 @@ impl Conductor {
         if let Some(cache) = &mut self.cache {
             cache.settle_leaving(&mut self.pool, &mut *self.exec);
         }
+        if let Err(message) = self.make_room() {
+            return self.fail(message);
+        }
+        if self.parts.is_empty() {
+            return;
+        }
         let used = match self.write_record(RecordKind::Resume { pause_ms: budget_ms }) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
