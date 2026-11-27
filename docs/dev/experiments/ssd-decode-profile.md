@@ -105,6 +105,18 @@ With two cores free (12 workers) an expert's reads take 2.8 ms and with three 2.
 the drive takes for one alone (2.0 ms), and the step is 8 to 12 % faster at 40 GiB and 16 to 24 %
 at 16 GiB; twelve workers keep the CPU's share (13.2 against 11.9 ms; 14.3 with ten).
 
+What the threads waited for a core, from `/proc/<pid>/task/*/schedstat` over 20 s of the decode
+at 39.5 GiB (alternating; the I/O threads are the reader of the model file and the one of the
+n-gram table's rows):
+
+| Run | `ares-io` (2 threads): waited for a core / ran | Waits per wake-up | The host's threads waited | The workers waited, each |
+| --- | ---: | ---: | ---: | ---: |
+| The engine's 13 pinned workers (two runs) | 1909 to 2113 / 42 ms | 200 to 212 µs (9 564 to 9 954 wake-ups) | 452 to 654 ms | 19 to 1093 ms |
+| 10 workers placed by the scheduler | 136 / 77 ms | 14 µs | 170 ms | 276 to 427 ms |
+
+So in the engine's placement the I/O thread waits a tenth of the time for a core, 0.2 ms each
+time it wakes for a completion, where it waits 14 µs with three cores free.
+
 ## The read-ahead
 
 - At 40 GiB the next layers' routers name 645 experts a step, 52 % of them picked; 40 of them in
@@ -129,7 +141,25 @@ are back at 64 to 77 % (the run's mean: 65.9 % in VRAM, 55.3 ms at the median, 1
 the 1024 timed steps after it 55.8 %, 70.4 ms). VRAM holds 12.7 % of the experts and gets 45 to
 77 % of the picks; between steps 7 to 10 experts a step are promoted, and the link carries
 nothing else (every miss is the CPU's). How fast the tiers catch up after a change of the text
-decides the slow windows; that is not measured beyond these windows.
+decides the slow windows; that is not measured beyond these windows. At 16 GiB (512 steps, the
+RAM tier holding a fifth of the experts) the fall lasts: 58 to 70 % in steps 1 to 192, then 36 to
+47 % for the 320 steps after (94 to 112 reads of the file a step, 239 to 277 ms).
+
+## UD-Q5_K_XL, and a context of 30 000 tokens
+
+The same runs (B, steps 1 to 256 after the context) on the 147 GiB UD-Q5_K_XL (2400 VRAM slots, 9.8
+%; 3744 RAM slots at 16 GiB, 10 032 at 39.5) and on UD-Q4_K_XL after 30 000 tokens of context:
+
+| Run | Step median / mean | In VRAM | Misses from RAM / the file (MB a step) | Waits: CPU / file (layers, ms each) |
+| --- | ---: | ---: | ---: | ---: |
+| UD-Q5_K_XL, 39.5 GiB | 93.8 / 101.8 ms | 54.3 % | 199.6 / 19.1 (77) | 11.6 / 54.7 ms (13.4, 4.1) |
+| UD-Q5_K_XL, 16 GiB | 201.8 / 220.0 ms | 54.3 % | 142.2 / 75.3 (303) | 3.8 / 181.1 ms (32.0, 5.7) |
+| UD-Q4_K_XL at 30 000, 39.5 GiB | 70.9 / 73.3 ms | 49.4 % | 233.5 / 9.6 (30) | 13.7 / 28.6 ms (7.7, 3.7) |
+| UD-Q4_K_XL at 30 000, 16 GiB | 205.6 / 211.9 ms | 49.6 % | 164.2 / 77.0 (242) | 3.6 / 177.5 ms (33.9, 5.2) |
+
+The larger file reads twice as much from the drive at 40 GiB, and its step is waiting for the
+file half the time. At 30 000 tokens the attention takes 1.14 ms a step against 0.92 at 4000, and
+the step is what its misses make it: a long context costs decode little on this model.
 
 ## Two small cards (the RTX 4070 and the RTX 3060, #24)
 
@@ -206,7 +236,7 @@ a run; the others are bounds from the parts of the step.
 | 4 | One read per expert (a file of Ares's own) | -1.5 to -3 ms (2 to 4 %) | -6 to -11 ms (3 to 6 %) | an expert alone takes 2.0 ms in three reads at depth 1; what one read of 3 MB takes is not measured |
 | 5 | No predictions where no place qualifies | -1.7 ms (2.4 %) | -1.7 ms (1 %) | measured: `--predict 0` takes 1.7 ms off the dense part and reads ahead nothing less that is used |
 | 6 | The resident experts' down product while the misses come ("reordered inference", LES, ProMoE) | -1.5 ms (2 %) | -1.5 ms (1 %) | the device computes about 0.1 ms of experts a layer, a third of it the down product; a layer waits 0.31 to 5 ms |
-| 7 | VRAM catches up faster after the text changes | not known | not known | the share in VRAM varies from 22 to 77 % by 64 steps of a decode and a slow window takes twice the step; the server's first asks find 28 to 60 %; the tiers do recover within 64 to 128 steps |
+| 7 | VRAM catches up faster after the text changes | not known | not known | the share in VRAM varies from 22 to 77 % by 64 steps and a slow window takes twice the step; at 40 GiB it recovers within 64 to 128 steps, at 16 GiB it stayed at 36 to 47 % for 320 steps; the server's first asks find 28 to 60 % |
 | 8 | Reading ahead on the predictions | none | none | of the experts no tier holds, 11 % (40 GiB) and 23 % (16 GiB) of the predicted are picked; the drive bounds the 16 GiB step; a prefetch waits 170 to 250 ms |
 
 - *1 comes first.* It is the largest measured saving and the smallest change, and it serves both
