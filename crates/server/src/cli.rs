@@ -529,7 +529,7 @@ fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use ares_cuda::{CacheFormat, Precision, PruneRule};
+    use ares_cuda::{CacheFormat, PruneRule};
     use ares_server::ReasoningFormat;
     use ares_server::defaults::Defaults;
     use ares_server::plan::{Drafter, ExpertPrune, LoadOptions, SplitKind};
@@ -598,8 +598,6 @@ mod tests {
             "f16",
             "--ram",
             "12G",
-            "--precision",
-            "exact",
             "--drafters",
             "none",
             "--window",
@@ -618,7 +616,6 @@ mod tests {
         assert_eq!(load.parallel, Some(3));
         assert_eq!(load.kv, Some((CacheFormat::F16, CacheFormat::F16)));
         assert_eq!(load.ram, Some(12 << 30));
-        assert_eq!(load.precision, Precision::Exact);
         assert_eq!(load.drafters, Some(Vec::new()));
         assert_eq!(load.window, Some(12));
         assert_eq!(
@@ -909,7 +906,6 @@ mod tests {
             (&["--cache", ""], "--cache"),
             (&["--cache-size", "plenty"], "--cache-size"),
             (&["--cache-size", "100M"], "--cache-size"),
-            (&["--precision", "sloppy"], "--precision"),
             (&["--drafters", "none,mtp"], "--drafters"),
             (&["--chat-var", "novalue"], "--chat-var"),
             (&["--chat-var", "=x"], "--chat-var"),

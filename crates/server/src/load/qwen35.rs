@@ -291,7 +291,6 @@ impl Asked {
         let window_rows = if self.drafts() { parallel.saturating_mul(self.window) } else { 0 };
         let defaults = Options::default();
         let part = Options {
-            precision: options.precision,
             kv: self.kv,
             max_rows: options.ubatch.unwrap_or(defaults.max_rows),
             logit_rows: window_rows.max(parallel),
@@ -649,16 +648,12 @@ fn log_split(held: &[Held], split: SplitKind, why_split: &str, spread: &Spread, 
     );
 }
 
-/// The plan's line of the formats of K and V, the products and the drafters.
+/// The plan's line of the formats of K and V and the drafters.
 fn log_drafting(options: &LoadOptions, asked: &Asked, held: &[Held], placement: &Placement) {
     tracing::info!(
-        "plan: K in {}, V in {}; products {}; {}",
+        "plan: K in {}, V in {}; {}",
         plan::format_name(asked.kv.0),
         plan::format_name(asked.kv.1),
-        match options.precision {
-            ares_cuda::Precision::Fast => "fast (8-bit activations for a few rows)",
-            ares_cuda::Precision::Exact => "exact (f16 on the tensor cores for every product)",
-        },
         match (asked.drafts(), &placement.draft) {
             (false, _) => match options.drafters {
                 Some(_) => "no drafters (--drafters none): no speculation".to_owned(),

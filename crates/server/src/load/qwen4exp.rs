@@ -268,12 +268,6 @@ impl Asked {
                  their keys and values are on the device that mixes the streams",
             ));
         }
-        if options.precision == ares_cuda::Precision::Exact {
-            return Err(refuse(
-                "--precision exact is not a choice for this model: its products have one kind of \
-                 arithmetic",
-            ));
-        }
         // The model's MTP block: in the model file (`--drafters mtp`, a file
         // that carries the `mtp.*` tensors) or a file of its own, which
         // --drafters names by its path (architecture `qwen4exp-mtp`). A DFlash
