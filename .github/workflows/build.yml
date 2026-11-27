@@ -24,7 +24,11 @@ env:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    container: nvidia/cuda:13.0.3-devel-ubuntu24.04
+    container:
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
+      # Docker's default seccomp profile refuses io_uring, which ares-io reads
+      # the model files with; its tests open a ring.
+      options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
 
