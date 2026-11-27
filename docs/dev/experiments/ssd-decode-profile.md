@@ -116,8 +116,8 @@ n-gram table's rows):
 
 So in the engine's placement the I/O thread waits a tenth of the time for a core, 0.2 ms each
 time it wakes for a completion, where it waits 4 to 14 µs with three cores free (the four runs'
-steps: 67.7 and 69.9 ms at the median with the engine's placement, 59.1 and 64.0 with ten
-workers).
+steps: 69.9 and 64.0 ms at the median with the engine's placement, 59.1 and 67.7 with ten
+workers; the step times of single runs overlap, the I/O thread's waits do not).
 
 ## The read-ahead
 
