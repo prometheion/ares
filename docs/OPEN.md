@@ -282,11 +282,11 @@ marks a line that only a GPU run can settle or check.
       1 of 32 on main; twice, in a `cargo test` beside other test binaries and builds of this
       machine, both `ram::nothing_is_written_while_ram_holds_a_conversation_and_all_of_it_when_the_engine_ends`
       and `ram::the_anchor_that_later_turns_share_inside_its_page_reaches_the_drive` saw no
-      records right after the engine before them was dropped: the engine that counted had no
-      level on SSD (`enabled: false`, its store did not open; `stored` now asserts that with the
-      reason), and `ram::an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram` once
-      found nothing cached after the restart, which 72 runs of the three alone under load, and
-      48 of the suite eight at once, did not repeat.
+      records right after the engine before them was dropped, and
+      `ram::an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram` once found nothing
+      cached after the restart: the next engine's store was "in use by another process" (a
+      process forked for the full-drive test holds the lock files' descriptors until its exec);
+      fixed 2026-11-27 by the SSD level waiting a second for a locked store.
       Alone and on an idle machine all pass. Files: `crates/runtime/tests/cache/ram.rs`,
       `prefix.rs`, `crates/runtime/src/cache/moves.rs` (`page_room`).
 

@@ -380,6 +380,27 @@ fn pages_that_settle_late_are_written_in_the_form_they_have() {
 }
 
 #[test]
+fn a_store_that_the_engine_before_holds_a_moment_longer_is_waited_for() {
+    // The engine before lets the store go 300 ms after the next one starts
+    // (an unload and a load, a lock that a forked process holds until it
+    // runs its program): the next one waits and has its level on SSD.
+    let dir = TempDir::new("moment");
+    let model = model(1, |_| {});
+    let before = engine(&model, config(256, 8, Some(store(&dir.0))));
+    let gone = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(before);
+    });
+    let next = engine(&model, config(256, 8, Some(store(&dir.0))));
+    gone.join().unwrap();
+    let s = next.snapshot();
+    assert!(s.counters.ssd.enabled, "{:?}", s.ssd_problem);
+    let prompt = text_of(71, 100);
+    assert_eq!(next.ask(&prompt, 10).run.text, fresh(&prompt, 10));
+    next.consistent();
+}
+
+#[test]
 fn a_second_engine_on_the_same_store_serves_without_it() {
     let dir = TempDir::new("two");
     let model = model(1, |_| {});

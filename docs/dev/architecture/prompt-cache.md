@@ -136,7 +136,11 @@ and after a restart of the server. Nothing is written as it is computed.
   turns leave behind, age and go without taking pages along. The index is
   rebuilt from the record headers when the store is opened. One process uses
   a store at a time (a lock file); a second server on the same directory and
-  fingerprint runs without the level and says so.
+  fingerprint runs without the level and says so, after waiting a second for
+  the lock: the engine before may hold it a moment longer, and so does a
+  process forked from this one until it runs its program (the tests' full
+  drive, which made two cache tests of an engine after a restart fail now
+  and then, their store "in use by another process").
 - **Bytes move outside of steps.** A page is written straight from its
   buffer in RAM by one writer thread, which syncs the drive a second after its
   last record (and every ten seconds while records keep coming); the buffer
