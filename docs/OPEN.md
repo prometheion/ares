@@ -204,7 +204,7 @@ marks a line that only a GPU run can settle or check.
 
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
-| Server, API, cache | 2 | 0 |
+| Server, API, cache | 3 | 1 |
 | Model, runtime, kernels | 15 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
@@ -251,6 +251,16 @@ marks a line that only a GPU run can settle or check.
       its stacks (`coredumpctl info`), decide; an abort without such a line points at the driver.
 
 ### Server, API, cache
+- [ ] GPU. A model unloaded and loaded again in the same process (`POST /models/unload`, then a
+      request) uploads its weights far slower than a first load: the 27B Q4_K_S on both local
+      cards (`--ram 8G --context 32768 --cache`, 2026-11-27, `fix/server-sweep` and
+      `fix/exact-anchor` alike) took 659 s for its 8.47 GiB on device 0 at the reload (16 to 28 s at
+      the first load of each process, one of them a minute after), and the other build was still
+      loading after 5 min, a device thread in state D, the machine's I/O pressure at 15 to 21 %
+      "full" from other agents' work. A fresh process loads fast meanwhile, so the reload path is
+      suspect (the page-locked staging taken anew on a machine whose memory is fragmented, the
+      model file read again). Logs `/var/tmp/ares-fixserver/bench/run2-Qwen3.8-27B--A1.log` and
+      `--B1.log`. Files: `crates/server/src/load/start.rs`, `crates/model/src/qwen35/device/`.
 - [ ] With several checkpoint places to a chunk (a device part whose checkpoint is under 16 MiB,
       `CHUNK_BYTES` 32 MiB: the 0.8B split over two cards, the synthetic test models; the 27B and
       Flash-Next have one place a chunk), the cache counts the places it uses and the books whole
