@@ -218,6 +218,10 @@ pub(super) fn load(
     log_steps_taken(&model, own_rows, max_rows, pass_rows);
     log_started(&runtime, budget.ssd.as_ref(), &model.drafters());
     fill_tiers(&runtime, &model, &name)?;
+    // The warm-up measured the prices of steps while the tiers were cold, which makes every
+    // window dear (one row 30.9 ms, two rows 114.8 ms on two cards, 2026-11-27): they are tried
+    // again from the first steps on, on the filled tiers.
+    runtime.age_prices();
     log_expert_costs(&model);
     log_taken(&model, &config, &held)?;
     match near {

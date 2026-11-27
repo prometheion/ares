@@ -1051,6 +1051,41 @@ fn windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay()
     }
 }
 
+/// The same cold start, and the owner says that the prices are old once the
+/// device is warm (a server whose tiers of experts were filled after the
+/// warm-up): the windows are tried from the first steps on, and chosen.
+#[test]
+fn windows_priced_out_on_a_cold_start_are_tried_at_once_when_the_prices_are_aged() {
+    let warm = Arc::new(AtomicBool::new(false));
+    let steps: Steps = Arc::default();
+    let model = drafting_model(&[0.97], 64);
+    let config = RuntimeConfig { window_rows: 8, warm_up: true, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
+        let warm = warm.clone();
+        e.with_step_cost(move |rows| {
+            if warm.load(Ordering::Relaxed) {
+                launches(rows)
+            } else {
+                Duration::from_millis(3 + 9 * u64::from(rows))
+            }
+        })
+        .with_link_cost(Duration::from_micros(300))
+        .without_sleeping()
+        .with_observer(watch(&steps))
+    });
+    let warm_up = steps.lock().unwrap().len();
+    warm.store(true, Ordering::Relaxed);
+    rt.age_prices();
+    alone(&rt, "a long and easy text", Some(300));
+    let seen: Vec<Seen> = steps.lock().unwrap()[warm_up..].to_vec();
+    let first = seen.iter().position(|s| s.windows > 0).expect("a window");
+    // The prompt's step, and the first token's, which measures one row warm.
+    assert!(first <= 2, "the first window at step {first}");
+    let rows: Vec<u32> = seen[first..].iter().map(|s| s.rows).collect();
+    let full = rows.iter().position(|rows| *rows == 8).expect("a window of a whole launch");
+    assert!(full <= 12, "{rows:?}");
+}
+
 /// A model whose MTP block is right six times in ten at every link and
 /// says so: 0.95 for a draft that is right and 0.15 for one that is wrong
 /// (`sure`), or nothing.

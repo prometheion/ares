@@ -208,6 +208,9 @@ fn flash_next_drafts_with_its_mtp_block() {
         SLOW,
     );
     let log = server.logged().join("\n");
+    for line in log.lines().filter(|l| l.contains("the price of a step") || l.contains("tiers")) {
+        eprintln!("LOG {line}");
+    }
     assert!(log.contains("MTP block") && log.contains("drafts"), "the plan names it: {log}");
     assert!(log.contains("experts share the tiers"), "and what it took: {log}");
     let client: &Client = &server;

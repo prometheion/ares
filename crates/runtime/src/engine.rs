@@ -468,6 +468,19 @@ impl Runtime {
         self.ask(|reply| Command::Stats { reset: true, reply }).map(StatsCopy::into_snapshot)
     }
 
+    /// Makes the prices of steps and of chains measured so far old
+    /// (`ares_sched::Curve::age`): something changed that the owner knows they
+    /// say little about now. A server calls it when the tiers of experts are
+    /// filled after the warm-up measured the prices on cold tiers, where every
+    /// window looks dear: each size is then tried again at the price of the
+    /// nearest smaller one measured since, from the first steps on instead of
+    /// after 256, and the steps that run measure it.
+    pub fn age_prices(&self) {
+        if let Some(sender) = self.commands.lock().expect("commands").as_ref() {
+            let _ = sender.send(Command::AgePrices);
+        }
+    }
+
     /// The running sequences and their page tables, for tests and logs.
     pub fn sequences(&self) -> Option<Vec<SequenceInfo>> {
         self.ask(|reply| Command::Inspect { reply })
