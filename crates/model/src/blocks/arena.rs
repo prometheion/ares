@@ -114,21 +114,23 @@ const PIECE: usize = 16 << 20;
 ///
 /// The stored bytes of a matrix are a slice of a mapping of the model file.
 /// Uploading from the mapping makes the driver fault the file in page by
-/// page, and the kernel reads around a fault only while the faults of that
-/// mapping mostly find the page cache: once they keep missing it (more than a
-/// hundred misses beyond the hits, Linux's `MMAP_LOTSAMISS`), every fault
-/// reads one page. A load of Qwen3.8-27B then read 38 MB per second from a
-/// drive that gives 900 to an ordinary read on a machine short of memory, and
-/// 5 to 20 MB per second (659 s for the weights of one device instead of 17)
-/// when it was loaded again in the same process after the kernel had taken
-/// back part of the file's pages (GitHub issue #66); a copy from a cold
+/// page, and Linux reads around a fault only while the faults of that file
+/// mostly find the page cache: every fault that finds nothing counts a miss,
+/// every hit takes one off, and past a hundred misses (`MMAP_LOTSAMISS` in
+/// `mm/filemap.c`) every fault reads one page. A hit on a page that was read
+/// again soon after the kernel took it back (a refault, the folio marked
+/// `workingset`) takes nothing off. So a load of Qwen3.8-27B read 38 MB per
+/// second from a drive that gives 900 to an ordinary read on a machine short
+/// of memory, and 5 to 20 MB per second (659 s for the weights of one device
+/// instead of 17) when it was loaded again in the same process soon after
+/// the kernel had taken the file's pages back from the first engine (GitHub
+/// issue #66, `docs/dev/experiments/load-and-stop.md`); a copy from a cold
 /// mapping without read-around gave 2 MB per second there, against 390 MB
-/// per second for ordinary reads and for the mapping with read-around
-/// (2026-11-27, the drive busy with other work). Ordinary reads are read
-/// ahead whatever the faults did, so bytes whose pages are not all in the
-/// page cache are read from the file itself, a piece at a time into the
-/// loader's memory, and uploaded from there; bytes that are all there are
-/// uploaded from the mapping, which saves that copy. Which file and where is
+/// per second for ordinary reads and for the mapping with read-around. An
+/// ordinary read is read ahead by its own size and counts no misses, so bytes
+/// whose pages are not all in the page cache are read from the file itself, a
+/// piece at a time into the loader's memory, and uploaded from there; bytes
+/// that are all there are uploaded from the mapping, which saves that copy. Which file and where is
 /// taken from the process's table of mappings, so nothing above the loader
 /// needs to know; bytes that are not a file's (a model built in memory) are
 /// uploaded from where they are.
