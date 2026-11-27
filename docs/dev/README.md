@@ -134,6 +134,9 @@ commands are in `crates/model/tools/capture/README.md`), which the scripts take
 as an argument or as `LLAMA_CPP_DIR`, with no default; they are not part of the
 cargo build.
 
+`crates/tokenizer/examples/draft_vocab.rs` makes and checks the draft
+vocabularies of `--draft-vocab` from a corpus, with the model's own tokenizer.
+
 `python3 tools/check-doc-links.py` checks the links between the documents, every
 mention of a document and every citation of a paragraph in the code
 (`<file>.md, "<name>"` or `"<name>" in <file>.md`). Run it after moving or
