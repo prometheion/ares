@@ -108,6 +108,8 @@ pub(crate) enum Item {
 pub(crate) struct Timings {
     /// Tokens of the prompt that were computed.
     pub prompt_tokens: u32,
+    /// Tokens of the prompt that the prompt cache gave.
+    pub cached_tokens: u32,
     /// The prompt: from the request's start in the engine to its first token,
     /// as the engine says it ([`Usage::prompt_time`]); from an engine that does
     /// not, `first_ms`.
@@ -124,8 +126,9 @@ pub(crate) struct Timings {
     /// Draft tokens put to the test and accepted for this request, when the
     /// engine's totals can be read as this request's: it ran alone.
     pub drafts: Option<(u64, u64)>,
-    /// A hash of the reply's token ids ([`Usage::output_hash`]).
-    pub output_hash: u64,
+    /// A hash of the reply's token ids ([`Usage::output_hash`]); `None` while
+    /// the reply runs ([`Run::timings_now`]).
+    pub output_hash: Option<u64>,
 }
 
 impl Timings {
@@ -352,6 +355,9 @@ struct Told {
     /// last line of its speed, when and at how many tokens.
     first: Option<Duration>,
     speed: Option<(Duration, u32)>,
+    /// The last report of the prompt's progress, and the reply's tokens so far.
+    prompt: Option<Progress>,
+    generated: u32,
 }
 
 impl Told {
@@ -610,12 +616,37 @@ impl Run {
         let first_ms = first as f64 / 1e6;
         Timings {
             prompt_tokens: usage.prompt_tokens.saturating_sub(usage.cached_prompt_tokens),
+            cached_tokens: usage.cached_prompt_tokens,
             prompt_ms: usage.prompt_time.map_or(first_ms, |time| time.as_secs_f64() * 1e3),
             first_ms,
             generated_tokens: usage.completion_tokens,
             generated_ms: end.saturating_sub(first) as f64 / 1e6,
             drafts,
-            output_hash: usage.output_hash,
+            output_hash: Some(usage.output_hash),
+        }
+    }
+
+    /// The timings of the reply so far, for llama.cpp's `timings_per_token`:
+    /// the prompt as its progress said it (the time of the last report, which
+    /// the step that ends the prompt sends), and the tokens generated since the
+    /// first and the time since it. No drafts and no hash before the end.
+    pub fn timings_now(&self) -> Timings {
+        let elapsed = self.marks.started.elapsed();
+        let first = self.told.first.unwrap_or(elapsed);
+        let first_ms = first.as_secs_f64() * 1e3;
+        let (prompt_tokens, cached_tokens, prompt_ms) = match self.told.prompt {
+            Some(p) => (p.total - p.cached, p.cached, p.elapsed.as_secs_f64() * 1e3),
+            None => (0, 0, first_ms),
+        };
+        Timings {
+            prompt_tokens,
+            cached_tokens,
+            prompt_ms,
+            first_ms,
+            generated_tokens: self.told.generated,
+            generated_ms: (elapsed - first).as_secs_f64() * 1e3,
+            drafts: None,
+            output_hash: None,
         }
     }
 
@@ -624,6 +655,7 @@ impl Run {
     /// latter laid out as llama.cpp's `print_timings_pp` (`tools/server/server-context.cpp`,
     /// commit d92ea9b, MIT).
     fn tell_progress(&mut self, progress: &Progress) {
+        self.told.prompt = Some(*progress);
         let id = self.guard.id;
         if !std::mem::replace(&mut self.told.started, true) {
             let waited = self.marks.started.elapsed().saturating_sub(progress.elapsed);
@@ -652,6 +684,7 @@ impl Run {
     /// The line of a long reply's speed, as llama.cpp's `print_timings_tg`
     /// writes it ([`Told::speed`] says when).
     fn tell_speed(&mut self, tokens: u32) {
+        self.told.generated = tokens;
         if let Some((tg, recent)) = self.told.speed(self.marks.started.elapsed(), tokens) {
             tracing::info!(
                 "request {} n_gen = {tokens:6}, tg = {tg:6.2} t/s, tg_3s = {recent:6.2} t/s",

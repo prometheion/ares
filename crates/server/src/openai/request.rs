@@ -94,6 +94,9 @@ pub(crate) struct Parsed {
     /// stream sends a ping, 0 or -1 for none; `None` when the request does not
     /// say ([`crate::routes::pings`]).
     pub ping: Option<i32>,
+    /// llama.cpp's `timings_per_token`: every chunk of a stream with text has
+    /// the timings of the reply so far.
+    pub timings_per_token: bool,
 }
 
 /// The header that gives a request its priority, for a client that cannot
@@ -215,6 +218,7 @@ const SERVED: &[&str] = &[
     "priority",
     "return_progress",
     "sse_ping_interval",
+    "timings_per_token",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -370,6 +374,7 @@ pub(crate) fn from_json(
         priority,
         progress: fields.bool("return_progress")?.unwrap_or(false),
         ping: ping_interval(&fields)?,
+        timings_per_token: fields.bool("timings_per_token")?.unwrap_or(false),
     })
 }
 

@@ -59,6 +59,7 @@ prompt and those marked "chat".
 | `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
 | `return_progress` | a stream says how far the prompt has got (llama.cpp's member) | see [Prompt progress](#prompt-progress); changes nothing without `stream` |
 | `sse_ping_interval` | the seconds of silence after which a stream sends a ping (llama.cpp's member) | whole seconds; `0` or `-1`: no pings; default 15 |
+| `timings_per_token` | the last chunk of every step of a stream has `timings`, the reply's so far (llama.cpp's member) | no hash and no drafts before the end; changes nothing without `stream` |
 | `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
 | `priority` | the request's priority | see [Priorities](#priorities) |
@@ -85,7 +86,8 @@ no chat template.
 
 The answer has OpenAI's shape and more: `usage.prompt_tokens_details.cached_tokens`
 (the part of the prompt the prompt cache gave), `usage.completion_tokens_details.reasoning_tokens`,
-`timings` (`prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, their rates,
+`timings` (llama.cpp's fields: `cache_n`, `prompt_n`, `prompt_ms`, `predicted_n`,
+`predicted_ms`, their milliseconds per token and rates,
 `draft_n` and `draft_n_accepted`, the request's own drafts, and `token_hash`, a
 hash of the reply's token ids; `prompt_ms` runs from the request's start in the
 engine, after its wait in line, to its first token, as llama.cpp's does), and `stop_reason` with the stop string that ended
@@ -126,7 +128,7 @@ state: every response says `"store": false`.
 
 | Field | Notes |
 | --- | --- |
-| `model`, `temperature`, `top_p`, `stream`, `priority`, `return_progress`, `sse_ping_interval` | as on the chat route; other sampling fields are refused |
+| `model`, `temperature`, `top_p`, `stream`, `priority`, `return_progress`, `sse_ping_interval`, `timings_per_token` | as on the chat route; other sampling fields are refused |
 | `instructions` | a system message |
 | `input` | a string, or items: messages (`user`, `assistant`, `system`, `developer`; parts `input_text`, `output_text`, `input_image`), `function_call`, `function_call_output`, `reasoning` |
 | `tools`, `tool_choice`, `parallel_tool_calls` | functions only; `tool_choice` `auto`, `none`, `required`, `{"type": "function", "name"}` |

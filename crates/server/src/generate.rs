@@ -188,6 +188,9 @@ pub(crate) struct Generation {
     /// Whether the client hears how far the prompt has got
     /// ([`Step::Progress`]).
     progress: bool,
+    /// Whether every chunk of the stream with text has the timings so far
+    /// ([`Generation::timings_now`]).
+    pub live_timings: bool,
     /// Dropped after the run: the model may be unloaded when its requests
     /// have let go of the engine.
     _lease: Lease,
@@ -237,13 +240,25 @@ impl Generation {
             app.stop.clone(),
             app.config.log_text,
         )?;
-        Ok(Self { run, sorter, stops, progress: false, _lease: lease.clone() })
+        Ok(Self { run, sorter, stops, progress: false, live_timings: false, _lease: lease.clone() })
     }
 
     /// The reply, whose client hears how far the prompt has got when
     /// `progress` (llama.cpp's `return_progress` on a stream).
     pub fn reporting(self, progress: bool) -> Self {
         Self { progress, ..self }
+    }
+
+    /// The reply, whose chunks with text have the timings so far when `live`
+    /// (llama.cpp's `timings_per_token` on a stream).
+    pub fn timing(self, live: bool) -> Self {
+        Self { live_timings: live, ..self }
+    }
+
+    /// The timings of the reply so far, for a chunk of a stream that is to
+    /// have them; `None` when the request did not ask.
+    pub fn timings_now(&self) -> Option<Timings> {
+        self.live_timings.then(|| self.run.timings_now())
     }
 
     /// The first step of a reply that is streamed, if the engine produces it

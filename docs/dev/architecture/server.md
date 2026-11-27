@@ -432,7 +432,15 @@ sends `sse_ping_interval` with every stream (llama.cpp's seconds of silence
 before a ping, `-1` none; its server's default is 30 s): a stream's pings are
 axum's keep-alive (`routes::pings`), a comment line after 15 s of silence on the
 OpenAI routes and Anthropic's `ping` event on Messages, at the interval the member
-names, and none for `0` or `-1`, on chat, completions, Responses and Messages. Tests:
+names, and none for `0` or `-1`, on chat, completions, Responses and Messages.
+And it sends `timings_per_token` (llama.cpp: every chunk of a stream carries the
+timings so far): the last chunk of each step with text gets `timings`
+(`Run::timings_now`: the prompt as its last progress event said it, the reply's
+tokens from `Event::Generated` and the time since its first; no drafts and no
+hash before the end), on chat, completions and the data of a Responses event.
+The `timings` of every answer have llama.cpp's fields, `cache_n`,
+`prompt_per_token_ms` and `predicted_per_token_ms` among them, which the web UI
+reads. Tests:
 `crates/runtime/tests/cache/prefix.rs` (steps and the cache, the pauses of a
 pass, a long step's share; every test's `Handle::finish` checks the order and
 the rise), `crates/server/tests/progress.rs` (the chunks of the three APIs as

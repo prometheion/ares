@@ -631,12 +631,13 @@ fn ending(finish: &'static str) -> Ending {
     };
     let timings = Timings {
         prompt_tokens: 10,
+        cached_tokens: 20,
         prompt_ms: 4.0,
         first_ms: 4.0,
         generated_tokens: 12,
         generated_ms: 22.0,
         drafts: None,
-        output_hash: 0xab,
+        output_hash: Some(0xab),
     };
     Ending { finish, usage, timings }
 }
@@ -882,11 +883,14 @@ fn the_response_has_the_items_the_status_the_usage_and_what_the_request_said() {
             "user": null,
             "metadata": {"run": "7"},
             "timings": {
+                "cache_n": 20,
                 "prompt_n": 10,
                 "prompt_ms": 4.0,
+                "prompt_per_token_ms": 0.4,
                 "prompt_per_second": 2500.0,
                 "predicted_n": 12,
                 "predicted_ms": 22.0,
+                "predicted_per_token_ms": 2.0,
                 "predicted_per_second": 500.0,
                 "token_hash": "00000000000000ab",
             },

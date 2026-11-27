@@ -90,7 +90,10 @@ async fn try_completion(
         }
         let sorter = sorter.with_call_ids(tools::call_ids(request.id));
         let progress = parsed.stream && parsed.progress;
-        runs.push(Generation::start(&app, &lease, request, sorter)?.reporting(progress));
+        let live = parsed.stream && parsed.timings_per_token;
+        runs.push(
+            Generation::start(&app, &lease, request, sorter)?.reporting(progress).timing(live),
+        );
     }
     let response = if parsed.stream {
         let pings = crate::routes::pings(KeepAlive::default(), parsed.ping);
@@ -342,7 +345,16 @@ impl Chunks {
                 Phase::Ready(Step::Pieces(pieces)) => {
                     self.phase = Phase::Pull;
                     // A piece that is held back or empty adds no chunk.
+                    let before = self.queue.len();
                     self.enqueue(pieces);
+                    // llama.cpp's `timings_per_token`: the last chunk of the
+                    // step has the timings so far.
+                    if self.queue.len() > before
+                        && let (Some(timings), Some(last)) =
+                            (self.reply.timings_now(), self.queue.back_mut())
+                    {
+                        reply::with_timings(last, timings);
+                    }
                 }
                 Phase::Ready(Step::Probs(probs)) => {
                     self.phase = Phase::Pull;

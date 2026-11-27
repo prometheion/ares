@@ -56,8 +56,10 @@ pub(crate) async fn answer<W: Writer>(
 ) -> Result<Response, ApiError> {
     let (streamed, lowered) = (parsed.stream, parsed.lowered);
     let progress = parsed.stream && parsed.progress;
+    let live = parsed.stream && parsed.timings_per_token;
     let keep_alive = crate::routes::pings(keep_alive, parsed.ping);
-    let reply = Generation::start(app, lease, parsed.request, sorter)?.reporting(progress);
+    let reply =
+        Generation::start(app, lease, parsed.request, sorter)?.reporting(progress).timing(live);
     let response = if streamed {
         stream(reply, writer, app, keep_alive).await
     } else {
@@ -132,7 +134,18 @@ impl<W: Writer> Events<W> {
                 None => self.reply.next().await,
             };
             match step {
-                Ok(Step::Pieces(pieces)) => self.writer.pieces(pieces, &mut self.queue),
+                Ok(Step::Pieces(pieces)) => {
+                    let before = self.queue.len();
+                    self.writer.pieces(pieces, &mut self.queue);
+                    // llama.cpp's `timings_per_token`: the data of the step's last
+                    // event has the timings so far.
+                    if self.queue.len() > before
+                        && let (Some(timings), Some((_, data))) =
+                            (self.reply.timings_now(), self.queue.back_mut())
+                    {
+                        crate::openai::reply::with_timings(data, timings);
+                    }
+                }
                 Ok(Step::Progress(progress)) => self.writer.progress(&progress, &mut self.queue),
                 Ok(Step::Probs(_)) => {}
                 Ok(Step::End(end)) => {

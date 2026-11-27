@@ -357,3 +357,69 @@ async fn sse_ping_interval_is_whole_seconds_from_minus_one() {
         assert_eq!(response.status().as_u16(), status, "{ping}");
     }
 }
+
+/// llama.cpp's `timings_per_token`: on a stream, every step's last chunk with
+/// text has the timings of the reply so far (its tokens rise, the prompt's are
+/// set, no hash yet), on chat and on the Responses route; the last chunk has the
+/// whole timings, with the hash. Its fields are llama.cpp's, `cache_n` and the
+/// milliseconds per token among them.
+#[tokio::test]
+async fn timings_per_token_puts_the_timings_so_far_on_the_chunks_of_a_stream() {
+    let app = served().await;
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": long_text()}],
+        "max_tokens": 12,
+        "stream": true,
+        "timings_per_token": true,
+    });
+    let chunks = streamed(&app, CHAT, body).await;
+    let text = |c: &&Value| {
+        c["choices"][0]["delta"]["content"].as_str().is_some_and(|text| !text.is_empty())
+    };
+    let live: Vec<&Value> = chunks.iter().filter(text).map(|c| &c["timings"]).collect();
+    assert!(live.len() >= 2 && live.iter().all(|t| t.is_object()), "{chunks:?}");
+    let generated: Vec<u64> = live.iter().map(|t| t["predicted_n"].as_u64().unwrap()).collect();
+    assert!(generated.windows(2).all(|pair| pair[0] < pair[1]), "{generated:?}");
+    for timings in &live {
+        assert!(timings["prompt_n"].as_u64().unwrap() > 128, "{timings}");
+        assert_eq!(timings["cache_n"], 0, "{timings}");
+        assert!(timings.get("token_hash").is_none(), "{timings}");
+    }
+    let last = chunks.iter().rev().find(|c| c.get("timings").is_some()).unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "length", "{last}");
+    assert_eq!(last["timings"]["predicted_n"], 12, "{last}");
+    assert!(last["timings"]["token_hash"].is_string(), "{last}");
+    for key in ["prompt_per_token_ms", "predicted_per_token_ms", "prompt_per_second"] {
+        assert!(last["timings"][key].as_f64().is_some(), "{key}: {last}");
+    }
+    // Without the member a chunk with text has none.
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 4,
+        "stream": true,
+    });
+    let chunks = streamed(&app, CHAT, body).await;
+    let with_text: Vec<&Value> = chunks.iter().filter(text).collect();
+    assert!(!with_text.is_empty() && with_text.iter().all(|c| c.get("timings").is_none()));
+
+    let body = json!({
+        "model": "synthetic",
+        "input": long_text(),
+        "max_output_tokens": 8,
+        "stream": true,
+        "timings_per_token": true,
+    });
+    let response = post(&app, "/v1/responses", &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let events: Vec<Value> = sse_payloads(&body_text(response).await)
+        .iter()
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let deltas: Vec<&Value> =
+        events.iter().filter(|e| e["type"] == "response.output_text.delta").collect();
+    assert!(
+        !deltas.is_empty() && deltas.iter().all(|e| e["timings"]["predicted_n"].as_u64() > Some(0))
+    );
+}
