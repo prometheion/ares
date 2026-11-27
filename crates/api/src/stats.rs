@@ -31,8 +31,12 @@ pub struct ExpertStats {
     /// the reads (a wide step's reads into staging are not among them).
     pub demand_reads: u64,
     pub demand_read_us: u64,
-    /// Microseconds layers waited for what they missed, summed over layers.
+    /// Microseconds layers waited for what they missed, summed over layers; and the same of
+    /// the steps of up to eight rows by what a layer waited for last: the CPU's sums of
+    /// experts in RAM, an upload from the RAM tier, an expert read from the file, one that
+    /// was on its way already.
     pub wait_us: u64,
+    pub wait_last_us: [u64; 4],
     /// The read-ahead of predicted picks: experts the routers of later layers, applied
     /// early, named for a layer before its own router ran, and of them those it picked;
     /// reads of predicted experts that no tier held, started before the layer's router,

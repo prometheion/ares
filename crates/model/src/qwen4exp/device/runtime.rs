@@ -542,6 +542,9 @@ impl Qwen4Exp {
         totals.demand_reads += stats.demand_reads;
         totals.demand_read_us += (stats.demand_read_ms * 1e3) as u64;
         totals.wait_us += (stats.wait_ms * 1e3) as u64;
+        for (total, ms) in totals.wait_last_us.iter_mut().zip(stats.wait_last_ms) {
+            *total += (ms * 1e3) as u64;
+        }
         totals.predicted += stats.predicted;
         totals.predicted_picked += stats.predicted_picked;
         // Wide steps read their predicted picks ahead through transit's guesses.

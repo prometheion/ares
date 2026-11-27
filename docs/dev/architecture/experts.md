@@ -224,7 +224,13 @@ runs), so their reads can start a layer or two before their records
 - *Counted* (`StoreStats`, `/metrics`): experts predicted and of them those picked
   (`ares_expert_predicted_total`, `ares_expert_predicted_picked_total`), reads ahead and
   their bytes, those the record picked and those it did not (`ares_expert_ahead_*`, the
-  wide steps' guesses included).
+  wide steps' guesses included). A layer's wait for its misses in a step of up to eight
+  rows (from its record to the last miss in a slot or delivered) is also counted by what
+  came last (`StoreStats::wait_last_ms`, `ares_expert_wait_{cpu,ram,file,on_its_way}_microseconds_total`):
+  the CPU's sums of experts in RAM, an upload from RAM, an expert read from the file
+  (uploaded, or computed by the CPU once its bytes landed), one on its way already; so a
+  profile of decode says which source the device waited for (`qwen4exp_run`'s `waits`
+  line).
 
 **Pruning as a fourth level** (`device/prune.rs`, `ExpertKernels::route_pruned`,
 `kernels/expert_router.cuh`). Next to VRAM, RAM and the file, a pick may also be
