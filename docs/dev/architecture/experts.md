@@ -169,6 +169,15 @@ runs), so their reads can start a layer or two before their records
   halved beyond 512, so they follow the text and the tiers): then a read for nothing costs
   the drive no more than the reads that are used save. Where the tiers hold little (one
   card, a small RAM tier, a larger file) more places qualify.
+- *Predicted only where a read may come of it* (`ExpertStore::ahead_depth`,
+  `Board::ahead_depth`). The routers of the predictions cost the device as much as a dense
+  layer's products, 1.7 ms a step of Flash-Next UD-Q4_K_XL on the RTX 4060 Ti, also in steps
+  whose kind has no place worth a read, where they only count. So each step of the decode
+  kernels predicts only as many layers ahead as a place of its kind (one row or several) and
+  distance qualifies, and every eighth step of a kind that would predict less predicts as far
+  as the parts can, so that the counts go on and a place that comes to be worth a read is
+  found. What the model computes does not change: a list of a step that made none carries
+  another step's token and is ignored.
 - *Bounds from the drive and the step.* At most as many experts on their way ahead as the
   drives take of prefetches at once (`Reader::prefetch_room`: four chunks of 512 KiB per
   drive, two experts of Flash-Next), and per step at most what the drive could read in the

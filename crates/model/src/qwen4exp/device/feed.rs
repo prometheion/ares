@@ -679,6 +679,15 @@ impl Feed {
         }
         self.guessed.fill(false);
         self.named_wide.fill(false);
+        let most = self.boards.iter().map(|board| board.ahead()).max().unwrap_or(0);
+        if rows <= MAX_BATCH && most > 0 {
+            // As far ahead as a read ahead may come of it, and now and then as far as the
+            // parts can, to keep the counts.
+            let depth = self.store.ahead_depth(rows as usize, most);
+            for board in &self.boards {
+                board.set_ahead_depth(depth);
+            }
+        }
         if rows > MAX_BATCH {
             // The next layer's picks are predicted where the step before read from the file.
             for index in 0..self.boards.len() {
