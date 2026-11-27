@@ -112,10 +112,12 @@ n-gram table's rows):
 | Run | `ares-io` (2 threads): waited for a core / ran | Waits per wake-up | The host's threads waited | The workers waited, each |
 | --- | ---: | ---: | ---: | ---: |
 | The engine's 13 pinned workers (two runs) | 1909 to 2113 / 42 ms | 200 to 212 µs (9 564 to 9 954 wake-ups) | 452 to 654 ms | 19 to 1093 ms |
-| 10 workers placed by the scheduler | 136 / 77 ms | 14 µs | 170 ms | 276 to 427 ms |
+| 10 workers placed by the scheduler (two runs) | 44 to 136 / 52 to 77 ms | 4 to 14 µs | 125 to 170 ms | 186 to 427 ms |
 
 So in the engine's placement the I/O thread waits a tenth of the time for a core, 0.2 ms each
-time it wakes for a completion, where it waits 14 µs with three cores free.
+time it wakes for a completion, where it waits 4 to 14 µs with three cores free (the four runs'
+steps: 67.7 and 59.1 ms at the median with the engine's placement, 69.9 and 64.0 with ten workers;
+the window and the text differ from run to run).
 
 ## The read-ahead
 
