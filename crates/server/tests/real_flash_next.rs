@@ -312,7 +312,8 @@ fn flash_next_answers_on_one_card() {
 /// Flash-Next keeps a usage profile of its experts in the `--cache` directory:
 /// the first start has none, reads the warm-up text and writes the profile;
 /// the next start fills the tiers from it instead of the warm-up and answers
-/// as the reference does; a damaged profile is ignored and written anew.
+/// as the reference does; a stop while the tiers fill from it ends the fill;
+/// a damaged profile is ignored and written anew.
 #[test]
 fn flash_next_starts_from_the_usage_profile_of_its_experts() {
     let Some(model) = flash_model() else { return };
@@ -384,6 +385,32 @@ fn flash_next_starts_from_the_usage_profile_of_its_experts() {
     let (picks, hits) = (server.metric("expert_picks_total"), server.metric("expert_hits_total"));
     eprintln!("RES profile: {picks} picks, {hits} in a slot");
     server.stop();
+
+    // A stop while the tiers fill from it cuts the fill short (GitHub issue
+    // #68): the server does not wait for the drive, and gives back all it took.
+    let mut command = common::process::ares();
+    command.arg("--model").arg(&model).args(["--port", &port(4).to_string()]).args([
+        "--devices",
+        devices.as_str(),
+        "--ram",
+        ram.as_str(),
+        "--cache",
+        dir.to_str().expect("a path in UTF-8"),
+    ]);
+    let mut server = Server::spawn(command, SLOW);
+    server.wait_for_log("the price of a step was measured");
+    server.signal("TERM");
+    let signalled = Instant::now();
+    let status = server.wait_exit();
+    let took = signalled.elapsed().as_secs_f64();
+    let log = server.logged().to_vec();
+    let line = log.iter().find(|line| line.contains("expert profile")).cloned();
+    eprintln!("RES profile: stopped {took:.1} s after a signal during the fill; {line:?}");
+    assert!(status.success(), "a clean stop: {status:?}\n{log:#?}");
+    assert!(line.is_some_and(|line| line.contains("cut short: the server stops")), "{log:#?}");
+    assert!(log.iter().any(|line| line.contains("released of the")), "{log:#?}");
+    assert!(!log.iter().any(|line| line.contains("did not come back")), "{log:#?}");
+    assert!(took < 30.0, "the stop waited {took:.1} s: {log:#?}");
 
     // A damaged profile is ignored with a line that says so, and written anew.
     let mut damaged = std::fs::read(&written[0]).unwrap();
