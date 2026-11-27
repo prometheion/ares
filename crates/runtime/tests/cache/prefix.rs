@@ -1534,11 +1534,11 @@ fn a_paused_pass_reports_the_share_it_has_done() {
     let (run, progress) = start(&e.rt, request(&prompt, Some(8))).unwrap().finish_with_progress();
     assert_eq!(run.text, fresh_run(shape, &prompt, 8).text, "as without pauses");
     let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
-    // The pass is the first 48 rows (the step ends at the last page before the
-    // prompt's end, where the cache keeps a checkpoint): the start, a report at
-    // each of its three pauses (a quarter of its rows more each), its end, and
-    // the end of the step of the last rows.
-    assert_eq!(said, [0, 12, 24, 36, 48, 60]);
+    // The pass is the first 59 rows (the step ends at the prompt's anchor, one
+    // cell before its end, where the cache keeps a checkpoint): the start, a
+    // report at each of its three pauses (a quarter of its rows more each,
+    // rounded), its end, and the end of the step of the last row.
+    assert_eq!(said, [0, 15, 30, 44, 59, 60]);
     e.consistent();
 }
 
@@ -1558,13 +1558,13 @@ fn a_long_step_reports_its_share_while_it_runs() {
     });
     let (_, progress) = start(&e.rt, request(&prompt, Some(4))).unwrap().finish_with_progress();
     let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
-    // The long step is the first 32 rows (it ends at the last page before the
-    // prompt's end): the start, nothing after one second (the model says nothing
-    // yet), two reports after two and three (as far as the share of its time), its
-    // end, and the end of the step of the last rows.
+    // The long step is the first 39 rows (it ends at the prompt's anchor, one
+    // cell before its end): the start, nothing after one second (the model says
+    // nothing yet), two reports after two and three (as far as the share of its
+    // time), its end, and the end of the step of the last row.
     assert_eq!(said.len(), 5, "{said:?}");
-    assert_eq!((said[0], said[3], said[4]), (0, 32, 40), "{said:?}");
-    assert!((15..=21).contains(&said[1]) && (24..=30).contains(&said[2]), "{said:?}");
+    assert_eq!((said[0], said[3], said[4]), (0, 39, 40), "{said:?}");
+    assert!((18..=25).contains(&said[1]) && (29..=36).contains(&said[2]), "{said:?}");
     let elapsed: Vec<u128> = progress.iter().map(|p| p.elapsed.as_millis()).collect();
     assert!(elapsed[1] >= 2000 && elapsed[2] >= 3000 && elapsed[3] >= 3600, "{elapsed:?}");
     e.consistent();
