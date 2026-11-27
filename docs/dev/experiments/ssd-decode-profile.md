@@ -115,15 +115,43 @@ fewer workers (11.9 to 14.3 ms).
   to 164.0) and the dense part 1.7 ms shorter (16.3 against 18.0 ms): the two routers a layer
   cost 1.7 ms a step and buy nothing here.
 
-## The step's tiers drift
+## The share in VRAM follows the text
 
-Steps 257 to 512 (the timed ones) find 45 % of their picks in VRAM against 57 % in steps 1 to
-256, miss 261 experts a step against 206, read 19.0 from the file against 8.6 (40 GiB; 100
-against 62 at 16 GiB), and take 93.6 ms against 67.5 (251 against 159). Between steps 7 to 10 experts
-a step are promoted to VRAM, and the link is otherwise idle (every miss is the CPU's). The text
-the model writes moves away from the context the tiers were filled with; whether the tiers or
-the text decide the 45 % is not measured (a longer decode with the hit rate per 64 steps would
-say).
+Steps 257 to 512 (the timed ones) found 45 % of their picks in VRAM against 57 % in steps 1 to
+256, missed 261 experts a step against 206, read 19.0 from the file against 8.6 (40 GiB; 100
+against 62 at 16 GiB), and took 93.6 ms against 67.5 (251 against 159). A decode of 1024 steps
+with the share printed per 64 steps (`--every 64`, 150718de, 40 GiB) shows no steady fall: the
+windows find 57 to 77 % in VRAM and take 46 to 67 ms at the median, a window where the text
+changes finds 22 % (374 misses and 29 reads of the file a step, 113 ms), and the next windows
+are back at 64 to 77 % (the run's mean: 65.9 % in VRAM, 55.3 ms at the median, 16.1 tokens/s;
+the 1024 timed steps after it 55.8 %, 70.4 ms). VRAM holds 12.7 % of the experts and gets 45 to
+77 % of the picks; between steps 7 to 10 experts a step are promoted, and the link carries
+nothing else (every miss is the CPU's). How fast the tiers catch up after a change of the text
+decides the slow windows; that is not measured beyond these windows.
+
+## Two small cards (the RTX 4070 and the RTX 3060, #24)
+
+The same tool on the development machine (both cards on every layer, the RTX 3060 the mixer;
+Swift IQ2_XS, the Flash-Next file this machine has, `--ram-gib 8`, `--every 64`; b5e9ecff with
+150718de; i5-13400F, six performance cores with two threads each and four efficiency cores;
+three other agents built and ran on the machine and its drive, load average 25 to 48):
+
+| Run | Step median / mean | In VRAM | Misses a step: CPU / uploaded; from the file | Waits: file (a layer) / CPU | n-gram rows a step |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| The engine's workers (load 34) | 62.0 / 81.0 ms | 96.7 % | 15.1 / 0.6; 2.6 | 32.2 (13.1) / 2.3 ms | 25.9 ms |
+| 6 workers (load 48) | 100.7 / 119.3 ms | 96.9 % | 10.9 / 3.9; 2.4 | 62.0 (27.8) / 1.8 ms | 33.7 ms |
+
+- The cards hold nearly every pick of this file (13 584 slots, 55 % of its experts), and the step
+  waits for the shared drive: 2.5 reads a step at 13 to 28 ms a layer, and the rows of the n-gram
+  table, read from the mapped file, 26 to 34 ms a step. Timed: the mixer card's stream mixers
+  31.5 ms and its exchange with the worker 3.3 ms, the worker's experts 32 ms and exchange 55 ms
+  (it waits for the mixer).
+- A first run at load 58 stopped ("a step stood still for 20 s while rows of the n-gram table
+  were read"): the tool's limit, at the drive's worst.
+- This CPU has a second thread per core and the workers leave them free, so the I/O thread has
+  a place; fewer workers did not help here (the two runs differ by the load more than by
+  anything else). UD-Q4_K_XL, the file of the profile above, is not on this machine (the disk
+  has 81 GB free).
 
 ## The counters cost nothing
 
@@ -167,12 +195,12 @@ a run; the others are bounds from the parts of the step.
 | # | Lever | 40 GiB | 16 GiB | Grounds |
 | --- | --- | ---: | ---: | --- |
 | 1 | A core for the I/O thread (the CPU workers leave the reader a core) | -10 ms (14 %) | -42 ms (23 %) | measured with `--cpu-workers 10`: -6.2 and -40 ms, the file waits -10 and -42 ms, the CPU's waits +2.4 ms for three workers fewer |
-| 2 | The tiers follow the generated text | up to -26 ms of the later steps (28 %) | up to -90 ms (36 %) | steps 257-512 miss 27 % more than steps 1-256 and take 39 % longer; the server's first asks find 28 to 47 % in VRAM; not known how much of it the tiers can hold |
+| 2 | The stream mixers at the card's bandwidth (#18) | up to -5.5 ms (8 %) | up to -5.5 ms (3 %) | 7.8 ms for 644 MiB that take 2.3 at 288 GB/s |
 | 3 | The CPU's share closer to the memory's bandwidth | -2 to -4 ms (3 to 6 %) | -1 ms | 4.3 experts a layer in 0.31 ms, 39 GB/s from RAM |
 | 4 | One read per expert (a file of Ares's own) | -1.5 to -3 ms (2 to 4 %) | -6 to -11 ms (3 to 6 %) | an expert alone takes 2.0 ms in three reads at depth 1; what one read of 3 MB takes is not measured |
 | 5 | No predictions where no place qualifies | -1.7 ms (2.4 %) | -1.7 ms (1 %) | measured: `--predict 0` takes 1.7 ms off the dense part and reads ahead nothing less that is used |
-| 6 | The stream mixers at the card's bandwidth (#18) | up to -5.5 ms (8 %) | up to -5.5 ms (3 %) | 7.8 ms for 644 MiB that take 2.3 at 288 GB/s |
-| 7 | The resident experts' down product while the misses come ("reordered inference", LES, ProMoE) | -1.5 ms (2 %) | -1.5 ms (1 %) | the device computes about 0.1 ms of experts a layer, a third of it the down product; a layer waits 0.31 to 5 ms |
+| 6 | The resident experts' down product while the misses come ("reordered inference", LES, ProMoE) | -1.5 ms (2 %) | -1.5 ms (1 %) | the device computes about 0.1 ms of experts a layer, a third of it the down product; a layer waits 0.31 to 5 ms |
+| 7 | VRAM catches up faster after the text changes | not known | not known | the share in VRAM varies from 22 to 77 % by 64 steps of a decode and a slow window takes twice the step; the server's first asks find 28 to 60 %; the tiers do recover within 64 to 128 steps |
 | 8 | Reading ahead on the predictions | none | none | of the experts no tier holds, 11 % (40 GiB) and 23 % (16 GiB) of the predicted are picked; the drive bounds the 16 GiB step; a prefetch waits 170 to 250 ms |
 
 - *1 comes first.* It is the largest measured saving and the smallest change, and it serves both
@@ -181,9 +209,10 @@ a run; the others are bounds from the parts of the step.
   a second thread per core every core is busy through the step. Strata's rule on this machine is
   9 workers (the performance cores but one and half of the efficiency cores), the host on core 0
   and its I/O threads on the four cores left.
-- *2 is the largest bound but not yet a lever.* Before a change, a measurement: the hit rate per
-  64 steps over 1024 steps, with the promotions between steps bounded by the link's time as now
-  and without the bound (the link carries nothing else in these steps).
-- *7 and 8 are small here.* LES's 1.94 times for reading ahead and reordering is on a phone,
+- *7 is not yet a lever.* The tiers do follow the text; what a change would buy is the speed at
+  which they catch up after the text changes. The measurement first: the share per 64 steps after
+  a change of the text, with the promotions between steps bounded by the link's time as now and
+  without the bound (the link carries nothing else in these steps).
+- *6 and 8 are small here.* LES's 1.94 times for reading ahead and reordering is on a phone,
   whose compute per layer is long beside a read; here a read is 20 to 50 times a layer's work on
   the device, and the experts no tier holds are the ones a prediction gets wrong.
