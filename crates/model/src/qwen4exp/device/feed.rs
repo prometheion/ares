@@ -27,6 +27,7 @@ use super::misses::WideStats;
 use super::part::ExpertAt;
 use super::placement::Placement;
 use super::prune::{PruneMask, PruneStats};
+use super::usage::START_STALL;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{Moe, MtpWeights, Weights};
 
@@ -636,19 +637,28 @@ impl Feed {
 
     /// Brings the experts `lists` names for each store layer into the tiers
     /// at the pace of a start ([`ExpertStore::plan_listed_fill`]), and lets
-    /// the store work until nothing moves any more.
+    /// the store work until it has brought them all and nothing is on its
+    /// way. Like the fill from a usage profile at the start, it gives the rest
+    /// up only when nothing has moved for [`START_STALL`]: on a busy machine
+    /// one read from the file can take seconds, and a bound of two seconds
+    /// left experts out that the tiers had room for.
     fn fill_lists(&mut self, lists: &[(usize, Vec<u32>)]) -> Result<(), Error> {
         let mut fill = self.store.plan_listed_fill(lists, FillOrder::File);
-        let mut last = (fill.left(), Instant::now());
-        while !(fill.is_done() && self.store.is_settled())
-            && last.1.elapsed() < Duration::from_secs(2)
-        {
+        let mut seen = (usize::MAX, Instant::now());
+        loop {
             self.store.advance_fill(&mut fill, FillPace::START)?;
-            if fill.left() != last.0 {
-                last = (fill.left(), Instant::now());
+            let settled = self.store.is_settled();
+            if fill.is_done() && settled {
+                return Ok(());
             }
+            let left = fill.left() + usize::from(!settled);
+            if left != seen.0 {
+                seen = (left, Instant::now());
+            } else if seen.1.elapsed() > START_STALL {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_micros(200));
         }
-        Ok(())
     }
 
     /// Brings the experts of the MTP block into the tiers as far as its

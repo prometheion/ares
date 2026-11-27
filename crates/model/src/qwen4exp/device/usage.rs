@@ -60,7 +60,7 @@ const STUCK: Duration = Duration::from_secs(2);
 
 /// How long the fill at the start may stand still before it gives up the
 /// rest: a drive that does not answer must not keep the model from serving.
-const START_STALL: Duration = Duration::from_secs(60);
+pub(super) const START_STALL: Duration = Duration::from_secs(60);
 
 /// What the start found of the profile.
 #[derive(Clone, Debug, PartialEq, Eq)]

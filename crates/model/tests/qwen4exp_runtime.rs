@@ -34,6 +34,7 @@ use ares_runtime::{
 };
 use ares_tokenizer::{ChatOptions, Json};
 use common::gpu::enabled;
+use common::helpers::{behind_the_best, is_near_best};
 use common::model::{Wrapped, byte_tokenizer, words};
 
 mod common;
@@ -588,6 +589,60 @@ fn reference_answer_at(path: &std::path::Path, prompt: &[u32], n: usize) -> Vec<
         answer.push(arg_max(window.logits_of(0).unwrap()));
     }
     answer
+}
+
+/// The error of the logits of a made-up model on the device that makes a near tie
+/// ([`is_near_best`]): the bound of the residual after a layer of the shipped types against the
+/// reference's in `qwen4exp_device` (4e-2, relative RMS), which lets an answer's token fall
+/// behind the reference's most likely one by 0.13 of the RMS of the row's logits. (A prompt of
+/// 480 rows read layer by layer began its answer with the reference's second token once, 0.07
+/// behind: 3.393 against 3.496, the third at 2.721, the RMS 1.455.)
+const LOGIT_ERROR: f64 = 4e-2;
+
+/// Fails the test unless `answer`, the greedy tokens an engine wrote after `prompt` on the
+/// made-up model in the file at `path`, is what the CPU reference writes up to near ties: the
+/// reference reads the prompt and then the answer's own tokens, and each token of the answer
+/// must be the reference's most likely one at its row or a near tie of it
+/// ([`is_near_best`] at [`LOGIT_ERROR`]). The device's arithmetic is not the reference's, and a
+/// made-up model has near ties that the difference flips, after which the two texts part;
+/// read along the answer, the reference judges every token of it all the same. Says how far
+/// the token furthest behind is.
+fn assert_near_the_reference(what: &str, path: &std::path::Path, prompt: &[u32], answer: &[u32]) {
+    let gguf = Gguf::open(path).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let mut state = SequenceState::new(&c);
+    let window = reference.window(&state, prompt, LogitRows::Last).unwrap();
+    reference.commit(&mut state, &window, prompt.len()).unwrap();
+    let mut logits = window.logits_of(prompt.len() - 1).unwrap().to_vec();
+    let (mut worst, mut at) = (0.0f64, 0);
+    for (i, &token) in answer.iter().enumerate() {
+        let behind = behind_the_best(&logits, token);
+        if behind > worst {
+            (worst, at) = (behind, i);
+        }
+        let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t);
+        let best = best.unwrap_or(0);
+        assert!(
+            is_near_best(token, &logits, LOGIT_ERROR),
+            "{what}: token {i} of {answer:?} is {token}, which the reference has at {} (its most \
+             likely, {best}, at {}: {behind:.3} of the RMS behind, a near tie is up to {:.3})",
+            logits[token as usize],
+            logits[best],
+            3.0 * LOGIT_ERROR + 1e-2,
+        );
+        if i + 1 < answer.len() {
+            let window = reference.window(&state, &[token], LogitRows::Last).unwrap();
+            reference.commit(&mut state, &window, 1).unwrap();
+            logits = window.logits_of(0).unwrap().to_vec();
+        }
+    }
+    eprintln!(
+        "TIE {what}: every token of {} is the reference's most likely one or a near tie; the \
+         furthest behind is token {at}, {worst:.3} of the RMS",
+        answer.len()
+    );
 }
 
 /// A prompt of `n` tokens of the vocabulary, from a seed.
@@ -1415,7 +1470,6 @@ fn a_request_cuts_in_between_the_pieces_of_a_long_prompt() {
             short_at.duration_since(begun),
             long_at.duration_since(begun),
         );
-        let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
         eprintln!(
             "CUT {placement:?}: short {short_got:?} (alone {short_alone:?}, reference \
              {short_reference:?}); long {long_got:?} (alone {long_alone:?}, reference \
@@ -1423,11 +1477,8 @@ fn a_request_cuts_in_between_the_pieces_of_a_long_prompt() {
         );
         assert!(paused >= 1, "{placement:?}: the long prompt's pass never paused");
         assert!(short_at < long_at, "{placement:?}: the short request waited for the long one");
-        assert!(leading(&short_got, &short_reference) >= 2, "{placement:?}: {short_got:?}");
-        assert!(
-            leading(&long_got, &long_reference).max(leading(&long_got, &long_steps)) >= 2,
-            "{placement:?}: {long_got:?}"
-        );
+        assert_near_the_reference(&format!("{placement:?}, short"), &path, &short, &short_got);
+        assert_near_the_reference(&format!("{placement:?}, long"), &path, &long, &long_got);
     }
 }
 
@@ -2431,8 +2482,18 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     {
         let view = vocabulary
             .map_or("the whole head".to_owned(), |v| format!("a draft vocabulary of {}", v.len()));
-        let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
+        // The replies without drafts report their probabilities, which judge a reply with
+        // drafts where it parts from them.
+        let greedy = Sampling {
+            temperature: Some(0.0),
+            logprobs: Some(LogprobRequest { top: 8, after_chain: false }),
+            ..Sampling::default()
+        };
         let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
+        let seeded_probs = Sampling {
+            logprobs: Some(LogprobRequest { top: 8, after_chain: true }),
+            ..seeded.clone()
+        };
         let (runtime, model) = start_flash_with(&path, Some(&draft), None, vocabulary);
         // The replies with drafts first: a reply that repeats one the engine has
         // written is drafted by the n-gram drafter alone.
@@ -2440,8 +2501,9 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
         let counters = runtime.snapshot().expect("the runtime is running").counters;
         let times = model.mtp_times();
-        let (plain, _) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
-        let (plain_seeded, _) = ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded, false);
+        let (plain, plain_probs) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
+        let (plain_seeded, seeded_probs) =
+            ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded_probs, false);
         let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
             - counters.draft_rows;
         let stats = model.take_store_stats().expect("the parts are open");
@@ -2469,10 +2531,52 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         assert_eq!(undrafted, 0, "the requests without drafts were drafted for");
         assert!(times.accepted[0] > 0, "none of the block's drafts was accepted: {times:?}");
         assert!(counters.drafts_rejected > 0, "no draft was rejected");
-        assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next, {view}");
-        assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next, {view}");
+        // A window's rows are computed in other steps than the rows of a reply without
+        // drafts, so a near tie may part the replies (2026-11-23: at token 16, "," against "."
+        // in the RTX 4070 and RTX 3060 split, with the whole head and the draft vocabulary
+        // alike). Where they part, the reply without drafts has the token of the reply with
+        // drafts close to its own (greedy), or among the tokens it could have drawn (sampled).
+        for (what, got, want, probs) in [
+            ("a greedy reply", &drafted, &plain, &plain_probs),
+            ("a sampled reply", &sampled, &plain_seeded, &seeded_probs),
+        ] {
+            let Some(at) = got.iter().zip(want.iter()).position(|(a, b)| a != b) else {
+                assert_eq!(got.len(), want.len(), "drafts changed the length of {what}, {view}");
+                continue;
+            };
+            let token = got[at];
+            let there = probs.get(at).expect("the reply without drafts reports every token");
+            let alternative = there.alternatives.iter().find(|a| a.token == token);
+            let behind = alternative.map_or(f32::INFINITY, |a| there.logprob - a.logprob);
+            eprintln!(
+                "RES Flash-Next, {view}: with drafts {what} parts at token {at}: {token} and not \
+                 {}; without drafts their log-probabilities are {:?} and {} (the alternatives \
+                 {:?})",
+                want[at],
+                alternative.map(|a| a.logprob),
+                there.logprob,
+                there.alternatives.iter().map(|a| (a.token, a.logprob)).collect::<Vec<_>>(),
+            );
+            match what {
+                "a greedy reply" => assert!(
+                    behind <= NEAR_TIE_NATS,
+                    "drafts changed {what} of Flash-Next, {view}: token {at} is {token}, \
+                     {behind} below the token without drafts ({got:?} against {want:?})"
+                ),
+                _ => assert!(
+                    alternative.is_some(),
+                    "drafts changed {what} of Flash-Next, {view}: token {at} is {token}, which \
+                     the reply without drafts could not draw ({got:?} against {want:?})"
+                ),
+            }
+        }
     }
 }
+
+/// How far below the most likely token a token of a reply of a real model may be in the
+/// log-probabilities of the same request written without drafts, and still be a near tie that
+/// the rounding of other steps flips: 0.25, the two within a factor of 1.3 of each other.
+const NEAR_TIE_NATS: f32 = 0.25;
 
 /// The same with the DFlash drafter (`ARES_TEST_DFLASH_FLASHNEXT`), which reads
 /// the mean of the model's four streams: Flash-Next writes with its drafts,

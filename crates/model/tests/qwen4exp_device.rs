@@ -35,6 +35,7 @@ use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
 use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve, StoreStats};
 use common::gpu::devices;
+use common::helpers::is_near_best;
 
 mod common;
 
@@ -156,7 +157,16 @@ fn session<'g>(
     let mut session = Session::open(gguf, c, w, devices, opts).expect("the model opens");
     let n_expert = c.experts.count as u32;
     let fill = session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
-    assert_eq!(fill.uploads as usize, c.n_layer * c.experts.count, "every expert has a slot");
+    // Whether the room or the fill was short.
+    let slots: usize = {
+        let store = session.store();
+        (0..store.n_layers()).map(|layer| store.slots(layer).0).sum()
+    };
+    assert_eq!(
+        fill.uploads as usize,
+        c.n_layer * c.experts.count,
+        "every expert has a slot: {slots} slots in VRAM, {fill:?}"
+    );
     session
 }
 
@@ -169,16 +179,6 @@ fn rel_rms(got: &[f32], want: &[f32]) -> f64 {
         size += f64::from(*w).powi(2);
     }
     (diff / size.max(1e-30)).sqrt()
-}
-
-/// Whether `pick` is the most likely token of `want` up to what the measured `error` of the
-/// logits (relative RMS) can move: a token within three times that of the largest logit,
-/// and within a hundredth of the logits' RMS (the error is a mean over the row; the logits
-/// of a made-up model's top tokens lie close together).
-fn is_near_best(pick: u32, want: &[f32], error: f64) -> bool {
-    let best = want.iter().copied().fold(f32::MIN, f32::max);
-    let rms = (want.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
-    f64::from(best - want[pick as usize]) <= (3.0 * error + 1e-2) * rms
 }
 
 fn arg_max(row: &[f32]) -> u32 {
@@ -713,8 +713,16 @@ fn wide_steps(devices: &[Device], precision: Precision, slots: Slots) {
             assert!(stats.transit_adopted > 0 && stats.evictions > 0, "{stats:?}");
         }
     }
-    // The quantized dense matrices cost the 8-bit activations of their products.
-    assert!(worst < 0.2, "logits {worst:.2e}");
+    // The quantized dense matrices cost the 8-bit activations of their products, and the
+    // rounding of a step is not the same from run to run: the many-row kernels add a row's
+    // experts in the order they finish, and the misses come in rounds as transit brings them.
+    // The 8-bit activation codes of the Fast precision make a difference of rounding one of
+    // tenths in this made-up model (2026-11-27, RTX 4070, six runs: the last row after the
+    // 256-row step 0.133 to 0.215 in Fast, at most 0.049 in Exact; the first step of 9 rows
+    // 3.8e-2 or 5.3e-2 in Fast, 3.8e-3 or 2.4e-2 in Exact with transit). Each pick is a near
+    // tie of the reference's at the measured error (above).
+    let bound = if precision == Precision::Fast { 0.3 } else { 0.1 };
+    assert!(worst < bound, "logits {worst:.2e}");
     // Single tokens go on from the state the wide steps left.
     for _ in 0..8 {
         let picks = session
