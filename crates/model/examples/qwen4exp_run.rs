@@ -81,7 +81,7 @@ use ares_model::qwen4exp::device::{
     Spread, TensorChoice, Wanted, read_time,
 };
 use ares_model::qwen4exp::{Config, Weights};
-use ares_runtime::expert_store::{Serve, StoreStats};
+use ares_runtime::expert_store::{Serve, StoreStats, WAITED_FOR};
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
 
 type AnyError = Box<dyn std::error::Error>;
@@ -358,6 +358,25 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
         stats.disk_miss_ms.iter().chain(&stats.ahead_miss_ms).map(|ms| f64::from(*ms)).sum::<f64>()
             / steps.max(1) as f64,
     )
+}
+
+/// What the layers that waited for misses waited for last, per step: the CPU's sums, an
+/// upload from RAM, a read of the file, an expert on its way.
+fn wait_line(stats: &StoreStats, steps: usize) -> String {
+    let per = |x: f64| x / steps.max(1) as f64;
+    let kinds: Vec<String> = WAITED_FOR
+        .iter()
+        .zip(stats.wait_last_ms.iter().zip(&stats.waits_last))
+        .map(|(name, (ms, n))| {
+            format!(
+                "{name} {:.2} ms in {:.1} layers ({:.3} ms a layer)",
+                per(*ms),
+                per(*n as f64),
+                ms / (*n).max(1) as f64
+            )
+        })
+        .collect();
+    format!("waits per step by what a layer waited for last: {}", kinds.join(", "))
 }
 
 /// Where the time of a miss from the file goes: the reader's latency of a demand read
@@ -1114,6 +1133,7 @@ fn run() -> Result<(), AnyError> {
                 if timed { ", with timed events" } else { "" },
             );
             println!("  store: {}", store_line(&stats, ms.len()));
+            println!("  {}", wait_line(&stats, ms.len()));
             println!("  drive: {}", drive_line(&stats, &session));
             println!("{}", step_classes(&kinds));
             if timed {

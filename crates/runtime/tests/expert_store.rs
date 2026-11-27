@@ -38,6 +38,9 @@ fn a_missing_pick_comes_from_the_file_into_a_slot() {
     assert_eq!((stats.demand_reads, stats.uploads), (2, 2));
     assert_eq!(stats.miss_ms.len(), 2);
     assert_eq!(stats.upload_bytes, 2 * 352);
+    // The layer waited once, and last for an expert from the file.
+    assert_eq!(stats.waits_last, [0, 0, 1, 0]);
+    assert_eq!(stats.wait_last_ms[2], stats.wait_ms);
 
     // The next step finds them.
     rig.store.begin_step();
@@ -153,6 +156,7 @@ fn an_evicted_expert_goes_down_to_ram_and_comes_back_without_a_read() {
     let stats = rig.store.take_stats();
     assert_eq!((stats.miss_from_ram, stats.miss_from_disk, stats.demand_reads), (2, 0, 0));
     assert_eq!(stats.uploads, 2);
+    assert_eq!(stats.waits_last, [0, 1, 0, 0], "the layer waited for an upload from RAM");
 }
 
 #[test]
@@ -674,6 +678,8 @@ mod hybrid {
         );
         assert!(rig.store.in_ram(0, 3) && rig.store.in_ram(0, 5));
         assert_eq!(rig.store.stats().cpu_experts, 2);
+        // The CPU's sums waited for the reads of their experts.
+        assert_eq!(rig.store.stats().waits_last, [0, 0, 1, 0]);
         rig.store.end_step().unwrap();
 
         // Between the steps the heat promotes them: the bytes, then the entry.
