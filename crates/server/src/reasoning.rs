@@ -30,8 +30,9 @@
 //! one token for each of those rows (`ares-runtime`'s guard), so a request with
 //! a budget is answered with it: `-1` is no budget of its own (the model's
 //! default holds, as in llama-server), and a request whose model does not
-//! think cannot have one. `reasoning_control`, which asks for llama-server's
-//! route that ends the thinking while it runs, is not built and refused.
+//! think cannot have one. `reasoning_control`, which arms llama-server's route
+//! that ends the thinking while it runs (`/v1/chat/completions/control`), is
+//! accepted: every reply here can be ended that way, armed or not.
 //!
 //! # The split
 //!
@@ -150,18 +151,9 @@ pub(crate) fn asked(fields: &Fields<'_>) -> Result<Asked, ApiError> {
         Some(Json::String(text)) => Some(text.clone()),
         Some(other) => return Err(wrong_type("reasoning_budget_message", "a string", other)),
     };
-    match fields.get("reasoning_control") {
-        None | Some(Json::Bool(false)) => {}
-        Some(Json::Bool(true)) => {
-            return Err(ApiError::invalid_param(
-                "reasoning_control",
-                "reasoning_control is not supported: the route that ends the thinking while it \
-                 runs (llama-server's /v1/chat/completions/control) is not built; a budget \
-                 (reasoning_budget_tokens) ends it at a number of tokens",
-            ));
-        }
-        Some(other) => return Err(wrong_type("reasoning_control", "a boolean", other)),
-    }
+    // llama.cpp arms its route that ends the thinking with it; here every reply
+    // can be ended by that route, so it says nothing more, and is a boolean.
+    fields.bool("reasoning_control")?;
     Ok(Asked { format, variables, effort, budget, budget_message })
 }
 

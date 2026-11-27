@@ -26,6 +26,13 @@ llama.cpp prints prefill and decode speed in its logs, and more errors by defaul
       gone. The prompt rate no longer counts the queue and the cache restore into the time (0.6
       tokens/s for one token computed of 55 before). `timings.prompt_ms` is the engine's prompt
       time and the draft counts are each request's own.
+- [x] llama.cpp's web UI (`ui/apps/chat` of llama.cpp) sent members Ares refused, so that client
+      could not use Ares (found 2026-11-26). Done 2026-11-27: `sse_ping_interval` (the stream's
+      pings), `timings_per_token` (the timings so far on a stream's chunks, and llama.cpp's
+      `cache_n` and milliseconds per token in every `timings`), `backend_sampling` (where
+      llama.cpp samples: without effect), `reasoning_control` with llama.cpp's
+      `/v1/chat/completions/control` (`reasoning_end` ends a running reply's thinking); and the
+      lines of a long reply's speed in the log (llama.cpp's `print_timings_tg`).
 
 ## 2026-11-25
 

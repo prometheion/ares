@@ -185,6 +185,12 @@ pub(crate) enum Command {
     /// The checkpoints may hold less page-locked memory than they do: the
     /// conductor gives the coldest up, also while nothing runs.
     Trim,
+    /// Ends the thinking of a request now ([`ares_api::Engine::end_thinking`]);
+    /// the answer is whether the request was inside it.
+    EndThinking {
+        id: RequestId,
+        reply: SyncSender<bool>,
+    },
     Shutdown,
 }
 
@@ -1043,6 +1049,14 @@ impl Conductor {
             }
             // The loop trims between steps, at its top; this woke it.
             Command::Trim => {}
+            Command::EndThinking { id, reply } => {
+                let a = match self.by_id.get(&id) {
+                    Some(Place::Slot(slot)) => self.slots[*slot as usize].as_mut(),
+                    Some(Place::Waiting) => self.waiting.iter_mut().find(|a| a.id == id),
+                    None => None,
+                };
+                let _ = reply.send(a.is_some_and(|a| a.sampler.end_thinking()));
+            }
             Command::Shutdown => self.shutting_down = true,
         }
     }

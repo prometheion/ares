@@ -71,7 +71,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | A20 | Infill | llama, ollama, swap | prefix plus suffix with the model's fill-in-the-middle tokens (`/infill`, `suffix`) | not started (`suffix` is refused) | yes | niche |
 | A21 | Speech, transcription, realtime audio | llama, vllm, ollama, kobold, localai, tfold, sonar, swap | `/v1/audio/*`, `/v1/realtime` over WebSocket | not started | no: newest model architectures only (other model kinds) | - |
 | A22 | Image, video and music generation | kobold, localai, trt, tfold, mistralrs, swap | `/v1/images/generations` and relatives | not started | no: newest model architectures only (other model kinds) | - |
-| A23 | Control of a running completion | llama | `POST /v1/chat/completions/control` with `reasoning_end` ends the thinking of a request in flight | not started | yes | niche |
+| A23 | Control of a running completion | llama | `POST /v1/chat/completions/control` with `reasoning_end` ends the thinking of a request in flight | done 2026-11-27 (`feat/progress-logs`) | yes | niche |
 | A24 | Cancel by id | tabby, vllm, kobold | cancel a request without closing its connection | not started | yes | niche |
 | A25 | OpenAPI description | vllm, tgi, mlc, kobold, lmdeploy, tabby, sonar | `/docs` or `openapi.json` | not started | yes | niche |
 | A26 | gRPC front end | vllm, sglang, trt, triton? | the same requests over gRPC | not started | yes | niche |

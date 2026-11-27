@@ -665,10 +665,6 @@ Pieces of real work, days each, in the order of work where the owner placed them
       is a question to the owner).
 
 ### Server and API
-- [ ] llama.cpp's web UI (`ui/apps/chat` of llama.cpp) sends `sse_ping_interval: 1` with every
-      stream, beside `return_progress`; Ares refuses it as a member it does not know, so that
-      client cannot talk to Ares yet (found 2026-11-26 by `feat/progress-logs`). Its tests also
-      send `timings_per_token`. Files: `crates/server/src/openai/request.rs` (`SERVED`).
 - [ ] Left of the prompt progress and the log (`feat/progress-logs`, 2026-11-26): a step of
       Flash-Next's prompt on lent VRAM that is not a pass, and the 27B's prompt steps, report
       after each step only (the share inside a step comes from the pass alone); the acceptance
@@ -676,7 +672,7 @@ Pieces of real work, days each, in the order of work where the owner placed them
       trace).
 - [ ] Left of the thinking budget and the loop guard (K03, K05, done 2026-11-22): the
       thresholds are fixed (no option); a passage loop of longer cycles (Strata's opt-in #728)
-      is not looked for; `reasoning_control` is not built (refused with a 400).
+      is not looked for.
 - [ ] Left of priorities (S06, done 2026-11-22): a prompt of a worse priority still takes its
       share of the time next to generation of a better one (the floor of generation, not the
       priority, bounds it); a threshold of the gap before a running request gives way (SGLang's,

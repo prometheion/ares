@@ -233,6 +233,18 @@ fn start(tags: Option<&Thinking>, budget: Option<u32>) -> State {
 }
 
 impl TokenFilter for Guard {
+    fn end_thinking(&mut self) -> bool {
+        let inside =
+            matches!(self.state.thinking.as_ref().map(Tracker::place), Some(Place::Inside { .. }));
+        if !inside || self.state.phase != Phase::Following || self.forced.is_empty() {
+            return false;
+        }
+        // As a budget that is spent: after the character a token cut in two.
+        self.state.phase =
+            if self.state.pending.is_empty() { Phase::Forcing { at: 0 } } else { Phase::Waiting };
+        true
+    }
+
     fn mask(&mut self, reply: &[u32], drafts: &[u32], mask: &mut TokenMask) -> bool {
         let state = self.at(reply);
         let state = self.after(state, drafts);
@@ -351,6 +363,33 @@ mod tests {
         assert_eq!(g.free_rows(&tokens("abc"), &tokens("de\n")), 2);
         assert_eq!(g.admitted(&tokens("abcde"), &tokens("\n<x")), 2);
         assert_eq!(g.admitted(&tokens("ab"), &tokens("cdefg")), 3);
+    }
+
+    /// llama.cpp's control `reasoning_end`: the thinking ends from the next row
+    /// on, as a spent budget ends it, also without a budget; not before the
+    /// thinking, nor after it, nor twice.
+    #[test]
+    fn a_thinking_ended_from_outside_ends_with_the_tokens_of_its_end() {
+        let mut g = guard(true, None);
+        let mut reply = tokens("abc");
+        assert_eq!(held(&mut g, &reply), None);
+        assert!(g.end_thinking());
+        for &token in &tokens("\n</think>\n\n") {
+            assert_eq!(held(&mut g, &reply), Some(token));
+            reply.push(token);
+        }
+        assert_eq!(held(&mut g, &reply), None);
+        assert!(!g.end_thinking(), "the thinking is over");
+        // A model that has not opened its thinking yet.
+        let mut g = guard(false, None);
+        assert_eq!(held(&mut g, &tokens("  ")), None);
+        assert!(!g.end_thinking());
+        // A character cut in two is finished first.
+        let mut g = guard(true, None);
+        assert_eq!(held(&mut g, &[b'a'.into(), 1000]), None);
+        assert!(g.end_thinking());
+        assert_eq!(held(&mut g, &[b'a'.into(), 1000]), None, "the rest of the character");
+        assert_eq!(held(&mut g, &[b'a'.into(), 1000, 1001]), Some(u32::from(b'\n')));
     }
 
     #[test]

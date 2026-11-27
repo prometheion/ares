@@ -423,3 +423,132 @@ async fn timings_per_token_puts_the_timings_so_far_on_the_chunks_of_a_stream() {
         !deltas.is_empty() && deltas.iter().all(|e| e["timings"]["predicted_n"].as_u64() > Some(0))
     );
 }
+
+/// The synthetic model that thinks until it writes `</never>`, which it never
+/// does, served with steps of a few milliseconds.
+async fn served_thinking() -> Router {
+    let mut config = SyntheticConfig::small(Split::Single, 1);
+    config.context_length = 2048;
+    config.chat = Some(ares_api::ChatFormat {
+        thinking: Some(ares_api::ThinkingFormat {
+            start: "<think>".into(),
+            end: "</never>".into(),
+            prompt_on: "<think>".into(),
+            prompt_off: "<think></never>".into(),
+            on_by_default: true,
+            effort: false,
+            refused_efforts: Vec::new(),
+        }),
+        tools: None,
+        system_first: true,
+    });
+    let model = Arc::new(SyntheticModel::new(config).unwrap());
+    let config = RuntimeConfig {
+        pages: 4096,
+        cells_per_page: 16,
+        max_slots: 4,
+        window_rows: 1,
+        warm_up: false,
+        ..RuntimeConfig::default()
+    };
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
+        .with_row_cost(Duration::from_millis(3), Duration::from_micros(5));
+    let runtime = Runtime::start(model, Box::new(host), config).unwrap();
+    let engine: Arc<dyn Engine> =
+        Arc::new(runtime.with_chat_template(Some("{{ messages }}".into())));
+    router_of(engine, ModelOptions::default(), ares_server::Config::default()).await
+}
+
+/// llama.cpp's `/v1/chat/completions/control` with `reasoning_end`: a stream's
+/// thinking ends at once and its answer follows (llama.cpp's web UI sends
+/// `reasoning_control: true` with every request and calls the route for its stop
+/// of the thinking). An id that names no running completion is `success: false`;
+/// an unknown action or no id is a 400.
+#[tokio::test]
+async fn the_control_route_ends_the_thinking_of_a_running_reply() {
+    use futures_util::StreamExt;
+    let app = served_thinking().await;
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": "think about it <think>"}],
+        "max_tokens": 300,
+        "stream": true,
+        "reasoning_control": true,
+    });
+    let response = post(&app, CHAT, &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut text = String::new();
+    // The id, and some thinking, before the control.
+    while !text.contains("reasoning_content") {
+        let bytes = stream.next().await.expect("the stream goes on").unwrap();
+        text.push_str(std::str::from_utf8(&bytes).unwrap());
+    }
+    let first = parse_sse(&text).chunks.into_iter().next().unwrap();
+    let id = first["id"].as_str().unwrap().to_owned();
+    let control = json!({"id": id, "action": "reasoning_end", "model": "synthetic"});
+    let (status, answer) =
+        json(post(&app, "/v1/chat/completions/control", &control.to_string()).await).await;
+    assert_eq!((status, answer), (StatusCode::OK, json!({"success": true})));
+    while let Some(bytes) = stream.next().await {
+        text.push_str(std::str::from_utf8(&bytes.unwrap()).unwrap());
+    }
+    let chunks = parse_sse(&text).chunks;
+    let content: String =
+        chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
+    assert!(!content.is_empty(), "an answer follows the thinking: {text}");
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect();
+    assert!(reasoning.chars().count() < 250, "the thinking ended early: {reasoning:?}");
+    // The completion has ended: nothing to end.
+    let (status, answer) =
+        json(post(&app, "/v1/chat/completions/control", &control.to_string()).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(answer["success"], false, "{answer}");
+    for (bad, param) in [
+        (json!({"id": id, "action": "stop"}), "action"),
+        (json!({"action": "reasoning_end"}), "id"),
+    ] {
+        let (status, answer) =
+            json(post(&app, "/v1/chat/completions/control", &bad.to_string()).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["error"]["param"], param, "{answer}");
+    }
+}
+
+/// The body llama.cpp's web UI (`ui/apps/chat` at d92ea9b) sends for a chat with
+/// its settings left as they come, as `ChatService.sendMessage` builds it: Ares
+/// serves it, with the progress, the pings and the timings it asks for.
+/// `backend_sampling` (where llama.cpp samples) says nothing here, and
+/// `reasoning_control` arms nothing more: every reply can be ended by the control
+/// route.
+#[tokio::test]
+async fn the_body_of_llama_cpps_web_ui_is_served() {
+    let app = served().await;
+    let body = json!({
+        "messages": [{"role": "user", "content": long_text()}],
+        "return_progress": true,
+        "sse_ping_interval": 1,
+        "stream": true,
+        "reasoning_format": "auto",
+        "reasoning_control": true,
+        "timings_per_token": true,
+        "backend_sampling": false,
+        "model": "synthetic",
+        "max_tokens": 8,
+    });
+    let chunks = streamed(&app, CHAT, body.clone()).await;
+    assert!(chunks.iter().any(|c| c.get("prompt_progress").is_some()), "{chunks:?}");
+    assert!(chunks.iter().any(|c| c["timings"]["predicted_n"] == 1), "{chunks:?}");
+    // The same members with other values: only their type is checked.
+    let mut other = body;
+    other["backend_sampling"] = json!(true);
+    other["reasoning_control"] = json!(false);
+    streamed(&app, CHAT, other.clone()).await;
+    other["backend_sampling"] = json!("yes");
+    let (status, answer) = json(post(&app, CHAT, &other.to_string()).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["param"], "backend_sampling", "{answer}");
+}

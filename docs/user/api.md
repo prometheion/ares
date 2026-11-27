@@ -18,6 +18,7 @@ does not read are passed over. `null` counts as "not set".
 | `POST` | `/v1/messages` | Anthropic Messages, whole or streamed |
 | `POST` | `/v1/responses` | OpenAI Responses, without state |
 | `POST` | `/v1/chat/completions/input_tokens`, `/v1/messages/count_tokens`, `/v1/responses/input_tokens` | count the prompt of a request of that API; nothing is generated |
+| `POST` | `/v1/chat/completions/control` | llama.cpp's control of a running completion: `{"id", "action": "reasoning_end", "model"}` ends its thinking ([Thinking](#thinking)) |
 | any | `/v1/responses/{id}`, `/v1/responses/{id}/{what}` | 404: no response is kept |
 | `GET` | `/props` | what a model is (llama.cpp's shape); `?model=<id>` with several models |
 | `POST` | `/tokenize`, `/detokenize` | text to tokens and back (llama.cpp's shapes) |
@@ -78,6 +79,7 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |
 | `ignore_eos`, `min_keep` | the reply does not end at the end token; a `min_keep` above 1 is refused |
+| `backend_sampling` | llama.cpp's choice of where it samples, whose draws are the same; Ares samples on the device: a boolean, without effect |
 
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
 `functions` and `function_call`, adaptive-p (`adaptive_target`,
@@ -175,6 +177,7 @@ that generates (for clients that cannot add a field, such as Claude Code with
 | effort | `reasoning_effort` | `output_config.effort` | `reasoning.effort` |
 | budget of tokens | `reasoning_budget_tokens`, `thinking_budget_tokens` or `thinking_token_budget` (`-1`: the model's default), `reasoning_budget_message` | `thinking.budget_tokens` | `thinking_token_budget` |
 | format | `reasoning_format`: `auto` or `none` | thinking blocks | a `reasoning` item |
+| end it now | `/v1/chat/completions/control` with the stream's `id` and `"action": "reasoning_end"`; `reasoning_control` is accepted | | |
 
 The defaults come from `--reasoning`, `--reasoning-effort`, `--reasoning-format`
 and `--reasoning-budget-tokens`. An effort is a 400 when the chat template does not
@@ -185,6 +188,11 @@ means the template's default (Flash-Next's template knows `low`, `medium` and
 spent, the budget's message and the end of the thinking are written and the
 answer follows. A budget on a model without thinking is refused. Thinking that
 loops is ended the same way, and one token repeated 256 times ends a reply.
+The control route ends the thinking of a running chat completion the same way at
+once, as llama.cpp's does: `{"success": true}`, or `false` with a `message` when no
+running completion of that id is inside its thinking. llama.cpp's
+`reasoning_control: true` arms its route for a request; here every reply can be
+ended, so the member is read for its type and says nothing more.
 Other `chat_template_kwargs` are template variables; `messages`, `tools`,
 `add_generation_prompt`, `bos_token` and `eos_token` are the server's.
 

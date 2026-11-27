@@ -440,7 +440,22 @@ tokens from `Event::Generated` and the time since its first; no drafts and no
 hash before the end), on chat, completions and the data of a Responses event.
 The `timings` of every answer have llama.cpp's fields, `cache_n`,
 `prompt_per_token_ms` and `predicted_per_token_ms` among them, which the web UI
-reads. Tests:
+reads. What else that web UI sends by default (`ChatService.sendMessage` and
+`getApiOptions` at d92ea9b, its settings as they come) is `reasoning_format:
+"auto"`, `reasoning_control: true` (llama.cpp arms its route that ends the
+thinking: here every reply can be ended by `/v1/chat/completions/control`, which
+`Engine::end_thinking` serves by forcing the guard's end of the thinking as a spent
+budget does, so the member is a boolean and says nothing more) and
+`backend_sampling: false` (where llama.cpp's sampler runs, whose draws are the
+same either way: Ares samples on the device, a boolean without effect);
+`server/tests/progress.rs` sends that body. What it sends only when a setting or
+an attachment asks: the sampling fields (served), `typ_p` (the web UI's name for
+typical sampling, which llama.cpp's server does not read and ignores; refused here
+by name, as every member it does not know), `samplers` as an array (served),
+`chat_template_kwargs`, `reasoning_effort`, `thinking_budget_tokens`,
+`continue_final_message` and `add_generation_prompt` (served), its `custom` JSON
+(whatever the user writes), and parts `input_audio` and `input_video` (refused:
+there is no audio or video input); the header `X-Conversation-Id` is passed over. Tests:
 `crates/runtime/tests/cache/prefix.rs` (steps and the cache, the pauses of a
 pass, a long step's share; every test's `Handle::finish` checks the order and
 the rise), `crates/server/tests/progress.rs` (the chunks of the three APIs as

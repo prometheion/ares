@@ -219,6 +219,10 @@ const SERVED: &[&str] = &[
     "return_progress",
     "sse_ping_interval",
     "timings_per_token",
+    // llama.cpp's choice of where its sampler runs, on the device ("backend")
+    // or on the host, whose draws are the same either way: Ares samples on the
+    // device whatever it says (read for its type in `from_json`).
+    "backend_sampling",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -361,6 +365,8 @@ pub(crate) fn from_json(
         Some(Json::Object(members)) => Fields(members).bool("include_usage")?.unwrap_or(false),
         Some(other) => return Err(wrong_type("stream_options", "an object", other)),
     };
+    // Where llama.cpp samples is no choice here, but the member is a boolean.
+    fields.bool("backend_sampling")?;
     Ok(Parsed {
         request,
         stream: fields.bool("stream")?.unwrap_or(false),

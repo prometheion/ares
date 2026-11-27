@@ -173,6 +173,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
             post(anthropic::count_tokens).fallback(anthropic::method_not_allowed),
         )
         .route("/v1/chat/completions/input_tokens", post(openai::chat_input_tokens))
+        .route("/v1/chat/completions/control", post(openai::control))
         .route("/v1/responses", post(responses::create))
         .route("/v1/responses/input_tokens", post(responses::input_tokens))
         .route("/v1/responses/{id}", any(responses::stored))

@@ -38,6 +38,75 @@ pub(crate) async fn completions(State(app): State<App>, request: Request) -> Res
     completion(app, request, Endpoint::Completions).await
 }
 
+/// `POST /v1/chat/completions/control`, llama.cpp's route that acts on a chat
+/// completion while it runs (`post_control` in `tools/server/server-context.cpp`
+/// of <https://github.com/ggml-org/llama.cpp>, commit d92ea9b, MIT): `{"id", "action",
+/// "model"}`, where the id is the one its stream gave (`chatcmpl-...`) and the
+/// only action is `reasoning_end`, which ends the reply's thinking now. Answers
+/// `{"success": true}`, or `false` with a `message` when no running completion
+/// of that id is inside its thinking.
+pub(crate) async fn control(State(app): State<App>, request: Request) -> Response {
+    match try_control(app, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn try_control(app: App, request: Request) -> Result<Response, ApiError> {
+    let body = read_body(request, &app.config).await?;
+    let json = request::read_json(&body)?;
+    let fields = request::Fields(request::members(&json)?);
+    for (name, _) in fields.0 {
+        if !["id", "action", "model"].contains(&name.as_str()) {
+            return Err(ApiError::invalid_param(
+                name.as_str(),
+                format!("{name} is not a member of a control"),
+            ));
+        }
+    }
+    let id = fields
+        .string("id")?
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ApiError::invalid_param("id", "missing completion id"))?;
+    match fields.string("action")? {
+        Some("reasoning_end") => {}
+        _ => return Err(ApiError::invalid_param("action", "unknown control action")),
+    }
+    let name = crate::routes::wanted(&app, fields.string("model")?.map(str::to_owned))?;
+    let answer = |success: bool, message: &str| {
+        let mut answer = serde_json::json!({ "success": success });
+        if !message.is_empty() {
+            answer["message"] = message.into();
+        }
+        json_response(answer.to_string())
+    };
+    // An id of another form, or of a model that is not loaded, names no
+    // running completion.
+    let number = id
+        .strip_prefix(Endpoint::Chat.id_prefix())
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+    let (Some(number), Ok(lease)) = (number, app.models.loaded(&name).await) else {
+        return Ok(answer(false, "no active completion for this id"));
+    };
+    let engine = lease.engine().clone();
+    let ended =
+        tokio::task::spawn_blocking(move || engine.end_thinking(ares_api::RequestId(number)))
+            .await
+            .map_err(|e| ApiError::internal(format!("the control was lost: {e}")))?
+            .map_err(|e| ApiError::from_engine(&**lease.engine(), e))?;
+    tracing::info!(
+        "request {:016x}: control reasoning_end, {}",
+        number,
+        if ended { "the thinking ends" } else { "nothing to end" }
+    );
+    Ok(if ended {
+        answer(true, "")
+    } else {
+        answer(false, "no active completion for this id is inside its thinking")
+    })
+}
+
 /// `POST /v1/chat/completions/input_tokens`: the tokens of the prompt a chat
 /// request comes to. The body is read as `/v1/chat/completions` reads it,
 /// and nothing is generated.
