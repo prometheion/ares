@@ -11,10 +11,11 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   kernels were written for the 27B's prompts. The dense products go through the tile
   kernels (`Kernels::product`) in the activation form the device and the type ask for:
   the int8 rows the fused kernels already leave (`mix_quant`, `gated_norm_quant`,
-  `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) when the
-  device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. Each
-  quantized type takes its own form (its measured path at the options' precision, as the
-  27B's chooser takes per matrix; the owner's decision of 2026-11-22): where the types of a
+  `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) for a type
+  whose measured path is f16, and for every type with exact products (`Options::precision`
+  `Exact`, a tool of the tests). Each quantized type takes its own form (its path measured
+  on the device, capped or not, as the 27B's chooser takes per matrix; the owner's
+  decisions of 2026-11-22 and 2026-11-26): where the types of a
   part's dense matrices differ (a type with no int8 tile kernel, such as the Q2_0 of three
   shared-expert downs of the IQ2_XS file, or the measured paths of a full-rate card, Q6_K,
   Q3_K and Q5_K f16 against IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and Q8_0 int8 on the RTX 4060

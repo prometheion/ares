@@ -11,7 +11,7 @@ file's context length) as far as the VRAM that is left holds it (a tensor
 split moves attention heads with their K and V to the devices with room as
 far as that context needs: see "What the second card is for"); the start-up
 report says what was chosen, why, what context was wanted and how much of it
-is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, precision, the model
+is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, the model
 drafters that take part (`--drafters`) and the room for their windows
 (`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM limit defaults
 to all the machine has, and below any limit the engine holds what the machine
@@ -39,7 +39,7 @@ timings in every answer of the OpenAI routes
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
 and in the last event of a stream). A request can switch drafting off for itself
 with `"draft": false`; the two replies of one request, with and without drafts,
-are then compared by their hashes over HTTP (they are equal, with the fast kernels and with `--precision exact`: see
+are then compared by their hashes over HTTP (they are equal: see
 "The text with drafts is the text without" under [Speculation](speculation.md)).
 The prefix cache is on for both models without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages

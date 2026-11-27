@@ -1128,6 +1128,20 @@ milliseconds when the kernels are loaded and the result is in the load log
   says so and names the remedy: per type, the path a probe at load found
   fastest of int8 and f16 with f16 accumulation (the more exact on ties).
 
+There is no option for the exact path either (`--precision` went on
+2026-11-26, issue #54): the owner decided that exact products everywhere are
+not a trade-off worth a choice, since the text of the faster path differs
+from theirs only slightly (8-bit activations: 1.05 % rms per product, f16
+sums 0.05 %, against the f16 operands' 0.03 %), so what is faster runs, on a
+capped card and an unlocked one. What exact products bought was a text that
+does not depend on what else runs in a step; the fast path gives that for
+generated rows (a single row and a window of drafts compute the same bits in
+any decode step, so the text with drafts is the text without), and a prompt
+row's rounding depends on the size of its step, so a text next to others or
+from the prompt cache may part at a near tie. `Precision::Exact` stays as a
+tool of the tests and benches, which hold a device to the CPU reference with
+it; no option of the server reaches it.
+
 The development machine's cards are capped, and the probe shows it exactly:
 f16 `mma` with f32 accumulation runs at 58.6 TFLOPS on the RTX 4070 and 25.6
 on the RTX 3060, with f16 accumulation at 117.0 and 51.2, and int8 at 234 and

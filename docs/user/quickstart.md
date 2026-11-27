@@ -94,7 +94,7 @@ A preset file gives a model a short id and aliases. With `--api-key`, set
 | --- | --- |
 | The log | standard error; `--log-file <FILE>` appends to a file, `--log-format json` writes one JSON object a line |
 | Log level | the `RUST_LOG` environment variable, default `info` (for example `RUST_LOG=debug`) |
-| At start | the devices, the split, the context and why, the RAM limit, and what each device took |
+| At start | the devices, the split, the context and why, the RAM limit, what each device took, and per device whether its tensor cores are capped and which kernel path each weight type was measured to be fastest on |
 | Per request | a line `request` when it is taken (model, API, `max_tokens`, sampling fields, tools, priority) and a line `request finished` (finish reason, `prompt_tokens`, `cached_prompt_tokens`, `queued_ms`, `prompt_ms`, `completion_tokens`, `reasoning_tokens`, `tokens_per_s`, `drafts`, `drafts_accepted`); the prompt and the reply only with `--log-text` |
 
 `GET /metrics` returns the counters of the loaded model in the Prometheus text
