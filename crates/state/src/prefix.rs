@@ -299,6 +299,19 @@ pub struct CachedPage {
     pub checkpoint: Option<CheckpointId>,
 }
 
+/// A tail of the index with the state at its end ([`PrefixIndex::cached_tails`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedTail {
+    pub hash: ChainHash,
+    pub page: PageId,
+    /// The page it goes on from, or the root.
+    pub prior: ChainHash,
+    /// The number of that page in its chain (0 for the root).
+    pub depth: u32,
+    pub tokens: Vec<u64>,
+    pub checkpoint: CheckpointId,
+}
+
 /// The names of a sequence's full pages, kept next to the sequence so that
 /// pages can be published as they fill without hashing the text again.
 #[derive(Clone, Debug)]
@@ -452,6 +465,32 @@ impl PrefixIndex {
             .collect();
         pages.sort_unstable_by_key(|(used, page)| (*used, page.hash));
         pages.into_iter().map(|(_, page)| page).collect()
+    }
+
+    /// Every tail the index holds that carries the state at its end, the
+    /// least recently used first: what an engine that ends writes to the
+    /// drive besides its pages.
+    pub fn cached_tails(&self) -> Vec<CachedTail> {
+        let mut tails: Vec<(u64, CachedTail)> = self
+            .tails
+            .iter()
+            .flat_map(|(prior, tails)| tails.iter().map(move |tail| (*prior, tail)))
+            .filter_map(|(prior, tail)| {
+                let checkpoint = tail.checkpoint?;
+                let depth = self.entries.get(&prior).map_or(0, |entry| entry.depth);
+                let cached = CachedTail {
+                    hash: tail.hash,
+                    page: tail.page,
+                    prior,
+                    depth,
+                    tokens: tail.tokens.clone(),
+                    checkpoint,
+                };
+                Some((tail.last_used, cached))
+            })
+            .collect();
+        tails.sort_unstable_by_key(|(used, tail)| (*used, tail.hash));
+        tails.into_iter().map(|(_, tail)| tail).collect()
     }
 
     /// Whether the index holds a page or a tail of this name.

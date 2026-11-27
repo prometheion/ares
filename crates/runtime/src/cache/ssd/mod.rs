@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ares_state::{Chain, ChainHash, Owner, PageId, PagePool, Sequence};
+use ares_state::{Chain, ChainHash, Owner, PageId, PagePool, Priority, Sequence};
 use ares_store::{Aligned, Fingerprint, Kind, Located, PageStore, Part};
 
 use super::ram::{Entry, Item};
@@ -70,6 +70,31 @@ use crate::exec::{Executor, HostBytes, Transfer, TransferKind, TransitPart};
 use crate::model::Durable;
 
 mod pump;
+
+/// The longest tail under `prior` with the state at its end that `rest`
+/// starts with, of `store`, of those `wanted` takes: its name and its cells.
+/// `next`, the full page that goes on from `prior` in the text, is no tail.
+fn stored_tail(
+    store: &PageStore,
+    prior: ChainHash,
+    next: Option<ChainHash>,
+    rest: &[u64],
+    wanted: impl Fn(ChainHash) -> bool,
+) -> Option<(ChainHash, usize)> {
+    let tails: Vec<ChainHash> = store
+        .children(prior)
+        .filter(|hash| Some(*hash) != next && store.contains(Kind::State, *hash) && wanted(*hash))
+        .collect();
+    if tails.is_empty() {
+        return None;
+    }
+    prior
+        .extensions(rest)
+        .enumerate()
+        .filter(|(_, hash)| tails.contains(hash))
+        .last()
+        .map(|(cells, hash)| (hash, cells + 1))
+}
 
 /// Checkpoints in transit at once.
 const STATE_BUFFERS: usize = 3;
@@ -376,6 +401,9 @@ struct Import {
     pages: Vec<(ChainHash, ChainHash, u32)>,
     /// The page at whose end the checkpoint to bring back lies.
     state: Option<usize>,
+    /// The tokens of the run's last entry when it is a tail (a partly used
+    /// page with the state at its end), which enters the index as one.
+    tail: Option<Vec<u64>>,
     state_parts: Option<Vec<TransitPart>>,
     state_asked: bool,
     /// Pages the readers were asked for, reads that have not come back, and
@@ -615,42 +643,79 @@ impl Ssd {
         })
     }
 
-    /// Looks for the pages of a prompt after the `have` the index has, among
-    /// the `total` full pages the prompt may take from a cache. Starts
+    /// Looks for the pages of a prompt of `looked` tokens (its last one is
+    /// computed) after the `have` the index has, among the `total` full pages
+    /// the prompt may take from a cache, with `cells` cells a page. Starts
     /// bringing a run of them back for `owner` and returns its first page,
     /// which the index then says is being computed.
     ///
     /// For a model with recurrent state the run ends at its deepest
     /// checkpoint in the store: the pages after it would be replayed row by
     /// row, which takes as long as computing them, and without a checkpoint
-    /// nothing is brought back.
+    /// nothing is brought back. The deepest may be the state at the end of a
+    /// tail the prompt goes on from (an anchor at the end of a message, a
+    /// request's end), deeper than `beyond`, where the cache can resume
+    /// already: the run is then the pages before it and the tail.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn want(
         &mut self,
         index: &mut ares_state::PrefixIndex,
         chain: &Chain,
+        looked: &[u64],
+        cells: u64,
         have: usize,
         total: usize,
+        beyond: u64,
         owner: Owner,
     ) -> Option<(ChainHash, Owner)> {
         let names = chain.hashes().get(have..total)?;
-        let (run, state) = {
+        let (run, state, tail) = {
             let store = self.shared.store();
             let run = run_of(index, names, |hash| store.contains(Kind::Page, hash));
-            (run, deepest(names, run, |hash| store.contains(Kind::State, hash)))
+            let state = deepest(names, run, |hash| store.contains(Kind::State, hash));
+            let floor = state.map_or(0, |state| (have + state + 1) as u64 * cells).max(beyond);
+            let tail = (0..=run).rev().filter(|_| self.recurrent).find_map(|j| {
+                let at = (have + j) as u64 * cells;
+                if at + cells <= floor {
+                    return None;
+                }
+                let rest = looked.get(at as usize..)?;
+                let rest = &rest[..rest.len().min(cells as usize - 1)];
+                let next = chain.hashes().get(have + j).copied();
+                // One the index holds is the cache's already (`beyond`).
+                let new = |hash: ChainHash| !index.holds(hash);
+                let (hash, n) = stored_tail(&store, chain.before(have + j), next, rest, new)?;
+                (at + n as u64 > floor).then_some((j, hash, n))
+            });
+            (run, state, tail)
         };
-        let run = match (self.recurrent, state) {
-            (true, Some(state)) => state + 1,
-            (true, None) => 0,
-            (false, _) => run,
-        };
-        if run == 0 {
-            return None;
+        // A tail a run brings back already: the prompt waits for it.
+        if let Some((_, hash, _)) = tail
+            && let ares_state::PageState::Computing(by) = index.state(hash)
+        {
+            return Some((hash, by));
         }
+        let (run, state) = match (self.recurrent, tail, state) {
+            (true, Some((j, ..)), _) => (j, Some(j)),
+            (true, None, Some(state)) => (state + 1, Some(state)),
+            (true, None, None) => return None,
+            (false, ..) => (run, None),
+        };
+        let mut pages = run_pages(chain, have, run);
+        let mut announced = names[..run].to_vec();
+        let tail = tail.map(|(_, hash, n)| {
+            let at = (have + run) * cells as usize;
+            pages.push((hash, chain.before(have + run), (have + run) as u32));
+            announced.push(hash);
+            looked[at..at + n].to_vec()
+        });
+        let first = *announced.first()?;
         self.jobs.push_back(Import {
             id: self.next_job,
             owner,
-            pages: run_pages(chain, have, run),
-            state: state.filter(|_| self.recurrent),
+            pages,
+            state,
+            tail,
             state_parts: None,
             state_asked: false,
             asked: 0,
@@ -662,8 +727,8 @@ impl Ssd {
         });
         self.next_job += 1;
         self.counters.imports += 1;
-        index.announce(owner, &names[..run]);
-        Some((names[0], owner))
+        index.announce(owner, &announced);
+        Some((first, owner))
     }
 
     /// Stops the threads, after the writer has written what it was given.

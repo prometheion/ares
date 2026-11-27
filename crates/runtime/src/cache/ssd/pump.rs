@@ -340,7 +340,9 @@ impl Cache {
                 let parts = job.ready.remove(&next).expect("checked above");
                 let depth = job.pages[next].2;
                 let behind = (job.pages.len() - 1 - next) as u64 * per_page;
-                let keep_form = keeps_form(depth, behind, settle, per_page);
+                // A tail keeps the form it has, as the newest cells of a run do.
+                let tail = job.tail.is_some() && next + 1 == job.pages.len();
+                let keep_form = tail || keeps_form(depth, behind, settle, per_page);
                 batch.push(Transfer {
                     kind: TransferKind::PageIn,
                     object: page.0,
@@ -398,13 +400,28 @@ impl Cache {
         let (hash, parent, depth) = job.pages[index];
         let with_state = job.state == Some(index);
         let came = ok && !job.failed;
+        // The run's last entry may be a tail: its cells and the state at its
+        // end, which the index holds as a tail under the page before it.
+        let tail = job.tail.clone().filter(|_| index + 1 == job.pages.len());
+        let mut gone = None;
         if came {
-            self.index.insert(pool, parent, hash, PageId(object));
+            match &tail {
+                Some(tokens) => {
+                    let page = PageId(object);
+                    gone = self.index.insert_tail(pool, parent, tokens, page, Priority::NORMAL);
+                }
+                None => {
+                    self.index.insert(pool, parent, hash, PageId(object));
+                }
+            }
             job.done += 1;
         } else {
             job.failed = true;
         }
         let owner = job.owner;
+        if let Some(evicted) = gone {
+            self.forget(evicted);
+        }
         if let (true, Some((_, place, state_ok))) = (with_state, state)
             && !(came && state_ok && self.hang(hash, place, owner, false))
         {
@@ -412,7 +429,7 @@ impl Cache {
         }
         match (came, &mut self.in_ram) {
             (true, Some(ram)) if ram.get(hash).is_none() => {
-                let mut entry = Entry::new(parent, depth, None);
+                let mut entry = Entry::new(parent, depth, tail);
                 entry.on_cards = true;
                 entry.stored = true;
                 entry.worth = true;
@@ -439,10 +456,16 @@ impl Cache {
         let order = self.in_ram.as_ref().map_or_else(Vec::new, |ram| ram.in_order());
         let cards = self.index.cached_pages();
         let left_behind = self.left_behind();
-        // Checkpoints: of RAM, and of the devices' pages.
+        // Checkpoints: of RAM, and of the devices' pages. One whose save
+        // waits for a record that will not run (a request's end state, saved
+        // with the next record) is not in its place yet: it is not written.
+        let saved = |cache: &Self, place: u32| !cache.saves.iter().any(|copy| copy.place == place);
         for hash in &order {
             let due = self.in_ram.as_ref().and_then(|ram| ram.get(*hash)).is_some_and(|entry| {
-                entry.parts.is_some() && entry.checkpoint.is_some_and(|h| h.worth && !h.stored)
+                entry.parts.is_some()
+                    && entry
+                        .checkpoint
+                        .is_some_and(|h| h.worth && !h.stored && saved(self, h.place))
             });
             if due {
                 self.clean(Item::Checkpoint, *hash);
@@ -452,6 +475,7 @@ impl Cache {
         for page in &cards {
             if let Some(id) = page.checkpoint
                 && !left_behind.contains(&page.hash)
+                && saved(self, id.0 as u32)
                 && let Some(mut out) =
                     self.state_out(id.0 as u32, page.hash, page.parent, page.depth)
             {
@@ -461,10 +485,28 @@ impl Cache {
                 self.settle_leaving(pool, exec);
             }
         }
+        // And the states at the ends of the devices' tails (an anchor at the
+        // end of a message, a request's end), one deeper than their pages.
+        let tails = self.index.cached_tails();
+        for tail in &tails {
+            let place = tail.checkpoint.0 as u32;
+            if !saved(self, place) {
+                if let Some(ssd) = &mut self.ssd {
+                    ssd.counters.states_skipped += 1;
+                }
+                continue;
+            }
+            if let Some(mut out) = self.state_out(place, tail.hash, tail.prior, tail.depth + 1) {
+                out.keep = true;
+                self.ssd.as_mut().expect("checked above").queue(Kind::State, tail.hash);
+                self.states_out.push(out);
+                self.settle_leaving(pool, exec);
+            }
+        }
         // Pages: what only RAM holds, from its buffers.
         for hash in &order {
             let due = self.in_ram.as_ref().and_then(|ram| ram.get(*hash)).is_some_and(|entry| {
-                entry.worth && !entry.stored && entry.tail.is_none() && entry.parts.is_some()
+                entry.worth && !entry.stored && entry.writes_whole() && entry.parts.is_some()
             });
             if due {
                 self.clean(Item::Page, *hash);
@@ -490,6 +532,33 @@ impl Cache {
                 ok: false,
             });
             notes.push(Note::CardsOut { hash: page.hash, parent: page.parent, depth: page.depth });
+            if batch.len() as u64 >= RESERVE {
+                self.carry_out(pool, exec, std::mem::take(&mut batch), std::mem::take(&mut notes));
+            }
+            if begun.elapsed() > DRAIN_LIMIT {
+                break;
+            }
+        }
+        // And the devices' tails whose states went to the drive.
+        for tail in &tails {
+            let ssd = self.ssd.as_ref().expect("checked above");
+            let in_ram = self.in_ram.as_ref().is_some_and(|ram| ram.get(tail.hash).is_some());
+            let stated = ssd.has_or_queued(Kind::State, tail.hash);
+            if !stated || in_ram || ssd.has_or_queued(Kind::Page, tail.hash) {
+                continue;
+            }
+            let room = self.page_room(pool, exec, &mut batch, &mut notes, true);
+            let Some(parts) = room else { break };
+            self.ssd.as_mut().expect("checked above").queue(Kind::Page, tail.hash);
+            batch.push(Transfer {
+                kind: TransferKind::PageOut,
+                object: tail.page.0,
+                keep_form: false,
+                parts,
+                ok: false,
+            });
+            let depth = tail.depth + 1;
+            notes.push(Note::CardsOut { hash: tail.hash, parent: tail.prior, depth });
             if batch.len() as u64 >= RESERVE {
                 self.carry_out(pool, exec, std::mem::take(&mut batch), std::mem::take(&mut notes));
             }

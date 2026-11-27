@@ -93,7 +93,9 @@ pub(super) struct Entry {
     pub on_cards: bool,
     /// The drive has the page.
     pub stored: bool,
-    /// The page's text was long enough to be written.
+    /// The page's text was long enough to be written; a tail is written only
+    /// with the state at its end (an anchor at the end of a message, a
+    /// request's end), where a later prompt resumes.
     pub worth: bool,
     /// When it was last used, and where it stands in the order now.
     stamp: u64,
@@ -122,11 +124,23 @@ impl Entry {
     fn page_class(&self, writes: bool) -> Class {
         if self.on_cards {
             Class::Copy
-        } else if writes && self.worth && !self.stored && self.tail.is_none() {
+        } else if writes && self.worth && !self.stored && self.writes_whole() {
             Class::Dirty
         } else {
             Class::Free
         }
+    }
+
+    /// A full page, or a tail that still has the state at its end: what is
+    /// worth a record on the drive (a tail alone is not found from there).
+    pub fn writes_whole(&self) -> bool {
+        self.tail.is_none() || self.checkpoint.is_some()
+    }
+
+    /// Its number on the drive: a page's in its chain; a tail's one more than
+    /// the page it hangs under, so that the store reaches that page first.
+    pub fn stored_depth(&self) -> u32 {
+        self.depth + u32::from(self.tail.is_some())
     }
 }
 

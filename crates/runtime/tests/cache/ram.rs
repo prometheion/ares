@@ -131,8 +131,8 @@ fn nothing_is_written_while_ram_holds_a_conversation_and_all_of_it_when_the_engi
         let next = format!("{text}{}", text_of(40, 20));
         let answer = e.ask(&next, 10);
         assert_eq!(answer.run.text, fresh(&next, 10));
-        // From the last checkpoint at a page boundary: the end of the last
-        // reply (a tail and the state after it) is not written.
+        // From the deepest state on the drive: at a page boundary or at the
+        // end of a tail (a prompt's anchor, a request's end whose save ran).
         let report = answer.report;
         assert!(report.cached_tokens as usize >= text.len() - 4 * PAGE as usize, "{report:?}");
     }
@@ -276,7 +276,11 @@ fn an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram() {
     assert_eq!(e.written().counters.ssd.pages_written, 0);
     drop(e);
     let stored = stored(&model, &dir.0);
-    assert_eq!(stored.store_pages, 3 * 19, "{stored:?}");
+    // The 57 full pages, and the tails with the states at their ends that the
+    // places still held (a prompt's anchor, a request's end; one whose save
+    // waits for a record that does not come is not written): two a text at
+    // most.
+    assert!((3 * 19..=3 * 19 + 6).contains(&stored.store_pages), "{stored:?}");
     let e = engine(&model, config(256, 0, Some(store(&dir.0))));
     for (text, said) in texts.iter().zip(&answers) {
         let next = format!("{text}{said}{}", text_of(95, 20));
