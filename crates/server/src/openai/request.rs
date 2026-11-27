@@ -90,6 +90,10 @@ pub(crate) struct Parsed {
     /// llama.cpp's `return_progress`: a stream says how far the prompt has
     /// got (`prompt_progress`) before its first text.
     pub progress: bool,
+    /// llama.cpp's `sse_ping_interval`: the seconds of silence after which a
+    /// stream sends a ping, 0 or -1 for none; `None` when the request does not
+    /// say ([`crate::routes::pings`]).
+    pub ping: Option<i32>,
 }
 
 /// The header that gives a request its priority, for a client that cannot
@@ -210,6 +214,7 @@ const SERVED: &[&str] = &[
     "min_keep",
     "priority",
     "return_progress",
+    "sse_ping_interval",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -364,6 +369,20 @@ pub(crate) fn from_json(
         lowered: None,
         priority,
         progress: fields.bool("return_progress")?.unwrap_or(false),
+        ping: ping_interval(&fields)?,
+    })
+}
+
+/// llama.cpp's `sse_ping_interval`: whole seconds from -1 (no pings) up.
+fn ping_interval(fields: &Fields<'_>) -> Result<Option<i32>, ApiError> {
+    let Some(seconds) = fields.int("sse_ping_interval")? else { return Ok(None) };
+    i32::try_from(seconds).ok().filter(|s| *s >= -1).map(Some).ok_or_else(|| {
+        ApiError::invalid_param(
+            "sse_ping_interval",
+            format!(
+                "sse_ping_interval must be the seconds between pings, or -1 for none; got {seconds}"
+            ),
+        )
     })
 }
 

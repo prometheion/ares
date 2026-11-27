@@ -56,6 +56,7 @@ pub(crate) async fn answer<W: Writer>(
 ) -> Result<Response, ApiError> {
     let (streamed, lowered) = (parsed.stream, parsed.lowered);
     let progress = parsed.stream && parsed.progress;
+    let keep_alive = crate::routes::pings(keep_alive, parsed.ping);
     let reply = Generation::start(app, lease, parsed.request, sorter)?.reporting(progress);
     let response = if streamed {
         stream(reply, writer, app, keep_alive).await
@@ -89,7 +90,7 @@ async fn stream<W: Writer>(
     mut reply: Generation,
     mut writer: W,
     app: &App,
-    keep_alive: KeepAlive,
+    keep_alive: Option<KeepAlive>,
 ) -> Result<Response, ApiError> {
     let first = reply.first(app.config.stream_wait).await?;
     let mut queue = VecDeque::new();

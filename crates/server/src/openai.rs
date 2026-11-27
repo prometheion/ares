@@ -93,7 +93,8 @@ async fn try_completion(
         runs.push(Generation::start(&app, &lease, request, sorter)?.reporting(progress));
     }
     let response = if parsed.stream {
-        stream(runs, head, parsed.include_usage, app.config.stream_wait).await
+        let pings = crate::routes::pings(KeepAlive::default(), parsed.ping);
+        stream(runs, head, parsed.include_usage, app.config.stream_wait, pings).await
     } else {
         collect(runs, head).await
     };
@@ -188,6 +189,7 @@ async fn stream(
     head: Head,
     include_usage: bool,
     wait: Duration,
+    pings: Option<KeepAlive>,
 ) -> Result<Response, ApiError> {
     let many = runs.len() > 1;
     let firsts = futures_util::future::try_join_all(runs.into_iter().map(|mut reply| async move {
@@ -228,7 +230,7 @@ async fn stream(
             .boxed(),
         None => merged.boxed(),
     };
-    Ok(sse_response(events, KeepAlive::default()))
+    Ok(sse_response(events, pings))
 }
 
 /// What the completions of one request share while they stream.

@@ -58,6 +58,7 @@ prompt and those marked "chat".
 | `stop` | stop strings | a string or an array; not empty |
 | `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
 | `return_progress` | a stream says how far the prompt has got (llama.cpp's member) | see [Prompt progress](#prompt-progress); changes nothing without `stream` |
+| `sse_ping_interval` | the seconds of silence after which a stream sends a ping (llama.cpp's member) | whole seconds; `0` or `-1`: no pings; default 15 |
 | `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
 | `priority` | the request's priority | see [Priorities](#priorities) |
@@ -105,6 +106,7 @@ limit, and its response the header `x-ares-max-tokens-limit` with it.
 | `tool_choice` | `auto`, `any`, `tool` with `name`, `none`; `disable_parallel_tool_use` |
 | `thinking` | see [Thinking](#thinking) |
 | `stop_sequences` | stop strings; `stop_reason` is `stop_sequence` and `stop_sequence` names it |
+| `sse_ping_interval` | llama.cpp's member: the seconds of silence before a `ping` event; `0` or `-1`: none |
 | `output_config` | `format: {"type": "json_schema", "schema": ...}`; `effort` is the reasoning effort |
 | `context_management` | the edits `clear_thinking_20251015` and `clear_tool_uses_20250919`, as Anthropic's service makes them; the response's `context_management.applied_edits` lists those that changed the prompt, with what they cleared; `count_tokens` adds `context_management.original_input_tokens`, the count before the edits |
 | `cache_control` | accepted on the body, blocks and tools, without effect: every prefix is cached anyway |
@@ -124,7 +126,7 @@ state: every response says `"store": false`.
 
 | Field | Notes |
 | --- | --- |
-| `model`, `temperature`, `top_p`, `stream`, `priority`, `return_progress` | as on the chat route; other sampling fields are refused |
+| `model`, `temperature`, `top_p`, `stream`, `priority`, `return_progress`, `sse_ping_interval` | as on the chat route; other sampling fields are refused |
 | `instructions` | a system message |
 | `input` | a string, or items: messages (`user`, `assistant`, `system`, `developer`; parts `input_text`, `output_text`, `input_image`), `function_call`, `function_call_output`, `reasoning` |
 | `tools`, `tool_choice`, `parallel_tool_calls` | functions only; `tool_choice` `auto`, `none`, `required`, `{"type": "function", "name"}` |
@@ -250,6 +252,9 @@ a body. Remote URLs are not fetched. One image becomes at most
 
 A stream starts after the engine's first step, so a refused request still gets
 an HTTP status, or after 10 seconds without it. A failure later is an error event.
+A stream that has sent nothing for 15 seconds sends a ping (a comment line `:`,
+on Messages a `ping` event); `sse_ping_interval` sets the seconds, `0` or `-1` none,
+as llama.cpp's member does (its server's default is 30).
 
 ### Prompt progress
 

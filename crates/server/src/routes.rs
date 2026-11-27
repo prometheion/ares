@@ -154,7 +154,7 @@ pub(crate) async fn model_events(State(app): State<App>) -> Response {
             }
         }
     });
-    sse_response(futures_util::stream::iter(first).chain(later), KeepAlive::default())
+    sse_response(futures_util::stream::iter(first).chain(later), Some(KeepAlive::default()))
 }
 
 /// The value of `model` in the query of a URL (`?model=<id>`), with its
@@ -223,16 +223,34 @@ pub(crate) fn with_limit(mut response: Response, lowered: Option<u32>) -> Respon
 
 /// The response of a stream of events. `keep_alive` is what goes out while
 /// the engine has nothing to say.
-pub(crate) fn sse_response<S>(events: S, keep_alive: KeepAlive) -> Response
+pub(crate) fn sse_response<S>(events: S, keep_alive: Option<KeepAlive>) -> Response
 where
     S: futures_util::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static,
 {
-    let mut response = Sse::new(events).keep_alive(keep_alive).into_response();
+    let mut response = match keep_alive {
+        Some(keep_alive) => Sse::new(events).keep_alive(keep_alive).into_response(),
+        None => Sse::new(events).into_response(),
+    };
     // Reverse proxies that buffer would hold the tokens back.
     response
         .headers_mut()
         .insert(HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"));
     response
+}
+
+/// The pings of a stream: the route's own (`route`, every 15 s of silence),
+/// at the interval a request asks for with llama.cpp's `sse_ping_interval`
+/// (seconds of silence before a ping; 0 or -1: none), as llama.cpp's server
+/// sends them while a stream stays silent (`tools/server/server-context.cpp` of
+/// <https://github.com/ggml-org/llama.cpp>, commit d92ea9b, MIT).
+pub(crate) fn pings(route: KeepAlive, asked: Option<i32>) -> Option<KeepAlive> {
+    match asked {
+        None => Some(route),
+        Some(seconds) if seconds > 0 => {
+            Some(route.interval(std::time::Duration::from_secs(seconds.unsigned_abs().into())))
+        }
+        Some(_) => None,
+    }
 }
 
 /// Reads the whole body, refusing more than the configuration's limit of

@@ -283,6 +283,77 @@ async fn the_log_of_a_request_says_what_it_took_as_llama_cpp_does() {
     // No key=value line of the request at the default level.
     let ours: Vec<&String> = lines.iter().filter(|line| line.contains(&id)).collect();
     assert!(ours.iter().all(|line| !line.contains("prompt_tokens_per_s")), "{ours:#?}");
-    let refusal = find("POST /v1/chat/completions: 400 invalid_request");
-    assert!(refusal.contains(" WARN ") && refusal.contains("return_progress"), "{refusal}");
+    let refusal = find("POST /v1/chat/completions: 400 invalid_request: return_progress");
+    assert!(refusal.contains(" WARN "), "{refusal}");
+}
+
+/// llama.cpp's `sse_ping_interval`: a stream that stays silent that many seconds
+/// sends a ping (a comment line on the OpenAI routes, Anthropic's `ping` event on
+/// /v1/messages), -1 and 0 none; without the member the route's own pings come
+/// every 15 s. The engine here sends a piece, is silent 2.3 s, and ends.
+#[tokio::test]
+async fn sse_ping_interval_sets_the_pings_of_a_silent_stream() {
+    let silent = |path: &'static str, ping: Option<i64>| async move {
+        let gate = Gate::default();
+        let engine = MockEngine::script(vec![
+            text("a"),
+            Step::Wait(gate.clone()),
+            text("b"),
+            done(ares_api::FinishReason::Stop, 3, 2),
+        ]);
+        let app = app(&engine).await;
+        let mut body = match path {
+            "/v1/messages" => json!({
+                "model": "mock",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }),
+            _ => {
+                json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}], "stream": true})
+            }
+        };
+        if let Some(ping) = ping {
+            body["sse_ping_interval"] = json!(ping);
+        }
+        let response = post(&app, path, &body.to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let opener = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2300)).await;
+            gate.open();
+        });
+        let text = body_text(response).await;
+        opener.await.unwrap();
+        let comments = text.lines().filter(|line| line.starts_with(':')).count();
+        let pings = text.lines().filter(|line| *line == "event: ping").count();
+        (comments, pings, text)
+    };
+    let (every_second, off, never, default, messages) = tokio::join!(
+        silent(CHAT, Some(1)),
+        silent(CHAT, Some(-1)),
+        silent(CHAT, Some(0)),
+        silent(CHAT, None),
+        silent("/v1/messages", Some(1)),
+    );
+    assert!((2..=3).contains(&every_second.0), "a ping a second: {}", every_second.2);
+    assert_eq!((off.0, never.0, default.0), (0, 0, 0), "{}", default.2);
+    // Anthropic's stream pings with its event; one comes before the stream's start too.
+    assert!(messages.1 >= 2, "{}", messages.2);
+}
+
+#[tokio::test]
+async fn sse_ping_interval_is_whole_seconds_from_minus_one() {
+    let engine = MockEngine::script(says("ok", 2, ares_api::FinishReason::Stop));
+    let app = app(&engine).await;
+    for (ping, status) in [(json!(-2), 400), (json!(1.5), 400), (json!("1"), 400), (json!(30), 200)]
+    {
+        let body = json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "sse_ping_interval": ping,
+        });
+        let response = post(&app, CHAT, &body.to_string()).await;
+        assert_eq!(response.status().as_u16(), status, "{ping}");
+    }
 }

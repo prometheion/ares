@@ -422,7 +422,12 @@ llama.cpp's `prompt_progress` {total, cache, processed, time_ms}: on a chunk
 with the role and no text on chat, with `text: ""` on completions, in a
 `response.in_progress` event on Responses; Messages has none, as llama.cpp.
 llama.cpp sends one per batch of the prompt and its web UI shows
-`(processed - cache) / (total - cache)`; the same holds here. Tests:
+`(processed - cache) / (total - cache)`; the same holds here. That web UI also
+sends `sse_ping_interval` with every stream (llama.cpp's seconds of silence
+before a ping, `-1` none; its server's default is 30 s): a stream's pings are
+axum's keep-alive (`routes::pings`), a comment line after 15 s of silence on the
+OpenAI routes and Anthropic's `ping` event on Messages, at the interval the member
+names, and none for `0` or `-1`, on chat, completions, Responses and Messages. Tests:
 `crates/runtime/tests/cache/prefix.rs` (steps and the cache, the pauses of a
 pass, a long step's share; every test's `Handle::finish` checks the order and
 the rise), `crates/server/tests/progress.rs` (the chunks of the three APIs as
