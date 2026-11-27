@@ -62,6 +62,11 @@ first row of "What was run" in [models.md](models.md#what-was-run)
 when the traffic is mixed, the English and German list for prose, the code list
 only for a server that writes code and little else.
 
+On Flash-Next a list makes a link of its MTP block cheaper (0.8 to 0.9 ms with
+the general list against 1.4 ms with the whole head); what that gives in tokens
+per second could not be told apart from the noise of a busy machine with
+experts on the SSD (the same measurement).
+
 ## The format
 
 One token id per line. Blank lines and lines that begin with `#` are left out.

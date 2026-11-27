@@ -118,3 +118,29 @@ VRAM at the end of a session was 11.4 to 11.5 GiB on the RTX 4070 and 10.0 to
 10.2 GiB on the RTX 3060 with every list; the device keeps the embedding rows
 of the list's tokens for the draft chain (131 MiB for the general list, 326 MiB
 for the 155,200 tokens without a list).
+
+## Flash-Next with its MTP block, measured (2026-11-27)
+
+Measured 2026-11-27 on the same machine and build: Flash-Next IQ2_XS on both
+cards, `--ram 8G`, its MTP block from `mtp-q2_0.gguf`, the same eight prompts
+with 200 tokens each; no list, the fork's list and the general list, two rounds
+in turn (none, the fork's, general; general, the fork's, none):
+
+| Session (load average) | tokens/s, mean of the prompts | accepted | MTP link |
+| --- | --- | --- | --- |
+| none (32.4) | 21.1 | 28 % | 1.4 ms |
+| the fork's (13.5) | 27.9 | 35 % | 0.9 ms |
+| general (10.7) | 26.3 | 50 % | 0.8 ms |
+| general (6.6) | 14.4 | 22 % | 0.9 ms |
+| the fork's (23.4) | 11.8 | 37 % | 0.9 ms |
+| none (16.9) | 28.4 | 41 % | 1.4 ms |
+
+The run does not tell the lists apart: sessions of one list differ by a factor
+of two, with other agents' builds keeping the machine at loads of 7 to 32, and
+at `--ram 8G` a quarter of the experts only on the SSD and the misses computed
+on the CPU. What is solid is the price of a link, measured at load: 1.4 ms with
+the whole head (the device that holds the output head holds all of it), 0.8 to
+0.9 ms with a list of 62,000 or 66,000 tokens, as on 2026-11-17 (1.38 to 1.40
+against 0.85 to 0.88, in [`speculation.md`](speculation.md)). Whether that
+shows in tokens per second wants a quiet machine, or the test machine, where
+the experts fit in RAM.
