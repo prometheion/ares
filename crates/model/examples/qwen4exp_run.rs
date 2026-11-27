@@ -12,7 +12,7 @@
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
 //!     [--read-ahead on|off] [--predict 2] [--fingerprint FILE] [--kv q8,q8]
-//!     [--near-pages N]
+//!     [--near-pages N] [--cpu-workers N]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -70,6 +70,9 @@
 //! - `--serve`: how an expert that is in no slot is served: `model` lets the
 //!   store's measured costs decide between an upload and the CPU (what the
 //!   engine does), `stream` uploads every one, `cpu` computes every one.
+//! - `--cpu-workers N`: `N` CPU workers that the scheduler places, instead of one
+//!   on every core but the host thread's: to measure what the workers' cores cost the
+//!   threads that drive the step and read the file.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -123,6 +126,7 @@ struct Args {
     fingerprint: Option<String>,
     kv: (CacheFormat, CacheFormat),
     near_pages: Option<u32>,
+    cpu_workers: Option<usize>,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -162,6 +166,7 @@ fn parse() -> Result<Args, AnyError> {
         fingerprint: None,
         kv: (CacheFormat::Q8, CacheFormat::Q8),
         near_pages: None,
+        cpu_workers: None,
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -234,6 +239,7 @@ fn parse() -> Result<Args, AnyError> {
                 }
             }
             "--predict" => args.predict = value()?.parse()?,
+            "--cpu-workers" => args.cpu_workers = Some(value()?.parse()?),
             "--serve" => {
                 args.serve = match value()?.as_str() {
                     "stream" => Serve::Stream,
@@ -635,6 +641,7 @@ fn run() -> Result<(), AnyError> {
         stall: Duration::from_secs(args.stall_s),
         transit: args.transit,
         read_ahead: args.read_ahead,
+        cpu_workers: args.cpu_workers,
         ..ModelOptions::default()
     };
     let opts = SessionOptions {
