@@ -1,3 +1,4 @@
 [toolchain]
-channel = "stable"
+# A version, not a channel: every machine and the CI build with the same compiler (#9).
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]

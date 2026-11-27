@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use ares_api::{ChatFormat, GenerateRequest, Message, Prompt, Role, TokenProbs, Usage};
+use ares_api::{ChatFormat, GenerateRequest, Message, Progress, Prompt, Role, TokenProbs, Usage};
 
 use crate::ReasoningFormat;
 use crate::bridge::{Item, Run, Timings};
@@ -112,7 +112,8 @@ fn log_request(app: &App, parsed: &Parsed, api: &'static str) {
         }
         ares_api::Prompt::Text(_) => (0, false),
     };
-    tracing::info!(
+    tracing::info!("request {} taken: {}", request.id, said(parsed, api, tools, continues));
+    tracing::debug!(
         id = %request.id,
         model = %request.model,
         api,
@@ -138,6 +139,44 @@ fn log_request(app: &App, parsed: &Parsed, api: &'static str) {
     }
 }
 
+/// What a request asks, for a person: its API and model, and of its
+/// parameters those it gives.
+fn said(parsed: &Parsed, api: &str, tools: usize, continues: bool) -> String {
+    let request = &parsed.request;
+    let sampling = &request.sampling;
+    let mut said = format!("{api}, model {}", request.model);
+    if parsed.stream {
+        said.push_str(", streamed");
+    }
+    if parsed.n > 1 {
+        said.push_str(&format!(", {} completions", parsed.n));
+    }
+    let mut add = |name: &str, value: Option<String>| {
+        if let Some(value) = value {
+            said.push_str(&format!(", {name} {value}"));
+        }
+    };
+    add("max_tokens", request.max_tokens.map(|n| n.to_string()));
+    add("temperature", sampling.temperature.map(|t| t.to_string()));
+    add("top_k", sampling.top_k.map(|k| k.to_string()));
+    add("top_p", sampling.top_p.map(|p| p.to_string()));
+    add("min_p", sampling.min_p.map(|p| p.to_string()));
+    add("seed", sampling.seed.map(|seed| seed.to_string()));
+    add("stop strings", (!request.stop.is_empty()).then(|| request.stop.len().to_string()));
+    add("tools", (tools > 0).then(|| tools.to_string()));
+    add("priority", (request.priority != 0).then(|| request.priority.to_string()));
+    if request.structure.is_some() {
+        said.push_str(", a grammar or schema");
+    }
+    if !request.draft {
+        said.push_str(", no drafts");
+    }
+    if continues {
+        said.push_str(", continues the last message");
+    }
+    said
+}
+
 /// A reply the engine is generating: the request in the engine and the
 /// sorter of its text. Dropping it before its end cancels the request.
 #[derive(Debug)]
@@ -146,6 +185,12 @@ pub(crate) struct Generation {
     sorter: Sorter,
     /// The request's stop strings, to name the one that ended the reply.
     stops: Vec<String>,
+    /// Whether the client hears how far the prompt has got
+    /// ([`Step::Progress`]).
+    progress: bool,
+    /// Whether every chunk of the stream with text has the timings so far
+    /// ([`Generation::timings_now`]).
+    pub live_timings: bool,
     /// Dropped after the run: the model may be unloaded when its requests
     /// have let go of the engine.
     _lease: Lease,
@@ -154,6 +199,9 @@ pub(crate) struct Generation {
 /// The next thing of a reply.
 #[derive(Debug)]
 pub(crate) enum Step {
+    /// How far the prompt has got, for a client that asked
+    /// ([`Generation::reporting`]).
+    Progress(Progress),
     /// What the sorter found in the text that came; nothing when all of it
     /// is held back.
     Pieces(Vec<Piece>),
@@ -192,7 +240,25 @@ impl Generation {
             app.stop.clone(),
             app.config.log_text,
         )?;
-        Ok(Self { run, sorter, stops, _lease: lease.clone() })
+        Ok(Self { run, sorter, stops, progress: false, live_timings: false, _lease: lease.clone() })
+    }
+
+    /// The reply, whose client hears how far the prompt has got when
+    /// `progress` (llama.cpp's `return_progress` on a stream).
+    pub fn reporting(self, progress: bool) -> Self {
+        Self { progress, ..self }
+    }
+
+    /// The reply, whose chunks with text have the timings so far when `live`
+    /// (llama.cpp's `timings_per_token` on a stream).
+    pub fn timing(self, live: bool) -> Self {
+        Self { live_timings: live, ..self }
+    }
+
+    /// The timings of the reply so far, for a chunk of a stream that is to
+    /// have them; `None` when the request did not ask.
+    pub fn timings_now(&self) -> Option<Timings> {
+        self.live_timings.then(|| self.run.timings_now())
     }
 
     /// The first step of a reply that is streamed, if the engine produces it
@@ -219,14 +285,18 @@ impl Generation {
     /// The next step of the reply, or the reason there will be none. After
     /// an `Err` or a [`Step::End`] the reply is over.
     pub async fn next(&mut self) -> Result<Step, ApiError> {
-        Ok(match self.run.next().await? {
-            Item::Text(text) => Step::Pieces(self.sorter.push(&text)),
-            Item::Probs(probs) => Step::Probs(probs),
-            Item::Done { finish, stopped_by, usage, timings } => {
-                let stop = stopped_by.and_then(|index| self.stops.get(index).cloned());
-                Step::End(End { rest: self.sorter.finish(), finish, stop, usage, timings })
-            }
-        })
+        loop {
+            return Ok(match self.run.next().await? {
+                Item::Progress(progress) if self.progress => Step::Progress(progress),
+                Item::Progress(_) | Item::Generated => continue,
+                Item::Text(text) => Step::Pieces(self.sorter.push(&text)),
+                Item::Probs(probs) => Step::Probs(probs),
+                Item::Done { finish, stopped_by, usage, timings } => {
+                    let stop = stopped_by.and_then(|index| self.stops.get(index).cloned());
+                    Step::End(End { rest: self.sorter.finish(), finish, stop, usage, timings })
+                }
+            });
+        }
     }
 }
 

@@ -25,6 +25,17 @@ impl Conductor {
             std::thread::sleep(Duration::from_millis(10));
         }
         let t_wait = Instant::now();
+        // A step of one prompt that runs long: its request hears how far the
+        // step has got while it runs, from a model that says so. A model may say
+        // nothing for the first seconds of a step (its first piece waits for the
+        // drive), so the conductor looks as long as the step runs.
+        if dispatched.is_ok()
+            && let Some((slot, rows)) = self.reporting_step()
+        {
+            while !self.exec.wait_for_step(self.config.conductor_spin, progress::LOOK) {
+                self.report_step_share(slot, rows);
+            }
+        }
         let collected = dispatched
             .and_then(|()| self.exec.collect(self.config.conductor_spin, &mut self.output));
         self.heartbeat.end();
@@ -122,6 +133,10 @@ impl Conductor {
                 return self.fail("the model paused a step of several sequences".into());
             }
             let part = self.parts[0];
+            // What the pass has done so far is the request's progress.
+            if self.reporting_step().is_some() {
+                self.report_step_share(part.slot, part.rows);
+            }
             self.paused = Some(part);
             self.hold_images(part);
             self.paused_inner = std::mem::take(&mut self.inner);
@@ -177,6 +192,12 @@ impl Conductor {
         if let Some(cache) = &mut self.cache {
             cache.settle_leaving(&mut self.pool, &mut *self.exec);
         }
+        if let Err(message) = self.make_room() {
+            return self.fail(message);
+        }
+        if self.parts.is_empty() {
+            return;
+        }
         let used = match self.write_record(RecordKind::Resume { pause_ms: budget_ms }) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
@@ -217,6 +238,7 @@ impl Conductor {
         }
         self.runs.clear();
         self.samplers.clear();
+        self.score_pairs.clear();
         self.step_rows.clear();
         self.updates.clear();
         self.bars.clear();
@@ -319,9 +341,14 @@ impl Conductor {
                             &mut self.step_rows,
                         );
                         self.samplers.push(row);
+                        // A fork of a decision reads its labels' logits there.
+                        if let Role::Fork { labels, .. } = &a.role {
+                            let wanted = self.samplers.len() as u32 - 1;
+                            self.score_pairs.extend(labels.iter().map(|t| (wanted, *t)));
+                        }
                     }
                 }
-                PartKind::Window | PartKind::Score { .. } => {
+                PartKind::Window => {
                     has_generation = !drafts_only;
                     if !drafts_only {
                         counters.window_rows += 1;
@@ -432,6 +459,9 @@ impl Conductor {
         writer.corrections(&self.step_rows.entries).map_err(full)?;
         writer.masks(&self.step_rows.masks, self.mask_words).map_err(full)?;
         writer.samplers(self.samplers.iter().copied()).map_err(full)?;
+        if !self.score_pairs.is_empty() {
+            writer.scores(&self.score_pairs).map_err(full)?;
+        }
         writer.commits(&self.commits).map_err(full)?;
         if drafts_only {
             // The devices commit these with this record: the round's must not

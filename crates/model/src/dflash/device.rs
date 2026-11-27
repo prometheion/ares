@@ -32,7 +32,7 @@ use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
     DFLASH_HEAD_DIM, DFLASH_MAX_BLOCK, DFLASH_MAX_RANK, DFLASH_MAX_TOP_K, DeviceBuffer, DevicePtr,
     DflashKernels, DflashSelect, DflashSeq, Event, Kernels, MAX_BATCH, PinnedBuffer, PrefillPath,
-    Ring, Selector, Stream,
+    Ring, Selector, Stream, WeightRange,
 };
 use ares_runtime::ModelError;
 
@@ -46,6 +46,8 @@ struct DMat {
     n_in: u32,
     n_out: u32,
     at: u64,
+    /// What the size of a float matrix's weights leaves of the tile kernels.
+    range: WeightRange,
 }
 
 #[derive(Clone, Debug)]
@@ -357,6 +359,7 @@ impl Drafter {
                 n_in: m.cols() as u32,
                 n_out: m.rows() as u32,
                 at: put(m.bytes())?,
+                range: WeightRange::of(m.ty(), m.bytes()),
             })
         };
         // The fusion in one matrix per tap: the columns of each tap are whole
@@ -512,18 +515,21 @@ impl Drafter {
         rows: u32,
         y: DevicePtr,
     ) -> Result<(), ModelError> {
-        self.product_at(kernels, stream, m.ty, self.weight(m.at), m.n_in, m.n_out, x, rows, y)
+        let w = self.weight(m.at);
+        self.product_at(kernels, stream, m.ty, m.range, w, m.n_in, m.n_out, x, rows, y)
     }
 
     /// `y = w x` for a matrix `w` of type `ty` as the file stores it, `rows`
     /// rows of activations at `x`: the decode kernels up to 8 rows, the tile
-    /// kernels above.
+    /// kernels above, unless the weights of a float matrix are too large for
+    /// the tiles' f16 (`range`): then the decode kernels, 8 rows at a time.
     #[allow(clippy::too_many_arguments)]
     fn product_at(
         &self,
         kernels: &Kernels,
         stream: &Stream,
         ty: GgmlType,
+        range: WeightRange,
         w: DevicePtr,
         n_in: u32,
         n_out: u32,
@@ -536,38 +542,48 @@ impl Drafter {
         // activations' scratch the bytes of the widest input at the most rows;
         // the matrix is on the device as the file stores it.
         unsafe {
-            if rows <= MAX_BATCH {
-                kernels.quantize_activations(stream, x, act, n_in, rows)?;
-                kernels.matvec(stream, ty, w, act, y, n_in, n_out, rows)?;
+            // The integer path where the type has one; the f16 path (exact weights, f16
+            // rows) for the floats and the types without.
+            let path = if ty.is_quantized() && kernels.has_prefill_path(ty, PrefillPath::Int8) {
+                PrefillPath::Int8
             } else {
-                // The integer path where the type has one; the f16 path (exact weights, f16
-                // rows) for the floats and the types without.
-                let path = if ty.is_quantized() && kernels.has_prefill_path(ty, PrefillPath::Int8) {
-                    PrefillPath::Int8
-                } else {
-                    PrefillPath::F16
-                };
-                kernels.prepare_prefill_activations(stream, path, x, act, n_in, rows)?;
-                kernels.matmul(stream, ty, path, w, act, y, n_in, n_out, rows)?;
+                PrefillPath::F16
+            };
+            match range.path(Some(path)) {
+                Some(path) if rows > MAX_BATCH => {
+                    kernels.prepare_prefill_activations(stream, path, x, act, n_in, rows)?;
+                    kernels.matmul(stream, ty, path, w, act, y, n_in, n_out, rows)?;
+                }
+                _ => {
+                    for first in (0..rows).step_by(MAX_BATCH as usize) {
+                        let n = (rows - first).min(MAX_BATCH);
+                        let x = x.offset(u64::from(first * n_in) * 4);
+                        let y = y.offset(u64::from(first * n_out) * 4);
+                        kernels.quantize_activations(stream, x, act, n_in, n)?;
+                        kernels.matvec(stream, ty, w, act, y, n_in, n_out, n)?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
     /// The model's draft head over the rows [`Drafter::pass_layers`] returned,
-    /// for a model whose head lies as the file stores it: `w` of type `ty`, a
-    /// row of `n_embd` values per column of the logits.
+    /// for a model whose head lies as the file stores it: `w` of type `ty` and
+    /// `range`, a row of `n_embd` values per column of the logits.
+    #[allow(clippy::too_many_arguments)]
     pub fn head_product(
         &self,
         kernels: &Kernels,
         stream: &Stream,
         ty: GgmlType,
+        range: WeightRange,
         w: DevicePtr,
         h: DevicePtr,
         rows: u32,
     ) -> Result<(), ModelError> {
-        let d = self.c.n_embd as u32;
-        self.product_at(kernels, stream, ty, w, d, self.setup.head_rows, h, rows, self.logits())
+        let (d, logits) = (self.c.n_embd as u32, self.logits());
+        self.product_at(kernels, stream, ty, range, w, d, self.setup.head_rows, h, rows, logits)
     }
 
     /// The start of a step of the model of `segments`: its rows, whose taps

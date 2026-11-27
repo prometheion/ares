@@ -88,6 +88,9 @@ pub struct ModelOptions {
     /// `max_rows` says). 0: none; a prompt read alone takes lent steps of up to
     /// [`Options::max_rows`] rows.
     pub pass_rows: u32,
+    /// Where the trial of the second device's role is kept between loads, per model,
+    /// cards, driver and binary (`roles.rs`); `None` measures it at every placement.
+    pub roles_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ModelOptions {
@@ -107,6 +110,7 @@ impl Default for ModelOptions {
             read_ahead: false,
             ram_piece: None,
             pass_rows: 0,
+            roles_dir: None,
         }
     }
 }

@@ -181,6 +181,8 @@ pub(crate) struct Watch {
     thinking: Option<(Thinking, Tracker)>,
     submitted: Instant,
     started: Option<Instant>,
+    /// From the first start to the first token.
+    prompt_time: Option<Duration>,
 }
 
 impl Watch {
@@ -192,7 +194,13 @@ impl Watch {
             let tracker = Tracker::new(&thinking);
             (thinking, tracker)
         });
-        Self { stop: StopMatcher::new(stops), thinking, submitted: Instant::now(), started: None }
+        Self {
+            stop: StopMatcher::new(stops),
+            thinking,
+            submitted: Instant::now(),
+            started: None,
+            prompt_time: None,
+        }
     }
 
     /// The request leaves the line and starts; only the first time counts.
@@ -241,6 +249,23 @@ impl Watch {
     /// How long the request waited before it first started.
     pub fn queued(&self) -> Option<Duration> {
         self.started.map(|started| started.duration_since(self.submitted))
+    }
+
+    /// The first token was taken: the prompt is read. Only the first time counts.
+    pub fn prompt_read(&mut self) {
+        if self.prompt_time.is_none() {
+            self.prompt_time = self.started.map(|started| started.elapsed());
+        }
+    }
+
+    /// From the first start to the first token, once there was one.
+    pub fn prompt_time(&self) -> Option<Duration> {
+        self.prompt_time
+    }
+
+    /// How long ago the request first started, if it has.
+    pub fn since_start(&self) -> Option<Duration> {
+        self.started.map(|started| started.elapsed())
     }
 }
 

@@ -26,9 +26,9 @@ use ares_cuda::{CacheFormat, Device};
 use ares_gguf::Gguf;
 use ares_model::qwen3vl::Projector;
 use ares_model::qwen4exp::device::{
-    ModelOptions, OpenError, Options, Placement, PruneSetup, Qwen4Exp, Spread, TensorChoice,
-    batch_rows, drafter_bytes, page_parts, place, profile_key, reads_layer_by_layer, slot_floors,
-    step_rows,
+    ModelOptions, OpenError, Options, Placement, PruneSetup, Qwen4Exp, RoleMemory, Spread,
+    TensorChoice, batch_rows, drafter_bytes, page_parts, place, profile_key, reads_layer_by_layer,
+    slot_floors, step_rows,
 };
 use ares_model::qwen4exp::weights::MTP_ARCHITECTURE;
 use ares_model::qwen4exp::{Config, MtpWeights};
@@ -38,6 +38,7 @@ use ares_tokenizer::Tokenizer;
 
 use super::devices::{Held, describe_links, hold_devices, ordinals, tower_of};
 use super::files::{chat_options, drafter_files, open_projector, read_vocabulary};
+use super::products::products_line;
 use super::ram::{Budget, Rest};
 use super::start::{self, Engine, log_started};
 use super::{LoadError, Loaded, VRAM_HEADROOM, join, log_context, model_error, refuse, short};
@@ -269,12 +270,6 @@ impl Asked {
                  their keys and values are on the device that mixes the streams",
             ));
         }
-        if options.precision == ares_cuda::Precision::Exact {
-            return Err(refuse(
-                "--precision exact is not a choice for this model: its products have one kind of \
-                 arithmetic",
-            ));
-        }
         // The model's MTP block: in the model file (`--drafters mtp`, a file
         // that carries the `mtp.*` tensors) or a file of its own, which
         // --drafters names by its path (architecture `qwen4exp-mtp`). A DFlash
@@ -368,6 +363,8 @@ impl Asked {
         if let Some(dir) = profile_dir(options) {
             model = model.with_usage_profile(&dir, Arc::new(|line| tracing::warn!("{line}")));
         }
+        // The tier of experts in RAM giving memory back to the machine.
+        model = model.with_log(Arc::new(|line| tracing::info!("{line}")));
         if let Some(tokens) = &self.vocabulary {
             model = model
                 .with_draft_vocabulary(tokens)
@@ -516,6 +513,7 @@ impl Planning<'_> {
             },
             headroom: VRAM_HEADROOM,
             spread,
+            roles_dir: profile_dir(self.options),
             ..ModelOptions::default()
         }
     }
@@ -758,8 +756,13 @@ fn log_drafting(asked: &Asked) {
 /// Says what a prompt read alone takes once the parts are open: the rows the
 /// expert slots lend for, which the model knows then, against the rows
 /// planned (`own_rows` in the parts' own memory, `max_rows` on lent VRAM,
-/// `pass_rows` of a pass, 0 for none).
+/// `pass_rows` of a pass, 0 for none). Nothing when it is what the plan's
+/// line said.
 fn log_steps_taken(model: &Qwen4Exp, own_rows: u32, max_rows: u32, pass_rows: u32) {
+    let planned = if pass_rows > own_rows { pass_rows } else { max_rows };
+    if model.max_rows() == planned {
+        return;
+    }
     if model.max_rows() > own_rows && pass_rows > own_rows {
         tracing::info!(
             "a prompt read alone runs layer by layer in steps of up to {} rows, kept on VRAM \
@@ -807,6 +810,11 @@ fn log_taken(model: &Arc<Qwen4Exp>, config: &Config, held: &[Held]) -> Result<()
             Bytes(report.scratch),
             Bytes(h.free.saturating_sub(free)),
             Bytes(free),
+        );
+        tracing::info!(
+            "device {}: {}",
+            h.device.ordinal(),
+            products_line(report.full_rate, &report.paths, &[])
         );
     }
     if let Some((vram, ram_slots, ram_bytes)) = model.expert_slots() {
@@ -899,8 +907,20 @@ fn log_trial(placement: &Placement, held: &[Held]) {
             )
         }
     };
+    let (when, kept_in) = match &trial.memory {
+        RoleMemory::Remembered(path) => {
+            (format!("remembered from {} (timed in", path.display()), String::new())
+        }
+        RoleMemory::Written(path) => {
+            ("timed at load (in".to_owned(), format!("; remembered in {}", path.display()))
+        }
+        RoleMemory::NotWritten(why) => {
+            ("timed at load (in".to_owned(), format!("; not remembered: {why}"))
+        }
+        RoleMemory::None => ("timed at load (in".to_owned(), String::new()),
+    };
     tracing::info!(
-        "plan: the role of device {worker}, timed at load in {:.1} s ({}): {}; kept: {}",
+        "plan: the role of device {worker}, {when} {:.1} s: {}): {}; kept: {}{kept_in}",
         trial.took.as_secs_f64(),
         if trial.wide_rows > 0 {
             format!("a decode step and a step of {} rows each", trial.wide_rows)

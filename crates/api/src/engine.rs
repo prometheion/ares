@@ -165,4 +165,14 @@ pub trait Engine: Send + Sync + 'static {
     fn stats(&self) -> Option<EngineStats> {
         None
     }
+
+    /// Ends the thinking of the running request `id` now: its reply goes on
+    /// with the tokens that end the thinking, as a spent budget of thinking
+    /// tokens ends it (llama.cpp's control `reasoning_end`). `Ok(false)` when
+    /// the engine holds no such request or its reply is not inside its
+    /// thinking. May wait for the end of the step the engine is in. The default
+    /// is an engine that cannot.
+    fn end_thinking(&self, _id: RequestId) -> Result<bool, EngineError> {
+        Err(EngineError::Unsupported("this engine cannot end the thinking of a reply".into()))
+    }
 }

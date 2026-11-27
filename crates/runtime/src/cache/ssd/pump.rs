@@ -321,6 +321,7 @@ impl Cache {
                                 kind: TransferKind::StateIn,
                                 object: place,
                                 keep_form: false,
+                                tail: false,
                                 parts,
                                 ok: false,
                             });
@@ -345,6 +346,7 @@ impl Cache {
                     kind: TransferKind::PageIn,
                     object: page.0,
                     keep_form,
+                    tail: false,
                     parts,
                     ok: false,
                 });
@@ -486,6 +488,7 @@ impl Cache {
                 kind: TransferKind::PageOut,
                 object: page.page.0,
                 keep_form: false,
+                tail: false,
                 parts,
                 ok: false,
             });

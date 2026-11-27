@@ -88,6 +88,16 @@ pub(crate) struct Parsed {
     /// The priority the body names (`priority`), which the request has
     /// unless a header names another ([`Parsed::take_priority`]).
     pub priority: Option<i32>,
+    /// llama.cpp's `return_progress`: a stream says how far the prompt has
+    /// got (`prompt_progress`) before its first text.
+    pub progress: bool,
+    /// llama.cpp's `sse_ping_interval`: the seconds of silence after which a
+    /// stream sends a ping, 0 or -1 for none; `None` when the request does not
+    /// say ([`crate::routes::pings`]).
+    pub ping: Option<i32>,
+    /// llama.cpp's `timings_per_token`: every chunk of a stream with text has
+    /// the timings of the reply so far.
+    pub timings_per_token: bool,
 }
 
 /// The header that gives a request its priority, for a client that cannot
@@ -208,6 +218,13 @@ const SERVED: &[&str] = &[
     "min_keep",
     "priority",
     "cache_prompt",
+    "return_progress",
+    "sse_ping_interval",
+    "timings_per_token",
+    // llama.cpp's choice of where its sampler runs, on the device ("backend")
+    // or on the host, whose draws are the same either way: Ares samples on the
+    // device whatever it says (read for its type in `from_json`).
+    "backend_sampling",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -353,6 +370,8 @@ pub(crate) fn from_json(
         })?),
     };
     let include_usage = stream_options(&fields)?;
+    // Where llama.cpp samples is no choice here, but the member is a boolean.
+    fields.bool("backend_sampling")?;
     Ok(Parsed {
         request,
         stream: fields.bool("stream")?.unwrap_or(false),
@@ -364,6 +383,22 @@ pub(crate) fn from_json(
         fresh_seed,
         lowered: None,
         priority,
+        progress: fields.bool("return_progress")?.unwrap_or(false),
+        ping: ping_interval(&fields)?,
+        timings_per_token: fields.bool("timings_per_token")?.unwrap_or(false),
+    })
+}
+
+/// llama.cpp's `sse_ping_interval`: whole seconds from -1 (no pings) up.
+fn ping_interval(fields: &Fields<'_>) -> Result<Option<i32>, ApiError> {
+    let Some(seconds) = fields.int("sse_ping_interval")? else { return Ok(None) };
+    i32::try_from(seconds).ok().filter(|s| *s >= -1).map(Some).ok_or_else(|| {
+        ApiError::invalid_param(
+            "sse_ping_interval",
+            format!(
+                "sse_ping_interval must be the seconds between pings, or -1 for none; got {seconds}"
+            ),
+        )
     })
 }
 

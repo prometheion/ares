@@ -1,0 +1,554 @@
+//! How far a prompt has got, as llama.cpp's server streams it (`return_progress`
+//! and `prompt_progress`), and the log of a request: through the real runtime with
+//! the synthetic model on a host executor, whose prompts are read in steps of 64
+//! rows.
+
+mod common;
+
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use ares_api::Engine;
+use ares_runtime::testing::HostExecutor;
+use ares_runtime::{Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_server::options::ModelOptions;
+use axum::Router;
+use axum::http::StatusCode;
+use common::*;
+use serde_json::{Value, json};
+
+const CHAT: &str = "/v1/chat/completions";
+const COMPLETIONS: &str = "/v1/completions";
+
+async fn served() -> Router {
+    let mut config = SyntheticConfig::small(Split::Single, 1);
+    config.context_length = 2048;
+    config.eos = Some(u32::from(b'~'));
+    let model = Arc::new(SyntheticModel::new(config).unwrap());
+    let config = RuntimeConfig {
+        pages: 4096,
+        cells_per_page: 16,
+        max_slots: 4,
+        window_rows: 1,
+        warm_up: false,
+        ..RuntimeConfig::default()
+    };
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
+        .with_row_cost(Duration::from_micros(200), Duration::from_micros(5));
+    let runtime = Runtime::start(model, Box::new(host), config).unwrap();
+    let engine: Arc<dyn Engine> =
+        Arc::new(runtime.with_chat_template(Some("{{ messages }}".into())));
+    router_of(engine, ModelOptions::default(), ares_server::Config::default()).await
+}
+
+/// A prompt long enough to take several steps.
+fn long_text() -> String {
+    "the quick brown fox jumps over the lazy dog ".repeat(7)
+}
+
+async fn streamed(app: &Router, path: &str, body: Value) -> Vec<Value> {
+    let response = post(app, path, &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream = parse_sse(&body_text(response).await);
+    assert!(stream.done, "the stream ends with [DONE]");
+    stream.chunks
+}
+
+/// The `prompt_progress` of the chunks that have one, and the place of the first
+/// chunk with text.
+fn progress_of(
+    chunks: &[Value],
+    text_of: impl Fn(&Value) -> Option<String>,
+) -> (Vec<Value>, usize) {
+    let progress: Vec<Value> =
+        chunks.iter().filter_map(|chunk| chunk.get("prompt_progress").cloned()).collect();
+    let first_text = chunks
+        .iter()
+        .position(|chunk| text_of(chunk).is_some_and(|text| !text.is_empty()))
+        .expect("the reply has text");
+    let last_progress = chunks.iter().rposition(|chunk| chunk.get("prompt_progress").is_some());
+    assert!(last_progress.is_none_or(|at| at < first_text), "progress after the text: {chunks:?}");
+    (progress, first_text)
+}
+
+/// What llama.cpp's server promises of its progress (its test
+/// `test_return_progress`): the first says the cached tokens are done, `total` and
+/// `cache` do not change, `processed` rises with every chunk, and the last says
+/// all of them are done.
+fn check_progress(progress: &[Value], cached: u64) {
+    assert!(progress.len() >= 3, "a report per step: {progress:?}");
+    let total = progress[0]["total"].as_u64().unwrap();
+    assert!(total > 128, "{progress:?}");
+    assert_eq!(progress[0]["cache"], cached, "{progress:?}");
+    assert_eq!(progress[0]["processed"], cached, "{progress:?}");
+    for pair in progress.windows(2) {
+        assert_eq!(pair[1]["total"], total);
+        assert_eq!(pair[1]["cache"], pair[0]["cache"]);
+        assert!(pair[1]["processed"].as_u64() > pair[0]["processed"].as_u64(), "{progress:?}");
+        assert!(pair[1]["time_ms"].as_u64() >= pair[0]["time_ms"].as_u64(), "{progress:?}");
+    }
+    assert_eq!(progress.last().unwrap()["processed"], total, "{progress:?}");
+    for p in progress {
+        let keys: Vec<&String> = p.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 4, "llama.cpp's four fields: {p}");
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_chat_says_how_far_its_prompt_has_got_before_its_text() {
+    let app = served().await;
+    let body = |progress: bool| {
+        json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": long_text()}],
+            "max_tokens": 6,
+            "stream": true,
+            "return_progress": progress,
+        })
+    };
+    let content =
+        |chunk: &Value| chunk["choices"][0]["delta"]["content"].as_str().map(str::to_owned);
+    let chunks = streamed(&app, CHAT, body(true)).await;
+    let (progress, _) = progress_of(&chunks, content);
+    check_progress(&progress, 0);
+    // A progress chunk is a chunk of the stream: the role, no text, and the
+    // fields every chunk has.
+    let chunk = chunks.iter().find(|c| c.get("prompt_progress").is_some()).unwrap();
+    assert_eq!(chunk["object"], "chat.completion.chunk", "{chunk}");
+    assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant", "{chunk}");
+    assert_eq!(chunk["choices"][0]["finish_reason"], Value::Null, "{chunk}");
+    // The same prompt again starts from the cache... of a model that has none
+    // here, so it is computed again; without the member a stream has no progress.
+    let chunks = streamed(&app, CHAT, body(false)).await;
+    assert!(chunks.iter().all(|c| c.get("prompt_progress").is_none()), "{chunks:?}");
+}
+
+#[tokio::test]
+async fn a_streamed_completion_says_how_far_its_prompt_has_got() {
+    let app = served().await;
+    let body = json!({
+        "model": "synthetic",
+        "prompt": long_text(),
+        "max_tokens": 6,
+        "stream": true,
+        "return_progress": true,
+    });
+    let text = |chunk: &Value| chunk["choices"][0]["text"].as_str().map(str::to_owned);
+    let chunks = streamed(&app, COMPLETIONS, body).await;
+    let (progress, _) = progress_of(&chunks, text);
+    check_progress(&progress, 0);
+    let chunk = chunks.iter().find(|c| c.get("prompt_progress").is_some()).unwrap();
+    assert_eq!(chunk["object"], "text_completion", "{chunk}");
+    assert_eq!(chunk["choices"][0]["text"], "", "{chunk}");
+}
+
+#[tokio::test]
+async fn a_streamed_response_says_how_far_its_prompt_has_got_in_its_in_progress_events() {
+    let app = served().await;
+    let body = json!({
+        "model": "synthetic",
+        "input": long_text(),
+        "max_output_tokens": 6,
+        "stream": true,
+        "return_progress": true,
+    });
+    let response = post(&app, "/v1/responses", &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let events: Vec<Value> = sse_payloads(&body_text(response).await)
+        .iter()
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let progress: Vec<Value> = events
+        .iter()
+        .filter_map(|event| {
+            let progress = event.get("prompt_progress")?;
+            assert_eq!(event["type"], "response.in_progress", "{event}");
+            assert_eq!(event["response"]["status"], "in_progress", "{event}");
+            Some(progress.clone())
+        })
+        .collect();
+    check_progress(&progress, 0);
+    let first_delta = events.iter().position(|e| e["type"] == "response.output_text.delta");
+    let last_progress = events.iter().rposition(|e| e.get("prompt_progress").is_some());
+    assert!(last_progress < first_delta, "{events:?}");
+}
+
+#[tokio::test]
+async fn return_progress_without_a_stream_changes_nothing_and_must_be_a_boolean() {
+    let app = served().await;
+    let body = |progress: Value| {
+        json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "return_progress": progress,
+        })
+    };
+    let (status, answer) = json(post(&app, CHAT, &body(json!(true)).to_string()).await).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer.get("prompt_progress").is_none(), "{answer}");
+    let (status, answer) = json(post(&app, CHAT, &body(json!("yes")).to_string()).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["param"], "return_progress", "{answer}");
+}
+
+/// Where the lines of the log go in a test: a buffer.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn lines(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).lines().map(str::to_owned).collect()
+    }
+}
+
+/// The log of this process at its default level, as the binary writes it. One
+/// for all: a log of one thread misses lines while other tests run.
+fn captured() -> &'static Captured {
+    static LOG: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the one log of the tests");
+        captured
+    })
+}
+
+/// The default log of a request is for a person, as llama.cpp's server writes
+/// its timings: the request as it is taken, its start in the engine with what the
+/// cache gave, and at its end the prompt's rate over the rows the engine ran for
+/// it, the rate of generation and the total; a refused request is a warning with
+/// its route, status, code and the message the client got.
+#[tokio::test]
+async fn the_log_of_a_request_says_what_it_took_as_llama_cpp_does() {
+    let captured = captured();
+    let app = served().await;
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": long_text()}],
+        "max_tokens": 6,
+        "temperature": 0,
+    });
+    let (status, answer) = json(post(&app, CHAT, &body.to_string()).await).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let prompt = answer["usage"]["prompt_tokens"].as_u64().unwrap();
+    let id = answer["id"].as_str().unwrap().trim_start_matches("chatcmpl-").to_owned();
+    let refused = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "return_progress": "yes",
+    });
+    let (status, _) = json(post(&app, CHAT, &refused.to_string()).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let lines = captured.lines();
+    let find = |what: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(what))
+            .unwrap_or_else(|| panic!("no line with '{what}' in {lines:#?}"))
+            .clone()
+    };
+    let taken = find(&format!("request {id} taken: "));
+    assert!(taken.contains(" INFO ") && taken.contains("chat, model synthetic"), "{taken}");
+    assert!(taken.contains("max_tokens 6") && taken.contains("temperature 0"), "{taken}");
+    let started = find(&format!("request {id} started after "));
+    assert!(started.contains(&format!("prompt of {prompt} tokens, 0 from the cache")), "{started}");
+    let finished = find(&format!("request {id} finished (length): prompt of {prompt} tokens"));
+    assert!(finished.contains("6 generated"), "{finished}");
+    let eval = find(&format!("request {id} prompt eval time = "));
+    assert!(eval.contains(&format!("/ {prompt:5} tokens (")), "{eval}");
+    assert!(eval.ends_with("tokens per second)"), "{eval}");
+    let generated = find(&format!("request {id}        eval time = "));
+    assert!(generated.contains("/     6 tokens ("), "{generated}");
+    let total = find(&format!("request {id}       total time = "));
+    assert!(total.ends_with(&format!("/ {:5} tokens", prompt + 6)), "{total}");
+    // No key=value line of the request at the default level.
+    let ours: Vec<&String> = lines.iter().filter(|line| line.contains(&id)).collect();
+    assert!(ours.iter().all(|line| !line.contains("prompt_tokens_per_s")), "{ours:#?}");
+    let refusal = find("POST /v1/chat/completions: 400 invalid_request: return_progress");
+    assert!(refusal.contains(" WARN "), "{refusal}");
+}
+
+/// llama.cpp's `sse_ping_interval`: a stream that stays silent that many seconds
+/// sends a ping (a comment line on the OpenAI routes, Anthropic's `ping` event on
+/// /v1/messages), -1 and 0 none; without the member the route's own pings come
+/// every 15 s. The engine here sends a piece, is silent 2.3 s, and ends.
+#[tokio::test]
+async fn sse_ping_interval_sets_the_pings_of_a_silent_stream() {
+    let silent = |path: &'static str, ping: Option<i64>| async move {
+        let gate = Gate::default();
+        let engine = MockEngine::script(vec![
+            text("a"),
+            Step::Wait(gate.clone()),
+            text("b"),
+            done(ares_api::FinishReason::Stop, 3, 2),
+        ]);
+        let app = app(&engine).await;
+        let mut body = match path {
+            "/v1/messages" => json!({
+                "model": "mock",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }),
+            _ => {
+                json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}], "stream": true})
+            }
+        };
+        if let Some(ping) = ping {
+            body["sse_ping_interval"] = json!(ping);
+        }
+        let response = post(&app, path, &body.to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let opener = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2300)).await;
+            gate.open();
+        });
+        let text = body_text(response).await;
+        opener.await.unwrap();
+        let comments = text.lines().filter(|line| line.starts_with(':')).count();
+        let pings = text.lines().filter(|line| *line == "event: ping").count();
+        (comments, pings, text)
+    };
+    let (every_second, off, never, default, messages) = tokio::join!(
+        silent(CHAT, Some(1)),
+        silent(CHAT, Some(-1)),
+        silent(CHAT, Some(0)),
+        silent(CHAT, None),
+        silent("/v1/messages", Some(1)),
+    );
+    assert!((2..=3).contains(&every_second.0), "a ping a second: {}", every_second.2);
+    assert_eq!((off.0, never.0, default.0), (0, 0, 0), "{}", default.2);
+    // Anthropic's stream pings with its event; one comes before the stream's start too.
+    assert!(messages.1 >= 2, "{}", messages.2);
+}
+
+#[tokio::test]
+async fn sse_ping_interval_is_whole_seconds_from_minus_one() {
+    let engine = MockEngine::script(says("ok", 2, ares_api::FinishReason::Stop));
+    let app = app(&engine).await;
+    for (ping, status) in [(json!(-2), 400), (json!(1.5), 400), (json!("1"), 400), (json!(30), 200)]
+    {
+        let body = json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "sse_ping_interval": ping,
+        });
+        let response = post(&app, CHAT, &body.to_string()).await;
+        assert_eq!(response.status().as_u16(), status, "{ping}");
+    }
+}
+
+/// llama.cpp's `timings_per_token`: on a stream, every step's last chunk with
+/// text has the timings of the reply so far (its tokens rise, the prompt's are
+/// set, no hash yet), on chat and on the Responses route; the last chunk has the
+/// whole timings, with the hash. Its fields are llama.cpp's, `cache_n` and the
+/// milliseconds per token among them.
+#[tokio::test]
+async fn timings_per_token_puts_the_timings_so_far_on_the_chunks_of_a_stream() {
+    let app = served().await;
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": long_text()}],
+        "max_tokens": 12,
+        "stream": true,
+        "timings_per_token": true,
+    });
+    let chunks = streamed(&app, CHAT, body).await;
+    let text = |c: &&Value| {
+        c["choices"][0]["delta"]["content"].as_str().is_some_and(|text| !text.is_empty())
+    };
+    let live: Vec<&Value> = chunks.iter().filter(text).map(|c| &c["timings"]).collect();
+    assert!(live.len() >= 2 && live.iter().all(|t| t.is_object()), "{chunks:?}");
+    let generated: Vec<u64> = live.iter().map(|t| t["predicted_n"].as_u64().unwrap()).collect();
+    assert!(generated.windows(2).all(|pair| pair[0] < pair[1]), "{generated:?}");
+    for timings in &live {
+        assert!(timings["prompt_n"].as_u64().unwrap() > 128, "{timings}");
+        assert_eq!(timings["cache_n"], 0, "{timings}");
+        assert!(timings.get("token_hash").is_none(), "{timings}");
+    }
+    let last = chunks.iter().rev().find(|c| c.get("timings").is_some()).unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "length", "{last}");
+    assert_eq!(last["timings"]["predicted_n"], 12, "{last}");
+    assert!(last["timings"]["token_hash"].is_string(), "{last}");
+    for key in ["prompt_per_token_ms", "predicted_per_token_ms", "prompt_per_second"] {
+        assert!(last["timings"][key].as_f64().is_some(), "{key}: {last}");
+    }
+    // Without the member a chunk with text has none.
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 4,
+        "stream": true,
+    });
+    let chunks = streamed(&app, CHAT, body).await;
+    let with_text: Vec<&Value> = chunks.iter().filter(text).collect();
+    assert!(!with_text.is_empty() && with_text.iter().all(|c| c.get("timings").is_none()));
+
+    let body = json!({
+        "model": "synthetic",
+        "input": long_text(),
+        "max_output_tokens": 8,
+        "stream": true,
+        "timings_per_token": true,
+    });
+    let response = post(&app, "/v1/responses", &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let events: Vec<Value> = sse_payloads(&body_text(response).await)
+        .iter()
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let deltas: Vec<&Value> =
+        events.iter().filter(|e| e["type"] == "response.output_text.delta").collect();
+    assert!(
+        !deltas.is_empty() && deltas.iter().all(|e| e["timings"]["predicted_n"].as_u64() > Some(0))
+    );
+}
+
+/// The synthetic model that thinks until it writes `</never>`, which it never
+/// does, served with steps of a few milliseconds.
+async fn served_thinking() -> Router {
+    let mut config = SyntheticConfig::small(Split::Single, 1);
+    config.context_length = 2048;
+    config.chat = Some(ares_api::ChatFormat {
+        thinking: Some(ares_api::ThinkingFormat {
+            start: "<think>".into(),
+            end: "</never>".into(),
+            prompt_on: "<think>".into(),
+            prompt_off: "<think></never>".into(),
+            on_by_default: true,
+            effort: false,
+            refused_efforts: Vec::new(),
+        }),
+        tools: None,
+        system_first: true,
+    });
+    let model = Arc::new(SyntheticModel::new(config).unwrap());
+    let config = RuntimeConfig {
+        pages: 4096,
+        cells_per_page: 16,
+        max_slots: 4,
+        window_rows: 1,
+        warm_up: false,
+        ..RuntimeConfig::default()
+    };
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
+        .with_row_cost(Duration::from_millis(3), Duration::from_micros(5));
+    let runtime = Runtime::start(model, Box::new(host), config).unwrap();
+    let engine: Arc<dyn Engine> =
+        Arc::new(runtime.with_chat_template(Some("{{ messages }}".into())));
+    router_of(engine, ModelOptions::default(), ares_server::Config::default()).await
+}
+
+/// llama.cpp's `/v1/chat/completions/control` with `reasoning_end`: a stream's
+/// thinking ends at once and its answer follows (llama.cpp's web UI sends
+/// `reasoning_control: true` with every request and calls the route for its stop
+/// of the thinking). An id that names no running completion is `success: false`;
+/// an unknown action or no id is a 400.
+#[tokio::test]
+async fn the_control_route_ends_the_thinking_of_a_running_reply() {
+    use futures_util::StreamExt;
+    let app = served_thinking().await;
+    let body = json!({
+        "model": "synthetic",
+        "messages": [{"role": "user", "content": "think about it <think>"}],
+        "max_tokens": 300,
+        "stream": true,
+        "reasoning_control": true,
+    });
+    let response = post(&app, CHAT, &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut text = String::new();
+    // The id, and some thinking, before the control.
+    while !text.contains("reasoning_content") {
+        let bytes = stream.next().await.expect("the stream goes on").unwrap();
+        text.push_str(std::str::from_utf8(&bytes).unwrap());
+    }
+    let first = parse_sse(&text).chunks.into_iter().next().unwrap();
+    let id = first["id"].as_str().unwrap().to_owned();
+    let control = json!({"id": id, "action": "reasoning_end", "model": "synthetic"});
+    let (status, answer) =
+        json(post(&app, "/v1/chat/completions/control", &control.to_string()).await).await;
+    assert_eq!((status, answer), (StatusCode::OK, json!({"success": true})));
+    while let Some(bytes) = stream.next().await {
+        text.push_str(std::str::from_utf8(&bytes.unwrap()).unwrap());
+    }
+    let chunks = parse_sse(&text).chunks;
+    let content: String =
+        chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
+    assert!(!content.is_empty(), "an answer follows the thinking: {text}");
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect();
+    assert!(reasoning.chars().count() < 250, "the thinking ended early: {reasoning:?}");
+    // The completion has ended: nothing to end.
+    let (status, answer) =
+        json(post(&app, "/v1/chat/completions/control", &control.to_string()).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(answer["success"], false, "{answer}");
+    for (bad, param) in [
+        (json!({"id": id, "action": "stop"}), "action"),
+        (json!({"action": "reasoning_end"}), "id"),
+    ] {
+        let (status, answer) =
+            json(post(&app, "/v1/chat/completions/control", &bad.to_string()).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["error"]["param"], param, "{answer}");
+    }
+}
+
+/// The body llama.cpp's web UI (`ui/apps/chat` at d92ea9b) sends for a chat with
+/// its settings left as they come, as `ChatService.sendMessage` builds it: Ares
+/// serves it, with the progress, the pings and the timings it asks for.
+/// `backend_sampling` (where llama.cpp samples) says nothing here, and
+/// `reasoning_control` arms nothing more: every reply can be ended by the control
+/// route.
+#[tokio::test]
+async fn the_body_of_llama_cpps_web_ui_is_served() {
+    let app = served().await;
+    let body = json!({
+        "messages": [{"role": "user", "content": long_text()}],
+        "return_progress": true,
+        "sse_ping_interval": 1,
+        "stream": true,
+        "reasoning_format": "auto",
+        "reasoning_control": true,
+        "timings_per_token": true,
+        "backend_sampling": false,
+        "model": "synthetic",
+        "max_tokens": 8,
+    });
+    let chunks = streamed(&app, CHAT, body.clone()).await;
+    assert!(chunks.iter().any(|c| c.get("prompt_progress").is_some()), "{chunks:?}");
+    assert!(chunks.iter().any(|c| c["timings"]["predicted_n"] == 1), "{chunks:?}");
+    // The same members with other values: only their type is checked.
+    let mut other = body;
+    other["backend_sampling"] = json!(true);
+    other["reasoning_control"] = json!(false);
+    streamed(&app, CHAT, other.clone()).await;
+    other["backend_sampling"] = json!("yes");
+    let (status, answer) = json(post(&app, CHAT, &other.to_string()).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["param"], "backend_sampling", "{answer}");
+}

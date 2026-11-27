@@ -20,20 +20,13 @@ use ares_cuda::{
     Result, Stream, Wait,
 };
 
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::Rng;
+
 const EXPERTS: u32 = 64;
 const TOP_K: u32 = 8;
 const MANY_ROWS: [u32; 3] = [8, 64, 512];
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-}
 
 /// The best of three runs of `reps` calls of `f`, in microseconds a call.
 fn time(

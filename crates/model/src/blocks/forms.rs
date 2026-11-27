@@ -310,6 +310,20 @@ impl Forms {
         Ok(())
     }
 
+    /// Gives `page` an exact slot for a page that comes in exact, whatever the
+    /// pool kept for its number before. A full page is settled, so it may be
+    /// converted to make room like any full page the cache holds; a `tail` (a
+    /// partly used page of the prefix cache) is not: it stays exact until the
+    /// pool frees it, as a tail that never left the device does.
+    pub(crate) fn adopt(&mut self, page: u32, tail: bool) -> Result<u32, Exhausted> {
+        self.release(page);
+        let slot = self.ensure(page, None)?;
+        if !tail {
+            self.settle_page(page);
+        }
+        Ok(slot)
+    }
+
     /// Converts `page` now when it is exact, as when the window of a sequence
     /// has left it: the job waits in [`Forms::take_jobs`].
     pub(crate) fn convert_page(&mut self, page: u32) {
@@ -433,6 +447,28 @@ mod tests {
     fn a_partly_used_page_is_never_converted_for_room() {
         let mut forms = Forms::new(1, 16, 256);
         forms.prepare(&[reach(0, 5)], page, true).unwrap();
+        let error = forms.prepare(&[second(0, 1)], other, true).unwrap_err();
+        assert_eq!(error, Exhausted { capacity: 1, partial: 1, in_step: 0 });
+        assert!(forms.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn a_tail_that_comes_back_exact_is_never_converted_for_room() {
+        // Page 3 comes back from RAM as a tail of the prefix cache, page 4 as
+        // a full page; later another sequence needs a slot.
+        let mut forms = Forms::new(2, 16, 256);
+        let tail = forms.adopt(3, true).unwrap();
+        let full = forms.adopt(4, false).unwrap();
+        forms.prepare(&[second(0, 1)], other, true).unwrap();
+        assert_eq!(
+            forms.take_jobs(),
+            [Convert { exact: full, page: 4 }],
+            "the full page makes room"
+        );
+        assert_eq!(forms.slot_of(3), Some(tail), "the tail stays exact");
+        // With the tail alone in the pool there is no room: it is not given up.
+        let mut forms = Forms::new(1, 16, 256);
+        forms.adopt(3, true).unwrap();
         let error = forms.prepare(&[second(0, 1)], other, true).unwrap_err();
         assert_eq!(error, Exhausted { capacity: 1, partial: 1, in_step: 0 });
         assert!(forms.take_jobs().is_empty());

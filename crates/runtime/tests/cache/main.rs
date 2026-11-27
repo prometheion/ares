@@ -17,6 +17,7 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+mod decisions;
 mod prefix;
 mod ram;
 mod ssd;

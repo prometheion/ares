@@ -625,6 +625,7 @@ fn head_rows<'g>(
         return head_parts(layout, m, parts, usage, first_token);
     }
     let n_out = parts.iter().flatten().map(|r| r.len()).sum::<usize>() as u32;
+    layout.chooser.loose(m.ty());
     let part = layout.rows(m, parts.into_iter().flatten().collect(), WeightLayout::File);
     Ok(HeadW { parts: vec![part], n_out, first_token })
 }

@@ -52,24 +52,36 @@ pub fn serve_model(model: &Path, port: u16, flags: &[&str], limit: Duration) -> 
     Server::start(command, limit)
 }
 
-/// [`serve_model`] as the suites of one model start it: on the test device,
-/// with exact products, so that a text does not depend on what else is in a
-/// step, and a context of 8192 tokens, unless `flags` name `--devices`,
-/// `--precision` or `--context`; a minute for anything ([`LIMIT`]).
+/// [`serve_model`] as the suites of one model start it: on the test device
+/// and with a context of 8192 tokens, unless `flags` name `--devices` or
+/// `--context`; a minute for anything ([`LIMIT`]).
 pub fn serve(model: &Path, port: u16, flags: &[&str]) -> Server {
     let device = super::test_device().to_string();
     let mut all: Vec<&str> = Vec::new();
     if !flags.contains(&"--devices") {
         all.extend(["--devices", device.as_str()]);
     }
-    if !flags.contains(&"--precision") {
-        all.extend(["--precision", "exact"]);
-    }
     if !flags.contains(&"--context") {
         all.extend(["--context", "8192"]);
     }
     all.extend(flags);
     serve_model(model, port, &all, LIMIT)
+}
+
+/// Checks that `got`, a reply computed in other steps than `want` (next to
+/// another request, or with its prompt from the cache), is `want` up to
+/// rounding: a row's rounding depends on the size of the step that computes it
+/// (the 8-bit activations of the few-row kernels against the tile kernels'
+/// path), so a near tie may part the texts, late, and never within their first
+/// `at_least` characters. A state that was not what it should be changes the
+/// first token. Says where two texts part.
+pub fn same_up_to_a_near_tie(what: &str, got: &str, want: &str, at_least: usize) {
+    if got == want {
+        return;
+    }
+    let shared = got.chars().zip(want.chars()).take_while(|(a, b)| a == b).count();
+    println!("RES {what}: the texts part after {shared} of {} characters", want.chars().count());
+    assert!(shared >= at_least, "{what}: {got:?} against {want:?}");
 }
 
 /// Polls until `condition` holds; fails the test after [`LIMIT`].

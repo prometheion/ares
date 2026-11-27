@@ -739,6 +739,7 @@ impl Pages<'_> {
                             item.len - at,
                             exact,
                             item.keep_form,
+                            item.tail,
                         )?
                     };
                 }

@@ -35,13 +35,12 @@
 //! ([`ares_api::Engine::chat_format`]); the `reasoning` module sorts the text
 //! by it and has the controls of llama-server for thinking.
 //!
-//! `/v1/systemone` has the request and response of llama.cpp's endpoint of
-//! that name (the TypeSafe System One API): typed questions about a `state`,
-//! answered by choosing among options. It is meant for every model ("Jev
-//! mode"); the runtime does not decide yet, so it answers 501 today. The
-//! `systemone` module says how the options that only a native decision model
-//! has are handled. Decisions and generation requests run at the same time
-//! and neither waits for the other.
+//! `/v1/systemone` has the request, the response and the errors of Flide's
+//! endpoint of that name (the TypeSafe System One API): typed questions about
+//! a `state`, answered by choosing among options, one request or several in
+//! one body. Every model answers there ("Jev mode"); the `systemone` module
+//! has the wire format. Decisions and generation requests run at the same
+//! time and neither waits for the other.
 //!
 //! The one non-obvious piece is the hand-over between the engine's threads
 //! and the async handlers, documented in the `bridge` module: what happens
@@ -174,6 +173,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
             post(anthropic::count_tokens).fallback(anthropic::method_not_allowed),
         )
         .route("/v1/chat/completions/input_tokens", post(openai::chat_input_tokens))
+        .route("/v1/chat/completions/control", post(openai::control))
         .route("/v1/responses", post(responses::create))
         .route("/v1/responses/input_tokens", post(responses::input_tokens))
         .route("/v1/responses/{id}", any(responses::stored))
@@ -182,6 +182,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
         .method_not_allowed_fallback(routes::method_not_allowed)
         .with_state(routes::App { models, config, stop })
         .layer(axum::middleware::from_fn_with_state(access, access::guard))
+        .layer(axum::middleware::from_fn(routes::tell_refusals))
 }
 
 /// Serves `models` on `listener` until `shutdown` completes.

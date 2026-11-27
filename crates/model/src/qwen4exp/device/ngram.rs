@@ -50,6 +50,8 @@ pub(super) struct NgramFeed {
     ahead: Option<Ahead>,
     stale: Vec<RowGather>,
     reads: u64,
+    /// Reads of table rows that have completed.
+    completed: u64,
     completions: Vec<Completion>,
     sequences: Vec<Sequence>,
     /// The draft windows of the last step.
@@ -78,6 +80,7 @@ impl NgramFeed {
             ahead: None,
             stale: Vec::new(),
             reads: 0,
+            completed: 0,
             completions: Vec::new(),
             sequences: (0..slots).map(|_| Sequence { position: 0, recent: Vec::new() }).collect(),
             windows: Vec::new(),
@@ -283,6 +286,7 @@ impl NgramFeed {
     pub(super) fn poll(&mut self) {
         let Some((reader, row_reader)) = &mut self.rows else { return };
         reader.poll(&mut self.completions);
+        self.completed += self.completions.len() as u64;
         for completion in self.completions.drain(..) {
             let mut left = row_reader.accept(&mut self.gather, completion);
             if let (Some(completion), Some(ahead)) = (left.take(), &mut self.ahead) {
@@ -294,6 +298,11 @@ impl NgramFeed {
             }
         }
         self.stale.retain(|gather| gather.pending() > 0);
+    }
+
+    /// The reads of table rows that have completed so far.
+    pub(super) fn completed(&self) -> u64 {
+        self.completed
     }
 
     /// Whether the rows of the step have arrived.

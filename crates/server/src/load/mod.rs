@@ -26,6 +26,7 @@
 mod devices;
 mod files;
 mod host;
+mod products;
 mod qwen35;
 mod qwen4exp;
 mod ram;

@@ -1211,6 +1211,85 @@ fn a_long_prompt_beside_generation_is_read_in_wide_steps_that_pause() {
     e.consistent();
 }
 
+/// Long prompts that come together while nothing generates, on a model that reads a wide
+/// prompt layer by layer (2026-11-25: the planner put two prompts into one step as wide as
+/// a prompt read alone, which such a model refuses, and the engine failed): the prompt the
+/// planner reads first is read alone in wide steps and the other after it, and a long
+/// prompt that comes while another's wide step is paused is read in pieces of the own rows
+/// until that step is done. No step wider than the own rows holds two prompts or runs
+/// beside a paused one (the executor notes both), and every request answers as it does
+/// alone.
+#[test]
+fn long_prompts_that_come_together_are_read_one_at_a_time() {
+    let mut rng = Rng(15);
+    let (a, b, c, d) = (rng.prompt(240), rng.prompt(200), rng.prompt(220), rng.prompt(260));
+    let shape = |c: &mut SyntheticConfig| {
+        c.own_rows = 16;
+        c.pauses_wide_steps = true;
+    };
+    let model = model(Some(CHECKPOINT), shape);
+    // Per step: its rows and its segments.
+    let seen: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let observed = seen.clone();
+    let e = engine_with(&model, paused_config(), |host| {
+        host.with_pauses(16, 4).with_delay(Duration::from_millis(1)).with_observer(move |view| {
+            observed.lock().unwrap().push((view.rows(), view.segments()));
+        })
+    });
+    let first = start(&e.rt, request(&a, Some(20))).unwrap();
+    let second = start(&e.rt, request(&b, Some(20))).unwrap();
+    let (first, second) = (first.finish(), second.finish());
+    assert_eq!(first.text, fresh_run(shape, &a, 20).text);
+    assert_eq!(second.text, fresh_run(shape, &b, 20).text);
+    let steps = seen.lock().unwrap().clone();
+    assert!(steps.iter().any(|s| s.0 > 16 && s.1 == 1), "wide steps of one prompt: {steps:?}");
+    assert!(steps.iter().all(|s| s.0 <= 16 || s.1 == 1), "{steps:?}");
+
+    // A long prompt that comes while another's wide step is paused.
+    let paused = e.snapshot().counters.steps_paused;
+    let fourth = start(&e.rt, request(&d, Some(20))).unwrap();
+    let deadline = Instant::now() + LIMIT;
+    while e.snapshot().counters.steps_paused == paused {
+        assert!(Instant::now() < deadline, "the step never paused");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let third = run_one(&e.rt, request(&c, Some(20)));
+    let fourth = fourth.finish();
+    assert_eq!(third.text, fresh_run(shape, &c, 20).text);
+    assert_eq!(fourth.text, fresh_run(shape, &d, 20).text);
+    e.consistent();
+}
+
+/// Prompts that come together while nothing generates, such as the forks of a decision (one
+/// text and a question each), on a model with few rows of its own that does not pause its
+/// steps: they share steps within the own rows, and each answers as it does alone (the shape
+/// of `feat/jev`'s test of a decision's forks, which met the refusal of a wider step of
+/// several prompts on Flash-Next, 2026-11-25).
+#[test]
+fn prompts_that_come_together_share_steps_within_the_own_rows() {
+    let mut rng = Rng(21);
+    let text = rng.prompt(150);
+    let prompts: Vec<String> = (0..6).map(|_| format!("{text}{}", rng.prompt(10))).collect();
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let seen: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let observed = seen.clone();
+    let e = engine_with(&model, config(256, 16), |host| {
+        host.with_observer(move |view| {
+            observed.lock().unwrap().push((view.rows(), view.segments()));
+        })
+    });
+    let started: Vec<_> =
+        prompts.iter().map(|prompt| start(&e.rt, request(prompt, Some(8))).unwrap()).collect();
+    for (handle, prompt) in started.into_iter().zip(&prompts) {
+        assert_eq!(handle.finish().text, fresh_run(shape, prompt, 8).text);
+    }
+    let steps = seen.lock().unwrap().clone();
+    assert!(steps.iter().any(|s| s.1 > 1), "they shared steps: {steps:?}");
+    assert!(steps.iter().all(|s| s.0 <= 16 || s.1 == 1), "{steps:?}");
+    e.consistent();
+}
+
 /// A request whose step is paused can be cancelled: what it computed is not kept, the
 /// model is told to give the step up, and the next request runs as it would alone.
 #[test]
@@ -1350,13 +1429,14 @@ fn a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state
 
 /// Pages a model keeps in host memory (from page 4 on, [`FarPages`]: the K and V of a context
 /// beyond VRAM) that only the prompt cache holds once their request ended rank as prompt cache,
-/// the lowest user of the engine's RAM (the owner's rule of 2026-11-22). With a tier of experts
-/// that wants more than the limit leaves, they leave the devices as soon as the request ended,
-/// with nothing below the devices to keep them (no level on SSD here): the next request with
-/// the same prompt finds only the pages in VRAM. With a tier that wants little, they stay. The
-/// answers are the same either way.
+/// the lowest user of the engine's RAM (the owner's rule of 2026-11-22). As many of them as one
+/// request can hold are the prompt cache's floor (2026-11-25): a tier of experts that wants more
+/// than the limit leaves does not take them, and the next request with the same prompt finds
+/// them, as it does beside a tier that wants little (until 2026-11-25 they left the devices as
+/// soon as the request ended, and that request found only the pages in VRAM). The answers are
+/// the same either way.
 #[test]
-fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory() {
+fn far_pages_of_a_finished_request_stay_when_the_tier_of_experts_wants_the_memory() {
     let mut rng = Rng(31);
     let prompt = rng.prompt(10 * PAGE as usize + 3);
     let mut texts = Vec::new();
@@ -1374,16 +1454,100 @@ fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_m
         let cached_far = ram.context_cached();
         let again = e.ask(&prompt, 4);
         let found = again.run.usage.cached_prompt_tokens;
-        if hungry {
-            assert_eq!(cached_far, 0, "the far pages went");
-            assert_eq!(found, 4 * PAGE, "only the pages in VRAM stayed cached");
-        } else {
-            assert!(cached_far >= 6 << 20, "the far pages stayed: {cached_far}");
-            assert!(found >= 10 * PAGE, "the whole prompt stayed cached: {found}");
-        }
+        assert!(cached_far >= 6 << 20, "hungry {hungry}: the far pages stayed: {cached_far}");
+        assert!(found >= 10 * PAGE, "hungry {hungry}: the whole prompt stayed cached: {found}");
+        // Another prompt beside the far pages the floor keeps takes the one place for its
+        // own checkpoints (the far pages are no room for a place), so it too comes back
+        // from its last checkpoint and replays less than a page (beside a tier that wants
+        // little, the ranking of many places decides).
+        let other = Rng(32).prompt(10 * PAGE as usize + 5);
+        e.ask(&other, 4);
+        let replayed = e.snapshot().counters.replay_rows;
+        let next = e.ask(&other, 4);
+        let replayed = e.snapshot().counters.replay_rows - replayed;
+        assert!(next.run.usage.cached_prompt_tokens >= 10 * PAGE, "hungry {hungry}");
+        assert!(!hungry || replayed < u64::from(PAGE), "{replayed} rows replayed");
         assert_eq!(again.run.text, first.run.text, "hungry {hungry}");
         texts.push(first.run.text);
         e.consistent();
     }
     assert_eq!(texts[0], texts[1]);
+}
+
+// --- the progress of a prompt ------------------------------------------------
+
+/// A prompt read in many steps hears how far it has got after each of them, from
+/// nothing to all of it, before its first text; a prompt the cache holds most of
+/// begins at the cached tokens, and the replay that rebuilds the state counts as
+/// work, so the count still rises step by step.
+#[test]
+fn a_prompt_hears_its_progress_step_by_step_from_what_the_cache_gave() {
+    let mut rng = Rng(41);
+    let prompt = rng.prompt(200);
+    let model = model(Some(CHECKPOINT), |_| {});
+    let e = engine(&model, config(256, 16));
+    let (first, progress) = start(&e.rt, request(&prompt, Some(8))).unwrap().finish_with_progress();
+    assert_eq!(first.usage.cached_prompt_tokens, 0);
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    // The steps end at the checkpoints, every page: a report after each.
+    assert!(said.len() >= 200 / PAGE as usize, "{said:?}");
+    assert_eq!((said[0], *said.last().unwrap()), (0, 200), "{said:?}");
+    assert!(progress.iter().all(|p| p.total == 200 && p.cached == 0));
+    let longer = format!("{prompt}{}", rng.prompt(60));
+    let (again, progress) = start(&e.rt, request(&longer, Some(8))).unwrap().finish_with_progress();
+    let cached = again.usage.cached_prompt_tokens;
+    assert!(cached >= 192, "{:?}", again.usage);
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    assert_eq!((said[0], *said.last().unwrap()), (cached, 260), "{said:?}");
+    assert!(said.len() >= 3, "the rest was read in steps of a page: {said:?}");
+    e.consistent();
+}
+
+/// A prompt the model reads in one step that pauses (a pass) hears the share of the
+/// pass done at every pause, where a count of rows done would not move until its end.
+#[test]
+fn a_paused_pass_reports_the_share_it_has_done() {
+    let mut rng = Rng(42);
+    let prompt = rng.prompt(60);
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let config = RuntimeConfig { checkpoint_prompt_interval: 64 * PAGE, ..paused_config() };
+    let e = engine_with(&model, config, |host| host.with_pauses(16, 4).with_shares());
+    let (run, progress) = start(&e.rt, request(&prompt, Some(8))).unwrap().finish_with_progress();
+    assert_eq!(run.text, fresh_run(shape, &prompt, 8).text, "as without pauses");
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    // The pass is the first 48 rows (the step ends at the last page before the
+    // prompt's end, where the cache keeps a checkpoint): the start, a report at
+    // each of its three pauses (a quarter of its rows more each), its end, and
+    // the end of the step of the last rows.
+    assert_eq!(said, [0, 12, 24, 36, 48, 60]);
+    e.consistent();
+}
+
+/// A step of a prompt that runs long reports how far it has got while it runs, about
+/// once a second, from a model that says so ([`ares_runtime::Executor::step_share`]),
+/// also when the model says nothing for its first second (Flash-Next's first piece of
+/// a pass after a load waits for the drive).
+#[test]
+fn a_long_step_reports_its_share_while_it_runs() {
+    let mut rng = Rng(43);
+    let prompt = rng.prompt(40);
+    let model = model(Some(CHECKPOINT), |_| {});
+    let config = RuntimeConfig { checkpoint_prompt_interval: 64 * PAGE, ..config(256, 16) };
+    let e = engine_with(&model, config, |host| {
+        host.with_step_cost(|rows| Duration::from_millis(if rows > 8 { 3600 } else { 1 }))
+            .with_shares_after(Duration::from_millis(1500))
+    });
+    let (_, progress) = start(&e.rt, request(&prompt, Some(4))).unwrap().finish_with_progress();
+    let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
+    // The long step is the first 32 rows (it ends at the last page before the
+    // prompt's end): the start, nothing after one second (the model says nothing
+    // yet), two reports after two and three (as far as the share of its time), its
+    // end, and the end of the step of the last rows.
+    assert_eq!(said.len(), 5, "{said:?}");
+    assert_eq!((said[0], said[3], said[4]), (0, 32, 40), "{said:?}");
+    assert!((15..=21).contains(&said[1]) && (24..=30).contains(&said[2]), "{said:?}");
+    let elapsed: Vec<u128> = progress.iter().map(|p| p.elapsed.as_millis()).collect();
+    assert!(elapsed[1] >= 2000 && elapsed[2] >= 3000 && elapsed[3] >= 3600, "{elapsed:?}");
+    e.consistent();
 }

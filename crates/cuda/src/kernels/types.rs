@@ -30,8 +30,8 @@ pub(crate) struct TypeInfo {
     /// type that was not measured.
     pub decode_rows: Option<u32>,
     /// Whether [`PrefillPath::F16Flush`](super::PrefillPath::F16Flush) was as fast as int8 on
-    /// the two capped cards the kernels were written on: the path of such a type that was not
-    /// measured on a capped card ([`Kernels::prefill_path_for`](super::Kernels::prefill_path_for)).
+    /// the two capped cards the kernels were written on: such a type takes an f16 path where it
+    /// was not measured, on every card ([`Kernels::prefill_path_for`](super::Kernels::prefill_path_for)).
     pub flush_as_fast: bool,
     /// The bytes of the tables of the gate and up decoder written for the many-row expert
     /// kernels (`kernels/expertrows_types.cuh`, and IQ1_S's in `mm_types_more.cuh`); `None`

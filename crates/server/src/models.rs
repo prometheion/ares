@@ -326,6 +326,10 @@ impl Shared {
         let reason = reason.or(own);
         match (&reason, status) {
             (Some(why), "failed") => tracing::error!(model = %entry.preset.id, "{status}: {why}"),
+            // An engine that failed is unloaded for it: the failure is an error.
+            (Some(why), "unloading") if entry.broken.is_some() => {
+                tracing::error!(model = %entry.preset.id, "{status} ({why})")
+            }
             (Some(why), _) => tracing::info!(model = %entry.preset.id, "{status} ({why})"),
             (None, _) => tracing::info!(model = %entry.preset.id, "{status}"),
         }

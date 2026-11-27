@@ -420,6 +420,8 @@ pub struct SyntheticModel {
     /// context: their MTP block drafts from it. The parts share it, so that
     /// all of them draft the same tokens.
     seen: Arc<Mutex<HashMap<(u32, u32), u32>>>,
+    /// How often the runtime said the steps that measure were done.
+    measured: std::sync::atomic::AtomicU32,
 }
 
 impl SyntheticModel {
@@ -427,7 +429,12 @@ impl SyntheticModel {
     /// opens the device parts.
     pub fn new(config: SyntheticConfig) -> Result<Self, ModelError> {
         config.validate()?;
-        Ok(Self { config: Arc::new(config), seen: Arc::default() })
+        Ok(Self { config: Arc::new(config), seen: Arc::default(), measured: Default::default() })
+    }
+
+    /// How often [`Model::measured`] was called.
+    pub fn measured_calls(&self) -> u32 {
+        self.measured.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn config(&self) -> &SyntheticConfig {
@@ -444,6 +451,20 @@ impl SyntheticModel {
         h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         h ^= h >> 31;
         ((h % u64::from(self.config.vocab())) as u32, (h >> 40) as f32)
+    }
+
+    /// The logit the host executors give `token` at a wanted row whose pick
+    /// is `pick` (a score of the record): the pick's is the largest, 4, and
+    /// any other token's a number from -8 to 0 that follows from the two, so
+    /// that a row that picks another token scores every token otherwise.
+    pub fn host_score(&self, pick: u32, token: u32) -> f32 {
+        if token == pick {
+            return 4.0;
+        }
+        let mut h = u64::from(pick) << 32 | u64::from(token);
+        h = (h ^ (h >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        -((h % 8000) as f32) / 1000.0
     }
 
     /// The context the row of `token` at `position` has: what the conductor
@@ -527,6 +548,10 @@ impl SyntheticModel {
 }
 
 impl Model for SyntheticModel {
+    fn measured(&self) {
+        self.measured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn card(&self) -> ModelCard {
         ModelCard {
             id: self.config.name.clone(),

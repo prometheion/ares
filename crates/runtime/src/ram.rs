@@ -96,6 +96,10 @@ struct Books {
     /// cannot work without (its staging slots and a few slots per layer).
     experts_want: u64,
     experts_floor: u64,
+    /// What the tier held when it last found nothing more to give (its slots
+    /// busy, or at their fewest): its floor until it gives or takes a piece
+    /// again, which forgets it. 0: none.
+    experts_stuck: u64,
     /// The most the prompt cache can use: the conductor's budget. And the
     /// part of it the cache keeps whatever the machine has: one checkpoint
     /// place for a model with recurrent state, and a few pages when its level
@@ -103,6 +107,11 @@ struct Books {
     cache_want: u64,
     place_floor: u64,
     pages_floor: u64,
+    /// The most bytes of K and V beyond VRAM that only the prompt cache holds
+    /// which it keeps whatever the tier of experts wants: the far pages of a
+    /// conversation, so that its next turn finds what it computed beyond VRAM
+    /// ([`PinnedRam::keep_context_cached`]).
+    far_keep: u64,
     /// What the machine lets the tier and the prompt cache hold above their
     /// floors; no bound with a fixed limit.
     experts_allow: u64,
@@ -155,14 +164,23 @@ impl Books {
     /// Why `bytes` more for `what` do not fit: who holds the limit.
     fn refusal(&self, bytes: u64, what: &str) -> String {
         format!(
-            "the RAM limit of {} has no room for {} more of {what}: the step record and \
-             read-back hold {}, the K/V beyond VRAM {}, the tier of experts {}, the prompt \
-             cache {}",
+            "the RAM limit of {} has no room for {} more of {what}: {}",
             Bytes(self.limit),
             Bytes(bytes),
+            self.holders()
+        )
+    }
+
+    /// Who holds the limit.
+    fn holders(&self) -> String {
+        format!(
+            "the step record and read-back hold {}, the K/V beyond VRAM {} (of which the prompt \
+             cache's {}), the tier of experts {} (it cannot give up {}), the prompt cache {}",
             Bytes(self.required),
             Bytes(self.context),
+            Bytes(self.context_cached),
             Bytes(self.experts),
+            Bytes(self.experts_floor()),
             Bytes(self.cache),
         )
     }
@@ -182,9 +200,20 @@ impl Books {
         self.cache + self.context_cached
     }
 
-    /// The prompt cache's floor, never more than it can use.
+    /// What the tier of experts cannot give up now: the part it cannot work
+    /// without, or what it held when it last found nothing more to give.
+    fn experts_floor(&self) -> u64 {
+        self.experts_floor.max(self.experts_stuck)
+    }
+
+    /// The prompt cache's floor, never more than it can use: one checkpoint
+    /// place, the pages its level on SSD moves state through, and the far pages
+    /// it holds up to [`Books::far_keep`]. The tier of experts does not take
+    /// it; the K and V of running sequences beyond VRAM do (the conductor gives
+    /// such pages up first when a step finds no room for them).
     fn cache_floor(&self) -> u64 {
         (self.place_floor + self.pages_floor).min(self.cache_want)
+            + self.context_cached.min(self.far_keep)
     }
 
     /// What the tier of experts and the prompt cache may hold now, by rank:
@@ -196,7 +225,7 @@ impl Books {
         let room = self.elastic_room();
         let cache_floor = self.cache_floor();
         let experts = self
-            .experts_floor
+            .experts_floor()
             .saturating_add(self.experts_allow)
             .min(room.saturating_sub(cache_floor));
         let tier = self.experts_want.max(self.experts);
@@ -208,9 +237,9 @@ impl Books {
     /// floors within the room the limit leaves them, by the same rank: what
     /// the machine shares out.
     fn wants(&self) -> (u64, u64) {
-        let floors = self.experts_floor + self.cache_floor();
+        let floors = self.experts_floor() + self.cache_floor();
         let room = self.elastic_room().saturating_sub(floors);
-        let experts = self.experts_want.saturating_sub(self.experts_floor).min(room);
+        let experts = self.experts_want.saturating_sub(self.experts_floor()).min(room);
         (experts, self.cache_want.saturating_sub(self.cache_floor()).min(room - experts))
     }
 }
@@ -262,7 +291,7 @@ impl Shared {
         let (experts_want, cache_want) = books.wants();
         Wants {
             locked: books.used(),
-            experts_held: books.experts.saturating_sub(books.experts_floor),
+            experts_held: books.experts.saturating_sub(books.experts_floor()),
             experts_want,
             cache_held: books.cache_usage().saturating_sub(books.cache_floor()),
             cache_want,
@@ -368,9 +397,11 @@ impl PinnedRam {
             experts: 0,
             experts_want: 0,
             experts_floor: 0,
+            experts_stuck: 0,
             cache_want: 0,
             place_floor: 0,
             pages_floor: 0,
+            far_keep: 0,
             experts_allow: allow,
             cache_allow: allow,
             asked: None,
@@ -456,6 +487,15 @@ impl PinnedRam {
         self.books().context_cached = bytes;
     }
 
+    /// Of the K/V beyond VRAM that only the prompt cache holds, up to `bytes`
+    /// are part of its floor: the tier of experts leaves them, so that a
+    /// conversation that goes on finds the far pages of its last turn on the
+    /// devices (as much as one request can hold beyond VRAM). The K and V of
+    /// running sequences beyond VRAM still outrank them.
+    pub fn keep_context_cached(&self, bytes: u64) {
+        self.books().far_keep = bytes;
+    }
+
     /// `len` bytes of address space for the K/V of the context beyond VRAM
     /// on `device`, of which nothing is locked yet: [`ContextRegion::lock`]
     /// locks, maps and books pieces of it.
@@ -504,17 +544,19 @@ impl PinnedRam {
             let mut books = self.books();
             books.experts_want = want;
             books.experts_floor = floor.min(want);
+            books.experts_stuck = 0;
         }
         if let Some(machine) = &self.shared.machine {
             machine.claim();
         }
     }
 
-    /// The tier of experts cannot go below `floor` bytes: it found that out
-    /// when it gave up all it could.
+    /// The tier of experts found nothing more to give at `floor` bytes: that
+    /// is its floor until it gives up or locks a piece again (a slot that was
+    /// busy may be free then), not for good.
     pub fn experts_floor(&self, floor: u64) {
         let mut books = self.books();
-        books.experts_floor = floor.min(books.experts_want);
+        books.experts_stuck = floor.min(books.experts_want);
     }
 
     /// Says what the prompt cache can use at most, the conductor's budget,
@@ -567,11 +609,18 @@ impl PinnedRam {
     }
 
     fn book_experts(&self, bytes: u64) -> Result<(), String> {
-        self.book(User::Experts, bytes, "the tier of experts")
+        let mut books = self.books();
+        books
+            .grow(User::Experts, bytes)
+            .map_err(|_| books.refusal(bytes, "the tier of experts"))?;
+        books.experts_stuck = 0;
+        Ok(())
     }
 
     fn release_experts(&self, bytes: u64) {
-        self.books().shrink(User::Experts, bytes);
+        let mut books = self.books();
+        books.shrink(User::Experts, bytes);
+        books.experts_stuck = 0;
     }
 
     /// Books `bytes` for what the executor cannot run without.
@@ -728,6 +777,12 @@ impl PinnedRam {
                     .sum::<u64>()
             })
             .sum()
+    }
+
+    /// The limit and who holds it now, for a message.
+    pub fn who_holds(&self) -> String {
+        let books = self.books();
+        format!("the limit is {}; {}", Bytes(books.limit), books.holders())
     }
 
     /// The bytes the limit leaves unbooked now.
@@ -1016,7 +1071,7 @@ struct ExpertPieces {
 
 impl Locker for ExpertPieces {
     unsafe fn lock(&mut self, ptr: *mut u8, len: usize) -> Result<Box<dyn Any + Send>, StoreError> {
-        self.ram.book_experts(len as u64).map_err(StoreError::Plan)?;
+        self.ram.book_experts(len as u64).map_err(StoreError::NoRoom)?;
         // Given back as it is dropped when the registration fails.
         let booking = Booking { ram: self.ram.clone(), user: Booked::Experts, bytes: len as u64 };
         // SAFETY: the caller's contract is that of the registration.

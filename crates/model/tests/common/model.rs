@@ -197,8 +197,18 @@ impl Model for Wrapped {
     fn abandon(&self, part: usize) {
         self.inner.abandon(part);
     }
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        self.inner.make_room(live)
+    }
+
     fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
         self.inner.before_step(record)
+    }
+    fn measured(&self) {
+        self.inner.measured();
+    }
+    fn idle(&self) {
+        self.inner.idle();
     }
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
         match &self.open {
