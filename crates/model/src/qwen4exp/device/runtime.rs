@@ -832,6 +832,13 @@ impl Model for Qwen4Exp {
         self.far
     }
 
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        match self.flow.get() {
+            Some(flow) => flow.make_room(live),
+            None => Ok(0),
+        }
+    }
+
     fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
         match self.flow.get() {
             Some(flow) => flow.before_step(record),

@@ -309,6 +309,10 @@ pub struct Counters {
     /// Requests that ended because the pool had no page left for them and
     /// nobody else was left to give way.
     pub requests_exhausted: u64,
+    /// Requests that ended because the RAM limit had no room for their K and
+    /// V beyond VRAM, with the prompt cache given up and the tier of experts
+    /// as small as it goes.
+    pub requests_no_memory: u64,
     /// Draft rows that were dropped from a step because their pages did not
     /// fit.
     pub draft_rows_cut: u64,

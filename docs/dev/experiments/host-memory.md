@@ -114,3 +114,68 @@ the thread that did it before (the end of a step unlocked the tier's pieces on a
 device thread, the conductor does it now as it collects the step; the RAM
 thread's frees of checkpoint chunks, which ran beside the steps, wait for the
 end of the step they meet).
+
+## Long prompts together and again beyond VRAM, measured (2026-11-25)
+
+The defects a user of Flash-Next reported (one RTX 4080, `--ram 40G` and `52G`, coding-agent
+requests of 40k to 50k tokens, often two at once), reproduced on the RTX 4070 and RTX 3060
+(IQ2_XS with its MTP block, `--ram 8G --context 262144 --parallel 4`: K and V of the first
+18 048 tokens in VRAM, the rest in RAM; `fix/flash-crashes`, the script
+`/var/tmp/ares-crashfix/repro.py`), main 1a28fb5c against the branch; load average 18 to 33
+from other agents' builds.
+
+| | main | branch |
+| --- | --- | --- |
+| Two chat requests 8 ms apart (one of 17.6k tokens with 13 tools, one of 3.4k without; also 56k and 6k) | the engine failed at once ("a step of 6112 rows in 2 segments"), the model went down | both answer |
+| A prompt of 32 034 tokens, then the same again | the second: 17 920 tokens from the cache, all of them replayed, first token after 107 s | 32 033 from the cache, 33 rows replayed, first token after 6.5 s |
+| A prompt of 93 425 tokens, then the same again | the second was read again; its tier's growth before a step was refused by the books ("no room for 62.8 MiB more of the tier of experts") and the engine failed | (2026-11-27, a text of 89 814 tokens) 89 813 from the cache, first token after 16.7 s |
+
+The repro on the branch (b251c819), five runs of both cases with new texts each (two
+servers of two runs and one of one): 5 of 5 answered; the short request of the pair had its
+first token after 14 to 37 s, the long one after 45 to 92 s; the repeat came from the cache
+with all but one token every time (32 021 to 32 035), its first token after 1.4 to 5.0 s.
+Main failed the pair again in the same run (05:16, "a step of 17586 rows in 2 segments").
+Before the place of a checkpoint was kept free of the far pages (an intermediate build), the
+repeat of a second text came from the cache all the same but replayed every row (110 s): the
+one place held the first text's anchor and the second found no room for its own.
+
+No loss beside it (the same, alternating main, branch, main, branch, each server from a copy
+of the same usage profile of the experts; a prompt of 8266 tokens, one of 8271 with 640 from
+the cache, a reply of 256 tokens after each; load average 2.5 to 10):
+
+| Run | Prompt 1 | Prompt 2 | Decode 1 | Decode 2 |
+| --- | --- | --- | --- | --- |
+| main | 14.93 s | 46.44 s | 6.6 tok/s | 6.9 tok/s |
+| branch | 14.34 s | 15.89 s | 11.3 tok/s | 14.1 tok/s |
+| main | 13.96 s | 15.69 s | 10.7 tok/s | 14.0 tok/s |
+| branch | 14.48 s | 16.51 s | 11.1 tok/s | 9.9 tok/s |
+
+The first run of main was disturbed (all four numbers far from the other three runs); the
+other three agree within the spread of one build's own runs.
+
+After the place of the step's checkpoints kept its room (2026-11-26, e2fa3e70, rebased on main
+0c4fbb60): the branch's own server test had failed twice on b251c819 ("the checkpoint places of
+the step: the RAM limit of 8.00 GiB has no room for 112.6 MiB more of checkpoints", at warm-up
+and on a request); it passes now from a cold start with the warm-up and from the profile (its
+repeat 38 458 of 38 459 tokens from the cache, 58 rows replayed). The repro again, five
+servers of one run each with new texts (load 6 to 30 from other agents' builds): 5 of 5; the
+pair's long request had its first token after 40 to 48 s and the short one after 12 to 14 s;
+the repeat came from the cache with all but one token (32 021 to 32 057), first token after
+1.3 to 7.8 s. Main 0c4fbb60 failed the pair at once ("a step of 17586 rows in 2 segments") and
+the model went down. A/B as above, main 0c4fbb60 against the branch:
+
+| Run | Load | Prompt 1 | Prompt 2 | Decode 1 | Decode 2 |
+| --- | --- | --- | --- | --- | --- |
+| main | 6.7 | 14.07 s | 15.75 s | 11.6 tok/s | 13.9 tok/s |
+| branch | 4.4 | 14.73 s | 16.55 s | 9.9 tok/s | 13.9 tok/s |
+| main | 3.7 | 14.73 s | 16.88 s | 9.5 tok/s | 13.5 tok/s |
+| branch | 6.2 | 14.85 s | 16.73 s | 10.8 tok/s | 13.8 tok/s |
+
+Within main's own spread (14.07 to 14.73 s for the first prompt); with the first A/B, main's
+first prompt took 13.96 to 14.93 s and the branch's 14.34 to 14.85 s. Load: weights in 9.1 to
+9.6 s and ready after 30.1 to 34.3 s in both builds; the plans of VRAM the same (room for
+expert slots 6.59 GiB on device 0, 11.22 GiB on device 1). The 8k prompts stay within the
+pages in VRAM, so the far K/V's rules are not met there. A short request (55 tokens, 54 from
+the cache) after the repeat of 89 814 tokens took 44 s: the experts it missed came from the
+drive at a median of 259 ms a read (47 ms an hour before, load 28 from other builds); after the
+repeats of 32k it took 2 to 8 s, as on main.
