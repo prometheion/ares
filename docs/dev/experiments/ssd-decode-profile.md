@@ -188,6 +188,13 @@ three other agents built and ran on the machine and its drive, load average 25 t
   anything else). UD-Q4_K_XL, the file of the profile above, is not on this machine (the disk
   has 81 GB free).
 
+## Main with the crash fixes (29c277e0)
+
+The same runs with `main` at 29c277e0 (#56 and the sweeps merged) against 83408e52, alternating
+(2026-11-27 17:19 to 17:33, load 4 to 10): at 39.5 GiB 69.2 / 73.5 ms against 69.3 / 74.0 (median
+/ mean; 56.6 % in VRAM, an expert's reads 3.68 against 3.71 ms); at 16 GiB 154.2 / 177.4 against
+160.4 / 200.8. The profile holds for the main of now.
+
 ## The counters cost nothing
 
 The wait counters (B against A, alternating, untimed medians): at 40 GiB 68.14 and 68.20 ms
