@@ -117,7 +117,7 @@ const DEFAULT_SHARED: u32 = 48 << 10;
 const MM_PREFETCH_L2_BYTES: u32 = 16 << 20;
 
 /// How the prefill family reads its activations and which of its two kernels it
-/// runs. See [`Kernels::prefill_path`].
+/// runs. See [`Kernels::prefill_path_for`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillPath {
     /// Integer `mma` over the weights' integer codes and activations quantized
