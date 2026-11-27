@@ -94,14 +94,16 @@ completion, has to wait for a core. With fewer workers that the scheduler places
 | --- | ---: | ---: | ---: | ---: |
 | 39.5, the engine's 13 pinned (B1, B2, B3) | 67.5 / 72.1 ms | 93.6 ms | 3.62; 2.73 ms | 25.2 / 11.9 ms |
 | 39.5, 13 placed by the scheduler | 68.0 / 73.3 | 93.5 | 3.60; 2.85 | 25.4 / 12.3 |
+| 39.5, 12 | 61.9 / 65.8 | 82.8 | 2.78; 1.76 | 17.2 / 13.2 |
 | 39.5, 10 | 61.9 / 65.6 | 82.8 | 2.50; 1.60 | 15.4 / 14.3 |
 | 39.5, 6 | 64.9 / 68.5 | 82.9 | 2.47; 1.58 | 17.9 / 15.0 |
 | 16, the engine's 13 pinned (B1, B2) | 158.6 / 181.0 | 251.2 | 5.09; 4.40 | 142.5 / 3.8 |
+| 16, 12 | 125.2 / 145.9 | 210.9 | 3.85; 3.62 | 107.6 / 3.8 |
 | 16, 10 | 121.2 / 140.9 | 210.7 | 3.89; 2.95 | 100.7 / 5.8 |
 
-With three cores free an expert's reads take 2.5 ms, about what the drive takes for one alone
-(2.0 ms), and the step is 8 to 12 % faster at 40 GiB and 16 to 24 % at 16 GiB; the CPU's share grows a little with
-fewer workers (11.9 to 14.3 ms).
+With two cores free (12 workers) an expert's reads take 2.8 ms and with three 2.5 ms, near what
+the drive takes for one alone (2.0 ms), and the step is 8 to 12 % faster at 40 GiB and 16 to 24 %
+at 16 GiB; twelve workers keep the CPU's share (13.2 against 11.9 ms; 14.3 with ten).
 
 ## The read-ahead
 
@@ -194,7 +196,7 @@ a run; the others are bounds from the parts of the step.
 
 | # | Lever | 40 GiB | 16 GiB | Grounds |
 | --- | --- | ---: | ---: | --- |
-| 1 | A core for the I/O thread (the CPU workers leave the reader a core) | -10 ms (14 %) | -42 ms (23 %) | measured with `--cpu-workers 10`: -6.2 and -40 ms, the file waits -10 and -42 ms, the CPU's waits +2.4 ms for three workers fewer |
+| 1 | A core for the I/O thread (the CPU workers leave the reader a core) | -6 to -11 ms (9 to 12 %) | -35 to -42 ms (16 to 23 %) | measured with 12 and 10 workers the scheduler places: -6.3 and -35 ms on the mean step, -11 and -40 ms on the later steps; the file waits -8 to -10 and -35 to -42 ms, the CPU's waits +1.3 ms with 12 |
 | 2 | The stream mixers at the card's bandwidth (#18) | up to -5.5 ms (8 %) | up to -5.5 ms (3 %) | 7.8 ms for 644 MiB that take 2.3 at 288 GB/s |
 | 3 | The CPU's share closer to the memory's bandwidth | -2 to -4 ms (3 to 6 %) | -1 ms | 4.3 experts a layer in 0.31 ms, 39 GB/s from RAM |
 | 4 | One read per expert (a file of Ares's own) | -1.5 to -3 ms (2 to 4 %) | -6 to -11 ms (3 to 6 %) | an expert alone takes 2.0 ms in three reads at depth 1; what one read of 3 MB takes is not measured |
