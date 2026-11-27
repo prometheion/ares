@@ -137,6 +137,21 @@ impl Layout {
 }
 
 /// Which pieces of the region the tier holds and what it may hold.
+/// What one shrink of the RAM tier gave back ([`ExpertStore::on_shrink`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RamShrink {
+    /// The pieces given up.
+    pub pieces: usize,
+    /// Their bytes.
+    pub bytes: u64,
+    /// The bytes the tier holds after it.
+    pub held: u64,
+    /// The bytes it may hold.
+    pub target: u64,
+    /// It holds more than it may and has nothing left to give.
+    pub at_floor: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct Pieces {
     pub layout: Layout,
@@ -227,6 +242,21 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.pieces.at_floor
     }
 
+    /// Forgets that the tier found nothing more to give: it tries again at
+    /// the next [`ExpertStore::shrink_ram`]. A slot that was busy (on its way
+    /// somewhere, or set aside) may be free since, so the floor the tier found
+    /// is not its floor for good.
+    pub fn retry_floor(&mut self) {
+        self.pieces.at_floor = false;
+    }
+
+    /// Tells `f` of every shrink of the RAM tier that gave up a piece, where
+    /// it gave it up (with the store held: `f` only reports). The runtime
+    /// writes no log; the owner of the store does.
+    pub fn on_shrink(&mut self, f: Box<dyn FnMut(RamShrink) + Send>) {
+        self.on_shrink = Some(f);
+    }
+
     /// Says how many bytes the tier may hold from now on. It follows between
     /// steps ([`ExpertStore::shrink_ram`], [`ExpertStore::grow_ram`]).
     pub fn set_ram_target(&mut self, bytes: u64) {
@@ -273,6 +303,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         let mut given = 0;
         let mut kept = HashSet::new();
+        let before = self.region.locked_bytes() as u64;
         while self.region.locked_bytes() as u64 > self.pieces.target {
             let Some(piece) = self.piece_to_release(&kept) else {
                 self.pieces.at_floor = true;
@@ -289,6 +320,18 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
         }
         self.pieces.shrinking = false;
+        if given > 0
+            && let Some(f) = &mut self.on_shrink
+        {
+            let held = self.region.locked_bytes() as u64;
+            f(RamShrink {
+                pieces: given,
+                bytes: before - held,
+                held,
+                target: self.pieces.target,
+                at_floor: self.pieces.at_floor,
+            });
+        }
         Ok(given)
     }
 
@@ -320,12 +363,19 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// Returns the pieces locked. Locking takes time (tens of milliseconds a
     /// piece) and is done here, by the caller's thread: call it between
     /// steps, where no step waits for the store (a lock waits for no step to
-    /// run, and inside one it fails: [`ares_cuda::gate`]).
+    /// run, and inside one it fails: [`ares_cuda::gate`]). A piece that the
+    /// RAM limit has no room for now (others hold more than the allowance
+    /// counted on, such as the prompt cache until it gives up what it holds
+    /// beyond its allowance) is no error: the tier stays as it is.
     pub fn grow_ram(&mut self, most: usize) -> Result<usize, StoreError> {
         let mut locked = 0;
         while locked < most {
             let Some(piece) = self.ram_piece_to_lock() else { break };
-            self.region.lock(piece)?;
+            match self.region.lock(piece) {
+                Ok(()) => {}
+                Err(StoreError::NoRoom(_)) => break,
+                Err(error) => return Err(error),
+            }
             self.revive(piece);
             self.stats.pieces_locked += 1;
             self.pieces.at_floor = false;

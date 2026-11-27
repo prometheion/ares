@@ -89,6 +89,13 @@ pub trait TokenFilter: Send {
         false
     }
 
+    /// Ends the reply's thinking from the next row on, as a spent budget of
+    /// thinking does, if the reply is inside it now; whether it was. A rule
+    /// that knows no thinking says `false`.
+    fn end_thinking(&mut self) -> bool {
+        false
+    }
+
     /// Why the rule can no longer be followed, if it cannot (the engine behind
     /// it failed in the middle of the reply). The request ends with an error:
     /// text that goes on without the rule is not what was asked for.
@@ -431,6 +438,12 @@ impl RequestSampler {
         self.stash.clear();
         let asked = self.params.logprobs.is_asked();
         self.stash.extend((0..picks.len()).map(|i| probs.get(i).filter(|_| asked).copied()));
+    }
+
+    /// Ends the reply's thinking from the next row on, if it is inside it now
+    /// ([`TokenFilter::end_thinking`]).
+    pub fn end_thinking(&mut self) -> bool {
+        self.filter.as_mut().is_some_and(|filter| filter.end_thinking())
     }
 
     /// Whether the request asked for probabilities.

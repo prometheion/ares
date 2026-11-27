@@ -211,6 +211,12 @@ pub struct PartReport {
     pub reserved: u64,
     /// How long the upload of the dense weights took.
     pub upload: Duration,
+    /// Whether the device's tensor cores add f16 products into f32 as fast as
+    /// into f16.
+    pub full_rate: bool,
+    /// The path of the tile kernels each quantized dense type takes in wide
+    /// steps, measured on the device.
+    pub paths: Vec<ares_cuda::PrefillChoice>,
 }
 
 impl PartReport {
@@ -232,6 +238,8 @@ impl PartReport {
             scratch: part.scratch_bytes(),
             reserved,
             upload: part.upload_time(),
+            full_rate: part.tensor_cores_full_rate(),
+            paths: part.prefill_paths(),
         }
     }
 }

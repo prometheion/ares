@@ -42,8 +42,9 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
 | --- | --- |
 | Parallel requests against the owner's fork at production settings (the owner, 2026-11-23: "the whole reason I am making the engine"): two generating, one generating beside a long prompt, two agent sessions, 3 to 8 at once, priorities | measured (see "Parallel requests against the owner's production"); the fixes merged 2026-11-24 (above). Open: the expert store stalling under a full loan ("Defects"), a floor that rises for a request near its end ("Features"); `--parallel` defaults to 4 (the owner, 2026-11-24) |
 | DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 | measured (`flash/trees-study`, instruments only, not merged): Flash-Next +1 to 3 % with a tree of 4, larger trees lose, reading ahead from token tables or route memory +1 % (they name 1.4 to 6 % of a round's missing experts); 27B +9 % with trees of at most 8 rows; the MTP chain with its own candidates as siblings is as good as a DFlash tree of 8 nodes. The lever the data point at: a distinct expert in a few-row step costs 16.5 µs (about 80 GB/s of the cards' 360 / 500); at 5 µs chains reach about 120 tokens/s and trees then pay +15 %. Owner's decision on what to build ("Questions to the owner") |
-| Jev mode (`feat/jev`, 2026-11-25) | in work ("Features", "Jev mode") |
+| Jev mode (`feat/jev`, 2026-11-25) | built and measured (what was done in [`dev/history.md`](dev/history.md), the numbers in [`dev/experiments/decisions.md`](dev/experiments/decisions.md)); what is left under "Features", "Jev mode" |
 | The push day's leftovers (`chore/leftovers`, 2026-11-25) | in work (under "Decided by the owner", the push day) |
+| Prompt progress as llama.cpp's server sends it, and a default log for a person (`feat/progress-logs`, the owner, 2026-11-26) | built (see [`dev/history.md`](dev/history.md), 2026-11-26), not merged; what is left is under "Features", "Server and API" |
 
 ## Decided by the owner (2026-11-22)
 - The triage's seven questions, answered 2026-11-25:
@@ -58,7 +59,8 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
     experts from the SSD, must be usable (slower, but working well). The option's name and form go to
     the owner before it is built.
   - The second card's role is remembered per model, cards, driver and binary, and measured again
-    when one of them changes (to build: `fix/model-sweep`).
+    when one of them changes (built on `fix/model-sweep`, 2026-11-25: `roles.rs`, `<fingerprint>.roles`
+    beside the usage profiles; "The second card's role" in `dev/architecture/devices.md`).
   - `cache_prompt` is accepted with its meaning: `true` is the normal behaviour, `false` makes the
     request neither read nor write the prompt cache (to build: `fix/server-sweep`).
   - DFlash2 trees come after the few-row kernels and are decided with those costs.
@@ -193,22 +195,9 @@ marks a line that only a GPU run can settle or check.
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
 | Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 15 | 11 |
+| Model, runtime, kernels | 13 | 12 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
-- [ ] Two long prompts arriving together become one step of 8007 rows in 2 segments, which
-      Flash-Next's layer pass refuses ("a step wider than 512 rows reads one prompt",
-      `qwen4exp/device/runtime/pass.rs` `pass_of`): both requests get 500 and the model is unloaded.
-      In work: `fix/flash-crashes`.
-- [ ] Far K/V finds no RAM room ("the tier of experts is at its floor and the prompt cache holds the
-      rest", `qwen4exp/device/flow.rs` `FAR_WAIT`) at `--ram 40G` beside a 39,810-token request and at
-      `--ram 52G` repeating a 50k prompt: the prompt cache (lowest rank) does not give way, the tier's
-      floor latches for good (`runtime/src/ram.rs` `experts_floor`), and the engine takes the model
-      down instead of ending one request. In work: `fix/flash-crashes`.
-- [ ] The same 49,965-token prompt sent again (one sequence, `--ram 52G`) was read again from the
-      start instead of taken from the prompt cache, while the first request's far pages still held
-      RAM as prompt cache; the second read's new far pages then hit the RAM failure above. A repeat
-      must reuse the finished sequence's pages and checkpoints. In work: `fix/flash-crashes`.
 - [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
       hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
 
@@ -263,6 +252,17 @@ Tests that fail:
       rule); the wide step's bound or its spread is to be settled (whether the integer prompt
       kernel raised the spread is not measured). Files: `crates/model/tests/qwen4exp_runtime.rs`,
       `crates/model/tests/qwen4exp_device.rs`.
+      *Seen on `fix/model-sweep` (2026-11-26, both local cards, load 10 to 30):* in the whole
+      `qwen4exp_runtime` suite `a_prompt_read_layer_by_layer_leaves_checkpoints_inside_it` failed
+      (its message was lost: the run was stopped) and the next test,
+      `a_prompt_read_layer_by_layer_reads_k_and_v_beyond_vram_from_a_copy`, did not end in 20
+      minutes (device 0 at 100 %, its device thread spinning, device 1 idle), as if a kernel the
+      failed test left behind still waited. Alone both passed (10 s and 3 s), and the suite again
+      31 of 31 at load 8 to 15. A test that fails should not leave the cards waiting for the
+      next. The same day `qwen4exp_device`
+      `experts_of_every_weight_type_on_the_cpu_change_nothing_3` failed once at load 16 to 20 on
+      "every expert has a slot" (353 of 384 experts got one, so the device had less room than at
+      other times) and passed alone at load 5 to 10.
 - [ ] GPU (two cards). `qwen4exp_device` with both cards on every layer
       (`ARES_TEST_SPREAD=tensor`, the share 0.5 and experts only alike), 2026-11-23 on main a36d379:
       `every_layer_of_wide_steps_matches_the_reference` (attention core 5.16e-2 against a bound of
@@ -301,25 +301,13 @@ Tests that fail:
       `crates/sched/src/confidence.rs`, the test.
 
 Wrong behaviour:
-- [ ] Flash-Next's K/V group sizes its partial states with the bound of before (twenty tiles of
-      the budget: `20 * target_blocks / kv_heads + 64`): a prompt that reads its prefix with
-      another sequence, or past its first tiles with K and V in `q7` to `q4`, can take more (the
-      27B failed so on 2026-11-23, fixed there by 5d5aee5f). To size it with
-      `PlanConfig::state_slots_bound` as the 27B does, measured for the slots it costs. Files:
-      `crates/model/src/qwen4exp/device/part/frame.rs`, `qwen4exp/device/part.rs` (`check_states`).
-- [ ] Device memory is not behind the gate of page-locked memory: `cuMemFree` "may perform
-      implicit synchronization" too (the libcuda deadlock's class). An engine allocates it when its
-      model opens and frees it when the model goes, but for the 27B's attention plan larger than
-      its buffer (`Plan::upload` inside a step) and an engine that unloads beside another that
-      serves. Files: `crates/cuda/src/memory.rs` (`DeviceBuffer::drop`), `crates/cuda/src/gate.rs`,
-      `crates/model/src/qwen35/device/part.rs`.
-- [ ] The 30-s checks of a step that waits count from the start of the wait, not from the last
-      progress, and then fail the step (`Flow::check`): seen 2026-11-24 as "a step stood still for
-      30s while rows of the n-gram table were read" at load 27 to 34 (main as well), beside the
-      hang after a long far request (the libcuda deadlock, fixed 2026-11-24). Timed from the start:
-      the n-gram wait, the throttle, `follow`, the lend waits and the pass's waits; only `wait_for`
-      and `complete` restart on progress. Files: `crates/model/src/qwen4exp/device/flow.rs`,
-      `qwen4exp/device/runtime/pass.rs`.
+- [ ] GPU. The step price the server measures at load is not monotonic in the rows (Flash-Next on
+      the local cards, 2026-11-25: 1 row 22.9 ms, 2 rows 118.7, 3 rows 166.4, 8 rows 80.9; the
+      report on an RTX 4080: 1 row 17.4, 2 rows 126.9, 8 rows 55.5). It is measured before the
+      warm-up fills the tiers, so the steps of few rows wait for experts from the drive; the
+      share and the piece size price steps by it until real steps teach the prices. Seen by
+      `fix/flash-crashes`, not the cause of its defects. Files: `crates/server/src/load/start.rs`,
+      `crates/runtime/src/conductor/measure.rs`.
 - [ ] GPU. Flash-Next: rounds between the pieces of a paused pass can stall the expert store when
       the pass borrows all the slots can lend ("a step stood still for 30s while the host held
       back the next layer ... the store waits for 7 to 9 experts and is not settled": a 21k-row
@@ -331,6 +319,14 @@ Wrong behaviour:
       slots (the item said `top_k + vram_reserve`), lower than when the stall was seen: check it
       again first. Files: `crates/runtime/src/expert_store/scratch.rs`, `hybrid.rs`,
       `transit.rs`, `crates/runtime/src/conductor/mod.rs`.
+      *Checked on `fix/model-sweep` (2026-11-25), not reproduced:* the local RTX 4070 alone,
+      IQ2_XS with the MTP block, `--ram 8G`, `--context 40960`; a fresh prompt of 31.1k to 31.2k
+      tokens read alone as a pass (steps of up to 32768 rows on lent VRAM), joined 3 s later by a
+      request that generates 400 tokens (`/var/tmp/ares-fixmodel/ab/d4.sh`): main a8920d61 4 runs
+      of 4 without a stall (prompt 62 to 69 s, the 400 tokens 104 to 114 s), the branch 2 of 2 and
+      4 more with the prompt cached, load 6 to 36. A pass opened beside generation is half as wide
+      (the conductor), where it never stalled. What is left is the robustness the item names (the
+      store bringing a step's experts whatever a loan holds), untested.
 - [ ] GPU. **Lent steps with the CPU's share** (found by `kvfix`, 2026-11-24; main's, not the far
       pages'): on the made-up model (`prompt(300, 7)`, the BF16 test file, steps of 32 rows on a
       loan, placement One) the first token's log-probabilities are 58 -1.80..-1.85 and 22
@@ -344,7 +340,12 @@ Wrong behaviour:
       share on lent VRAM is computed differently in some runs. The reading of `misses.rs`,
       `hybrid/wide.rs`, `cpu/mod.rs` and `transit.rs` found no cause; a diagnostic that prints the
       first tokens' log-probabilities per run (`zz_dbg_lent_gaps`, with the serve mode and a log
-      line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`). Files:
+      line per wide layer's CPU share) is in `/var/tmp/ares-kvfix/` (`exp5-all.patch`).
+      *Classified on `fix/model-sweep` (2026-11-25): a defect, not a near tie.* The CPU reference
+      (the patch's `zz_dbg_reference_margins`, same file and prompt) puts 58 first with a gap of
+      0.433 to 22 (logits); the common state's log-probabilities (-1.80..-1.85 against
+      -2.20..-2.25, a gap of about 0.40) agree with it, the other state's (-2.14 against -2.10, 22
+      ahead by 0.04) is off by about 0.47. The cause is not found. Files:
       `crates/model/src/qwen4exp/device/misses.rs`, `crates/runtime/src/expert_store/hybrid/wide.rs`,
       `expert_store/cpu/mod.rs`, `expert_store/transit.rs`.
 - [ ] GPU. With both devices on every layer the MTP block's chains after a pass agree with the
@@ -369,6 +370,16 @@ Wrong behaviour:
       Not looked into (a cache replay runs as wide rows, which round differently from single rows,
       but then 160 tokens should differ too). Files: `crates/model/src/qwen35/device/`,
       `crates/runtime/src/cache/`, `crates/server/tests/real_drafts.rs`.
+      *Looked at on `fix/model-sweep` (2026-11-25, main a8920d61, the local RTX 4070, one card,
+      no drafts, `/var/tmp/ares-fixmodel/ab/d8.sh`): a near tie, not a defect by the owner's rule.*
+      The two replies of 40 tokens (the same hashes as above) part at their last token only: the
+      first, its prompt of 66 tokens read as one step, has " " -1.411 before ' "' -1.475; the second,
+      from the cache (`prompt_n` 1: one row computed after the state at cell 65), ' "' -1.428 before
+      " " -1.481. The first reply of 40 is the first 40 tokens of the reply of 160. At 160 all agree
+      because none came from the cache: each of the three requests read all 66 tokens (the reply
+      ends with its end token at 148 tokens, and the next request found no state to resume from;
+      after a reply cut at 40 it did). That difference of the cache is the server's
+      (`fix/server-sweep`: a checkpoint at the end of every request).
 
 ## Small fixes
 Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of a done piece.
@@ -376,7 +387,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 | Area | Small fixes |
 | --- | --- |
 | Server, API, cache | 10 |
-| Model, runtime, kernels | 14 |
+| Model, runtime, kernels | 5 |
 
 ### Server, API, cache
 - [ ] An MTP block inside Flash-Next's own model file is used only when `--drafters mtp` names
@@ -432,51 +443,54 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       still decoded on the host for every pass (both models). Files:
       `crates/model/src/dflash/device.rs` (`pass_layers`), `qwen35/device/part/dflash.rs`,
       `qwen4exp/device/part/dflash.rs`, `crates/model/src/blocks/rows.rs`.
+      *Not done on `fix/model-sweep` (2026-11-25):* what it takes: `pass_layers` writes a pass's
+      `block` rows per sequence on the host (the newest token's row decoded through the `embed`
+      callback, then the mask row) and uploads them, 16 rows of `n_embd` f32 a sequence (320 KiB
+      for the 27B). On the device: the mask row uploaded once at open and copied into rows 1 to
+      `block - 1`, the newest token's row gathered from the table's staged rows (`rows::source`,
+      `embed_gather`) into a row of its own and copied to row 0; the drafter's device test against
+      the reference (`crates/model/tests/dflash.rs`, the 27B's drafter file) checks it.
 - [ ] Flash-Next past the dense limit: a draft window's row that reaches across the point where
       a tile leaves the newest cells reads that tile exact, the row alone reads it converted
       (`Group::ahead` is planned for rows within the limit only; the lists are made on the
       device from the table, which still names the exact entry). A shadow row of the table for
       such rows would close it. Files: `crates/model/src/blocks/kv.rs`, `blocks/forms.rs`,
-      `crates/model/src/qwen4exp/device/part.rs` (`build_plan`).
+      `crates/model/src/qwen4exp/device/part.rs` (`build_plan`). *Not done on `fix/model-sweep`
+      (2026-11-25).*
 - [ ] Transit adoption (`transit_adopt`, the prompt chunks' experts taking VRAM slots after a
       wide step) asks only "hotter than the coldest member" (with the swap margin when the member
       has to be copied down), not the rule of a promotion (`promote_hot`); it was left for the work
       on prompt chunks that borrow expert slots, which is merged. Files:
       `crates/runtime/src/expert_store/transit.rs`, `expert_store/hybrid.rs`.
+      *Looked at on `fix/model-sweep` (2026-11-25), not changed:* the two rules differ where the
+      costs do. A promotion uploads the newcomer over the link, so it asks the margin and the bonus
+      of `SwapRule` (against trading places back and forth, an upload each time); an adoption finds
+      the newcomer on the device already (a copy inside VRAM), and asks the same margin exactly
+      when the swap costs a transfer (the member copied down to RAM). When RAM holds the member,
+      the swap moves nothing over the link, and a promotion back still needs the margin, so no
+      upload can trade places back and forth. The promotion's rule there would keep a colder member
+      in VRAM for nothing. Open only as a measurement (adoptions per prompt and the decode after it
+      with the margin on both), if someone doubts it.
 - [ ] The MTP block's experts are not in the usage profile (they are filled in the order of their
       numbers at the start). Files: `crates/model/src/qwen4exp/device/usage.rs`,
       `qwen4exp/device/feed.rs` (`fill_mtp`), `crates/runtime/src/expert_store/profile.rs`.
-- [ ] The heat counts the steps that measure the price of a step at the start (token 0, about a
-      thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
-      still counts it for a model without a profile. Files:
-      `crates/runtime/src/conductor/measure.rs`, `crates/model/src/qwen4exp/device/usage.rs`.
-- [ ] A loan of VRAM stays while the engine is idle after a request that ended with its prompt
-      (it goes back at the next step only). Files: `crates/model/src/qwen4exp/device/flow.rs`,
-      `qwen4exp/device/runtime/pass.rs`.
-- [ ] A log line when the tier shrinks (a shrink is counted only; the runtime has no log, so the
-      server needs a callback). Files: `crates/runtime/src/expert_store/elastic.rs`,
-      `crates/runtime/src/ram.rs`, the server's loader.
-- [ ] Flash-Next's step scratch starts its buffers on a 64-byte line, not the 128-byte line fixed
-      for the 27B (`Kernels::ACTIVATION_LINE`). File: `crates/model/src/qwen4exp/device/part/frame.rs`
-      (`PieceCarve`).
+      *Looked at on `fix/model-sweep` (2026-11-25), not a gap:* the MTP block's layer is resident
+      (`feed.rs`, `spec_of(.., true)`; its bytes, every expert, come out of the device's budget
+      before the tiers), and `fill_mtp` brings all of its experts when the parts open, before the
+      first step. A profile could only change the order of a fill that ends before the engine
+      serves; nothing of the block is chosen by heat. It matters only if the block stops being
+      resident (a block larger than VRAM), which nothing plans.
 - [ ] Float experts beyond the f16 range are not caught in the many-row kernels (`WeightRange` is
       applied to the dense matrices and the router only). Files:
       `crates/model/src/qwen4exp/device/load.rs`, `qwen4exp/device/part/wide.rs`,
       `crates/cuda/src/experts.rs`.
-- [ ] The DFlash drafter's float matrices take the f16 tile path above eight rows without the
-      range check of Flash-Next's (`WeightRange`). File: `crates/model/src/dflash/device.rs`.
-- [ ] Sampler: a row with no finite logit reports `-0.0` where the reference says minus infinity
-      (the test leaves such rows out). Files: `crates/cuda/kernels/sampler*.cuh`,
-      `crates/cuda/src/sampler.rs`, `crates/cuda/tests/sampler.rs`.
-- [ ] `qwen35_run` with the DFlash drafter at the default split and a 32k context: the tool sizes
-      its pool from the context alone and the device's ledger refuses the drafter (the server's
-      plan counts it, through the model's `footprint`). File: `crates/model/examples/qwen35_run.rs`.
-- [ ] The randomized test of admission plays one priority. File: `crates/sched/tests/admission.rs`.
-- [ ] The examples' own copies of `Rng` (attention, expert layer, expert rows, expert types,
-      sampler steps, far attention benches) and `f32_bytes` (attention, expert layer, expert
-      rows), where `crates/cuda/tests/common` has them. Left as it is on purpose: the runtime's
-      `store_hidden` (a hot CPU path); optional: the kernel side's type lists per module as an
-      X-macro list. Files: `crates/cuda/examples/`.
+      *Looked at on `fix/model-sweep` (2026-11-25), not done:* the many-row kernels turn a float
+      expert's weights into f16 (`EngMmFloat`, `mm_types_more.cuh`; beyond 65504 an infinity). The
+      dense matrices are read at load, the experts are not (a streamed model's experts would all
+      have to be read), so the check belongs where the store reads an expert (float shapes only, a
+      pass over its bytes), and a wide step needs a way for a layer with such an expert that does
+      not exist yet (the decode kernels eight rows at a time, or the CPU). Only files with float
+      experts are concerned; none of the owner's are.
 
 ### Decode under offload (a user's runs, 2026-11-25): the aim of item 3
 One RTX 4080 16 GB, Flash-Next UD-IQ4_XS (87 GiB), `--ram 52G`, `--context 131072`, `--parallel 1`, MTP:
@@ -552,7 +566,7 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
 `/var/tmp/ares-survey/src/`. The settings and tables: [`dev/experiments/against-the-fork.md`](dev/experiments/against-the-fork.md).
 - [ ] Quality against the fork at equal settings (KL or top-1); VRAM was measured 2026-11-23
       (11.5 / 10.1 against 11.6 / 11.7 GiB).
-- [ ] Float matrices under the fast precision use f16 sums (0.04 to 0.06 % rms) where the
+- [ ] Float matrices on a capped card use f16 sums (0.04 to 0.06 % rms) where the
       F32 matrices of an IQ4_XS file were exact before: decide with a KL measurement (the 27B's
       chooser; Flash-Next's float products keep f32 sums).
 - [ ] A turn that continues at 17-23k read 576 tokens/s (fork 880; Ares 1020 from the start of a
@@ -571,7 +585,14 @@ The fork is archived since 2026-11-25: comparisons use a build from a clone unde
       VRAM, quality.
 
 ## Questions to the owner
-- None open (the seven of the triage answered 2026-11-25, under "Decided by the owner").
+- The far pages a finished request leaves (`fix/flash-crashes`, 2026-11-25): the prompt cache's
+  floor now keeps as many as one request can hold beyond VRAM from the tier of experts, so that
+  the same long prompt sent again comes from the cache (asked by the coordinator after the
+  report of 2026-11-25; the decision of 2026-11-22 above had them give way before the tier).
+  They still give way to running sequences' K and V first. Open: whether the machine's memory
+  pressure (another program growing) should take them before the tier too; today it does not
+  (they are in the floor). Files: `crates/runtime/src/ram.rs` (`Books::cache_floor`,
+  `keep_context_cached`), `crates/runtime/src/cache/moves.rs` (`trim`).
 
 ## Features
 Pieces of real work, days each, in the order of work where the owner placed them.
@@ -664,9 +685,14 @@ Pieces of real work, days each, in the order of work where the owner placed them
       is a question to the owner).
 
 ### Server and API
+- [ ] Left of the prompt progress and the log (`feat/progress-logs`, 2026-11-26): a step of
+      Flash-Next's prompt on lent VRAM that is not a pass, and the 27B's prompt steps, report
+      after each step only (the share inside a step comes from the pass alone); the acceptance
+      of drafts by position is in `/metrics`, not in a request's lines (llama.cpp prints it at
+      trace).
 - [ ] Left of the thinking budget and the loop guard (K03, K05, done 2026-11-22): the
       thresholds are fixed (no option); a passage loop of longer cycles (Strata's opt-in #728)
-      is not looked for; `reasoning_control` is not built (refused with a 400).
+      is not looked for.
 - [ ] Left of priorities (S06, done 2026-11-22): a prompt of a worse priority still takes its
       share of the time next to generation of a better one (the floor of generation, not the
       priority, bounds it); a threshold of the gap before a running request gives way (SGLang's,
@@ -718,20 +744,25 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       vision tower. In the order (the owner, 2026-11-23): after the 27B and Flash-Next are at least
       as fast as the fork and Strata in everything, one piece at a time.
 
-### Jev mode (in work on `feat/jev`, 2026-11-25)
-- [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime. Later.
-      Reference (2026-11-18): Flide, https://github.com/OmniJev/Flide (Apache-2.0, Python and
-      Triton, a server for the Jev `/v1/systemone` API, paper arXiv:2610.42148): "exact state
-      forking", one state forked into the questions, each answered in one forward pass, the
-      answer the one the model gives the question alone; a gated delta-rule kernel (from
-      flash-linear-attention), so recurrent state is forked as in our models; Qwen3.5 and Gemma 4
-      chat models and the OneJev / Open-Jev decision models; several requests in one body, up
-      to 256 options a question, a session cache (`--session-cache-gb`), `--batch-invariant`.
-      Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
-      in 28 s; "up to 9.5 times faster than vLLM and SGLang".
-      Its groundwork in the runtime, kept by the cleanup for it (2026-11-24): the decisions of
-      `ares-sched` (`Want::Score`, `PartKind::Score`, the option rows first in `plan`), the
-      conductor's arms for them, and `Engine::decide`, which answers Unsupported today.
+### Jev mode (`feat/jev`, 2026-11-25)
+- [ ] Forks as rows of one step whatever `--parallel` is: a fork today is a sequence with a slot
+      of its own (150 MiB of recurrent state on the 27B) that restores the parent's checkpoint
+      from RAM, so with the owner's `--parallel 2` the questions of a decision run two at a time
+      (1.3 to 2.1 s a decision of 8 questions on the 27B, 2026-11-26,
+      [`dev/experiments/decisions.md`](dev/experiments/decisions.md)).
+      Flide's way is a fork that reads the parent's state and writes none: a segment flag for the
+      delta-rule and convolution kernels (state read from the parent's slot), page tables and
+      exact entries for fork slots that have no recurrent state, the MTP block and DFlash
+      skipping fork rows, and the conductor seating forks in those slots. It touches both models'
+      device parts, the kernels and the executor's tables.
+- [ ] Images in a decision (Flide puts a request's `images` ahead of the text of the user turn,
+      for a model that reads them): refused with Flide's 422 today.
+- [ ] A decision model's own calibration (Flide's `template` format: temperatures, label sets,
+      readout heads in the model's files) and the formats of native decision models (OneJev,
+      Open-Jev and the rest): only chat models are asked, as Flide's `next_token` asks them.
+- [ ] Flide's `--batch-invariant` (the same bits whatever a request is batched with): a fork's
+      logits depend on the size of the steps its rows run in, as every prompt's do ("Rounding"
+      in [`dev/architecture/sequence-state.md`](dev/architecture/sequence-state.md)).
 
 ### Vulkan (last)
 - [ ] A backend-free crate and the `ares-gpu` facade; expert and Flash-Next kernels; both

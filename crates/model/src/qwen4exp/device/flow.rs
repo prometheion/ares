@@ -48,6 +48,9 @@ pub(super) const LEAD_LAYERS: usize = 6;
 /// an expert can end, before the device threads leave it.
 const DRAIN: Duration = Duration::from_secs(5);
 
+/// How often a wait of a second or more looks at what the steps moved ([`Flow::check`]).
+const LOOK_EVERY: Duration = Duration::from_millis(10);
+
 /// How long the tier of experts locks pieces at a time when it may hold
 /// more and no step runs: the thread that watches the machine's memory does
 /// it, it must look again soon, and a step that begins waits for it.
@@ -77,6 +80,11 @@ pub(super) struct Flow {
     /// Uploads and reads the store had finished the last time anyone looked.
     pub(super) uploads_seen: AtomicU64,
     pub(super) stall: Duration,
+    /// For a wait that has stood still a while ([`Flow::check`]): what the steps
+    /// had moved when it was last seen to change, when, and when it was last looked at.
+    pub(super) moved_at: Mutex<(u64, Instant, Instant)>,
+    /// Reads of the n-gram table's rows done the last time anyone looked.
+    pub(super) ngram_seen: AtomicU64,
     /// What the store counted, summed over the times it was read.
     pub(super) totals: Mutex<ExpertStats>,
     /// What the wide steps found and waited for, since the engine started.
@@ -145,6 +153,8 @@ impl Flow {
             failed: AtomicBool::new(false),
             uploads_seen: AtomicU64::new(0),
             stall,
+            moved_at: Mutex::new((0, Instant::now(), Instant::now())),
+            ngram_seen: AtomicU64::new(0),
             totals: Mutex::new(ExpertStats { ram_tier_bytes: ram_bytes, ..Default::default() }),
             wide: Mutex::new(WideStats::default()),
             own_rows,
@@ -253,7 +263,13 @@ impl Flow {
                 }
                 pages.get(near as usize..).unwrap_or(&[]).to_vec()
             };
-            self.lock_far(&mut feed, &live)?;
+            if let Some(short) = self.lock_far(&mut feed, &live, FAR_WAIT)? {
+                return Err(invalid(format!(
+                    "the RAM limit has no room for {} more of K and V beyond VRAM: {}",
+                    Bytes(short),
+                    self.ram.who_holds()
+                )));
+            }
         }
         // The number `begin` knows the step by (see `Qwen4ExpDevice::enqueue_step`).
         self.prepared.store(u64::from(record.step()) + 1, Ordering::Release);
@@ -261,6 +277,29 @@ impl Flow {
             feed.store.grow_ram(1).map_err(|e| invalid(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// The K and V beyond VRAM of the pool pages `live` (a flag per pool page) are
+    /// about to be in use: the pieces of the far pools they lie in are locked and the
+    /// others given back, the tier of experts giving what its allowance no longer
+    /// holds ([`Flow::lock_far`]). Returns the bytes the RAM limit still lacks (0:
+    /// room enough) for the conductor, which makes the prompt cache give way and
+    /// asks again, or ends a request ([`ares_runtime::Model::make_room`]). The pages
+    /// in use from now on are those of `live`, as a record's tables would name them.
+    pub(super) fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        let Some(near) =
+            self.far.first().map(|pool| pool.lock().unwrap_or_else(|e| e.into_inner()).near())
+        else {
+            return Ok(0);
+        };
+        let mut feed = self.lock_feed();
+        let far = {
+            let mut pages = self.pages_live.lock().unwrap_or_else(|e| e.into_inner());
+            pages.clear();
+            pages.extend_from_slice(live);
+            pages.get(near as usize..).unwrap_or(&[]).to_vec()
+        };
+        Ok(self.lock_far(&mut feed, &far, Duration::ZERO)?.unwrap_or(0))
     }
 
     /// Pool page `page` came in by a transfer: it is in use from now on,
@@ -339,17 +378,27 @@ impl Flow {
 
     /// Locks the pieces of every far pool that hold far pages in use (`live`,
     /// a flag per far slot) and gives back the others, between steps (from
-    /// [`Flow::before_step`]), with the store not in a step. The tier of
-    /// experts gives up what the RAM limit has no room for: a running
-    /// sequence's K and V rank above it (see "Host memory" in
-    /// `docs/dev/architecture/host-memory.md`).
-    fn lock_far(&self, feed: &mut Feed, live: &[bool]) -> Result<(), ModelError> {
+    /// [`Flow::make_room`] and [`Flow::before_step`]), with the store not in a
+    /// step. The tier of experts gives up what its allowance no longer holds: a
+    /// running sequence's K and V rank above it (see "Host memory" in
+    /// `docs/dev/architecture/host-memory.md`); what the prompt cache holds
+    /// beyond its allowance is the conductor's to give. Once all is locked, a
+    /// tier above its allowance gives the difference too: the K and V may have
+    /// taken room that was free for the prompt cache's floor. Returns the bytes
+    /// the limit still lacks once the tier holds no more than its allowance (or
+    /// has nothing more to give) and `wait` has passed, `None` when all is locked.
+    fn lock_far(
+        &self,
+        feed: &mut Feed,
+        live: &[bool],
+        wait: Duration,
+    ) -> Result<Option<u64>, ModelError> {
         if self.far.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut last = self.far_live.lock().unwrap_or_else(|e| e.into_inner());
         if last.as_slice() == live {
-            return Ok(());
+            return Ok(None);
         }
         let mut pools: Vec<_> =
             self.far.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner())).collect();
@@ -372,29 +421,52 @@ impl Flow {
                 None => break,
                 Some(Err(error)) => return Err(error),
                 Some(Ok(short)) => {
-                    if started.elapsed() > FAR_WAIT {
-                        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
-                        return Err(invalid(format!(
-                            "the RAM limit has no room for {} more of K and V beyond VRAM: the \
-                             tier of experts is at its floor and the prompt cache holds the rest",
-                            Bytes(short.0)
-                        )));
-                    }
-                    // The tier gives up what its allowance no longer has room for.
-                    feed.store.set_ram_target(self.ram.experts_allowance());
-                    feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
+                    // The tier gives up what its allowance no longer has room for. It
+                    // tries again what it found busy before: what is free now goes.
+                    let allowance = self.ram.experts_allowance();
+                    feed.store.set_ram_target(allowance);
+                    feed.store.retry_floor();
+                    let given = feed
+                        .store
+                        .shrink_ram(FAR_SHRINK_WAIT)
+                        .map_err(|e| invalid(e.to_string()))?;
                     drop(feed.store.take_released());
                     if feed.store.ram_at_floor() {
                         self.ram.experts_floor(feed.store.ram_bytes().0);
                     }
                     self.ram.sweep_checkpoints();
+                    // Nothing more comes from the tier: it holds no more than its
+                    // allowance, or has nothing left it can give. What the limit
+                    // lacks then is the prompt cache's to give (the conductor's), or
+                    // no one's.
+                    let settled = given == 0
+                        && (feed.store.ram_bytes().0 <= allowance || feed.store.ram_at_floor());
+                    if (settled && started.elapsed() >= wait) || started.elapsed() > FAR_WAIT {
+                        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+                        return Ok(Some(short.0));
+                    }
                 }
             }
         }
-        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+        let now: u64 = pools.iter().map(|p| p.locked()).sum();
+        self.ram.set_context_target(now);
+        // K and V that found the room they took free leave the tier above its
+        // allowance when that room was the prompt cache's floor, such as the place
+        // of a checkpoint the step locks as it is handed over: the tier gives the
+        // difference now, before that lock (it waits for none).
+        let allowance = self.ram.experts_allowance();
+        if now > locked && feed.store.ram_bytes().0 > allowance {
+            feed.store.set_ram_target(allowance);
+            feed.store.retry_floor();
+            feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
+            drop(feed.store.take_released());
+            if feed.store.ram_at_floor() {
+                self.ram.experts_floor(feed.store.ram_bytes().0);
+            }
+        }
         last.clear();
         last.extend_from_slice(live);
-        Ok(())
+        Ok(None)
     }
 
     /// Lends every device the VRAM of a step wider than the parts' own
@@ -473,13 +545,38 @@ impl Flow {
         layers as u64 + self.uploads_seen.load(Ordering::Relaxed)
     }
 
-    /// An error when another part failed, or when the step has stood still
-    /// since `started` for longer than a step may.
+    /// An error when another part failed, or when the step has stood still for
+    /// longer than a step may: since the wait began at `started`, and since
+    /// anything of the steps last moved ([`Flow::moved`]). What moved is looked at
+    /// only in a wait of a second or more; a wait that holds the store (the
+    /// lend waits) sees no read or upload end and counts from its start.
     pub(super) fn check(&self, started: Instant, what: &str) -> Result<(), ModelError> {
         if self.failed.load(Ordering::Acquire) {
             return Err(ModelError::Aborted);
         }
-        if started.elapsed() < self.stall {
+        let waited = started.elapsed();
+        if waited < self.stall.min(Duration::from_secs(1)) {
+            return Ok(());
+        }
+        // What moved is looked at every few milliseconds at most, by one waiting thread at a
+        // time: a look takes the store's lock, which the pumps of the waits need.
+        let mut at = match self.moved_at.try_lock() {
+            Ok(at) => at,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return Ok(()),
+        };
+        let now = Instant::now();
+        let still = if now.saturating_duration_since(at.2) >= LOOK_EVERY {
+            at.2 = now;
+            let mut mark = (at.0, at.1);
+            let still = stood_still(waited, self.moved(), &mut mark, now);
+            (at.0, at.1) = mark;
+            still
+        } else {
+            waited.min(now.saturating_duration_since(at.1))
+        };
+        drop(at);
+        if still < self.stall {
             return Ok(());
         }
         self.fail();
@@ -488,7 +585,26 @@ impl Flow {
             Ok(feed) => feed.standing_still(&enqueued),
             Err(_) => "the expert store is busy".to_owned(),
         };
-        Err(invalid(format!("a step stood still for {:.0?} while {what}: {state}", self.stall)))
+        Err(invalid(format!("a step stood still for {still:.0?} while {what}: {state}")))
+    }
+
+    /// A number that changes whenever anything of the steps moves: what
+    /// [`Flow::progress`] counts, a pass's rows handed on, taken or let run, and
+    /// reads of the n-gram table's rows that ended.
+    fn moved(&self) -> u64 {
+        let ngram = match self.ngram.try_lock() {
+            Ok(ngram) => {
+                self.ngram_seen.store(ngram.completed(), Ordering::Relaxed);
+                ngram.completed()
+            }
+            Err(_) => self.ngram_seen.load(Ordering::Relaxed),
+        };
+        let pass =
+            self.pass_sent.load(Ordering::Acquire) + self.pass_released.load(Ordering::Acquire);
+        self.progress()
+            .wrapping_add(pass as u64)
+            .wrapping_add(self.pass_go.load(Ordering::Acquire))
+            .wrapping_add(ngram)
     }
 
     /// Serves the store until `part` has no layer enqueued more than the lead
@@ -532,6 +648,29 @@ impl Flow {
                 break;
             }
             std::hint::spin_loop();
+        }
+    }
+
+    /// Nothing runs and nobody waits ([`Model::idle`](ares_runtime::Model::idle)):
+    /// VRAM lent for wide steps and for a pass that has read its rows goes back
+    /// now, so that the tiers have their slots while the engine idles, not at
+    /// the next step. No step follows to read what the last one left there.
+    /// A pass that has not read all its rows keeps its loan.
+    pub(super) fn idle(&self) {
+        let mut feed = self.lock_feed();
+        if feed.store.in_step() {
+            return;
+        }
+        if !self.forget_done_pass() {
+            return;
+        }
+        self.on_loan.store(false, Ordering::Release);
+        for device in 0..self.lent.len() {
+            // What fails here (the fill from RAM into the slots given back)
+            // fails the next step, which gives back again.
+            if feed.store.return_scratch(device).is_err() {
+                return;
+            }
         }
     }
 
@@ -660,6 +799,16 @@ impl Flow {
     }
 }
 
+/// How long a wait that began `waited` ago has stood still: since it began or since
+/// the steps last moved, whichever is later. `at` is what they had `moved` when that
+/// was last seen to change, and when; it takes `moved` at `now` when that differs.
+fn stood_still(waited: Duration, moved: u64, at: &mut (u64, Instant), now: Instant) -> Duration {
+    if at.0 != moved {
+        *at = (moved, now);
+    }
+    waited.min(now.saturating_duration_since(at.1))
+}
+
 /// Marks pool page `page` in use in `pages`, a flag per page.
 fn mark_live(pages: &mut Vec<bool>, page: u32) {
     if pages.len() <= page as usize {
@@ -746,5 +895,24 @@ impl Routing {
     /// Whether both devices work on every layer.
     pub(super) fn shared(&self) -> bool {
         self.owned.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_stands_still_from_its_start_or_the_last_move_whichever_is_later() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        // Nothing moved since long before the wait: it counts from its start.
+        let mut at = (7, t0);
+        assert_eq!(stood_still(s(31), 7, &mut at, t0 + s(100)), s(31));
+        // Something moved: it counts from when that was seen.
+        assert_eq!(stood_still(s(32), 8, &mut at, t0 + s(101)), s(0));
+        assert_eq!(at, (8, t0 + s(101)));
+        assert_eq!(stood_still(s(50), 8, &mut at, t0 + s(119)), s(18));
+        assert_eq!(stood_still(s(70), 8, &mut at, t0 + s(139)), s(38));
     }
 }

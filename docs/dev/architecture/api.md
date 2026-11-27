@@ -126,7 +126,7 @@ The controls are llama-server's, under its names and defaults:
 | Effort | `--reasoning-effort` | `reasoning_effort` | the variable `reasoning_effort`; refused if the template does not read it; of the usual values (`minimal` to `xhigh`) the ones the template raises for are found when the model is set up (`refused_efforts`: Flash-Next `minimal` and `high`, the 27B `minimal`): `high` is then the template's default, as on `/v1/messages`, and another one is refused |
 | Thinking of earlier turns stays in the prompt | `--reasoning-preserve` (default on), `--no-reasoning-preserve` | `chat_template_kwargs.preserve_reasoning` | the variable `preserve_reasoning` |
 | Any other variable of the template | `--chat-var` | `chat_template_kwargs` | the variable; `messages`, `tools`, `add_generation_prompt`, `bos_token` and `eos_token` are the server's |
-| A budget of thinking tokens and the message injected when it is spent | `--reasoning-budget-tokens` (llama-server's `--reasoning-budget`), `--reasoning-budget-message` | `reasoning_budget_tokens`, `thinking_budget_tokens`, vLLM's `thinking_token_budget` (also on `/v1/responses`), `reasoning_budget_message`; Anthropic's `thinking.budget_tokens` | the guard of the reply (below); `-1` is no budget of the request's own (the model's default holds, as in llama-server); `reasoning_control` (llama-server's route that ends the thinking while it runs) is not built and refused |
+| A budget of thinking tokens and the message injected when it is spent | `--reasoning-budget-tokens` (llama-server's `--reasoning-budget`), `--reasoning-budget-message` | `reasoning_budget_tokens`, `thinking_budget_tokens`, vLLM's `thinking_token_budget` (also on `/v1/responses`), `reasoning_budget_message`; Anthropic's `thinking.budget_tokens` | the guard of the reply (below); `-1` is no budget of the request's own (the model's default holds, as in llama-server); `reasoning_control` (llama-server's arming of its route that ends the thinking while it runs) is accepted: `/v1/chat/completions/control` with `reasoning_end` ends any running reply's thinking (`Engine::end_thinking`, the guard forced as a spent budget forces it) |
 
 *The budget and the guard against loops* (`crates/runtime/src/guard.rs`).
 llama-server keeps the budget in its sampler, which forces the tokens of the
@@ -793,8 +793,8 @@ that the first request does not find every slot empty. It has the prefix cache
 and the prompt cache on SSD as the 27B has them; it speculates only with a model
 drafter that `--drafters` names (its MTP block, from the model file or a file of
 its own, and a DFlash drafter), whose window is 4 rows by default and at most 8,
-and takes `--draft-vocab` with one. It has no `--shares` and no `--precision
-exact`; asking for either is an error that names it. Thinking is handled as for the
+and takes `--draft-vocab` with one. It has no `--shares`; asking for it is an
+error that names it. Thinking is handled as for the
 27B: the model declares what its chat template says (`Model::chat_format`), so
 the reasoning of a reply comes apart from the content, in streams too, and
 `--reasoning` and the controls of a request work the same way; a reply that

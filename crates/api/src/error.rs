@@ -38,6 +38,12 @@ pub enum EngineError {
     /// A bug or a failed device. The client did nothing wrong.
     #[error("internal engine error: {0}")]
     Internal(String),
+    /// The engine's memory limit had no room for what the request needed
+    /// while it ran (its state beyond VRAM, with what else ran then): the
+    /// request ended, the model stays up. Retrying later can succeed; the
+    /// message says what was short.
+    #[error("{0}")]
+    NoMemory(String),
 }
 
 #[cfg(test)]

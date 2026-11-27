@@ -142,6 +142,8 @@ pub struct HostExecutor {
     devices: usize,
     record: Vec<u8>,
     picks: Vec<Pick>,
+    /// The logits the record's scores name, from the step that ran last.
+    scores: Vec<f32>,
     delay: Duration,
     /// The time of a step by its rows, in place of `delay`.
     step_cost: Option<Box<dyn Fn(u32) -> Duration + Send>>,
@@ -179,6 +181,11 @@ pub struct HostExecutor {
     pauses: Option<Pauses>,
     paused_inner: Vec<crate::InnerSave>,
     paused: bool,
+    /// Whether the executor says how far a step has got ([`HostExecutor::with_shares`]),
+    /// from how long into the step on, and the piece the step that was dispatched is of
+    /// the step the model runs in pieces.
+    shares: Option<Duration>,
+    piece: Option<(u32, u32)>,
 }
 
 /// Which steps a model that reads long prompts in pieces pauses: a step of one prompt
@@ -258,6 +265,7 @@ impl HostExecutor {
             devices: 1,
             record: vec![0; record_bytes],
             picks: Vec::new(),
+            scores: Vec::new(),
             delay: Duration::ZERO,
             step_cost: None,
             step_delay: Duration::ZERO,
@@ -282,6 +290,8 @@ impl HostExecutor {
             pauses: None,
             paused_inner: Vec::new(),
             paused: false,
+            shares: None,
+            piece: None,
         }
     }
 
@@ -390,6 +400,22 @@ impl HostExecutor {
     pub fn with_pauses(mut self, rows: u32, pieces: u32) -> Self {
         assert!(pieces >= 1, "a step is at least one piece");
         self.pauses = Some(Pauses::new(rows, pieces));
+        self
+    }
+
+    /// Says how far the step in flight has got ([`Executor::step_share`]), as a model
+    /// that reads a long prompt in pieces does: the share of its time that has passed,
+    /// and of a step run in pieces ([`HostExecutor::with_pauses`]) the pieces before
+    /// it and that share of its own. A step that sleeps ends its waits within a limit
+    /// ([`Executor::wait_for_step`]) when it is over or the limit is.
+    pub fn with_shares(self) -> Self {
+        self.with_shares_after(Duration::ZERO)
+    }
+
+    /// [`HostExecutor::with_shares`] from `silent` into a step on: before, the model
+    /// says nothing, as one whose first piece waits for the drive.
+    pub fn with_shares_after(mut self, silent: Duration) -> Self {
+        self.shares = Some(silent);
         self
     }
 
@@ -504,9 +530,36 @@ impl Executor for HostExecutor {
         let mut rows_run = true;
         let mut inner: Vec<crate::InnerSave> =
             (0..view.inner_saves()).map(|i| view.inner_save(i)).collect();
+        // A step wider than the model's own rows borrows memory for its time, which only
+        // a prompt read alone gets (a model that reads it layer by layer refuses any
+        // other); and a model keeps one paused step, so no other wide step runs while
+        // one is paused.
+        let own = self.model.own_rows();
+        if !view.drafts_only() && view.rows() > own {
+            if view.segments() > 1 {
+                note(
+                    &self.problems,
+                    format!("a step of {} rows in {} segments", view.rows(), view.segments()),
+                );
+            }
+            let paused = self.pauses.as_ref().and_then(Pauses::paused_slot);
+            if let Some(slot) = paused
+                && (0..view.segments()).any(|i| view.segment(i).slot != slot)
+            {
+                note(
+                    &self.problems,
+                    format!(
+                        "a step of {} rows while the step of slot {slot} is paused",
+                        view.rows()
+                    ),
+                );
+            }
+        }
+        self.piece = None;
         if let Some(pauses) = &mut self.pauses
             && let Some(done) = pauses.step(&view)
         {
+            self.piece = Some((done, pauses.pieces()));
             self.paused = done < pauses.pieces();
             rows_run = !self.paused;
             if done == 1 {
@@ -580,6 +633,16 @@ impl Executor for HostExecutor {
             }
         }
         drop(tables);
+        // The scores are read from the logits before the masks change them:
+        // here, from the picks the rows make without them.
+        self.scores.clear();
+        for i in 0..view.scores() {
+            let (row, token) = view.score(i);
+            self.scores.push(match self.picks.get(row as usize) {
+                Some(pick) => self.model.host_score(pick.token, token),
+                None => f32::NAN,
+            });
+        }
         Self::apply_masks(&view, &mut self.picks, self.model.config().vocab());
         // Rows the model left: from the first in a window on, another token.
         self.inexact.clear();
@@ -611,6 +674,34 @@ impl Executor for HostExecutor {
         Ok(())
     }
 
+    fn wait_for_step(&mut self, _spin: Duration, limit: Duration) -> bool {
+        if !self.sleeps || self.gate.is_some() {
+            return true;
+        }
+        match self.step_delay.checked_sub(self.dispatched_at.elapsed()) {
+            Some(left) if left > limit => {
+                std::thread::sleep(limit);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn step_share(&self) -> Option<f64> {
+        if self.shares.is_none_or(|silent| self.dispatched_at.elapsed() < silent) {
+            return None;
+        }
+        let passed = if self.step_delay.is_zero() {
+            1.0
+        } else {
+            (self.dispatched_at.elapsed().as_secs_f64() / self.step_delay.as_secs_f64()).min(1.0)
+        };
+        Some(match self.piece {
+            Some((done, of)) => (f64::from(done - 1) + passed) / f64::from(of),
+            None => passed,
+        })
+    }
+
     fn collect(&mut self, _spin: Duration, out: &mut StepOutput) -> Result<Woke, ExecError> {
         if let Some(gate) = &self.gate
             && !gate.wait(Duration::from_secs(20))
@@ -630,6 +721,8 @@ impl Executor for HostExecutor {
         }
         out.picks.clear();
         out.picks.extend_from_slice(&self.picks);
+        out.scores.clear();
+        out.scores.extend_from_slice(&self.scores);
         out.drafts.clear();
         out.drafts.extend_from_slice(&self.drafts);
         out.draft_probs.clear();

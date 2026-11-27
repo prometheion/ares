@@ -24,32 +24,15 @@ use ares_cuda::{
     Event, PlanConfig, Planner, Result, Stream, Wait, devices,
 };
 
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::{Rng, f32_bytes};
+
 const TILE: usize = 128;
 const CONVERTED: u32 = 0x8000_0000;
 const D: usize = 256;
 const KV: usize = 4;
 const G: usize = 6;
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn gaussian(&mut self) -> f32 {
-        let u1 = (self.next() >> 40) as f32 / (1u64 << 24) as f32 + 1e-7;
-        let u2 = (self.next() >> 40) as f32 / (1u64 << 24) as f32;
-        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
 
 fn u32_bytes(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -186,8 +169,8 @@ fn build(
 
     let mut rng = Rng(99);
     let step = 4096usize.min(len);
-    let k_host: Vec<f32> = (0..step * KV * D).map(|_| rng.gaussian()).collect();
-    let v_host: Vec<f32> = (0..step * KV * D).map(|_| rng.gaussian()).collect();
+    let k_host: Vec<f32> = (0..step * KV * D).map(|_| rng.normal()).collect();
+    let v_host: Vec<f32> = (0..step * KV * D).map(|_| rng.normal()).collect();
     let k_dev = upload(device, &f32_bytes(&k_host))?;
     let v_dev = upload(device, &f32_bytes(&v_host))?;
     let status = upload(device, &[0u8; 4])?;
@@ -268,7 +251,7 @@ fn time_step(
     let n_rows = rows * setup.seqs.len().max(views);
     let q_total = KV * G;
     let mut rng = Rng(7);
-    let q: Vec<f32> = (0..n_rows * q_total * D).map(|_| rng.gaussian()).collect();
+    let q: Vec<f32> = (0..n_rows * q_total * D).map(|_| rng.normal()).collect();
     let q_dev = upload(device, &f32_bytes(&q))?;
     let out = DeviceBuffer::new(device, (n_rows * q_total * D * 4) as u64)?;
     let mut planner = Planner::new(

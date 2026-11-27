@@ -18,13 +18,14 @@ does not read are passed over. `null` counts as "not set".
 | `POST` | `/v1/messages` | Anthropic Messages, whole or streamed |
 | `POST` | `/v1/responses` | OpenAI Responses, without state |
 | `POST` | `/v1/chat/completions/input_tokens`, `/v1/messages/count_tokens`, `/v1/responses/input_tokens` | count the prompt of a request of that API; nothing is generated |
+| `POST` | `/v1/chat/completions/control` | llama.cpp's control of a running completion: `{"id", "action": "reasoning_end", "model"}` ends its thinking ([Thinking](#thinking)) |
 | any | `/v1/responses/{id}`, `/v1/responses/{id}/{what}` | 404: no response is kept |
 | `GET` | `/props` | what a model is (llama.cpp's shape); `?model=<id>` with several models |
 | `POST` | `/tokenize`, `/detokenize` | text to tokens and back (llama.cpp's shapes) |
 | `GET` | `/metrics` | counters and histograms in the Prometheus text format; `?model=<id>` with several models |
 | `POST` | `/models/load`, `/models/unload` | `{"model": "<id>"}`: load or unload a model; answers `{"success": true}` at once |
 | `GET` | `/models/sse` | Server-Sent Events: the state of every model, then every change (`{"model", "event": "model_status", "data": {"status", "reason"}}`) |
-| `POST` | `/v1/systemone` | the decision route of Jev mode; answers 501 until it is built |
+| `POST` | `/v1/systemone` | decisions (Jev mode): questions about a state answered by choosing among options, see [Decisions](#decisions) |
 
 Every generating request names its `model`: an id or an alias. An unknown model
 is a 404 `model_not_found` that lists the ids. A model that is not loaded is
@@ -41,6 +42,7 @@ the server has one.
 | 404 / 405 | an unknown route or model / a wrong method |
 | 408 / 413 | the body did not arrive within `--timeout` / the body is larger than 64 MiB |
 | 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/metrics`, and `/tokenize` and `/detokenize` without a `model`), the server is stopping |
+| 507 | `insufficient_memory` with `Retry-After: 1`: the RAM limit (`--ram`) had no room for the request's state beyond VRAM while it ran, with the prompt cache given up; the request ended (in a stream, as an error event), the model serves on |
 
 Errors have OpenAI's shape `{"error": {"message", "type", "param", "code"}}`,
 and Anthropic's `{"type": "error", "error": {"type", "message"}}` on `/v1/messages`.
@@ -57,6 +59,9 @@ prompt and those marked "chat".
 | `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; of several, `n_predict` holds, then `max_completion_tokens` |
 | `stop` | stop strings | a string or an array; not empty |
 | `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
+| `return_progress` | a stream says how far the prompt has got (llama.cpp's member) | see [Prompt progress](#prompt-progress); changes nothing without `stream` |
+| `sse_ping_interval` | the seconds of silence after which a stream sends a ping (llama.cpp's member) | whole seconds; `0` or `-1`: no pings; default 15 |
+| `timings_per_token` | the last chunk of every step of a stream has `timings`, the reply's so far (llama.cpp's member) | no hash and no drafts before the end; changes nothing without `stream` |
 | `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
 | `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
 | `priority` | the request's priority | see [Priorities](#priorities) |
@@ -75,6 +80,7 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |
 | `ignore_eos`, `min_keep` | the reply does not end at the end token; a `min_keep` above 1 is refused |
+| `backend_sampling` | llama.cpp's choice of where it samples, whose draws are the same; Ares samples on the device: a boolean, without effect |
 
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
 `functions` and `function_call`, adaptive-p (`adaptive_target`,
@@ -83,9 +89,11 @@ no chat template.
 
 The answer has OpenAI's shape and more: `usage.prompt_tokens_details.cached_tokens`
 (the part of the prompt the prompt cache gave), `usage.completion_tokens_details.reasoning_tokens`,
-`timings` (`prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, their rates,
-`draft_n` and `draft_n_accepted` for a request that ran alone, and `token_hash`, a
-hash of the reply's token ids), and `stop_reason` with the stop string that ended
+`timings` (llama.cpp's fields: `cache_n`, `prompt_n`, `prompt_ms`, `predicted_n`,
+`predicted_ms`, their milliseconds per token and rates,
+`draft_n` and `draft_n_accepted`, the request's own drafts, and `token_hash`, a
+hash of the reply's token ids; `prompt_ms` runs from the request's start in the
+engine, after its wait in line, to its first token, as llama.cpp's does), and `stop_reason` with the stop string that ended
 the reply. A request that asked for more tokens than `--max-tokens-limit` gets the
 limit, and its response the header `x-ares-max-tokens-limit` with it.
 
@@ -103,6 +111,7 @@ limit, and its response the header `x-ares-max-tokens-limit` with it.
 | `tool_choice` | `auto`, `any`, `tool` with `name`, `none`; `disable_parallel_tool_use` |
 | `thinking` | see [Thinking](#thinking) |
 | `stop_sequences` | stop strings; `stop_reason` is `stop_sequence` and `stop_sequence` names it |
+| `sse_ping_interval` | llama.cpp's member: the seconds of silence before a `ping` event; `0` or `-1`: none |
 | `output_config` | `format: {"type": "json_schema", "schema": ...}`; `effort` is the reasoning effort |
 | `context_management` | the edits `clear_thinking_20251015` and `clear_tool_uses_20250919`, as Anthropic's service makes them; the response's `context_management.applied_edits` lists those that changed the prompt, with what they cleared; `count_tokens` adds `context_management.original_input_tokens`, the count before the edits |
 | `cache_control` | accepted on the body, blocks and tools, without effect: every prefix is cached anyway |
@@ -122,7 +131,7 @@ state: every response says `"store": false`.
 
 | Field | Notes |
 | --- | --- |
-| `model`, `temperature`, `top_p`, `stream`, `priority` | as on the chat route; other sampling fields are refused |
+| `model`, `temperature`, `top_p`, `stream`, `priority`, `return_progress`, `sse_ping_interval`, `timings_per_token` | as on the chat route; other sampling fields are refused |
 | `instructions` | a system message |
 | `input` | a string, or items: messages (`user`, `assistant`, `system`, `developer`; parts `input_text`, `output_text`, `input_image`), `function_call`, `function_call_output`, `reasoning` |
 | `tools`, `tool_choice`, `parallel_tool_calls` | functions only; `tool_choice` `auto`, `none`, `required`, `{"type": "function", "name"}` |
@@ -169,6 +178,7 @@ that generates (for clients that cannot add a field, such as Claude Code with
 | effort | `reasoning_effort` | `output_config.effort` | `reasoning.effort` |
 | budget of tokens | `reasoning_budget_tokens`, `thinking_budget_tokens` or `thinking_token_budget` (`-1`: the model's default), `reasoning_budget_message` | `thinking.budget_tokens` | `thinking_token_budget` |
 | format | `reasoning_format`: `auto` or `none` | thinking blocks | a `reasoning` item |
+| end it now | `/v1/chat/completions/control` with the stream's `id` and `"action": "reasoning_end"`; `reasoning_control` is accepted | | |
 
 The defaults come from `--reasoning`, `--reasoning-effort`, `--reasoning-format`
 and `--reasoning-budget-tokens`. An effort is a 400 when the chat template does not
@@ -179,6 +189,11 @@ means the template's default (Flash-Next's template knows `low`, `medium` and
 spent, the budget's message and the end of the thinking are written and the
 answer follows. A budget on a model without thinking is refused. Thinking that
 loops is ended the same way, and one token repeated 256 times ends a reply.
+The control route ends the thinking of a running chat completion the same way at
+once, as llama.cpp's does: `{"success": true}`, or `false` with a `message` when no
+running completion of that id is inside its thinking. llama.cpp's
+`reasoning_control: true` arms its route for a request; here every reply can be
+ended, so the member is read for its type and says nothing more.
 Other `chat_template_kwargs` are template variables; `messages`, `tools`,
 `add_generation_prompt`, `bos_token` and `eos_token` are the server's.
 
@@ -238,6 +253,41 @@ An image has at most 16384 pixels a side and 64 megapixels, within the 64 MiB of
 a body. Remote URLs are not fetched. One image becomes at most
 `--image-max-tokens` tokens; a larger one is shrunk.
 
+## Decisions
+
+`POST /v1/systemone` answers typed questions about a `state` by choosing among
+options, with no text generated ("Jev mode"), for every model. The request, the
+answer and the errors are Flide's (TypeSafe's System One API), so a client of
+Flide works unchanged.
+
+| Field | Meaning |
+| --- | --- |
+| `state` | what the questions are about: text, or any JSON (written into the prompt as Python's `json.dumps` writes it); null when left out |
+| `model` | the model's id or an alias; `jev-latest` or none: the one model the server serves |
+| `questions` | a map of question id to `{"type", "instructions", "criteria"}`: `choice` with `criteria` a map of option to description (1 to 256 options), `score` with a list of levels (1 to 256), `noul` with `{"true", "false"}` descriptions (optional); `instructions` (any JSON) optional |
+| `requests` | instead of `state` and `questions`: a list of up to 1024 such requests, answered together; one that fails fails them all |
+
+The answer is `{"model", "answers", "usage", "meta"}`: a `choice` has the chosen
+key, the `probabilities` of all options and a `confidence`; a `score` the
+expected level (`score`), the `legend` as sent, the `probabilities` and a
+`confidence`; a `noul` the probability of yes (`noul`). Numbers have six
+places. `usage` counts `input_tokens` (the shared state once and every
+question's rest) and one `output_tokens` a question; `meta` says how the model
+read it (`prefix_tokens` shared, `branches`, `cached_tokens` of the state from
+the prompt cache). Several requests answer `{"model", "results": [...]}`.
+
+Every question is a prompt of its own: the state, a blank line, the question
+with its options labeled (A to Z and two-letter labels, `yes`/`no`, 0 to 9),
+thinking off, read at the first token of the reply as vLLM's and Flide's
+`/v1/systemone` read a chat model. The questions share the state: it is
+computed once (or found in the prompt cache) and forked into the questions.
+Errors are Flide's: 422 with `{"detail": [{"loc", "msg", "type"}]}` for a
+request that cannot be served as written, 404 for a model that is not served,
+429 with `Retry-After` when the line is full, else `{"detail": "..."}`. The
+query takes `debias` and `debug`, which a chat model has no use for. Images
+are refused (422); there is no streaming. Every answer carries
+`x-typesafe-request-id` (the client's, or one of the server's).
+
 ## Streaming
 
 | API | Events |
@@ -248,6 +298,38 @@ a body. Remote URLs are not fetched. One image becomes at most
 
 A stream starts after the engine's first step, so a refused request still gets
 an HTTP status, or after 10 seconds without it. A failure later is an error event.
+A stream that has sent nothing for 15 seconds sends a ping (a comment line `:`,
+on Messages a `ping` event); `sse_ping_interval` sets the seconds, `0` or `-1` none,
+as llama.cpp's member does (its server's default is 30).
+
+### Prompt progress
+
+`return_progress: true` on a streamed `/v1/chat/completions`, `/v1/completions` or
+`/v1/responses` request asks for llama.cpp's `prompt_progress` before the first
+text: `{"total", "cache", "processed", "time_ms"}`, all tokens of the prompt, those
+the prompt cache gave, those done with the cached ones, and the milliseconds since
+the request started in the engine (its wait in line not counted). A client shows
+`(processed - cache) / (total - cache)`, as llama.cpp's web UI does.
+
+| API | Where it is |
+| --- | --- |
+| chat | a chunk with the role and no text (`delta: {"role": "assistant", "content": ""}`) |
+| completions | a chunk with `text: ""` |
+| Responses | a `response.in_progress` event |
+
+The first comes when the request starts in the engine (`processed` is `cache`),
+one after every step that read rows of the prompt, and the last, with
+`processed` equal to `total`, just before the first text; `processed` rises with
+every one. That is when llama.cpp's server sends them, per batch of the prompt.
+What Ares adds: the count of what is done follows the work, not the finished
+rows. The rows a prompt that the cache holds runs again to rebuild the model's
+state from a checkpoint are work too, so `processed` moves during them; and
+Flash-Next, which reads a long prompt layer by layer as one step (a pass), says
+how far the pass has got, by its layers and the pieces of each, about once a
+second while it runs: `processed` is then `cache` plus that share of the
+prompt's tokens, and moves through the pass where a count of finished tokens
+would jump from nothing to all at its end. `/v1/messages` has no progress, as in
+llama.cpp (Anthropic's API has no such member; it is refused there).
 
 ## Other routes
 

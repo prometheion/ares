@@ -11,7 +11,7 @@ file's context length) as far as the VRAM that is left holds it (a tensor
 split moves attention heads with their K and V to the devices with room as
 far as that context needs: see "What the second card is for"); the start-up
 report says what was chosen, why, what context was wanted and how much of it
-is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, precision, the model
+is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, the model
 drafters that take part (`--drafters`) and the room for their windows
 (`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM limit defaults
 to all the machine has, and below any limit the engine holds what the machine
@@ -39,7 +39,7 @@ timings in every answer of the OpenAI routes
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
 and in the last event of a stream). A request can switch drafting off for itself
 with `"draft": false`; the two replies of one request, with and without drafts,
-are then compared by their hashes over HTTP (they are equal, with the fast kernels and with `--precision exact`: see
+are then compared by their hashes over HTTP (they are equal: see
 "The text with drafts is the text without" under [Speculation](speculation.md)).
 The prefix cache is on for both models without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages
@@ -277,8 +277,11 @@ generates, for a client that cannot add a member to a body (Claude Code's
 `ANTHROPIC_CUSTOM_HEADERS`, the `http_headers` of a provider of Codex); the
 Messages API has no such member, so there it is the header alone. Body and
 header that name two different ones are refused. It is always on: a server
-whose requests all say nothing behaves as before (the randomized test of
-admission, which plays one priority, still holds).
+whose requests all say nothing behaves as before. The randomized test of
+admission (`crates/sched/tests/admission.rs`) plays one priority in some runs
+and two or three in others, where it checks that a shortage spills the worst
+priority first, that a running request gives way only to a better one, and that
+a spilled request still in line holds back its own and every worse priority.
 
 What the others do. llama.cpp's server has no priority of requests (it puts
 only its own tasks, cancels and the like, at the front of its queue). vLLM
@@ -309,8 +312,11 @@ Here every place where the engine chooses between requests honours it:
   no threshold. The victims are spilled as for a shortage: their pages go to
   the prefix cache and their state becomes a checkpoint, so they come back as
   a prefix hit, and they do not come back in the pass that made them give
-  way. A shortage of pages spills the worst priority first (vLLM's victim),
-  then by the old rule. The sequence of a step the model paused (a prompt read
+  way. What they let go of is room for the newcomer except the pages of its
+  cached prefix that running sequences hold (it takes those again, and its
+  charge left them out; until 2026-11-25 they were counted twice). A shortage
+  of pages spills the worst priority first (vLLM's victim), then by the old
+  rule. The sequence of a step the model paused (a prompt read
   layer by layer) gives way to neither (`Claims::keep`): its state is neither
   before nor after its rows.
 - *The rows of a step* (`ares_sched::plan`): the newest tokens, the rows of
@@ -363,12 +369,38 @@ widest step of a prompt of Flash-Next with experts from the SSD takes tens of
 seconds. A step is watched from its dispatch to its collect; the steps of the
 warm-up are not.
 
-**What the server logs and measures.** Every generating request has a line
-with its parameters when it is taken (the model, the limit of tokens, the
-sampling fields in effect, the stop strings and tools it has, whether it
-continues a message) and one when it ends (the reason, prompt and cached
-tokens, generated and reasoning tokens, the wait in the line, the times, the
-drafts, the seed it asked for). `--log-text` adds the prompt and the reply,
+**What the server logs and measures** (`crates/server/src/bridge.rs`,
+`generate.rs`, `routes::tell_refusals`; the owner, 2026-11-26: as informative
+as llama.cpp's by default, and for a person). A request's lines are sentences,
+the timings laid out as llama.cpp's `print_timings`, each beginning with
+`request <id>`: when it is taken (its API, model and the parameters it gives);
+when it starts in the engine (at its first progress event: the prompt, what the
+cache gave, the time since the hand-over); how far a long prompt has got
+(`prompt processing, n_tokens = , progress = , t = s / tokens per second`, as
+llama.cpp's `print_timings_pp`: from 3 s into the prompt, when another tenth is
+done or 10 s have passed, never within 3 s of the last line); how fast a long
+reply comes (`n_gen = , tg = t/s, tg_3s = t/s`, as llama.cpp's
+`print_timings_tg`: from the 100th token, at most once in 3 s, the rate of the
+tokens after the first since the first, and over the time since the last line;
+from `Event::Generated`, the reply's tokens so far, which the engine sends with
+every step's text); and at its end the
+reason, the prompt with the cached and replayed tokens apart, the generated and
+thinking tokens and the wait in line, then `prompt eval time` (the engine's
+time of the prompt, `Usage::prompt_time`, over the rows it ran for it: the
+computed and the replayed), `eval time` (the tokens after the first over the
+time after the first token), `total time`, and `draft acceptance` (accepted of
+proposed, the mean length `1 + accepted / windows` and the mean chain
+`proposed / windows`, from the request's own counts, `Usage::drafts`). Until
+2026-11-26 the end was one line of fields whose prompt rate divided the
+computed tokens by the time from the hand-over, queue and cache restore
+included (0.6 tokens/s for one token computed of 55). The same fields as
+before are the debug lines `request` and `request finished`. Every refusal and
+failure that a client gets is written by one layer over all routes
+(`tell_refusals`, from the error the response carries, `error::Refused`): the
+method and path, the status, the code, the request's id when the engine had it,
+and the message, a warning (a 500 an error); a failure inside a stream is
+written where the stream writes it (`ApiError::tell`). An unload after an
+engine failure is an error with the cause. `--log-text` adds the prompt and the reply,
 which a log otherwise never holds. `--log-format json` writes every line as a
 JSON object for collectors, `--log-file <FILE>` appends to a file instead of
 standard error; the level is `RUST_LOG`. `/metrics` has, for every model, the
@@ -376,6 +408,64 @@ histograms of the requests that ended with a reply (`crates/server/src/metrics/l
 the wait in the engine's line (`ares_request_queue_seconds`, from the watch),
 the prompt after it, the time to the first token, the time per token after the
 first, and the whole request, all from the hand-over to the engine.
+
+**Prompt progress** (`crates/runtime/src/conductor/progress.rs`,
+`openai/reply.rs`, `responses/reply.rs`; llama.cpp's `return_progress`, taken
+over 2026-11-26). The engine sends `Event::Progress` {total, cached, processed,
+elapsed} to every request whose prompt it reads: when it first starts (the
+cached tokens are done), after every step that ran rows of its prompt (in
+`Conductor::deliver`, before the step's text, so the step that ends the prompt
+reports it whole first), never after the first token; `processed` only rises.
+What is left is counted in the rows still to run for the prompt (the replayed
+ones included), spread over the tokens the cache did not give, so a replay
+moves the count. A long step of one prompt is waited for in slices of a second
+(`Executor::wait_for_step`: the bell's wait with a time limit, only for a step
+whose one part is a prompt that still reports), and after each slice the
+conductor reports the share the model says it has done
+(`Executor::step_share`, from `StepContext::share`, which Flash-Next's pass
+raises after every micro-batch: the micro-batches of the model's layers done),
+and again at every pause of the pass. Steps of generation wait as before, and a
+model that says nothing of its steps costs one slice per long step. The bridge
+uses every event for the log and lets one go that finds the queue half full;
+`Generation::reporting` passes them to a stream that asked (`return_progress` on
+chat, completions and Responses, read by the chat reader), which writes
+llama.cpp's `prompt_progress` {total, cache, processed, time_ms}: on a chunk
+with the role and no text on chat, with `text: ""` on completions, in a
+`response.in_progress` event on Responses; Messages has none, as llama.cpp.
+llama.cpp sends one per batch of the prompt and its web UI shows
+`(processed - cache) / (total - cache)`; the same holds here. That web UI also
+sends `sse_ping_interval` with every stream (llama.cpp's seconds of silence
+before a ping, `-1` none; its server's default is 30 s): a stream's pings are
+axum's keep-alive (`routes::pings`), a comment line after 15 s of silence on the
+OpenAI routes and Anthropic's `ping` event on Messages, at the interval the member
+names, and none for `0` or `-1`, on chat, completions, Responses and Messages.
+And it sends `timings_per_token` (llama.cpp: every chunk of a stream carries the
+timings so far): the last chunk of each step with text gets `timings`
+(`Run::timings_now`: the prompt as its last progress event said it, the reply's
+tokens from `Event::Generated` and the time since its first; no drafts and no
+hash before the end), on chat, completions and the data of a Responses event.
+The `timings` of every answer have llama.cpp's fields, `cache_n`,
+`prompt_per_token_ms` and `predicted_per_token_ms` among them, which the web UI
+reads. What else that web UI sends by default (`ChatService.sendMessage` and
+`getApiOptions` at d92ea9b, its settings as they come) is `reasoning_format:
+"auto"`, `reasoning_control: true` (llama.cpp arms its route that ends the
+thinking: here every reply can be ended by `/v1/chat/completions/control`, which
+`Engine::end_thinking` serves by forcing the guard's end of the thinking as a spent
+budget does, so the member is a boolean and says nothing more) and
+`backend_sampling: false` (where llama.cpp's sampler runs, whose draws are the
+same either way: Ares samples on the device, a boolean without effect);
+`server/tests/progress.rs` sends that body. What it sends only when a setting or
+an attachment asks: the sampling fields (served), `typ_p` (the web UI's name for
+typical sampling, which llama.cpp's server does not read and ignores; refused here
+by name, as every member it does not know), `samplers` as an array (served),
+`chat_template_kwargs`, `reasoning_effort`, `thinking_budget_tokens`,
+`continue_final_message` and `add_generation_prompt` (served), its `custom` JSON
+(whatever the user writes), and parts `input_audio` and `input_video` (refused:
+there is no audio or video input); the header `X-Conversation-Id` is passed over. Tests:
+`crates/runtime/tests/cache/prefix.rs` (steps and the cache, the pauses of a
+pass, a long step's share; every test's `Handle::finish` checks the order and
+the rise), `crates/server/tests/progress.rs` (the chunks of the three APIs as
+llama.cpp's test `test_return_progress` checks them, and the log).
 
 **Several models (router mode).** `ares --models-preset <file.ini>` serves the
 models of a preset file. A model is loaded when a request names it, stays

@@ -1,6 +1,6 @@
 //! Errors in the shape OpenAI clients parse, and in Anthropic's for its routes.
 
-use ares_api::{Engine, EngineError};
+use ares_api::{Engine, EngineError, RequestId};
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -21,6 +21,8 @@ pub(crate) struct ApiError {
     pub param: Option<String>,
     /// Seconds after which a retry is worth trying.
     pub retry_after: Option<u32>,
+    /// The request the engine had when it failed, for the log.
+    pub request: Option<RequestId>,
 }
 
 const INVALID_REQUEST: &str = "invalid_request_error";
@@ -35,6 +37,7 @@ impl ApiError {
             code: "invalid_request",
             param: None,
             retry_after: None,
+            request: None,
         }
     }
 
@@ -139,6 +142,7 @@ impl ApiError {
             code: "internal_error",
             param: None,
             retry_after: None,
+            request: None,
         }
     }
 
@@ -212,7 +216,35 @@ impl ApiError {
                 ..Self::internal(message)
             },
             EngineError::Unsupported(_) => Self::unsupported(message),
+            // The request found no room in the engine's memory limit (`--ram`) and
+            // ended; the model serves on.
+            EngineError::NoMemory(_) => Self {
+                status: StatusCode::INSUFFICIENT_STORAGE,
+                code: "insufficient_memory",
+                retry_after: Some(1),
+                ..Self::internal(message)
+            },
             EngineError::Internal(_) => Self::internal(message),
+        }
+    }
+
+    /// The error of the request `id`, for the log.
+    pub fn of_request(self, id: RequestId) -> Self {
+        Self { request: Some(id), ..self }
+    }
+
+    /// Writes the error into the log as its client gets it: a refusal, or a
+    /// failure in the middle of a stream (`where`, the method and path of the
+    /// route, or what failed). A failure of the server is an error; a refusal
+    /// of the request, and a service that is not there for now (503), a
+    /// warning.
+    pub fn tell(&self, at: &str) {
+        let request = self.request.map(|id| format!(" (request {id})")).unwrap_or_default();
+        let status = self.status.as_u16();
+        if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!("{at}: {status} {}{request}: {}", self.code, self.message);
+        } else {
+            tracing::warn!("{at}: {status} {}{request}: {}", self.code, self.message);
         }
     }
 
@@ -278,16 +310,19 @@ pub(crate) struct Anthropic(pub ApiError);
 impl IntoResponse for Anthropic {
     fn into_response(self) -> Response {
         let error = self.0;
-        if error.status.is_server_error() {
-            tracing::warn!(status = error.status.as_u16(), code = error.code, "{}", error.message);
-        }
         let mut response = (error.status, Json(error.anthropic())).into_response();
         if let Some(seconds) = error.retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
+        response.extensions_mut().insert(Refused(error));
         response
     }
 }
+
+/// The error a response carries, for the layer that writes refusals into the
+/// log with their route ([`crate::routes::tell_refusals`]).
+#[derive(Debug, Clone)]
+pub(crate) struct Refused(pub ApiError);
 
 #[derive(Serialize)]
 pub(crate) struct AnthropicEnvelope<'a> {
@@ -319,9 +354,6 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        if self.status.is_server_error() {
-            tracing::warn!(status = self.status.as_u16(), code = self.code, "{}", self.message);
-        }
         let mut response = (self.status, Json(self.body())).into_response();
         if let Some(seconds) = self.retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(seconds));
@@ -331,6 +363,7 @@ impl IntoResponse for ApiError {
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
+        response.extensions_mut().insert(Refused(self));
         response
     }
 }

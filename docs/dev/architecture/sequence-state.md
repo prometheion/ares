@@ -311,18 +311,52 @@ one array per part, indexed by page number.
     words follow with a wide margin; a text with near ties (a list whose order
     the model is unsure of) can part at one, as can two requests that decode
     together instead of alone.
-- Decisions ("Jev mode"): choosing among fixed options (a label, a tool, the
-  fields of a schema) needs no generation. The options are scored from the
-  logits after the shared prompt, and options longer than one token are
-  forks of the prompt's sequence that run as rows of one step. TheCodacus'
-  fork does this for llama.cpp on `/v1/decision`; here it is a use of `fork`
-  and the planner, on the official endpoint, `POST /v1/systemone`. The
-  endpoint is wire-compatible with llama.cpp's and is served for any model,
-  not only for native decision models. Decision rows share steps with
-  generation: the planner takes them as `Want::Score`, after the newest token
-  of every generating sequence and before drafts and prompts, so neither kind
-  of request waits for the other. The endpoint and `Engine::decide` exist and
-  are tested against a mock engine; the scoring comes with the runtime.
+- **Decisions** ("Jev mode"): typed questions about a state answered by choosing
+  among fixed options, with no generation, on `POST /v1/systemone` for every
+  model. The request, the answers and the way a chat model is asked are
+  Flide's (https://github.com/OmniJev/Flide, its `next_token` format in style
+  `vllm`, the rendering of vLLM's endpoint): every question is a prompt of its
+  own, one user turn with the state, a blank line and the question with its
+  options labeled (A to Z, then the two-letter labels that are one token;
+  `yes` and `no`; 0 to 9), thinking off, and the answer is the softmax of the
+  labels' logits at the first token of the reply (`ares_api::Question::render`
+  and `answer`). The questions of a request share the state as the start of
+  their prompts, and Flide's exact state forking is done with the prefix
+  cache (`conductor/decisions.rs`):
+  - **The parent**: the shared start runs as a request of its own that reads
+    its prompt and ends. As every request does, it leaves its pages, its
+    partly used last page and its recurrent state at its end in the cache
+    (`Conductor::keep`); a state read before is found there, as any prompt.
+  - **The forks**: then every question is a request whose prompt is the whole
+    question. It shares the parent's pages, copies the partly used page
+    before its first write, restores the checkpoint (an exact copy of the
+    delta-rule matrices and the convolution windows at the end of the shared
+    start, the fork of Flide's Gated DeltaNet layers) and computes only its
+    own rows. The forks are prompts like any other: they share steps with each
+    other and with generation, as many at once as there are slots, shortest
+    first.
+  - **The read**: a fork's last row is wanted, and the step hands back the
+    logits of the question's label tokens there, before the sampler changes
+    any (the record's *scores*, gathered on the device that holds each token's
+    column, see `record.rs`). The fork then ends and leaves nothing in the
+    cache: no checkpoint (it would cut the fork's step, cost a copy and serve
+    nobody) and no pages (without a checkpoint they would shadow the parent's
+    for the same question asked again, since a lookup takes the longest path of
+    pages and replays from the last checkpoint on it).
+  A question alone gets the same logits up to the rounding of its rows' steps
+  (see "Rounding" above): the parent and the forks are prompts computed from
+  the same pages and state a request of the whole prompt would read. When the
+  cache cannot hold what the parent left, a fork restores an earlier
+  checkpoint and replays, or computes from its first token: the answers are
+  the same and only the work is not shared. A decision of one question has no
+  parent, nor has one whose shared start the cache holds with the state at
+  its end (an agent's next question about a state read before): its forks
+  start from it at once. The parts of a decision are requests the conductor makes (ids with
+  the top bit set); the counts of requests and the accounting of what
+  requests produce leave them out. On the 27B at the owner's production
+  settings (two slots) a decision answers 1.5 to 1.9 times the questions per
+  second that a chat completion of one token per question does (2026-11-26,
+  [`../experiments/decisions.md`](../experiments/decisions.md)).
 - `PageLayout`: bytes per page per device, from which the pool's capacity
   follows. For a `qwen4exp`-shaped model the full 262 144-token context is
   3.47 GiB with K and V as Strata stores them (int8, a scale per 64 values)
@@ -387,7 +421,10 @@ same way on every device, from the segments of the record:
   cache. When it is short the full page that was used least recently and that
   no sequence of the step reads is converted for room (a cached page loses its
   exactness, never its text); a partly used page never is, which is why the
-  cache keeps at most one tail per slot (`PrefixCache::tails_per_slot`).
+  cache keeps at most one tail per slot (`PrefixCache::tails_per_slot`). A
+  tail that comes back from RAM is such a page too: the transfer says it is a
+  tail (`Transfer::tail`), and the pool takes it without settling it
+  (`Forms::adopt`).
 - Page copies copy the exact entry; a page that is copied is always partly
   used, hence exact.
 - A row reads a tile converted from the position at which the tile has left

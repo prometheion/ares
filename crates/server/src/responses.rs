@@ -349,6 +349,10 @@ impl Writer for Created {
         error_event(error, &mut self.sequence)
     }
 
+    fn progress(&mut self, progress: &ares_api::Progress, out: &mut VecDeque<Written>) {
+        out.push_back(self.head.progress(progress, &mut self.sequence));
+    }
+
     fn take(&mut self, pieces: Vec<Piece>) {
         self.output.push(pieces);
     }

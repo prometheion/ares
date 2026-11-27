@@ -126,6 +126,9 @@ pub struct Qwen4Exp {
     mtp_watch: Arc<Mutex<Watch>>,
     /// The usage profile of the experts, for a model that keeps one.
     usage: Usage,
+    /// Where the lines go that the owner should hear of while the model
+    /// serves ([`Qwen4Exp::with_log`]).
+    log: Option<Log>,
     /// The token embedding table where the file is mapped (`blocks/rows.rs`).
     rows: Arc<HostTable>,
     /// The rows of the widest step, once the parts are open: what the expert
@@ -239,6 +242,7 @@ impl Qwen4Exp {
             mtp_report: Mutex::new(None),
             mtp_watch: Arc::default(),
             usage: Usage::default(),
+            log: None,
             rows,
             lone_rows: OnceLock::new(),
             pass_span: OnceLock::new(),
@@ -289,6 +293,14 @@ impl Qwen4Exp {
         self.view = HeadView::new(n, n, Some(tokens)).map_err(OpenError::Choice)?;
         self.opts.part.head_order = self.view.order.clone();
         Ok(self)
+    }
+
+    /// Sends `log` the lines the owner should hear of while the model serves:
+    /// the tier of experts in RAM giving memory back to the machine. Before
+    /// the runtime opens the parts.
+    pub fn with_log(mut self, log: Log) -> Self {
+        self.log = Some(log);
+        self
     }
 
     /// Keeps the usage profile of the model's experts in `dir` (see
@@ -488,6 +500,14 @@ impl Qwen4Exp {
     /// `ExpertStore::transit_odds`); `None` before the parts are open.
     pub fn guess_odds(&self) -> Option<[(f32, f32); 9]> {
         Some(self.flow.get()?.lock_feed().store.transit_odds())
+    }
+
+    /// Whether a device has VRAM of its expert slots lent now (for wide steps or a pass);
+    /// `None` before the parts are open.
+    pub fn holds_loan(&self) -> Option<bool> {
+        let flow = self.flow.get()?;
+        let feed = flow.lock_feed();
+        Some((0..self.placement.n_devices()).any(|d| feed.store.has_scratch(d)))
     }
 
     /// What the expert store counted since the last call; `None` before the
@@ -815,10 +835,31 @@ impl Model for Qwen4Exp {
         self.far
     }
 
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        match self.flow.get() {
+            Some(flow) => flow.make_room(live),
+            None => Ok(0),
+        }
+    }
+
     fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
         match self.flow.get() {
             Some(flow) => flow.before_step(record),
             None => Ok(()),
+        }
+    }
+
+    fn idle(&self) {
+        if let Some(flow) = self.flow.get() {
+            flow.idle();
+        }
+    }
+
+    fn measured(&self) {
+        // The measurement's picks are no text's: with a usage profile or
+        // without, the heat starts from what requests pick.
+        if let Some(flow) = self.flow.get() {
+            flow.lock_feed().store.forget_heat();
         }
     }
 

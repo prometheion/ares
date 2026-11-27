@@ -82,7 +82,6 @@ fn the_file_is_recognised_as_a_model_the_build_runs() {
 fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
     let stderr = refuses(&["--shares", "0.5,0.5"], "--shares");
     assert!(stderr.contains("--split"), "it says what to use instead: {stderr}");
-    refuses(&["--precision", "exact"], "--precision");
     // Without a model drafter nothing speculates: a draft vocabulary would
     // order the head for no drafter, and a window would be room for nothing.
     let stderr = refuses(&["--draft-vocab", "tokens.txt"], "--draft-vocab");

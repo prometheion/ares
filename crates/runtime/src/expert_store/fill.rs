@@ -161,6 +161,15 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.worth_stale[layer] = true;
     }
 
+    /// Forgets the heat of every layer: the steps so far routed no text (the
+    /// ones that measured what a step costs).
+    pub fn forget_heat(&mut self) {
+        for layer in 0..self.heat.n_layers() {
+            self.heat.layer_mut(layer).fill(0.0);
+            self.worth_stale[layer] = true;
+        }
+    }
+
     /// The slots of `layer` that stay free in VRAM for the misses of a step,
     /// where the store keeps them free between steps: none in a layer that
     /// holds all its experts.

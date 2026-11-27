@@ -214,6 +214,7 @@ dependencies = [
  "ares-api",
  "ares-gguf",
  "minijinja",
+ "sha2",
  "thiserror",
 ]
 

@@ -210,7 +210,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
         let text = text.clone();
         EventSink::new(move |event| {
             match event {
-                Event::Logprobs(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
                 Event::Text(piece) => text.lock().unwrap().push_str(&piece),
                 Event::Done { .. } => {
                     let _ = tx.send(Ok(()));
@@ -322,6 +322,7 @@ fn ask_with(
         EventSink::new(move |event| {
             match event {
                 Event::Logprobs(probs) => said.lock().unwrap().1.extend(probs),
+                Event::Progress(_) | Event::Generated(_) => {}
                 Event::Text(piece) => said.lock().unwrap().0.push_str(&piece),
                 Event::Done { .. } => {
                     let _ = tx.send(Ok(()));
