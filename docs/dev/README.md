@@ -45,6 +45,7 @@ repository and are not needed to build, run or test Ares.
 | [`flash-next.md`](experiments/flash-next.md) | Flash-Next's decode through the server, K and V beyond VRAM, files in any type, the usage profile, members and loans, reading ahead, the gap between 17 and 22 ms, pruning |
 | [`flash-next-prompts.md`](experiments/flash-next-prompts.md) | wide steps, their float matrices, transit, lent VRAM, passes layer by layer |
 | [`against-strata.md`](experiments/against-strata.md) | Flash-Next against Strata on the test machine, from the SSD |
+| [`ssd-decode-profile.md`](experiments/ssd-decode-profile.md) | where a decode step of Flash-Next goes with most experts off the card, and the levers of the SSD ranked by it |
 | [`against-the-fork.md`](experiments/against-the-fork.md) | the 27B against the owner's llama.cpp fork at production settings, alone and in parallel |
 | [`claude-code.md`](experiments/claude-code.md) | Claude Code against Ares |
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
