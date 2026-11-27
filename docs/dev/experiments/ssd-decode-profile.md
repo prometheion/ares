@@ -159,8 +159,8 @@ The same runs (B, steps 1 to 256 after the context) on the 147 GiB UD-Q5_K_XL (2
 
 The larger file reads 2.2 times as many experts from the drive at 40 GiB (2.8 times the bytes),
 and its step waits for the file half the time. At 30 000 tokens the attention takes 1.14 ms a step
-against 0.92 at 4000, and
-the step is what its misses make it: a long context costs decode little on this model.
+against 0.92 at 4000, and the step is what its misses make it: a long context costs decode little
+on this model.
 
 ## Two small cards (the RTX 4070 and the RTX 3060, #24)
 
