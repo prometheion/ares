@@ -61,6 +61,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Claude Code | works against `/v1/messages`, with `context_management` and `thinking.display` |
 | Reply length | `--max-tokens` and the cap `--max-tokens-limit` |
 | Continuing a message | a last assistant message is continued (prefill) |
+| Prompt progress | llama.cpp's `return_progress` on streams: `prompt_progress` as the prompt is read, also through a pass of Flash-Next ([api.md](api.md#prompt-progress)) |
 | Decisions (Jev mode) | `/v1/systemone` as Flide serves it: questions about a state answered from the labels' logits, the state computed once and forked into the questions, several requests in one body |
 
 ## Server
@@ -72,5 +73,5 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Several models | `--models-preset <file.ini>`: loaded on request, aliases, idle unload, load and unload routes |
 | The line | `--queue <N>` bounds it (503 with `Retry-After`); `--timeout` for slow clients |
 | Watchdog | a step that runs longer than 600 s fails its engine; its requests end with the reason |
-| Logs and metrics | a line per request, Prometheus metrics ([quickstart.md](quickstart.md#logs-and-metrics)) |
+| Logs and metrics | a request's timings as llama.cpp prints them, the progress of long prompts, every refusal with its reason; Prometheus metrics ([quickstart.md](quickstart.md#logs-and-metrics)) |
 | Version | `ares --version` names the version, the commit and the day of the build; so do the log's first line and `/props` |

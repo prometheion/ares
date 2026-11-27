@@ -47,7 +47,7 @@ pub use decision::{
 };
 pub use engine::{Engine, ModelCard};
 pub use error::EngineError;
-pub use event::{Alternative, Event, FinishReason, TokenProbs, Usage};
+pub use event::{Alternative, Drafts, Event, FinishReason, Progress, TokenProbs, Usage};
 pub use json::Json;
 pub use message::{Image, Message, Role};
 pub use request::{GenerateRequest, Prompt, RequestId};

@@ -29,3 +29,48 @@ there first: its first token came 3372 ms after the new prompt arrived against
 with two places are the time until one of the generations ends (one ran
 3000 tokens in under a second where the greedy text loops and the n-gram
 drafts take it).
+
+## Prompt progress and the log on the step's path (2026-11-27)
+
+`feat/progress-logs` against main (8acd73a4, the same code as 83408e52), on the local cards
+(RTX 4070 + RTX 3060): Qwen3.8-27B-UD-Q4_K_S with `--ram 6G --context 16384 --parallel 1`,
+the binaries started in turn (A, B, A, B), each with a decode of 256 tokens without drafts
+(`draft: false`, greedy, `ignore_eos`) twice and a prompt of 8497 tokens read cold (a new first
+line each time, one token out) twice, through `/v1/chat/completions`; the load average 14 to 23
+from other agents' builds (`/var/tmp/ares-progress/scripts/runab.sh`, `ab.py`):
+
+| Side (load) | Decode, tokens/s | 8.5k prompt, s by the client |
+| --- | --- | --- |
+| A main (23) | 40.45, 40.40 | 7.085, 7.125 |
+| B branch (14) | 40.23, 40.01 | 7.173, 7.157 |
+| A main (15) | 40.06, 40.12 | 7.086, 7.093 |
+| B branch (16) | 40.44, 40.30 | 7.078, 7.103 |
+
+Decode 40.26 against 40.24 tokens/s, the prompt 7.10 against 7.13 s (B faster in the second
+pair): nothing beyond the noise. What changed on the path: a step whose one part is a prompt is
+waited for in slices of a second (the same spin, a park with a time limit), the step's events
+carry one progress event per prompt, and a window counts its drafts for its request. A first
+round at load 30 to 47 (decode with drafts, whose choice follows the measured prices) was too
+noisy to read: prompt A 7.02, 7.09, 7.19, 7.16 s against B 7.47, 7.77, 7.13, 7.11 s. Two sides
+of the second round were lost to the drive (the 27B's pages had left the page cache, and its
+load read 47 MB/s beside other agents' runs) and are not in the table.
+
+The progress through a pass, on the same cards (2026-11-26, Flash-Next IQ2_XS with `--ram 8G`
+and its MTP block of q2, from a cold profile, load 3 to 8): a streamed chat of 8883 tokens read
+as one pass got `processed` 0, 555, 1203, 2056, 2796, 3490, 4256, 5017, 5804, 6385, 7053, 7773,
+8513, 8882 and 8883, one every 1.1 s, and its log the lines at 3.3, 6.6, 9.9 and 13.2 s (623 to
+645 tokens per second); the prompt took 14.4 s. Before the fix of the first look (the pass's
+first micro-batch waited for the drive for more than a second, and the conductor stopped
+looking) the same request got only 0 and 8883, after 20.4 s.
+
+The same A/B again with the branch at f5db7b9e (2026-11-27, besides the above the event of the
+reply's tokens after every step, `Event::Generated`), on a quiet machine (load 1.9 to 2.6), three
+pairs:
+
+| Side | Decode, tokens/s | 8.5k prompt, s |
+| --- | --- | --- |
+| A main | 40.513, 40.470 · 40.412, 40.397 · 40.514, 40.500 | 7.062, 7.082 · 7.101, 7.119 · 7.098, 7.117 |
+| B branch | 40.527, 40.515 · 40.474, 40.459 · 40.405, 40.390 | 7.102, 7.125 · 7.087, 7.110 · 7.096, 7.125 |
+
+Decode 40.468 against 40.462 tokens/s (-0.015 %), the prompt 7.096 against 7.108 s (+0.17 %):
+no difference.

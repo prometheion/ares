@@ -172,6 +172,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
             post(anthropic::count_tokens).fallback(anthropic::method_not_allowed),
         )
         .route("/v1/chat/completions/input_tokens", post(openai::chat_input_tokens))
+        .route("/v1/chat/completions/control", post(openai::control))
         .route("/v1/responses", post(responses::create))
         .route("/v1/responses/input_tokens", post(responses::input_tokens))
         .route("/v1/responses/{id}", any(responses::stored))
@@ -180,6 +181,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
         .method_not_allowed_fallback(routes::method_not_allowed)
         .with_state(routes::App { models, config, stop })
         .layer(axum::middleware::from_fn_with_state(access, access::guard))
+        .layer(axum::middleware::from_fn(routes::tell_refusals))
 }
 
 /// Serves `models` on `listener` until `shutdown` completes.

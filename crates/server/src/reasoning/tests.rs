@@ -470,8 +470,9 @@ fn a_budget_for_the_thinking_is_read_under_every_name() {
     assert!(refused(&two).contains("different budgets"));
     let message = asked_from(&[("reasoning_budget_message", text("Enough."))]).unwrap();
     assert_eq!(message.budget_message.as_deref(), Some("Enough."));
-    assert!(refused(&[("reasoning_control", Json::Bool(true))]).contains("reasoning_control"));
+    assert!(asked_from(&[("reasoning_control", Json::Bool(true))]).is_ok());
     assert!(asked_from(&[("reasoning_control", Json::Bool(false))]).is_ok());
+    assert!(refused(&[("reasoning_control", text("yes"))]).contains("reasoning_control"));
     // A model that does not think has no thinking to bound.
     let error = planned(&[("reasoning_budget_tokens", Json::Int(8))], None).unwrap_err();
     assert_eq!(error.param.as_deref(), Some("reasoning_budget_tokens"));

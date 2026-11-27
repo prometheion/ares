@@ -38,6 +38,75 @@ pub(crate) async fn completions(State(app): State<App>, request: Request) -> Res
     completion(app, request, Endpoint::Completions).await
 }
 
+/// `POST /v1/chat/completions/control`, llama.cpp's route that acts on a chat
+/// completion while it runs (`post_control` in `tools/server/server-context.cpp`
+/// of <https://github.com/ggml-org/llama.cpp>, commit d92ea9b, MIT): `{"id", "action",
+/// "model"}`, where the id is the one its stream gave (`chatcmpl-...`) and the
+/// only action is `reasoning_end`, which ends the reply's thinking now. Answers
+/// `{"success": true}`, or `false` with a `message` when no running completion
+/// of that id is inside its thinking.
+pub(crate) async fn control(State(app): State<App>, request: Request) -> Response {
+    match try_control(app, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn try_control(app: App, request: Request) -> Result<Response, ApiError> {
+    let body = read_body(request, &app.config).await?;
+    let json = request::read_json(&body)?;
+    let fields = request::Fields(request::members(&json)?);
+    for (name, _) in fields.0 {
+        if !["id", "action", "model"].contains(&name.as_str()) {
+            return Err(ApiError::invalid_param(
+                name.as_str(),
+                format!("{name} is not a member of a control"),
+            ));
+        }
+    }
+    let id = fields
+        .string("id")?
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ApiError::invalid_param("id", "missing completion id"))?;
+    match fields.string("action")? {
+        Some("reasoning_end") => {}
+        _ => return Err(ApiError::invalid_param("action", "unknown control action")),
+    }
+    let name = crate::routes::wanted(&app, fields.string("model")?.map(str::to_owned))?;
+    let answer = |success: bool, message: &str| {
+        let mut answer = serde_json::json!({ "success": success });
+        if !message.is_empty() {
+            answer["message"] = message.into();
+        }
+        json_response(answer.to_string())
+    };
+    // An id of another form, or of a model that is not loaded, names no
+    // running completion.
+    let number = id
+        .strip_prefix(Endpoint::Chat.id_prefix())
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+    let (Some(number), Ok(lease)) = (number, app.models.loaded(&name).await) else {
+        return Ok(answer(false, "no active completion for this id"));
+    };
+    let engine = lease.engine().clone();
+    let ended =
+        tokio::task::spawn_blocking(move || engine.end_thinking(ares_api::RequestId(number)))
+            .await
+            .map_err(|e| ApiError::internal(format!("the control was lost: {e}")))?
+            .map_err(|e| ApiError::from_engine(&**lease.engine(), e))?;
+    tracing::info!(
+        "request {:016x}: control reasoning_end, {}",
+        number,
+        if ended { "the thinking ends" } else { "nothing to end" }
+    );
+    Ok(if ended {
+        answer(true, "")
+    } else {
+        answer(false, "no active completion for this id is inside its thinking")
+    })
+}
+
 /// `POST /v1/chat/completions/input_tokens`: the tokens of the prompt a chat
 /// request comes to. The body is read as `/v1/chat/completions` reads it,
 /// and nothing is generated.
@@ -89,10 +158,15 @@ async fn try_completion(
                 request.sampling.seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
         let sorter = sorter.with_call_ids(tools::call_ids(request.id));
-        runs.push(Generation::start(&app, &lease, request, sorter)?);
+        let progress = parsed.stream && parsed.progress;
+        let live = parsed.stream && parsed.timings_per_token;
+        runs.push(
+            Generation::start(&app, &lease, request, sorter)?.reporting(progress).timing(live),
+        );
     }
     let response = if parsed.stream {
-        stream(runs, head, parsed.include_usage, app.config.stream_wait).await
+        let pings = crate::routes::pings(KeepAlive::default(), parsed.ping);
+        stream(runs, head, parsed.include_usage, app.config.stream_wait, pings).await
     } else {
         collect(runs, head).await
     };
@@ -137,6 +211,7 @@ async fn collect_one(mut reply: Generation) -> Result<Collected, ApiError> {
     };
     loop {
         match reply.next().await? {
+            Step::Progress(_) => {}
             Step::Pieces(pieces) => take(pieces),
             Step::Probs(more) => probs.extend(more),
             Step::End(End { rest, finish, stop, usage, timings }) => {
@@ -186,6 +261,7 @@ async fn stream(
     head: Head,
     include_usage: bool,
     wait: Duration,
+    pings: Option<KeepAlive>,
 ) -> Result<Response, ApiError> {
     let many = runs.len() > 1;
     let firsts = futures_util::future::try_join_all(runs.into_iter().map(|mut reply| async move {
@@ -226,7 +302,7 @@ async fn stream(
             .boxed(),
         None => merged.boxed(),
     };
-    Ok(sse_response(events, KeepAlive::default()))
+    Ok(sse_response(events, pings))
 }
 
 /// What the completions of one request share while they stream.
@@ -338,11 +414,24 @@ impl Chunks {
                 Phase::Ready(Step::Pieces(pieces)) => {
                     self.phase = Phase::Pull;
                     // A piece that is held back or empty adds no chunk.
+                    let before = self.queue.len();
                     self.enqueue(pieces);
+                    // llama.cpp's `timings_per_token`: the last chunk of the
+                    // step has the timings so far.
+                    if self.queue.len() > before
+                        && let (Some(timings), Some(last)) =
+                            (self.reply.timings_now(), self.queue.back_mut())
+                    {
+                        reply::with_timings(last, timings);
+                    }
                 }
                 Phase::Ready(Step::Probs(probs)) => {
                     self.phase = Phase::Pull;
                     return Some(self.head.probs_chunk(&probs, self.sent));
+                }
+                Phase::Ready(Step::Progress(progress)) => {
+                    self.phase = Phase::Pull;
+                    return Some(self.head.progress_chunk(&progress));
                 }
                 Phase::Ready(Step::End(End { rest, finish, stop, usage, timings })) => {
                     self.enqueue(rest);
@@ -363,6 +452,7 @@ impl Chunks {
                 Phase::Pull => match self.reply.next().await {
                     Ok(step) => self.phase = Phase::Ready(step),
                     Err(error) => {
+                        error.tell("the stream failed");
                         if let Some(shared) = &self.shared {
                             shared.failed.store(true, Ordering::Release);
                         }

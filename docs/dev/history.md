@@ -7,6 +7,33 @@ they were written then; an open remainder of an item is listed in `OPEN.md` agai
 
 ## 2026-11-26
 
+Done on `feat/progress-logs` (2026-11-26), the owner's request of the day ("llama.cpp's server
+sends prefill progress; that should work as with llama.cpp. And the logs are not good:
+llama.cpp prints prefill and decode speed in its logs, and more errors by default"):
+
+- [x] Prompt progress as llama.cpp's server sends it (`return_progress`, `prompt_progress`
+      {total, cache, processed, time_ms}, taken from its server at d92ea9b, MIT) on streamed
+      chat, completions and Responses (`response.in_progress`); the first when the request starts,
+      one per step of the prompt, the last with `processed == total` before the first text.
+      Ares counts the work: replayed rows move the count, and Flash-Next's pass says how far it
+      has got (`StepContext::share`, read about once a second while the step runs). Messages has
+      none, as llama.cpp. See "Prompt progress" in `dev/architecture/server.md`.
+- [x] The default log for a person: a request's lines (taken, started, the progress of a long
+      prompt, the end with `prompt eval time` over the rows run in the engine's own prompt time,
+      `eval time`, `total time`, `draft acceptance` with the mean length and chain, from the
+      request's own counts), every refusal and failure with its route, status, code and message,
+      an unload after an engine failure as an error, the load's repeated line of a prompt's steps
+      gone. The prompt rate no longer counts the queue and the cache restore into the time (0.6
+      tokens/s for one token computed of 55 before). `timings.prompt_ms` is the engine's prompt
+      time and the draft counts are each request's own.
+- [x] llama.cpp's web UI (`ui/apps/chat` of llama.cpp) sent members Ares refused, so that client
+      could not use Ares (found 2026-11-26). Done 2026-11-27: `sse_ping_interval` (the stream's
+      pings), `timings_per_token` (the timings so far on a stream's chunks, and llama.cpp's
+      `cache_n` and milliseconds per token in every `timings`), `backend_sampling` (where
+      llama.cpp samples: without effect), `reasoning_control` with llama.cpp's
+      `/v1/chat/completions/control` (`reasoning_end` ends a running reply's thinking); and the
+      lines of a long reply's speed in the log (llama.cpp's `print_timings_tg`).
+
 Found and fixed on `feat/jev` (2026-11-26):
 
 - [x] A tail of the prompt cache that went to RAM and came back was settled as a full page on

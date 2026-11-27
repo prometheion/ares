@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
+use ares_api::Progress;
 use axum::response::Response;
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 
@@ -32,6 +33,10 @@ pub(crate) trait Writer: Send + 'static {
     fn end(&mut self, end: End, out: &mut VecDeque<Written>);
     /// The event of a failure after the stream started, its last one.
     fn error(&mut self, error: &ApiError) -> Written;
+    /// The events that say how far the prompt has got, for a request that
+    /// asked (llama.cpp's `return_progress`); none from an API that has no
+    /// place for it.
+    fn progress(&mut self, _progress: &Progress, _out: &mut VecDeque<Written>) {}
     /// Takes pieces of a reply that is answered whole.
     fn take(&mut self, pieces: Vec<Piece>);
     /// The body of a reply that is answered whole, at its end.
@@ -50,7 +55,11 @@ pub(crate) async fn answer<W: Writer>(
     keep_alive: KeepAlive,
 ) -> Result<Response, ApiError> {
     let (streamed, lowered) = (parsed.stream, parsed.lowered);
-    let reply = Generation::start(app, lease, parsed.request, sorter)?;
+    let progress = parsed.stream && parsed.progress;
+    let live = parsed.stream && parsed.timings_per_token;
+    let keep_alive = crate::routes::pings(keep_alive, parsed.ping);
+    let reply =
+        Generation::start(app, lease, parsed.request, sorter)?.reporting(progress).timing(live);
     let response = if streamed {
         stream(reply, writer, app, keep_alive).await
     } else {
@@ -65,7 +74,7 @@ async fn whole<W: Writer>(mut reply: Generation, mut writer: W) -> Result<Respon
     loop {
         match reply.next().await? {
             Step::Pieces(pieces) => writer.take(pieces),
-            Step::Probs(_) => {}
+            Step::Probs(_) | Step::Progress(_) => {}
             Step::End(end) => return Ok(json_response(writer.whole(end))),
         }
     }
@@ -83,7 +92,7 @@ async fn stream<W: Writer>(
     mut reply: Generation,
     mut writer: W,
     app: &App,
-    keep_alive: KeepAlive,
+    keep_alive: Option<KeepAlive>,
 ) -> Result<Response, ApiError> {
     let first = reply.first(app.config.stream_wait).await?;
     let mut queue = VecDeque::new();
@@ -125,13 +134,26 @@ impl<W: Writer> Events<W> {
                 None => self.reply.next().await,
             };
             match step {
-                Ok(Step::Pieces(pieces)) => self.writer.pieces(pieces, &mut self.queue),
+                Ok(Step::Pieces(pieces)) => {
+                    let before = self.queue.len();
+                    self.writer.pieces(pieces, &mut self.queue);
+                    // llama.cpp's `timings_per_token`: the data of the step's last
+                    // event has the timings so far.
+                    if self.queue.len() > before
+                        && let (Some(timings), Some((_, data))) =
+                            (self.reply.timings_now(), self.queue.back_mut())
+                    {
+                        crate::openai::reply::with_timings(data, timings);
+                    }
+                }
+                Ok(Step::Progress(progress)) => self.writer.progress(&progress, &mut self.queue),
                 Ok(Step::Probs(_)) => {}
                 Ok(Step::End(end)) => {
                     self.writer.end(end, &mut self.queue);
                     self.over = true;
                 }
                 Err(error) => {
+                    error.tell("the stream failed");
                     self.over = true;
                     return Some(self.writer.error(&error));
                 }

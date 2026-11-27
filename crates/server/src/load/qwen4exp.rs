@@ -757,8 +757,13 @@ fn log_drafting(asked: &Asked) {
 /// Says what a prompt read alone takes once the parts are open: the rows the
 /// expert slots lend for, which the model knows then, against the rows
 /// planned (`own_rows` in the parts' own memory, `max_rows` on lent VRAM,
-/// `pass_rows` of a pass, 0 for none).
+/// `pass_rows` of a pass, 0 for none). Nothing when it is what the plan's
+/// line said.
 fn log_steps_taken(model: &Qwen4Exp, own_rows: u32, max_rows: u32, pass_rows: u32) {
+    let planned = if pass_rows > own_rows { pass_rows } else { max_rows };
+    if model.max_rows() == planned {
+        return;
+    }
     if model.max_rows() > own_rows && pass_rows > own_rows {
         tracing::info!(
             "a prompt read alone runs layer by layer in steps of up to {} rows, kept on VRAM \

@@ -620,6 +620,11 @@ impl Engine for Runtime {
         self.failure.get().cloned()
     }
 
+    fn end_thinking(&self, id: RequestId) -> Result<bool, EngineError> {
+        self.ask(|reply| Command::EndThinking { id, reply })
+            .ok_or_else(|| EngineError::Internal("the engine is not running".into()))
+    }
+
     fn stats(&self) -> Option<EngineStats> {
         let snapshot = self.snapshot()?;
         let c = &snapshot.counters;

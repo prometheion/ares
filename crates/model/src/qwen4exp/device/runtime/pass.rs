@@ -568,6 +568,12 @@ impl Qwen4ExpDevice {
         let base = token.wrapping_mul(self.per_step).wrapping_add(1);
         let block =
             |i: usize, m: usize| base.wrapping_add(((i as u64 * micro_n + m as u64) * 8) as u32);
+        // The pass says how far it has got from its start (from where it stopped,
+        // when it goes on), before its first micro-batch, which may wait long for
+        // the drive.
+        let model_pieces = self.model_layers as u64 * micro_n;
+        let at = (self.part.layer_range().start + run.layer) as u64 * micro_n + run.next as u64;
+        step.share.fetch_max(ares_runtime::share_of(at, model_pieces), Ordering::Relaxed);
         while run.layer < n_layers {
             let i = run.layer;
             while run.next < run.micro.len() {
@@ -626,6 +632,10 @@ impl Qwen4ExpDevice {
                 self.flow.pump()?;
                 run.next += 1;
                 ran += 1;
+                // How far the pass has got, for the progress of its prompt: the
+                // micro-batches of the layers of the model done, on every part.
+                let done = layer_no as u64 * micro_n + m as u64 + 1;
+                step.share.fetch_max(ares_runtime::share_of(done, model_pieces), Ordering::Relaxed);
             }
             // Every micro-batch has routed: the picks of all rows go to the host, and the
             // layer's experts run for all of them.

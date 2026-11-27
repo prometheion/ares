@@ -139,7 +139,7 @@ fn first_token(runtime: &Runtime, id: u64, state: &Json, question: &str) -> u32 
             Event::Error(e) => {
                 let _ = tx.send(Err(e.clone()));
             }
-            Event::Text(_) => {}
+            Event::Text(_) | Event::Progress(_) | Event::Generated(_) => {}
         }
         true
     });

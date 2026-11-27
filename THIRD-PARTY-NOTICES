@@ -12,6 +12,13 @@ Used in: crates/quant (a port of ggml's quantization and dequantization code),
 crates/core/src/ggml_type.rs (the numbering and block geometry of the weight
 types), and the codebook tables generated from ggml-common.h
 (crates/cuda/kernels/gen_iq_tables.py, crates/quant/tools/gen_tables.py).
+From its server (tools/server at commit d92ea9bb126ab957849dd0c0f1f881a64de7dc86):
+the request member `return_progress`, the stream's `prompt_progress` and when
+it is sent (server-task.cpp, server-context.cpp; in
+crates/server/src/openai/reply.rs, crates/server/src/responses/reply.rs and
+crates/runtime/src/conductor/progress.rs), and the layout of the timings in the
+log (print_timings and print_timings_pp of server-context.cpp; in
+crates/server/src/bridge.rs).
 
 MIT License
 

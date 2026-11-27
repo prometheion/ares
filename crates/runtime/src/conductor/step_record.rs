@@ -21,6 +21,17 @@ impl Conductor {
         self.heartbeat.begin();
         let dispatched = self.exec.dispatch(&meta);
         let t_wait = Instant::now();
+        // A step of one prompt that runs long: its request hears how far the
+        // step has got while it runs, from a model that says so. A model may say
+        // nothing for the first seconds of a step (its first piece waits for the
+        // drive), so the conductor looks as long as the step runs.
+        if dispatched.is_ok()
+            && let Some((slot, rows)) = self.reporting_step()
+        {
+            while !self.exec.wait_for_step(self.config.conductor_spin, progress::LOOK) {
+                self.report_step_share(slot, rows);
+            }
+        }
         let collected = dispatched
             .and_then(|()| self.exec.collect(self.config.conductor_spin, &mut self.output));
         self.heartbeat.end();
@@ -118,6 +129,10 @@ impl Conductor {
                 return self.fail("the model paused a step of several sequences".into());
             }
             let part = self.parts[0];
+            // What the pass has done so far is the request's progress.
+            if self.reporting_step().is_some() {
+                self.report_step_share(part.slot, part.rows);
+            }
             self.paused = Some(part);
             self.hold_images(part);
             self.paused_inner = std::mem::take(&mut self.inner);

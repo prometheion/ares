@@ -106,7 +106,8 @@ A preset file gives a model a short id and aliases. With `--api-key`, set
 | The log | standard error; `--log-file <FILE>` appends to a file, `--log-format json` writes one JSON object a line |
 | Log level | the `RUST_LOG` environment variable, default `info` (for example `RUST_LOG=debug`) |
 | At start | the devices, the split, the context and why, the RAM limit, what each device took, and per device whether its tensor cores are capped and which kernel path each weight type was measured to be fastest on |
-| Per request | a line `request` when it is taken (model, API, `max_tokens`, sampling fields, tools, priority) and a line `request finished` (finish reason, `prompt_tokens`, `cached_prompt_tokens`, `queued_ms`, `prompt_ms`, `completion_tokens`, `reasoning_tokens`, `tokens_per_s`, `drafts`, `drafts_accepted`); the prompt and the reply only with `--log-text` |
+| Per request | lines for a person, laid out as llama.cpp's server writes its timings: when it is taken (API, model, the parameters it gives), when it starts in the engine (the prompt, what the cache gave, the wait), how far a long prompt has got (from 3 s on, every tenth or 10 s), how fast a long reply comes (`n_gen`, `tg` since its first token and `tg_3s` over the last 3 s, once in 3 s from its 100th token), and at its end the reason, `prompt eval time` (over the rows the engine ran for the prompt, the cached tokens named apart), `eval time`, `total time` and `draft acceptance` (accepted of proposed, mean length and mean chain); the same as fields at `RUST_LOG=ares_server=debug`; the prompt and the reply only with `--log-text` |
+| Errors | every refusal and failure a client gets, with its route, status, code and message: a warning, a 500 an error |
 
 `GET /metrics` returns the counters of the loaded model in the Prometheus text
 format (`?model=<id>` when the server has several models). Useful ones:

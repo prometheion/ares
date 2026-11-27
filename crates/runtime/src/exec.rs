@@ -207,6 +207,23 @@ pub trait Executor: Send {
     /// before it parks, and is told how the wait ended.
     fn collect(&mut self, spin: Duration, out: &mut StepOutput) -> Result<Woke, ExecError>;
 
+    /// Waits at most `limit` (spinning for `spin` first, as [`Executor::collect`]
+    /// does) for the step started by the last [`Executor::dispatch`] to end, so that
+    /// the conductor can tell a long step's requests how far it has got
+    /// ([`Executor::step_share`]) while it runs. Returns `false` when the step still
+    /// runs; `true` when it has ended, or when the executor cannot tell, in which case
+    /// [`Executor::collect`] waits for it. The default cannot tell.
+    fn wait_for_step(&mut self, _spin: Duration, _limit: Duration) -> bool {
+        true
+    }
+
+    /// How much of the step in flight the model has done, from 0 to 1, from a model
+    /// that runs a long step in pieces and says so as it goes
+    /// ([`StepContext::share`](crate::StepContext)); `None` from one that does not.
+    fn step_share(&self) -> Option<f64> {
+        None
+    }
+
     /// How the devices' waits for work have ended so far, summed.
     fn device_wakes(&self) -> crate::sync::WakeCounts;
 

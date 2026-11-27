@@ -171,7 +171,7 @@ fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
         assert_eq!(timings["predicted_n"], 48);
         assert!(timings["prompt_ms"].as_f64().unwrap() > 0.0, "{timings}");
         assert!(timings["predicted_per_second"].as_f64().unwrap() > 1.0, "{timings}");
-        assert!(timings["draft_n"].as_u64().is_some(), "it ran alone: {timings}");
+        assert!(timings["draft_n"].as_u64().is_some(), "its own drafts: {timings}");
         assert!(timings["draft_n_accepted"].as_u64() <= timings["draft_n"].as_u64());
 
         let mut streaming = sampled.clone();
@@ -349,7 +349,9 @@ fn two_requests_run_at_once_and_each_gets_its_own_text() {
     assert_eq!(german_together.1, "length");
     for timings in [&german_together.2, &english_together.2] {
         assert_eq!(timings["predicted_n"], 160);
-        assert!(timings.get("draft_n").is_none(), "drafts are counted for both: {timings}");
+        // The engine counts each request's own drafts, also next to another.
+        let drafts = timings["draft_n"].as_u64().expect("its own drafts");
+        assert!(timings["draft_n_accepted"].as_u64().unwrap() <= drafts, "{timings}");
     }
     assert_eq!(server.metric("requests_finished_total"), 4);
     assert_eq!(server.metric("sequences"), 0);

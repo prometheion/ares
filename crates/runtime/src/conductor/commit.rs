@@ -129,6 +129,11 @@ impl Conductor {
                             // are worth.
                             a.drafter.observe(&mut self.corpus, made, right);
                         }
+                        // The request's own, counted as the engine's totals are:
+                        // the rows of drafts its windows carried.
+                        a.drafts.proposed += drafts as u32;
+                        a.drafts.accepted += accepted as u32;
+                        a.drafts.windows += 1;
                         let counters = &mut self.stats.counters;
                         counters.draft_lengths[source][made.min(DRAFT_POSITIONS)] += 1;
                         counters.drafts_accepted += accepted as u64;
@@ -276,11 +281,18 @@ impl Conductor {
                 self.retire(slot, FinishReason::Cancelled);
                 continue;
             }
-            let mut listening = true;
+            // How far the prompt has got comes first: the step that ends it
+            // reports it whole before its first text.
+            let mut listening = match self.parts[i].kind {
+                PartKind::Prefill { .. } => a.report_progress(0.0),
+                _ => true,
+            };
+            // Then how many tokens the reply has, before its text.
+            listening = listening && a.report_generated();
             // The probabilities of the tokens whose text goes out now go out
             // first (a token that prints nothing goes out with the text
             // before it).
-            if a.sampler.wants_probs() {
+            if listening && a.sampler.wants_probs() {
                 let probs = a.sampler.text_sent(a.emitted.len());
                 if !probs.is_empty() {
                     listening = a.sink.send(Event::Logprobs(probs));

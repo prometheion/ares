@@ -32,6 +32,8 @@ pub(super) struct Qwen4ExpDevice {
     /// Whether the devices hold a range of layers each (and hand the residual
     /// over) rather than share every layer.
     pub(super) by_layers: bool,
+    /// The layers of the model, on all parts.
+    pub(super) model_layers: usize,
     pub(super) n_vocab: u32,
     /// Values of one row of the residual streams.
     pub(super) wide: u32,
@@ -95,6 +97,7 @@ impl Qwen4ExpDevice {
             index,
             devices: model.placement.n_devices(),
             by_layers: model.placement.tensor.is_none(),
+            model_layers: c.n_layer,
             n_vocab: c.n_vocab as u32,
             wide: c.wide() as u32,
             // A pass numbers the exchanges of its pieces from the step's base: a block of

@@ -90,6 +90,44 @@ impl Bell {
         self.park_past(seen)
     }
 
+    /// [`Bell::wait_past`] for at most `limit` after the spin: `None` when the
+    /// count is still `seen` then.
+    pub fn wait_past_within(
+        &self,
+        seen: u64,
+        spin: Duration,
+        limit: Duration,
+    ) -> Option<(u64, Woke)> {
+        let start = Instant::now();
+        loop {
+            for _ in 0..64 {
+                let now = self.count.load(Ordering::Acquire);
+                if now != seen {
+                    return Some((now, Woke::Spinning));
+                }
+                spin_loop();
+            }
+            if start.elapsed() >= spin {
+                break;
+            }
+        }
+        let deadline = Instant::now() + limit;
+        loop {
+            self.parked.store(true, Ordering::SeqCst);
+            let now = self.count.load(Ordering::SeqCst);
+            if now != seen {
+                self.parked.store(false, Ordering::SeqCst);
+                return Some((now, Woke::Parked));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.parked.store(false, Ordering::SeqCst);
+                return None;
+            }
+            thread::park_timeout(left);
+        }
+    }
+
     /// Parks until the count differs from `seen`.
     fn park_past(&self, seen: u64) -> (u64, Woke) {
         loop {
@@ -129,6 +167,30 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn a_wait_within_a_limit_ends_at_the_limit_or_at_the_ring() {
+        let bell = Arc::new(Bell::new());
+        bell.bind();
+        let begun = Instant::now();
+        assert_eq!(bell.wait_past_within(0, Duration::ZERO, Duration::from_millis(30)), None);
+        assert!(begun.elapsed() >= Duration::from_millis(30));
+        let ringer = {
+            let bell = bell.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                bell.ring();
+            })
+        };
+        let woke = bell.wait_past_within(0, Duration::ZERO, Duration::from_secs(5));
+        assert_eq!(woke.map(|(count, _)| count), Some(1));
+        ringer.join().unwrap();
+        // A ring that came before is seen at once.
+        assert_eq!(
+            bell.wait_past_within(0, Duration::ZERO, Duration::ZERO),
+            Some((1, Woke::Spinning))
+        );
+    }
 
     #[test]
     fn a_ring_before_the_wait_is_seen_at_once() {
