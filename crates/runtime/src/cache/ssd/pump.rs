@@ -341,14 +341,15 @@ impl Cache {
                 let parts = job.ready.remove(&next).expect("checked above");
                 let depth = job.pages[next].2;
                 let behind = (job.pages.len() - 1 - next) as u64 * per_page;
-                // A tail keeps the form it has, as the newest cells of a run do.
+                // A tail keeps the form it has, as the newest cells of a run do,
+                // and the devices take it for a partly used page, as one from RAM.
                 let tail = job.tail.is_some() && next + 1 == job.pages.len();
                 let keep_form = tail || keeps_form(depth, behind, settle, per_page);
                 batch.push(Transfer {
                     kind: TransferKind::PageIn,
                     object: page.0,
                     keep_form,
-                    tail: false,
+                    tail,
                     parts,
                     ok: false,
                 });
@@ -557,6 +558,7 @@ impl Cache {
                 kind: TransferKind::PageOut,
                 object: tail.page.0,
                 keep_form: false,
+                tail: false,
                 parts,
                 ok: false,
             });
