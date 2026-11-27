@@ -9,7 +9,7 @@
 //!     [--placement] [--read-time] [--profile A.q4route,B.q4route]
 //!     [--check DIR/NAME,...] [--chat] [--generate 64]
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
-//!     [--decode-steps 64]
+//!     [--decode-steps 64] [--every 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
 //!     [--read-ahead on|off] [--predict 2] [--fingerprint FILE] [--kv q8,q8]
 //!     [--near-pages N] [--cpu-workers N]
@@ -41,7 +41,9 @@
 //! - `--decode-at N`: milliseconds per decode step with `N` tokens of the
 //!   text as the context; `--breakdown` adds device time by kind (the
 //!   timed events cost a part of a step themselves, so steps are measured
-//!   both ways).
+//!   both ways). `--every K` prints a line per `K` steps of the untimed ones: the
+//!   share of picks in VRAM, the misses, the reads of the file and the median step, to
+//!   see how the tiers follow the text the model writes.
 //! - `--prefill N`: reads `N` tokens of `--text` from an empty sequence and
 //!   reports tokens per second, in steps of `--rows` rows (default 8, the decode
 //!   kernels' limit; more runs the many-row kernels and reports what the wide steps
@@ -114,6 +116,7 @@ struct Args {
     text_file: Vec<String>,
     decode_at: Vec<usize>,
     decode_steps: usize,
+    every: usize,
     prefill: usize,
     repeat: usize,
     rows: u32,
@@ -154,6 +157,7 @@ fn parse() -> Result<Args, AnyError> {
         text_file: Vec::new(),
         decode_at: Vec::new(),
         decode_steps: 64,
+        every: 0,
         prefill: 0,
         repeat: 1,
         rows: 8,
@@ -210,6 +214,7 @@ fn parse() -> Result<Args, AnyError> {
                     list(value()?).iter().map(|d| d.parse()).collect::<Result<_, _>>()?
             }
             "--decode-steps" => args.decode_steps = value()?.parse()?,
+            "--every" => args.every = value()?.parse()?,
             "--prefill" => args.prefill = value()?.parse()?,
             "--rows" => args.rows = value()?.parse()?,
             "--repeat" => args.repeat = value()?.parse()?,
@@ -1088,6 +1093,8 @@ fn run() -> Result<(), AnyError> {
             let mut host = [Duration::ZERO; 4];
             let mut ms = Vec::new();
             let mut kinds: Vec<StepKind> = Vec::new();
+            // Picks and hits since the last `--every` line.
+            let mut window = (0u64, 0u64);
             let first = tokens.len() - 1;
             for _ in 0..args.decode_steps {
                 let before = session.store().stats().clone();
@@ -1108,6 +1115,24 @@ fn run() -> Result<(), AnyError> {
                     from_file: after.miss_from_disk - before.miss_from_disk,
                     rows_ms: time.rows.as_secs_f64() * 1e3,
                 });
+                window.0 += after.picks - before.picks;
+                window.1 += after.hits - before.hits;
+                if !timed && args.every > 0 && kinds.len().is_multiple_of(args.every) {
+                    let last = &kinds[kinds.len() - args.every..];
+                    let mut ms: Vec<f64> = last.iter().map(|k| k.ms).collect();
+                    let n = args.every as f64;
+                    println!(
+                        "  steps {}-{}: {:.1} % of picks in VRAM, {:.1} misses and {:.1} reads of \
+                         the file a step, median {:.2} ms",
+                        kinds.len() - args.every + 1,
+                        kinds.len(),
+                        100.0 * window.1 as f64 / window.0.max(1) as f64,
+                        last.iter().map(|k| k.misses as f64).sum::<f64>() / n,
+                        last.iter().map(|k| k.from_file as f64).sum::<f64>() / n,
+                        median(&mut ms),
+                    );
+                    window = (0, 0);
+                }
                 for (total, part) in
                     host.iter_mut().zip([time.prepare, time.rows, time.enqueue, time.wait])
                 {
