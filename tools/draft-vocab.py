@@ -15,7 +15,8 @@ DIR/git/ (removable afterwards); half an hour, most of it waiting for the
 datasets server, which allows a few dozen requests a minute.
 
 `make` runs `crates/tokenizer/examples/draft_vocab.rs` for each ready file of
-MIXES, with the weights, licences and sources of the parts in its header.
+MIXES, with the weights, licences and sources of the parts in its header. The
+guide is docs/user/draft-vocab.md.
 """
 
 import hashlib

@@ -26,6 +26,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | --- | --- |
 | Speculative decoding | model drafts and the n-gram drafter; a step verifies as many drafts as pay, by their probability and the measured price of a step |
 | Exact drafts | on the 27B the text with drafts is token for token the text without |
+| Draft vocabularies | `--draft-vocab` limits the tokens the model drafters propose; ready lists for the models' tokenizer, and an example that makes and checks one on your own text ([draft-vocab.md](draft-vocab.md)) |
 | Prompts beside generation | prompts are read in pieces between rounds; each generating request keeps `--generation-floor` tokens/s (20) |
 | Long prompts, Flash-Next | read layer by layer, each expert crosses the link once per prompt; a new request cuts in between micro-batches |
 | Prompt kernels | the path of each weight type measured at load on every card; the attention of long prompts has a kernel of its own |
