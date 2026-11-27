@@ -253,6 +253,8 @@ impl Conductor {
                 PartKind::Prefill { .. } => a.report_progress(0.0),
                 _ => true,
             };
+            // Then how many tokens the reply has, before its text.
+            listening = listening && a.report_generated();
             // The probabilities of the tokens whose text goes out now go out
             // first (a token that prints nothing goes out with the text
             // before it).

@@ -251,7 +251,7 @@ impl Rig {
         let text = Arc::new(Mutex::new(String::new()));
         let sink = EventSink::new(move |event| {
             match event {
-                Event::Logprobs(_) | Event::Progress(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
                 Event::Text(piece) => text.lock().unwrap().push_str(&piece),
                 Event::Done { finish, usage } => {
                     let text = std::mem::take(&mut *text.lock().unwrap());

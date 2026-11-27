@@ -669,12 +669,11 @@ Pieces of real work, days each, in the order of work where the owner placed them
       stream, beside `return_progress`; Ares refuses it as a member it does not know, so that
       client cannot talk to Ares yet (found 2026-11-26 by `feat/progress-logs`). Its tests also
       send `timings_per_token`. Files: `crates/server/src/openai/request.rs` (`SERVED`).
-- [ ] Left of the prompt progress and the log (`feat/progress-logs`, 2026-11-26): no lines of a
-      long generation's speed (llama.cpp's `print_timings_tg`: `n_gen`, the rate and the rate of
-      the last 3 s, every 3 s after 100 tokens); a step of Flash-Next's prompt on lent VRAM that
-      is not a pass, and the 27B's prompt steps, report after each step only (the share inside a
-      step comes from the pass alone); the acceptance of drafts by position is in `/metrics`, not
-      in a request's lines (llama.cpp prints it at trace).
+- [ ] Left of the prompt progress and the log (`feat/progress-logs`, 2026-11-26): a step of
+      Flash-Next's prompt on lent VRAM that is not a pass, and the 27B's prompt steps, report
+      after each step only (the share inside a step comes from the pass alone); the acceptance
+      of drafts by position is in `/metrics`, not in a request's lines (llama.cpp prints it at
+      trace).
 - [ ] Left of the thinking budget and the loop guard (K03, K05, done 2026-11-22): the
       thresholds are fixed (no option); a passage loop of longer cycles (Strata's opt-in #728)
       is not looked for; `reasoning_control` is not built (refused with a 400).

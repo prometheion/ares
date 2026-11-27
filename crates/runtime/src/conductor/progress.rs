@@ -40,6 +40,8 @@ pub(super) struct PromptProgress {
     over: bool,
     /// The rows replayed when the first token came, `None` before.
     replayed: Option<u32>,
+    /// The reply's tokens the last [`Event::Generated`] said.
+    generated: u32,
 }
 
 impl PromptProgress {
@@ -105,6 +107,16 @@ impl Active {
         }
         self.progress.sent = processed;
         self.sink.send(Event::Progress(self.progress_now(processed)))
+    }
+
+    /// Tells the request how many tokens its reply has, if it has more than the
+    /// last event said. Returns `false` when the sink refused it.
+    pub(super) fn report_generated(&mut self) -> bool {
+        if self.completion <= self.progress.generated {
+            return true;
+        }
+        self.progress.generated = self.completion;
+        self.sink.send(Event::Generated(self.completion))
     }
 
     fn progress_now(&self, processed: u32) -> ares_api::Progress {

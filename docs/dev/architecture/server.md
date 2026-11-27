@@ -372,7 +372,12 @@ when it starts in the engine (at its first progress event: the prompt, what the
 cache gave, the time since the hand-over); how far a long prompt has got
 (`prompt processing, n_tokens = , progress = , t = s / tokens per second`, as
 llama.cpp's `print_timings_pp`: from 3 s into the prompt, when another tenth is
-done or 10 s have passed, never within 3 s of the last line); and at its end the
+done or 10 s have passed, never within 3 s of the last line); how fast a long
+reply comes (`n_gen = , tg = t/s, tg_3s = t/s`, as llama.cpp's
+`print_timings_tg`: from the 100th token, at most once in 3 s, the rate of the
+tokens after the first since the first, and over the time since the last line;
+from `Event::Generated`, the reply's tokens so far, which the engine sends with
+every step's text); and at its end the
 reason, the prompt with the cached and replayed tokens apart, the generated and
 thinking tokens and the wait in line, then `prompt eval time` (the engine's
 time of the prompt, `Usage::prompt_time`, over the rows it ran for it: the

@@ -6,8 +6,8 @@ use crate::EngineError;
 
 /// One step of a request's life, as seen by the front end.
 ///
-/// A request produces any number of [`Event::Progress`], [`Event::Text`] and
-/// [`Event::Logprobs`] events followed by exactly one terminal event,
+/// A request produces any number of [`Event::Progress`], [`Event::Generated`],
+/// [`Event::Text`] and [`Event::Logprobs`] events followed by exactly one terminal event,
 /// [`Event::Done`] or [`Event::Error`]. Nothing follows the terminal event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -15,6 +15,9 @@ pub enum Event {
     /// step that ran rows of its prompt, up to the step that ends it, whose
     /// progress comes before its text. Never after the first text.
     Progress(Progress),
+    /// How many tokens the reply has so far: after every step that took some,
+    /// before the step's text.
+    Generated(u32),
     /// A piece of output text.
     ///
     /// It is valid UTF-8 by construction (a `String`) and must never split a
@@ -37,7 +40,10 @@ pub enum Event {
 impl Event {
     /// Whether this event ends the request.
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, Event::Text(_) | Event::Logprobs(_) | Event::Progress(_))
+        !matches!(
+            self,
+            Event::Text(_) | Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_)
+        )
     }
 }
 
@@ -181,6 +187,7 @@ mod tests {
         let progress =
             Progress { total: 8, cached: 2, processed: 2, elapsed: std::time::Duration::ZERO };
         assert!(!Event::Progress(progress).is_terminal());
+        assert!(!Event::Generated(3).is_terminal());
         assert!(Event::Done { finish: FinishReason::Stop, usage: Usage::default() }.is_terminal());
         assert!(Event::Error(EngineError::Overloaded).is_terminal());
     }

@@ -120,7 +120,7 @@ fn say(runtime: &Runtime, text: &str) -> Result<String, EngineError> {
             panic!("no event within {PATIENCE:?} after the request: the step hangs")
         }) {
             Event::Text(piece) => answer.push_str(&piece),
-            Event::Logprobs(_) | Event::Progress(_) => {}
+            Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
             Event::Done { .. } => return Ok(answer),
             Event::Error(error) => return Err(error),
         }

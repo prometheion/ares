@@ -53,7 +53,9 @@
 //! A request's lines are for a person, laid out as llama.cpp's server lays out
 //! its timings: when it starts in the engine (its prompt, what the cache gave),
 //! how far a long prompt has got (from 3 s into it, at most once in 3 s, when
-//! another tenth is done or 10 s have passed), and at its end the prompt's
+//! another tenth is done or 10 s have passed), how fast a long reply comes
+//! (from its 100th token, once in 3 s, as llama.cpp's `print_timings_tg`: the
+//! rate since the first token and over the last 3 s), and at its end the prompt's
 //! rate over the rows the engine ran for it, the rate of generation, the total
 //! and the drafts. The same in fields, for a program, is the debug line
 //! `request finished`.
@@ -84,6 +86,9 @@ use crate::metrics::latency::{Latency, Took};
 pub(crate) enum Item {
     /// How far the prompt has got.
     Progress(Progress),
+    /// The reply has more tokens (the run keeps their count; [`Run::next`]
+    /// passes it over).
+    Generated,
     Text(String),
     /// The probabilities of the tokens whose text went out.
     Probs(Vec<TokenProbs>),
@@ -343,6 +348,10 @@ pub(crate) struct Run {
 struct Told {
     started: bool,
     last: Option<(Duration, f64)>,
+    /// Of the reply: when its first token came (after the hand-over), and the
+    /// last line of its speed, when and at how many tokens.
+    first: Option<Duration>,
+    speed: Option<(Duration, u32)>,
 }
 
 impl Told {
@@ -360,7 +369,28 @@ impl Told {
         self.last = Some((t, share));
         true
     }
+
+    /// Whether a line of the reply's speed is due at `now` (after the hand-over)
+    /// with `tokens` generated, and notes it if it is: the rate since the first
+    /// token and over the time since the last line, as llama.cpp's
+    /// `print_timings_tg` computes them (`tools/server/server-context.cpp`,
+    /// commit d92ea9b, MIT): from the 100th token, at most once in 3 s.
+    fn speed(&mut self, now: Duration, tokens: u32) -> Option<(f64, f64)> {
+        let first = *self.first.get_or_insert(now);
+        let (last_at, last_n) = self.speed.unwrap_or((first, 0));
+        if tokens < SPEED_FROM || now < last_at + SPEED_LINES {
+            return None;
+        }
+        self.speed = Some((now, tokens));
+        let rate = |n: u32, time: Duration| f64::from(n) / time.as_secs_f64().max(1e-9);
+        Some((rate(tokens.saturating_sub(1), now - first), rate(tokens - last_n, now - last_at)))
+    }
 }
+
+/// A reply has lines of its speed from this many tokens on, at most one in
+/// [`SPEED_LINES`] (llama.cpp's `print_timings_tg`).
+const SPEED_FROM: u32 = 100;
+const SPEED_LINES: Duration = Duration::from_secs(3);
 
 /// A prompt that is read longer than this has lines of its progress in the log,
 /// at most one in this time.
@@ -407,7 +437,9 @@ impl Run {
             clock.note(&event);
             // A report of progress that finds the queue half full is let go:
             // the next one says more, and it must not end the request.
-            if matches!(event, Event::Progress(_)) && tx.capacity() * 2 <= room {
+            if matches!(event, Event::Progress(_) | Event::Generated(_))
+                && tx.capacity() * 2 <= room
+            {
                 return true;
             }
             if !event.is_terminal() && tx.capacity() <= 1 {
@@ -443,7 +475,12 @@ impl Run {
     /// `next` must not be called again.
     pub async fn next(&mut self) -> Result<Item, ApiError> {
         let id = self.guard.id;
-        self.pull().await.map_err(|error| error.of_request(id))
+        loop {
+            match self.pull().await.map_err(|error| error.of_request(id))? {
+                Item::Generated => {}
+                item => return Ok(item),
+            }
+        }
     }
 
     async fn pull(&mut self) -> Result<Item, ApiError> {
@@ -486,6 +523,10 @@ impl Run {
             Event::Progress(progress) => {
                 self.tell_progress(&progress);
                 Ok(Item::Progress(progress))
+            }
+            Event::Generated(tokens) => {
+                self.tell_speed(tokens);
+                Ok(Item::Generated)
             }
             Event::Text(text) => {
                 if let Some(kept) = &mut self.text {
@@ -606,6 +647,17 @@ impl Run {
             t.as_secs_f64(),
             f64::from(done) / t.as_secs_f64(),
         );
+    }
+
+    /// The line of a long reply's speed, as llama.cpp's `print_timings_tg`
+    /// writes it ([`Told::speed`] says when).
+    fn tell_speed(&mut self, tokens: u32) {
+        if let Some((tg, recent)) = self.told.speed(self.marks.started.elapsed(), tokens) {
+            tracing::info!(
+                "request {} n_gen = {tokens:6}, tg = {tg:6.2} t/s, tg_3s = {recent:6.2} t/s",
+                self.guard.id,
+            );
+        }
     }
 
     fn slow(&mut self) -> ApiError {
@@ -801,5 +853,20 @@ mod tests {
         assert!(told.due(s(6.5), 0.6));
         assert!(told.due(s(16.5), 0.61), "after 10 s whatever it did");
         assert!(!told.due(s(30.0), 1.0), "the end is the request's own line");
+    }
+
+    /// A reply's speed is in the log from its 100th token, at most once in 3 s
+    /// after its first token or the last line, with the rate since the first
+    /// token (of the tokens after it) and over the time since the last line.
+    #[test]
+    fn the_lines_of_a_replys_speed_come_from_the_hundredth_token_once_in_three_seconds() {
+        let s = Duration::from_secs_f64;
+        let mut told = Told::default();
+        assert_eq!(told.speed(s(1.0), 1), None, "the first token starts the clock");
+        assert_eq!(told.speed(s(3.5), 99), None, "fewer than 100 tokens");
+        assert_eq!(told.speed(s(3.9), 300), None, "not within 3 s of the first token");
+        assert_eq!(told.speed(s(4.0), 301), Some((100.0, 100.33333333333333)));
+        assert_eq!(told.speed(s(6.9), 600), None, "not within 3 s of the last line");
+        assert_eq!(told.speed(s(7.0), 601), Some((100.0, 100.0)));
     }
 }

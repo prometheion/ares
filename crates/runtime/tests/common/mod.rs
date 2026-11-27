@@ -154,12 +154,17 @@ impl Handle {
         let mut text = String::new();
         let mut probs = Vec::new();
         let mut progress: Vec<Progress> = Vec::new();
+        let mut generated = 0;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
+                Ok(Event::Generated(tokens)) => {
+                    assert!(tokens > generated, "the reply's tokens {generated} then {tokens}");
+                    generated = tokens;
+                }
                 Ok(Event::Progress(now)) => {
                     assert!(
-                        text.is_empty() && probs.is_empty(),
+                        text.is_empty() && probs.is_empty() && generated == 0,
                         "progress after the text: {now:?}"
                     );
                     if let Some(last) = progress.last() {
@@ -184,6 +189,7 @@ impl Handle {
                         self.rx.recv_timeout(Duration::from_millis(50)).is_err(),
                         "events after the terminal one"
                     );
+                    assert!(generated <= usage.completion_tokens, "{generated} of {usage:?}");
                     if usage.completion_tokens > 0 && !self.begun.get() {
                         let (first, last) = (progress.first(), progress.last());
                         assert_eq!(
@@ -211,7 +217,9 @@ impl Handle {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
-                Ok(Event::Text(_) | Event::Logprobs(_) | Event::Progress(_)) => {}
+                Ok(
+                    Event::Text(_) | Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_),
+                ) => {}
                 Ok(Event::Done { .. }) => panic!("request {} did not fail", self.id),
                 Ok(Event::Error(error)) => return error,
                 Err(_) => panic!("request {} did not end within {LIMIT:?}", self.id),
@@ -228,7 +236,7 @@ impl Handle {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
                 Ok(Event::Text(piece)) => text.push_str(&piece),
-                Ok(Event::Progress(_)) => {}
+                Ok(Event::Progress(_) | Event::Generated(_)) => {}
                 other => panic!("request {} gave {other:?} before {n} characters", self.id),
             }
         }

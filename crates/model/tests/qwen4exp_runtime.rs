@@ -404,7 +404,7 @@ fn ask_sampled(
             match event {
                 Event::Text(piece) => said.lock().unwrap().0.push_str(&piece),
                 Event::Logprobs(probs) => said.lock().unwrap().1.extend(probs),
-                Event::Progress(_) => {}
+                Event::Progress(_) | Event::Generated(_) => {}
                 Event::Done { .. } => {
                     let _ = tx.send(Ok(()));
                 }
@@ -497,7 +497,7 @@ fn submit_text(
                 Event::Error(error) => {
                     let _ = tx.send(Err(error.to_string()));
                 }
-                Event::Logprobs(_) | Event::Progress(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
             }
             true
         })
@@ -1428,7 +1428,7 @@ fn submit_timed(
                 Event::Error(error) => {
                     let _ = tx.send(Err(error.to_string()));
                 }
-                Event::Logprobs(_) | Event::Progress(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
             }
             true
         })

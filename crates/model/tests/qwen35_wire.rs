@@ -51,7 +51,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_token
         let state = state.clone();
         EventSink::new(move |event| {
             match event {
-                Event::Logprobs(_) | Event::Progress(_) => {}
+                Event::Logprobs(_) | Event::Progress(_) | Event::Generated(_) => {}
                 Event::Text(piece) => {
                     let mut state = state.lock().unwrap();
                     state.0.push_str(&piece);

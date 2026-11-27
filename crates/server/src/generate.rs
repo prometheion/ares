@@ -270,22 +270,18 @@ impl Generation {
     /// The next step of the reply, or the reason there will be none. After
     /// an `Err` or a [`Step::End`] the reply is over.
     pub async fn next(&mut self) -> Result<Step, ApiError> {
-        let item = loop {
-            match self.run.next().await? {
-                Item::Progress(progress) if self.progress => break Item::Progress(progress),
-                Item::Progress(_) => {}
-                item => break item,
-            }
-        };
-        Ok(match item {
-            Item::Progress(progress) => Step::Progress(progress),
-            Item::Text(text) => Step::Pieces(self.sorter.push(&text)),
-            Item::Probs(probs) => Step::Probs(probs),
-            Item::Done { finish, stopped_by, usage, timings } => {
-                let stop = stopped_by.and_then(|index| self.stops.get(index).cloned());
-                Step::End(End { rest: self.sorter.finish(), finish, stop, usage, timings })
-            }
-        })
+        loop {
+            return Ok(match self.run.next().await? {
+                Item::Progress(progress) if self.progress => Step::Progress(progress),
+                Item::Progress(_) | Item::Generated => continue,
+                Item::Text(text) => Step::Pieces(self.sorter.push(&text)),
+                Item::Probs(probs) => Step::Probs(probs),
+                Item::Done { finish, stopped_by, usage, timings } => {
+                    let stop = stopped_by.and_then(|index| self.stops.get(index).cloned());
+                    Step::End(End { rest: self.sorter.finish(), finish, stop, usage, timings })
+                }
+            });
+        }
     }
 }
 
