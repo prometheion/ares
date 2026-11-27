@@ -92,7 +92,8 @@ one setup on the date given, not general claims.
 ## Recommended settings
 
 The 27B on two 12 GiB cards, the first row above, with the general draft
-vocabulary of this repository ([draft-vocab.md](draft-vocab.md)):
+vocabulary of this repository, for English prose, code and shell
+([draft-vocab.md](draft-vocab.md) says how to make one for another language):
 
 ```sh
 ares --model ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf --devices 0,1 \

@@ -22,17 +22,20 @@ the draft at that place is wrong and the model rejects it. The list does not
 decide the text: the model verifies every draft. What a list changes is the
 speed.
 
-- **It pays** when the list holds what the model writes. The 27B on two cards
-  at the production settings decodes 11 % faster with the general list than
-  without one (German prose 21 % faster), and 2.6 % faster than with the
-  llama.cpp fork's list it replaces; an MTP link takes 1.4 ms instead of 2.2.
+- **It pays** when the list holds what the model writes. With the general
+  list the 27B on two cards at the production settings decodes 6.5 % faster
+  on English, code and shell than without a list, and 3.7 % faster than with
+  the llama.cpp fork's list it replaces; an MTP link takes 1.4 ms instead of
+  2.3.
 - **It costs** when the text has many tokens outside the list: a language or a
   kind of text the list was not made for. Each such token breaks a chain of
-  drafts. The code list makes German prose 35 % slower than the general list
-  does, and 21 % slower than no list at all.
-- **Smaller is not always better.** The general mix at coverage 0.98 (40,851
-  tokens) has links 0.15 ms cheaper than at 0.995, and was 1 % slower on the
-  27B: it loses more drafts than the links save.
+  drafts. The ready lists are English: the general and the English list cover
+  0.70 to 0.82 of German text, and the English list made German prose no faster
+  than no list at all (see
+  [Adding a language](#adding-a-language)).
+- **Smaller is not always better.** A general list at coverage 0.98 (40,851
+  tokens, measured with German parts) has links 0.15 ms cheaper than at 0.995,
+  and was 1 % slower on the 27B: it loses more drafts than the links save.
 
 A list is read at load. Every id must be a token of the model, listed once, and
 the list may not be longer than the rows of the head on the drafters' device.
@@ -42,30 +45,39 @@ The 27B under a layer split takes no list.
 
 Qwen3.8 27B, Qwen3.8 Flash-Next and Qwen3.5 0.8B share one tokenizer (the
 files of all three have the fingerprint `c2a79d23...`), so one set of lists
-serves them all. They are in [`draft-vocab/`](draft-vocab/), each made at
-coverage 0.995 of its corpus, whose parts, sizes, weights, licences and pinned
-sources its header names:
+serves them all. The lists in [`draft-vocab/`](draft-vocab/) are English: English
+prose, code, and the text of tools (shell commands, configuration files,
+logs). Each is made at coverage 0.995 of its corpus, whose parts, sizes,
+weights, licences and pinned sources its header names:
 
-| File | For | ids | Corpus (weight) | The 27B on two cards, tokens/s |
+| File | For | ids | Corpus (weight) |
+| --- | --- | --- | --- |
+| [`qwen35-general.txt`](draft-vocab/qwen35-general.txt) | English prose, code and shell together | 57,903 | English Wikipedia (0.3), English technical documents (0.2), Python, Rust, Go, TypeScript and C (0.3), command pages, compose and Kubernetes files, shell scripts and logs (0.2) |
+| [`qwen35-en.txt`](draft-vocab/qwen35-en.txt) | English prose | 50,617 | English Wikipedia (0.6), English technical documents (0.4) |
+| [`qwen35-code.txt`](draft-vocab/qwen35-code.txt) | code | 30,826 | the code above (0.75), English technical documents (0.25) |
+
+Take the general list unless the server writes one kind of text only. What
+they gave the 27B on two cards at the production settings, in tokens per
+second, greedy replies of 400 tokens to two prompts of each kind:
+
+| List | English prose | code | shell | all |
 | --- | --- | --- | --- | --- |
-| [`qwen35-general.txt`](draft-vocab/qwen35-general.txt) | a mix of German, English, code and shell | 62,437 | German Wikipedia (0.2) and technical documents (0.15), English Wikipedia (0.15) and technical documents (0.15), code (0.2), shell (0.15) | 89.6 on the mix: German 75.1, English 78.7, code 113.3, shell 91.5 |
-| [`qwen35-en-de.txt`](draft-vocab/qwen35-en-de.txt) | English and German prose | 55,841 | Wikipedia and technical documents in both languages | 86.9: German 75.3, English 81.3, code 102.7, shell 88.1 |
-| [`qwen35-en.txt`](draft-vocab/qwen35-en.txt) | English prose | 50,617 | English Wikipedia (0.6) and technical documents (0.4) | 82.0: English 81.4; German 61.3, as slow as no list |
-| [`qwen35-code.txt`](draft-vocab/qwen35-code.txt) | code | 30,826 | Python, Rust, Go, TypeScript and C (0.75), English technical documents (0.25) | 80.0: code 117.1; German 48.9 |
-| no list | | | | 80.9: German 62.1, English 75.1, code 104.9, shell 81.4 |
-| the fork's list (`draft-vocab-qwen3.8-ende.txt`) | | 66,343 | not named | 87.3: German 73.6, English 76.3, code 112.4, shell 86.9 |
+| `qwen35-general.txt` | 80.5 | 112.5 | 95.9 | **96.3** |
+| `qwen35-en.txt` | 80.8 | 103.5 | 90.1 | 91.5 |
+| no list | 76.4 | 105.2 | 89.5 | 90.4 |
+| the fork's list (66,343 ids, not shipped) | 78.5 | 106.1 | 94.1 | 92.9 |
 
-The numbers are greedy replies of 400 tokens to two prompts of each kind,
-alternated over the lists, measured on 2026-11-27 with the settings of the
-first row of "What was run" in [models.md](models.md#what-was-run)
-([the measurement](../dev/experiments/draft-vocab.md)). Take the general list
-when the traffic is mixed, the English and German list for prose, the code list
-only for a server that writes code and little else.
+The code list, measured in an earlier run of the same day, was 3 % faster on
+code than a general list and 9 % slower on English prose (71.7 against 78.7).
 
-On Flash-Next a list makes a link of its MTP block cheaper (0.8 to 0.9 ms with
-the general list against 1.4 ms with the whole head); what that gives in tokens
-per second could not be told apart from the noise of a busy machine with
-experts on the SSD (the same measurement).
+Measured on 2026-11-27 with the settings of the first row of "What was run" in
+[models.md](models.md#what-was-run), the lists alternated
+([the measurement](../dev/experiments/draft-vocab.md)).
+
+On Flash-Next a list makes a link of its MTP block cheaper (0.8 to 0.9 ms
+against 1.4 ms with the whole head); what that gives in tokens per second could
+not be told apart from the noise of a busy machine with experts on the SSD
+(the same measurement).
 
 ## The format
 
@@ -102,17 +114,17 @@ weight 0.2.
 **Coverage** is the share of the corpus' tokens the list holds. The tool takes
 the most frequent tokens until it is reached. The most frequent tokens cover
 most text, and each further step of coverage takes many more tokens: on the mix
-of the general list, 0.9 takes 14,078 ids, 0.98 40,851, 0.99 52,283, 0.995
-62,437 and 0.999 81,163 (the tool prints this curve for every corpus).
+of the general list, 0.9 takes 11,681 ids, 0.98 37,474, 0.99 48,322, 0.995
+57,903 and 0.999 75,209 (the tool prints this curve for every corpus).
 
-- **0.995** is where the ready lists are made, and on the 27B the general list
-  at 0.995 was faster than at 0.98. Take it unless you measure otherwise.
+- **0.995** is where the ready lists are made, and on the 27B a general list at
+  0.995 was faster than at 0.98. Take it unless you measure otherwise.
 - A corpus of encyclopedic text has more rare names than the model's replies,
-  so a list covers the replies better than its corpus: the general list covers
-  0.994 of its German Wikipedia part and 0.999 of the 27B's German replies.
-- Text unlike the corpus loses more, and by topic: the same list covered 0.976
-  of two English essays, whose missing tokens were the words of their topics
-  (" movable", " antibodies").
+  so a list covers the replies better than its corpus.
+- Text unlike the corpus loses more, and by topic: the general list covered
+  0.982 of the English essays of the measurement, whose missing tokens were the
+  words of their topics (" Gutenberg"), and 0.981 of the shell replies, which
+  lacked the words of `zpool status` (" ONLINE").
 - Under the 27B's tensor split, a list longer than the head rows of the
   drafters' device (155,200 at shares 0.625 / 0.375) is refused at load.
 
@@ -124,9 +136,9 @@ model file, so it tokenizes exactly as the server does:
 ```sh
 cargo run --release -p ares-tokenizer --example draft_vocab -- make \
   ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf --coverage 0.995 \
-  --title "German answers and shell" --out my-vocab.txt \
-  --corpus ~/corpus/answers-de --weight 0.6 --licence "my own" \
-  --corpus ~/corpus/shell --weight 0.4 --licence "MIT" --source "my scripts"
+  --title "My answers and scripts" --out my-vocab.txt \
+  --corpus ~/corpus/answers --weight 0.6 --licence "my own" \
+  --corpus ~/corpus/scripts --weight 0.4 --licence "MIT" --source "my scripts"
 ```
 
 - `--corpus PATH` is one part: a file or a directory, read with everything
@@ -144,15 +156,49 @@ cargo run --release -p ares-tokenizer --example draft_vocab -- make \
   MB take seconds.
 
 `tools/draft-vocab.py` makes the ready lists again: `fetch DIR` downloads their
-corpus into an empty directory (about 250 MB, from the pinned sources in the
-script), and `make DIR MODEL.gguf OUT_DIR` runs the tool for each of them.
+corpus into an empty directory (about 100 MB of text, from the pinned sources
+in the script), and `make DIR MODEL.gguf OUT_DIR` runs the tool for each of
+them.
+
+### Adding a language
+
+A model that writes another language needs a list that holds it. The ready
+lists leave much of a language out: the general and the English list cover
+0.70 to 0.82 of German text. Make a list from the corpus of the ready lists and
+a part in your language, weighted by its share of what the model writes.
+German, for example, with German Wikipedia articles and German technical
+documents of your own, each a directory of UTF-8 text files:
+
+```sh
+python3 -I tools/draft-vocab.py fetch ~/corpus/ready
+cargo run --release -p ares-tokenizer --example draft_vocab -- make \
+  ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf --coverage 0.995 \
+  --title "German, English, code and shell" --out de-general.txt \
+  --corpus ~/corpus/de-wiki --weight 0.2 --licence "CC BY-SA" --source "German Wikipedia" \
+  --corpus ~/corpus/de-docs --weight 0.15 \
+  --corpus ~/corpus/ready/wiki-en --weight 0.15 \
+  --corpus ~/corpus/ready/docs-en --weight 0.15 \
+  --corpus ~/corpus/ready/code --weight 0.2 \
+  --corpus ~/corpus/ready/shell --weight 0.15
+draft_vocab check ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf de-general.txt --corpus ~/corpus/de-answers
+```
+
+(`draft_vocab` stands for the same `cargo run` line.) A list made this way, with
+53 MB of German Wikipedia and 2 MB of German technical documents, had 62,437
+ids. It made the 27B's German prose 21 % faster than no list and 22 % faster
+than the English list, lost 3 % on English prose against the English list, and
+was faster than it on code and shell (the first section of the measurement).
+Keep the English parts unless the model writes only your language: code,
+commands and logs are English text too. A list of one kind of text alone is
+fast on it and slow on everything else: the code list made German prose 21 %
+slower than no list.
 
 ## Checking a list on your own text
 
 ```sh
 cargo run --release -p ares-tokenizer --example draft_vocab -- check \
   ~/models/Qwen3.8-27B-UD-Q4_K_S.gguf docs/user/draft-vocab/qwen35-general.txt \
-  --corpus ~/corpus/answers-de --corpus ~/corpus/code
+  --corpus ~/corpus/answers --corpus ~/corpus/code
 ```
 
 It says whether the tokenizer the list's header names is the model's, whether

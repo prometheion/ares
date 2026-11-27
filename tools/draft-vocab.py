@@ -10,9 +10,9 @@ other sources as git checkouts at a pinned commit, of which the text files are
 copied into DIR/<part>/<source>/. The text is data: nothing in it is run.
 Downloaded files are untrusted, so run this with `python3 -I` from the
 repository, never from inside DIR. A fetch that was cut off is taken up again
-by the same command. About 150 MB of text, and 350 MB of git objects in
-DIR/git/ (removable afterwards); half an hour, most of it waiting for the
-datasets server, which allows a few dozen requests a minute.
+by the same command. About 100 MB of text, and 350 MB of git objects in
+DIR/git/ (removable afterwards); a quarter of an hour, most of it waiting for
+the datasets server, which allows a few dozen requests a minute.
 
 `make` runs `crates/tokenizer/examples/draft_vocab.rs` for each ready file of
 MIXES, with the weights, licences and sources of the parts in its header. The
@@ -41,7 +41,6 @@ WIKIPEDIA_DATASET = "wikimedia/wikipedia"
 WIKIPEDIA_REVISION = "b04c8d1ceb2f5cd4588862100d08de323dccfbaa"
 WIKIPEDIA = {
     # part: (config, batches)
-    "wiki-de": ("20231101.de", 160),
     "wiki-en": ("20231101.en", 120),
 }
 WIKIPEDIA_LICENCE = "CC BY-SA 3.0 and GFDL"
@@ -81,15 +80,6 @@ GIT = [
     ("docs-en", "debian-handbook-en", "https://salsa.debian.org/hertzog/debian-handbook.git",
      "e270a04f621a681c6c1e16b9ee965967186e02ef", "CC BY-SA 3.0 or GPL-2.0-or-later", ["de-DE"],
      [".po"], 6_000_000),
-    ("docs-de", "debian-handbook-de", "https://salsa.debian.org/hertzog/debian-handbook.git",
-     "e270a04f621a681c6c1e16b9ee965967186e02ef", "CC BY-SA 3.0 or GPL-2.0-or-later", ["de-DE"],
-     [".po"], 6_000_000),
-    ("docs-de", "art-of-command-line-de", "https://github.com/jlevy/the-art-of-command-line",
-     "6b50745d2e788add2e8f1ed29010e72659a9a074", "CC BY-SA 4.0", ["."], ["README-de.md"], 1_000_000),
-    ("docs-de", "kubernetes-de", "https://github.com/kubernetes/website",
-     "61712ddb619690242534e6e86bb5646c88f16c2e", "CC BY 4.0", ["content/de"], [".md"], 12_000_000),
-    ("docs-de", "tldr-de", "https://github.com/tldr-pages/tldr",
-     "f22746ca8c573a2f9acee35e51794131ce0267a6", "CC BY 4.0", ["pages.de"], [".md"], 12_000_000),
     ("shell", "tldr-en", "https://github.com/tldr-pages/tldr",
      "f22746ca8c573a2f9acee35e51794131ce0267a6", "CC BY 4.0", ["pages"], [".md"], 8_000_000),
     ("shell", "awesome-compose", "https://github.com/docker/awesome-compose",
@@ -111,30 +101,27 @@ GIT = [
 LOG_HEAD = 40_000
 
 # Sources whose files are turned into plain text: the Debian Administrator's
-# Handbook is DocBook in gettext catalogues, the English text in `msgid`, the
-# German translation in `msgstr`.
-TEXT_OF = {"debian-handbook-en": "msgid", "debian-handbook-de": "msgstr"}
+# Handbook is DocBook in gettext catalogues, and the German catalogues hold the
+# English text in `msgid`.
+TEXT_OF = {"debian-handbook-en": "msgid"}
 
 # What each part is, for the headers.
 PARTS = {
-    "wiki-de": "German Wikipedia (wikimedia/wikipedia 20231101.de)",
     "wiki-en": "English Wikipedia (wikimedia/wikipedia 20231101.en)",
     "code": "Python, Rust, Go, TypeScript and C",
     "docs-en": "English technical documents in Markdown",
-    "docs-de": "German technical documents and command pages in Markdown",
     "shell": "command pages, compose and Kubernetes files, shell scripts, logs",
 }
 
-# The ready files: file name, title, coverage, {part: weight}.
+# The ready files: file name, title, coverage, {part: weight}. They are English
+# only (the owner, 2026-11-27); docs/user/draft-vocab.md shows how to add a
+# language.
 MIXES = [
     ("qwen35-en.txt", "English", 0.995, {"wiki-en": 0.6, "docs-en": 0.4}),
-    ("qwen35-en-de.txt", "English and German", 0.995,
-     {"wiki-en": 0.3, "docs-en": 0.2, "wiki-de": 0.3, "docs-de": 0.2}),
     ("qwen35-code.txt", "Code, with its English documents", 0.995,
      {"code": 0.75, "docs-en": 0.25}),
-    ("qwen35-general.txt", "English, German, code and shell", 0.995,
-     {"wiki-de": 0.2, "docs-de": 0.15, "wiki-en": 0.15, "docs-en": 0.15, "code": 0.2,
-      "shell": 0.15}),
+    ("qwen35-general.txt", "English, code and shell", 0.995,
+     {"wiki-en": 0.3, "docs-en": 0.2, "code": 0.3, "shell": 0.2}),
 ]
 
 
