@@ -27,7 +27,9 @@ count those bytes in the prompt cache's share and not against the tier
 (`PinnedRam::set_context_cached`), and while the prompt cache holds more than
 its allowance the conductor takes such pages off the devices first
 (`Cache::trim`, `PrefixIndex::evict_where`): into RAM when the allowance has
-room, on to the drive with `--cache`, or nowhere. The far pool unlocks a piece
+room, on to the drive with `--cache`, or nowhere. A run that has just come
+back from the drive is not among them until the prompt that waits for it has
+looked (`Cache::release_landed`, #104). The far pool unlocks a piece
 once no page in use lies in it, and the memory goes back to the tier. Until
 2026-11-25 a tier that wants more than the limit leaves (Flash-Next at any
 `--ram` below the size of its experts) left the prompt cache only its one

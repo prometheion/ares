@@ -456,6 +456,11 @@ pub(crate) struct Ssd {
     /// for such a run does not ask the drive for it again, and the prompt
     /// goes on with what the cache has ([`Ssd::want`]).
     cut: HashSet<ChainHash>,
+    /// The pages of the runs that ended in this pump, held until the trim
+    /// after it is done ([`Cache::release_landed`]).
+    ///
+    /// [`Cache::release_landed`]: super::Cache::release_landed
+    landed: Vec<Sequence>,
     pub(super) counters: SsdCounters,
 }
 
@@ -555,6 +560,7 @@ impl Ssd {
             jobs: VecDeque::new(),
             next_job: 0,
             cut: HashSet::new(),
+            landed: Vec::new(),
             counters: SsdCounters { enabled: true, ..SsdCounters::default() },
         })
     }

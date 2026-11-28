@@ -374,13 +374,29 @@ impl Cache {
                 ssd.cut(job.pages.last().map(|page| page.0));
             }
             self.index.withdraw(job.owner);
-            std::mem::take(&mut job.held).release(pool);
+            ssd.landed.push(std::mem::take(&mut job.held));
             for parts in std::mem::take(&mut job.ready).into_values() {
                 self.recycle(parts, false);
             }
             if let Some(parts) = job.state_parts.take() {
                 self.recycle(parts, true);
             }
+        }
+    }
+
+    /// Lets go of the pages of the runs that ended in the last pump: the
+    /// index alone holds them now. The trim after that pump calls it when it
+    /// is done, so that it never takes a run from the prompt that waited for
+    /// it before that prompt has looked again (the step after the trim).
+    /// Until 2026-11-28 the run was let go of as it ended: with far pages
+    /// beyond the floor's and a cache over its allowance, the trim took the
+    /// run's far pages first when no other chain ended in a far page, the
+    /// prompt found them on the drive again, and it waited for the same run
+    /// for ever while the drive read it 300 to 400 times a second (#104).
+    pub(in crate::cache) fn release_landed(&mut self, pool: &mut PagePool) {
+        let Some(ssd) = &mut self.ssd else { return };
+        for run in ssd.landed.drain(..) {
+            run.release(pool);
         }
     }
 
@@ -451,6 +467,7 @@ impl Cache {
     /// coldest first, then the pages of the devices. Waits for the writer,
     /// at most for [`DRAIN_LIMIT`], and stops the threads.
     pub(crate) fn drain(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) {
+        self.release_landed(pool);
         self.settle_leaving(pool, exec);
         let Some(ssd) = &mut self.ssd else { return };
         // Runs that come back are for requests that are gone.
