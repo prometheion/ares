@@ -758,6 +758,47 @@ mod tests {
         assert_eq!(VramCap::Every(gib).check(&cards, Some(&[1])), Ok(()));
     }
 
+    /// A plan under a cap is the plan of devices that have what the cap leaves: the pages of
+    /// context follow the fullest device, and the shares of a split leave the capped device
+    /// no more than it holds.
+    #[test]
+    fn a_plan_under_a_cap_keeps_to_what_the_cap_leaves_on_every_device() {
+        use ares_cuda::vram::{VramLimit, room_under};
+        let (gib, mib) = (1u64 << 30, 1u64 << 20);
+        let headroom = 256 * mib;
+        // Two cards with 11.5 GiB free; the process holds 150 MiB on each (its contexts).
+        let free = 11 * gib + 512 * mib;
+        let own = Some(150 * mib);
+        let room = |limit| room_under(free, limit, own).unwrap();
+        assert_eq!(room(None), free);
+        let capped = room(Some(VramLimit::Cap(9 * gib)));
+        assert_eq!(capped, 9 * gib - 150 * mib);
+        // The 27B's shape on two cards: weights and step 6 GiB and 4 GiB, 30 MiB a page.
+        let rooms = |usable: [u64; 2]| {
+            [(usable[0], 6 * gib), (usable[1], 4 * gib)].map(|(usable, fixed)| Room {
+                usable: usable - headroom,
+                fixed,
+                per_sequence: 150 * mib,
+                per_page: 30 * mib,
+            })
+        };
+        let all = pages_that_fit(&rooms([free, free]), 2);
+        let under = pages_that_fit(&rooms([capped, free]), 2);
+        assert!(under < all, "{under} of {all}");
+        // What the pages take on the capped card fits what the cap leaves.
+        let taken = 6 * gib + 2 * 150 * mib + u64::from(under) * 30 * mib + headroom;
+        assert!(taken <= capped && capped - taken < 30 * mib, "{taken} of {capped}");
+        // A reserve of a display comes off what is free the same way.
+        assert_eq!(room(Some(VramLimit::Reserve(768 * mib))), free - 768 * mib);
+        // Shares by bandwidth (0.6 / 0.4 of 16 GiB of weights) are lowered where the cap leaves
+        // a device less than its share.
+        let wanted = [0.6, 0.4];
+        let most = [(capped - headroom) as f64 / (16 * gib) as f64, 1.0];
+        let shares = ares_model::qwen35::device::fit_shares(&wanted, &most).unwrap();
+        assert!(shares[0] < 0.6 && (shares[0] - most[0]).abs() < 1e-9, "{shares:?}");
+        assert!((shares[0] + shares[1] - 1.0).abs() < 1e-9);
+    }
+
     #[test]
     fn format_names_go_both_ways() {
         for format in CacheFormat::ALL {
