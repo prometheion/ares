@@ -535,8 +535,15 @@ device's flag with a token that is behind the later kernels
 values in a step nobody reads. A part that fails to build
 tells the model (`Model::abandon`) so that the parts that wait for its
 measurements (`qwen35`'s layout choice, which waited two minutes) go on at
-once. A thread that has not stopped ten seconds after it was told to is left
-behind and the shutdown ends. `ares_runtime::testing::Faulty` makes a model
+once, and a part whose step failed tells its model too (`DeviceModel::step_failed`,
+also for a panic the model did not see), so that Flash-Next's other part gives
+its waits up at once. A host thread of a step never waits in the driver for
+work that may wait for another device: Flash-Next's pass waited for the inbox of
+its next micro-batch so, with both devices on every layer, and after the other
+device failed it stood there for good, its device at 100 % (the hang after a
+failed test, #67); it now waits where a failed part or a step that stands still
+ends the wait (`Flow::wait_for`). A thread that has not stopped ten seconds
+after it was told to is left behind and the shutdown ends. `ares_runtime::testing::Faulty` makes a model
 fail on purpose, and `qwen35_failure` runs it on two cards.
 
 Measured 2026-11-10 with that model (RTX 4070 and RTX 3060, 128 tokens per

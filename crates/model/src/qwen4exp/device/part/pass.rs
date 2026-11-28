@@ -638,6 +638,16 @@ impl Part {
         result
     }
 
+    /// What the next micro-batch of the pass waits for before its inbox is written: the event
+    /// behind the last copy from the buffer of the ring it takes, which the device has read
+    /// once the kernels before it have run. The caller waits for it where a wait gives up when
+    /// another part failed (`Flow::wait_for`): those kernels may wait for the other device,
+    /// which then never comes.
+    pub fn pass_inbox_read(&self) -> Option<&Event> {
+        let state = self.pass.as_ref()?;
+        state.ring.get(state.ring_at).map(|(_, event)| event)
+    }
+
     /// Ends micro-batch `m` after the part's last layer: writes the last layer's output to
     /// its streams, or on the part with the head computes the logits of its rows that are
     /// wanted (`env` says which); returns how many.

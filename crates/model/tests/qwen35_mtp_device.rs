@@ -261,8 +261,7 @@ struct Chain {
 
 #[test]
 fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return;
     }
     let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };

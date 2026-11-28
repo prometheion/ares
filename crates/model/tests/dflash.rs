@@ -271,8 +271,7 @@ fn device_against_reference(path: &PathBuf, device: &Device) {
 
 #[test]
 fn the_drafter_on_the_device_drafts_what_the_reference_drafts() {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return;
     }
     let ordinal = std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

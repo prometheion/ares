@@ -187,4 +187,8 @@ impl DeviceModel for FaultyPart {
     fn model_draft_ms(&mut self) -> f64 {
         self.inner.model_draft_ms()
     }
+
+    fn step_failed(&mut self) {
+        self.inner.step_failed();
+    }
 }

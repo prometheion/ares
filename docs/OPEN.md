@@ -369,7 +369,13 @@ Wrong behaviour:
 - [ ] GPU. With both devices on every layer the MTP block's chains after a pass agree with the
       reference's for 1 to 3 links where after steps of the own rows 5 to 7 (the trunk's tokens
       are the reference's): cause not found. Files: `crates/model/src/qwen4exp/device/part/pass.rs`,
-      `qwen4exp/device/runtime/pass.rs`, `qwen4exp/device/part/mtp.rs`.
+      `qwen4exp/device/runtime/pass.rs`, `qwen4exp/device/part/mtp.rs`. On one device too
+      (2026-11-28, `the_mtp_block_follows_a_prompt_read_layer_by_layer`, which now judges every
+      chain's first link by the reference): when the policy asks the made-up block for 30 to 36
+      chains instead of one (no warm-up, a busy machine; 5 of 8 runs), the first links of the
+      chains from cells 323, 325 and 329 after the prompt of 300 draft tokens the reference ranks
+      0.62 to 0.77 of the RMS of its logits behind its own (1.04 from cell 300 once), the same
+      cells and tokens in every such run: no near tie. The test fails then.
 - [ ] GPU. Runs that should give the same bits do not (found while measuring pruning, IQ2_XS, two
       cards, the tool `qwen4exp_prune`, 1000 tokens teacher-forced after a prompt of 256): with the
       prompt in steps of eight rows the next texts in the same slot after `Session::restart`

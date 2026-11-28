@@ -1,6 +1,7 @@
 //! The small helpers of the tests: the files the environment names, values
 //! read from bytes, how far one row of values is from another, the token a row
-//! of logits picks, and a random generator.
+//! of logits picks and how close another token comes to it, and a random
+//! generator.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +70,27 @@ pub fn argmax_lead(x: &[f32]) -> (u32, f32) {
         }
     }
     (best as u32, x[best] - second)
+}
+
+/// How far `token` falls behind the most likely token of a row of `logits`, as
+/// a share of the RMS of the row's logits: 0 for the most likely token.
+pub fn behind_the_best(logits: &[f32], token: u32) -> f64 {
+    let best = logits.iter().copied().fold(f32::MIN, f32::max);
+    let rms =
+        (logits.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / logits.len() as f64).sqrt();
+    f64::from(best - logits[token as usize]) / rms.max(1e-30)
+}
+
+/// Whether `token` is the most likely token of `want`, a reference's logits, up
+/// to what an `error` of the logits that picked it (their relative RMS from
+/// `want`) can move: within three times that of the largest logit, and within a
+/// hundredth of the logits' RMS (the error is a mean over the row; the logits
+/// of a made-up model's top tokens lie close together). A token that passes and
+/// is not the most likely one is a near tie; the greedy texts of a made-up
+/// model part at such tokens, which the device's arithmetic picks one way and
+/// the reference's the other.
+pub fn is_near_best(token: u32, want: &[f32], error: f64) -> bool {
+    behind_the_best(want, token) <= 3.0 * error + 1e-2
 }
 
 /// A xorshift generator: the same seed gives the same values.

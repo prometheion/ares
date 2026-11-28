@@ -35,6 +35,7 @@ use ares_runtime::{
 };
 use ares_tokenizer::{ChatOptions, Json};
 use common::gpu::enabled;
+use common::helpers::{behind_the_best, is_near_best};
 use common::model::{Wrapped, byte_tokenizer, words};
 
 mod common;
@@ -591,6 +592,67 @@ fn reference_answer_at(path: &std::path::Path, prompt: &[u32], n: usize) -> Vec<
         answer.push(arg_max(window.logits_of(0).unwrap()));
     }
     answer
+}
+
+/// The error of the logits of a made-up model on the device that makes a near tie
+/// ([`is_near_best`]): the bound of the residual after a layer of the shipped types against the
+/// reference's in `qwen4exp_device` (4e-2, relative RMS), which lets an answer's token fall
+/// behind the reference's most likely one by 0.13 of the RMS of the row's logits. (A prompt of
+/// 480 rows read layer by layer began its answer with the reference's second token once, 0.07
+/// behind: 3.393 against 3.496, the third at 2.721, the RMS 1.455.)
+const LOGIT_ERROR: f64 = 4e-2;
+
+/// [`LOGIT_ERROR`] for a draft of the MTP block: the block reads the residual after the model's
+/// last layer, whose difference from the reference's is that of every layer before it, and adds
+/// its own layer. Its first links fell up to 0.131 of the RMS behind the reference's draft at
+/// near ties (both devices on every layer, 2026-11-28), against 0.13 at [`LOGIT_ERROR`]; the
+/// tokens that were clearly worse fell 0.62 and more behind. 6e-2 lets a draft fall 0.19 behind.
+const MTP_LOGIT_ERROR: f64 = 6e-2;
+
+/// Fails the test unless `answer`, the greedy tokens an engine wrote after `prompt` on the
+/// made-up model in the file at `path`, is what the CPU reference writes up to near ties: the
+/// reference reads the prompt and then the answer's own tokens, and each token of the answer
+/// must be the reference's most likely one at its row or a near tie of it
+/// ([`is_near_best`] at [`LOGIT_ERROR`]). The device's arithmetic is not the reference's, and a
+/// made-up model has near ties that the difference flips, after which the two texts part;
+/// read along the answer, the reference judges every token of it all the same. Says how far
+/// the token furthest behind is.
+fn assert_near_the_reference(what: &str, path: &std::path::Path, prompt: &[u32], answer: &[u32]) {
+    let gguf = Gguf::open(path).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let mut state = SequenceState::new(&c);
+    let window = reference.window(&state, prompt, LogitRows::Last).unwrap();
+    reference.commit(&mut state, &window, prompt.len()).unwrap();
+    let mut logits = window.logits_of(prompt.len() - 1).unwrap().to_vec();
+    let (mut worst, mut at) = (0.0f64, 0);
+    for (i, &token) in answer.iter().enumerate() {
+        let behind = behind_the_best(&logits, token);
+        if behind > worst {
+            (worst, at) = (behind, i);
+        }
+        let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t);
+        let best = best.unwrap_or(0);
+        assert!(
+            is_near_best(token, &logits, LOGIT_ERROR),
+            "{what}: token {i} of {answer:?} is {token}, which the reference has at {} (its most \
+             likely, {best}, at {}: {behind:.3} of the RMS behind, a near tie is up to {:.3})",
+            logits[token as usize],
+            logits[best],
+            3.0 * LOGIT_ERROR + 1e-2,
+        );
+        if i + 1 < answer.len() {
+            let window = reference.window(&state, &[token], LogitRows::Last).unwrap();
+            reference.commit(&mut state, &window, 1).unwrap();
+            logits = window.logits_of(0).unwrap().to_vec();
+        }
+    }
+    eprintln!(
+        "TIE {what}: every token of {} is the reference's most likely one or a near tie; the \
+         furthest behind is token {at}, {worst:.3} of the RMS",
+        answer.len()
+    );
 }
 
 /// A prompt of `n` tokens of the vocabulary, from a seed.
@@ -1469,7 +1531,6 @@ fn a_request_cuts_in_between_the_pieces_of_a_long_prompt() {
             short_at.duration_since(begun),
             long_at.duration_since(begun),
         );
-        let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
         eprintln!(
             "CUT {placement:?}: short {short_got:?} (alone {short_alone:?}, reference \
              {short_reference:?}); long {long_got:?} (alone {long_alone:?}, reference \
@@ -1477,11 +1538,8 @@ fn a_request_cuts_in_between_the_pieces_of_a_long_prompt() {
         );
         assert!(paused >= 1, "{placement:?}: the long prompt's pass never paused");
         assert!(short_at < long_at, "{placement:?}: the short request waited for the long one");
-        assert!(leading(&short_got, &short_reference) >= 2, "{placement:?}: {short_got:?}");
-        assert!(
-            leading(&long_got, &long_reference).max(leading(&long_got, &long_steps)) >= 2,
-            "{placement:?}: {long_got:?}"
-        );
+        assert_near_the_reference(&format!("{placement:?}, short"), &path, &short, &short_got);
+        assert_near_the_reference(&format!("{placement:?}, long"), &path, &long, &long_got);
     }
 }
 
@@ -1516,14 +1574,15 @@ fn long_prompts_that_come_at_once_are_read_one_after_the_other() {
         let paused = runtime.snapshot().expect("the runtime is running").counters.steps_paused;
         runtime.shutdown();
         eprintln!("TOGETHER {placement:?}: {got:?} (alone {alone:?}), {paused} steps paused");
+        // Each answers as the reference does up to near ties (`assert_near_the_reference`).
         for i in 0..prompts.len() {
-            assert!(
-                leading(&got[i], &references[i]).max(leading(&got[i], &alone[i])) >= 2,
-                "{placement:?}: prompt {i}: {:?}, alone {:?}, reference {:?}",
-                got[i],
-                alone[i],
-                references[i]
+            eprintln!(
+                "TOGETHER {placement:?}: prompt {i}: {} tokens as the reference's, {} as alone",
+                leading(&got[i], &references[i]),
+                leading(&got[i], &alone[i]),
             );
+            let what = format!("{placement:?}, prompt {i}");
+            assert_near_the_reference(&what, &path, &prompts[i], &got[i]);
         }
     }
 }
@@ -1579,6 +1638,139 @@ fn submit_timed(
         )
         .unwrap();
     (rx, first)
+}
+
+/// A test that fails while its engine is in the middle of a prompt read layer by layer leaves
+/// the devices to the tests after it: its thread unwinds, the engine goes with it and stops
+/// its work on the devices, and the next engine on the same devices answers in its usual
+/// time, in every placement. The failure comes where the pass is surely in its middle: a
+/// short request has cut in, so the pass has paused between two micro-batches with its rows
+/// on loan (`a_request_cuts_in_between_the_pieces_of_a_long_prompt`), and the short answer
+/// is being written.
+#[test]
+fn a_test_that_fails_in_the_middle_of_a_pass_leaves_the_devices_to_the_next() {
+    if !enabled() {
+        return;
+    }
+    let long = prompt(480, 7);
+    let short = prompt(12, 8);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    for placement in placements() {
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let begun = std::time::Instant::now();
+        let alone = ask(&runtime, 1, &short, 8);
+        let usual = begun.elapsed();
+        runtime.shutdown();
+        let failed = std::thread::spawn({
+            let (path, long, short) = (path.clone(), long.clone(), short.clone());
+            move || {
+                let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+                let (long_rx, _) = submit_timed(&runtime, 2, &long, 8);
+                std::thread::sleep(Duration::from_millis(5));
+                let (_short_rx, short_first) = submit_timed(&runtime, 3, &short, 8);
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while short_first.lock().unwrap().is_none() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the short request wrote nothing"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // The long prompt's pass has paused and has not ended.
+                let paused = runtime.snapshot().map_or(0, |s| s.counters.steps_paused) >= 1
+                    && long_rx.try_recv().is_err();
+                panic!("a failure on purpose, with the long prompt's pass paused: {paused}");
+            }
+        })
+        .join();
+        let message = failed.expect_err("the test on the thread failed");
+        let message = message.downcast_ref::<String>().cloned().unwrap_or_default();
+        // The next engine on the same devices.
+        let begun = std::time::Instant::now();
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let started = begun.elapsed();
+        let begun = std::time::Instant::now();
+        let after = submit(&runtime, 4, &short, 8).recv_timeout(Duration::from_secs(60));
+        let took = begun.elapsed();
+        runtime.shutdown();
+        eprintln!(
+            "AFTER {placement:?}: {message}; the next engine started in {started:?} and answered \
+             in {took:?} (alone before: {usual:?})"
+        );
+        let after = after.expect("the next engine answers within a minute").unwrap();
+        assert!(message.ends_with("paused: true"), "{placement:?}: the failure came too late");
+        assert_eq!(after.len(), alone.len(), "{placement:?}: {after:?} after the failed test");
+        assert_near_the_reference(&format!("{placement:?}, after"), &path, &short, &after);
+    }
+}
+
+/// An engine whose device fails in the step of a prompt read layer by layer ends the request
+/// with an error, and the test that asked fails; the next engine on the same devices answers
+/// in its usual time, in every placement. The last device fails as the step begins
+/// (`ares_runtime::testing::Faulty`), so that in a split the other device has enqueued its
+/// part of the pass and waits for this one's: those waits are given up, and nothing of the
+/// failed engine stays on the devices. (With both devices on every layer the other device's
+/// thread waited in the driver for the inbox of its next micro-batch behind kernels that
+/// waited for the failed device, its device at 100 % for good, and the request, the engine's
+/// end and the next test with it: the hang of #67. In the split by layers it gave up after 30
+/// s.)
+#[test]
+fn an_engine_whose_device_fails_in_a_pass_leaves_the_devices_to_the_next() {
+    use ares_runtime::testing::{Failure, Fault, Faulty};
+    if !enabled() {
+        return;
+    }
+    let long = prompt(480, 7);
+    let short = prompt(12, 8);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    for placement in placements() {
+        let devices = open_devices(placement);
+        // The steps are numbered from the first request's: no warm-up.
+        let fault = Fault { device: devices.len() - 1, step: 1, how: Failure::Error };
+        let gguf = Gguf::open(&path).unwrap();
+        let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+        let mut opts = options(placement, n_layer, 16, MAX_ROWS, 16);
+        opts.pass_rows = 512;
+        let inner = Arc::new(
+            Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap(),
+        );
+        let config = RuntimeConfig {
+            pages: 16,
+            cells_per_page: 128,
+            max_slots: SLOTS,
+            warm_up: false,
+            ..RuntimeConfig::default()
+        };
+        let model: Arc<dyn Model> = Arc::new(Faulty::new(made(&inner, Cache::On), fault));
+        let mut gpu = GpuConfig::new(&config, &*model);
+        gpu.ram_limit += 256 << 20;
+        gpu.vram_headroom = 512 << 20;
+        let runtime = Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts");
+        let begun = std::time::Instant::now();
+        let failed = submit(&runtime, 1, &long, 8).recv_timeout(Duration::from_secs(60));
+        let ended = begun.elapsed();
+        let failure = runtime.failure();
+        drop(runtime);
+        drop(inner);
+        let failed = failed.expect("the request ends within a minute");
+        assert!(failed.is_err(), "{placement:?}: the pass did not fail: {failed:?}");
+        // The next engine on the same devices.
+        let begun = std::time::Instant::now();
+        let (runtime, _) = start_passing(&path, placement, 16, 512, 16);
+        let started = begun.elapsed();
+        let begun = std::time::Instant::now();
+        let after = submit(&runtime, 2, &short, 8).recv_timeout(Duration::from_secs(60));
+        let took = begun.elapsed();
+        runtime.shutdown();
+        eprintln!(
+            "AFTER-ERROR {placement:?}: {failed:?} after {ended:?} (the engine: {failure:?}); \
+             the next engine started in {started:?} and answered in {took:?}"
+        );
+        // The other device gives up at once, not when its step has stood still for 30 s.
+        assert!(ended < Duration::from_secs(20), "{placement:?}: the failure took {ended:?}");
+        let after = after.expect("the next engine answers within a minute").unwrap();
+        assert_near_the_reference(&format!("{placement:?}, after an error"), &path, &short, &after);
+    }
 }
 
 /// A prompt read layer by layer with few enough rows has the CPU compute the experts it misses
@@ -2055,16 +2247,31 @@ struct Followed {
     wide: usize,
 }
 
-/// The chains the MTP block of the made-up model `seed` made for a request
-/// that read `prompt` and wrote `answer`, against the CPU reference's chains
-/// from the same cells: per link, how many were compared (a link is compared
-/// when the links before it agreed) and how many agreed.
+/// How the links of the MTP block's chains on the device came out against the CPU reference
+/// ([`chains_against_the_reference`]): per link, how many were compared, how many are the
+/// reference's draft, how many a near tie of it and how many neither, and the first links
+/// that are neither.
+struct Judged {
+    compared: [usize; 8],
+    agreed: [usize; 8],
+    tied: [usize; 8],
+    far: [usize; 8],
+    wrong: Vec<String>,
+}
+
+/// The chains the MTP block of the made-up model `seed` made for a request that read `prompt`
+/// and wrote `answer`, link by link against the CPU reference's block from the same cells: the
+/// reference follows each chain's own drafts, and says of each link whether its draft is the
+/// reference's most likely token there or a near tie of it ([`is_near_best`] at
+/// [`MTP_LOGIT_ERROR`]); the first link of every chain must be. A made-up block has near ties that
+/// the device's arithmetic flips, and a chain that took the other token goes on from it; a
+/// block that is wired wrongly drafts tokens the reference ranks far down.
 fn chains_against_the_reference(
     seed: u64,
     chains: &[ares_model::qwen4exp::device::MtpDrafted],
     prompt: &[u32],
     answer: &[u32],
-) -> ([usize; 8], [usize; 8]) {
+) -> Judged {
     let gguf = Gguf::open(gguf_path(seed)).unwrap();
     let file = Gguf::open(draft_path(seed)).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
@@ -2093,7 +2300,8 @@ fn chains_against_the_reference(
             LogitRows::None,
         )
         .unwrap();
-    let (mut compared, mut agreed) = ([0usize; 8], [0usize; 8]);
+    let mut judged =
+        Judged { compared: [0; 8], agreed: [0; 8], tied: [0; 8], far: [0; 8], wrong: Vec::new() };
     for chain in chains {
         // The window started at the newest token's cell; the chain's first
         // link is the cell before it.
@@ -2103,23 +2311,48 @@ fn chains_against_the_reference(
         }
         let mut state = MtpState::new();
         reference.mtp_commit(&mut state, &follow, newest - 1).unwrap();
-        let row = &f.trunk[(newest - 1) * f.wide..newest * f.wide];
-        let want =
-            reference.draft_chain(&head, &state, row, chain.token, chain.drafts.len()).unwrap();
-        for (link, (got, want)) in chain.drafts.iter().zip(&want).enumerate() {
-            compared[link] += 1;
-            if got != want {
+        let mut row = f.trunk[(newest - 1) * f.wide..newest * f.wide].to_vec();
+        let mut token = chain.token;
+        for (link, &got) in chain.drafts.iter().enumerate().take(8) {
+            let window =
+                reference.draft_window(&head, &state, &row, &[token], LogitRows::All).unwrap();
+            reference.mtp_commit(&mut state, &window, 1).unwrap();
+            let logits = window.logits_of(0).expect("the row has logits");
+            let want = window.draft(0).expect("the row has logits");
+            judged.compared[link] += 1;
+            if got == want {
+                judged.agreed[link] += 1;
+            } else {
+                let behind = behind_the_best(logits, got);
                 eprintln!(
-                    "RES a chain from cell {} parts from the reference's at link {link} of {}",
+                    "RES a chain from cell {} drafts {got} at link {link} of {}, the reference \
+                     {want}: {} against {}, {behind:.3} of the RMS behind",
                     newest - 1,
-                    chain.drafts.len()
+                    chain.drafts.len(),
+                    logits[got as usize],
+                    logits[want as usize],
                 );
-                break;
+                match is_near_best(got, logits, MTP_LOGIT_ERROR) {
+                    true => judged.tied[link] += 1,
+                    false => judged.far[link] += 1,
+                }
+                // A later link starts from the block's own residual of the link before, on
+                // the device and in the reference alike, so their difference grows from link
+                // to link (link 5 of a chain once 0.136 of the RMS behind): the first links
+                // are held to the near tie.
+                if link == 0 && !is_near_best(got, logits, MTP_LOGIT_ERROR) {
+                    judged.wrong.push(format!(
+                        "a chain from cell {}: its first link drafts {got}, the reference {want}, \
+                         {behind:.3} of the RMS behind",
+                        newest - 1
+                    ));
+                }
             }
-            agreed[link] += 1;
+            // The chain goes on from its own draft, and the reference with it.
+            (token, row) = (got, window.out);
         }
     }
-    (compared, agreed)
+    judged
 }
 
 /// The model drafts with its own MTP block in every placement, and the
@@ -2144,10 +2377,13 @@ fn the_mtp_block_drafts_what_the_reference_drafts_in_every_placement() {
         let report = model.mtp_report().expect("the model has an MTP block");
         let times = model.mtp_times();
         runtime.shutdown();
-        let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
+        let Judged { compared, agreed, tied, far, wrong } =
+            chains_against_the_reference(1, &chains, &prompt, &answer);
         eprintln!(
             "RES {placement:?}: {} chains of {} links in all; against the reference per link \
-             {agreed:?} of {compared:?}; draft rows {}, accepted {}, rejected {}; the block on \
+             {agreed:?} of {compared:?}, {tied:?} near ties and {far:?} \
+             farther; draft rows {}, accepted {}, \
+             rejected {}; the block on \
              part {}: weights {} B, pools {} B, buffers {} B; {:.2} ms a link",
             chains.len(),
             counters.model_draft_links,
@@ -2161,19 +2397,11 @@ fn the_mtp_block_drafts_what_the_reference_drafts_in_every_placement() {
             times.chain_ms / times.links.max(1) as f64,
         );
         assert!(counters.model_draft_links > 0, "{placement:?}: the block drafted nothing");
-        // A made-up block is never right, so the policy stops asking it after
-        // a chain or a few: what there is must be the reference's. A made-up
-        // model has near ties that the device's arithmetic flips, so one
-        // chain in five may part; a block that is wired wrongly agrees by
-        // chance, once in a hundred.
+        // A made-up block is never right, and how often the policy asks it all the same
+        // depends on the prices the steps measure on the day (one chain in most runs, 21 in
+        // one): each link is judged where it parts from the reference, whatever the count.
         assert!(compared[0] >= 1, "{placement:?}: no chain to compare");
-        assert!(
-            agreed[0] + compared[0] / 5 + usize::from(compared[0] < 5 && compared[0] > 1)
-                >= compared[0],
-            "{placement:?}: first links agree in {} of {}",
-            agreed[0],
-            compared[0]
-        );
+        assert!(wrong.is_empty(), "{placement:?}: first links that are no near tie: {wrong:#?}");
     }
 }
 
@@ -2221,10 +2449,13 @@ fn the_mtp_block_follows_a_prompt_read_layer_by_layer() {
         let counters = runtime.snapshot().expect("the runtime is running").counters;
         let loans = model.take_store_stats().expect("the parts are open").scratch_loans;
         runtime.shutdown();
-        let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
+        let Judged { compared, agreed, tied, far, wrong } =
+            chains_against_the_reference(1, &chains, &prompt, &answer);
         eprintln!(
             "MTP-PASS {placement:?}: a pass of up to {} rows, {loans} loans; {} chains; against \
-             the reference per link {agreed:?} of {compared:?}; draft rows {}, accepted {}",
+             the reference per link {agreed:?} of {compared:?}, {tied:?} near ties and {far:?} \
+             farther; draft \
+             rows {}, accepted {}",
             model.max_rows(),
             chains.len(),
             counters.draft_rows,
@@ -2237,13 +2468,7 @@ fn the_mtp_block_follows_a_prompt_read_layer_by_layer() {
         if placement == Placement::Shared {
             continue;
         }
-        assert!(
-            agreed[0] + compared[0] / 5 + usize::from(compared[0] < 5 && compared[0] > 1)
-                >= compared[0],
-            "{placement:?}: first links agree in {} of {}",
-            agreed[0],
-            compared[0]
-        );
+        assert!(wrong.is_empty(), "{placement:?}: first links that are no near tie: {wrong:#?}");
     }
 }
 
@@ -2273,22 +2498,17 @@ fn the_mtp_block_follows_wide_steps_that_start_at_any_cell() {
         let times = model.mtp_times();
         runtime.shutdown();
         let answer = answer.unwrap_or_else(|e| panic!("{placement:?}: the request failed: {e}"));
-        let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
+        let Judged { compared, agreed, tied, far, wrong } =
+            chains_against_the_reference(1, &chains, &prompt, &answer);
         eprintln!(
             "RES {placement:?}: {} chains; against the reference per link {agreed:?} of \
-             {compared:?}; {} rows only wrote keys",
+             {compared:?}, {tied:?} near ties and {far:?} farther; {} rows only wrote keys",
             chains.len(),
             times.key_rows
         );
         assert!(times.key_rows as usize >= prompt.len() - 1, "{placement:?}: {times:?}");
         assert!(compared[0] >= 1, "{placement:?}: no chain to compare");
-        assert!(
-            agreed[0] + compared[0] / 5 + usize::from(compared[0] < 5 && compared[0] > 1)
-                >= compared[0],
-            "{placement:?}: first links agree in {} of {}",
-            agreed[0],
-            compared[0]
-        );
+        assert!(wrong.is_empty(), "{placement:?}: first links that are no near tie: {wrong:#?}");
     }
 }
 
@@ -2530,8 +2750,18 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     {
         let view = vocabulary
             .map_or("the whole head".to_owned(), |v| format!("a draft vocabulary of {}", v.len()));
-        let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
+        // The replies without drafts report their probabilities, which judge a reply with
+        // drafts where it parts from them.
+        let greedy = Sampling {
+            temperature: Some(0.0),
+            logprobs: Some(LogprobRequest { top: 8, after_chain: false }),
+            ..Sampling::default()
+        };
         let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
+        let seeded_probs = Sampling {
+            logprobs: Some(LogprobRequest { top: 8, after_chain: true }),
+            ..seeded.clone()
+        };
         let (runtime, model) = start_flash_with(&path, Some(&draft), None, vocabulary);
         // The replies with drafts first: a reply that repeats one the engine has
         // written is drafted by the n-gram drafter alone.
@@ -2539,8 +2769,9 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
         let counters = runtime.snapshot().expect("the runtime is running").counters;
         let times = model.mtp_times();
-        let (plain, _) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
-        let (plain_seeded, _) = ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded, false);
+        let (plain, plain_probs) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
+        let (plain_seeded, seeded_probs) =
+            ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded_probs, false);
         let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
             - counters.draft_rows;
         let stats = model.take_store_stats().expect("the parts are open");
@@ -2568,10 +2799,52 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         assert_eq!(undrafted, 0, "the requests without drafts were drafted for");
         assert!(times.accepted[0] > 0, "none of the block's drafts was accepted: {times:?}");
         assert!(counters.drafts_rejected > 0, "no draft was rejected");
-        assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next, {view}");
-        assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next, {view}");
+        // A window's rows are computed in other steps than the rows of a reply without
+        // drafts, so a near tie may part the replies (2026-11-23: at token 16, "," against "."
+        // in the RTX 4070 and RTX 3060 split, with the whole head and the draft vocabulary
+        // alike). Where they part, the reply without drafts has the token of the reply with
+        // drafts close to its own (greedy), or among the tokens it could have drawn (sampled).
+        for (what, got, want, probs) in [
+            ("a greedy reply", &drafted, &plain, &plain_probs),
+            ("a sampled reply", &sampled, &plain_seeded, &seeded_probs),
+        ] {
+            let Some(at) = got.iter().zip(want.iter()).position(|(a, b)| a != b) else {
+                assert_eq!(got.len(), want.len(), "drafts changed the length of {what}, {view}");
+                continue;
+            };
+            let token = got[at];
+            let there = probs.get(at).expect("the reply without drafts reports every token");
+            let alternative = there.alternatives.iter().find(|a| a.token == token);
+            let behind = alternative.map_or(f32::INFINITY, |a| there.logprob - a.logprob);
+            eprintln!(
+                "RES Flash-Next, {view}: with drafts {what} parts at token {at}: {token} and not \
+                 {}; without drafts their log-probabilities are {:?} and {} (the alternatives \
+                 {:?})",
+                want[at],
+                alternative.map(|a| a.logprob),
+                there.logprob,
+                there.alternatives.iter().map(|a| (a.token, a.logprob)).collect::<Vec<_>>(),
+            );
+            match what {
+                "a greedy reply" => assert!(
+                    behind <= NEAR_TIE_NATS,
+                    "drafts changed {what} of Flash-Next, {view}: token {at} is {token}, \
+                     {behind} below the token without drafts ({got:?} against {want:?})"
+                ),
+                _ => assert!(
+                    alternative.is_some(),
+                    "drafts changed {what} of Flash-Next, {view}: token {at} is {token}, which \
+                     the reply without drafts could not draw ({got:?} against {want:?})"
+                ),
+            }
+        }
     }
 }
+
+/// How far below the most likely token a token of a reply of a real model may be in the
+/// log-probabilities of the same request written without drafts, and still be a near tie that
+/// the rounding of other steps flips: 0.25, the two within a factor of 1.3 of each other.
+const NEAR_TIE_NATS: f32 = 0.25;
 
 /// The same with the DFlash drafter (`ARES_TEST_DFLASH_FLASHNEXT`), which reads
 /// the mean of the model's four streams: Flash-Next writes with its drafts,
