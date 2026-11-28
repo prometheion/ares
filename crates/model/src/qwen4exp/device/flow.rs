@@ -968,25 +968,6 @@ impl Routing {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_wait_stands_still_from_its_start_or_the_last_move_whichever_is_later() {
-        let s = Duration::from_secs;
-        let t0 = Instant::now();
-        // Nothing moved since long before the wait: it counts from its start.
-        let mut at = (7, t0);
-        assert_eq!(stood_still(s(31), 7, &mut at, t0 + s(100)), s(31));
-        // Something moved: it counts from when that was seen.
-        assert_eq!(stood_still(s(32), 8, &mut at, t0 + s(101)), s(0));
-        assert_eq!(at, (8, t0 + s(101)));
-        assert_eq!(stood_still(s(50), 8, &mut at, t0 + s(119)), s(18));
-        assert_eq!(stood_still(s(70), 8, &mut at, t0 + s(139)), s(38));
-    }
-}
-
 /// The tier of experts gives VRAM back when other programs need the devices'
 /// memory, and takes it again (`ares_runtime::vram`).
 impl VramUser for Flow {
@@ -1007,5 +988,24 @@ impl VramUser for Flow {
             self.follow_vram(&mut feed);
             self.vram_of(&feed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_stands_still_from_its_start_or_the_last_move_whichever_is_later() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        // Nothing moved since long before the wait: it counts from its start.
+        let mut at = (7, t0);
+        assert_eq!(stood_still(s(31), 7, &mut at, t0 + s(100)), s(31));
+        // Something moved: it counts from when that was seen.
+        assert_eq!(stood_still(s(32), 8, &mut at, t0 + s(101)), s(0));
+        assert_eq!(at, (8, t0 + s(101)));
+        assert_eq!(stood_still(s(50), 8, &mut at, t0 + s(119)), s(18));
+        assert_eq!(stood_still(s(70), 8, &mut at, t0 + s(139)), s(38));
     }
 }

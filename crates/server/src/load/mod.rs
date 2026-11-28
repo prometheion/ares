@@ -239,12 +239,19 @@ impl Loaded {
                         Bytes(release.taken),
                         Bytes(after.free),
                     );
-                    // Allocation granularity aside, all of it comes back.
-                    if back + 16 * MIB < release.taken {
+                    // Allocation granularity aside, all of it comes back: what the
+                    // process holds is what it held before the load, by NVML's count
+                    // (the expert slots gave and took VRAM while the model ran), or
+                    // by what the device has free without it.
+                    let kept = match (held.own, ares_cuda::device_use(info.pci)) {
+                        (Some(before), Ok(now)) => now.own.saturating_sub(before),
+                        _ => release.taken.saturating_sub(back),
+                    };
+                    if kept > 16 * MIB {
                         tracing::warn!(
                             "device {}: {} of what the model took did not come back",
                             info.ordinal,
-                            Bytes(release.taken - back)
+                            Bytes(kept)
                         );
                     }
                     devices.push(release);

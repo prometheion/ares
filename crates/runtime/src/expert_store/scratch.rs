@@ -163,7 +163,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// Whether nothing touches the VRAM slots of `device` now: no expert is
     /// wanted or read, nothing is on its way to or from the device.
-    pub(super) fn vram_quiet(&self, device: usize) -> bool {
+    fn vram_quiet(&self, device: usize) -> bool {
         self.wants.is_empty()
             && self.reads.is_empty()
             && self.device_ops[device].iter().all(|ops| ops.is_empty())

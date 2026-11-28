@@ -220,6 +220,15 @@ impl<D: SlotDevice> ExpertStore<D> {
         (0..slots).rev().take_while(|slot| self.slot_alive(pool, *slot)).count() as u32
     }
 
+    /// Whether nothing is on its way into or out of the slots of `device`: no
+    /// upload, promotion or copy down, no expert moving from a transit slot.
+    /// A read from the file into RAM takes no VRAM slot before it has landed
+    /// (the upload takes one, [`ExpertStore::poll`]), so reads may run: while
+    /// a model decodes, the reads ahead almost never stop.
+    fn vram_slots_quiet(&self, device: usize) -> bool {
+        self.device_ops[device].iter().all(|ops| ops.is_empty()) && !self.transit.is_busy()
+    }
+
     /// Gives the memory of the pieces that have left to the device, once the
     /// device has done what moved out of them. Never waits.
     pub(super) fn settle_vram(&mut self) -> Result<(), StoreError> {
@@ -256,8 +265,8 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Gives up pieces of `device` until the tier holds no more there than
-    /// its target, if no step runs, no loan is out and nothing touches the
-    /// device's slots; waits up to `wait` for what is on its way. Returns the
+    /// its target, if no step runs, no loan is out and nothing is on its way
+    /// into or out of the device's slots; waits up to `wait` for what is. Returns the
     /// pieces given up; their memory goes back to the device once the device
     /// has done the moves out of them ([`ExpertStore::poll`]).
     pub fn shrink_vram(&mut self, device: usize, wait: Duration) -> Result<usize, StoreError> {
@@ -273,7 +282,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let begun = Instant::now();
         loop {
             self.poll()?;
-            if self.vram_quiet(device) {
+            if self.vram_slots_quiet(device) {
                 break;
             }
             if begun.elapsed() >= wait {

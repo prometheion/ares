@@ -17,6 +17,10 @@ pub(crate) struct Held {
     pub(crate) room: u64,
     /// What the engine leaves on the device, for the log.
     pub(crate) limit: String,
+    /// What the process held there by NVML's count, when NVML says: an
+    /// unload checks against it what came back, since the expert slots give
+    /// and take VRAM while the model runs.
+    pub(crate) own: Option<u64>,
 }
 
 /// Opens the devices the operator named, or all the driver reports, and says
@@ -65,7 +69,8 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
         let limit = super::vram::limit(&device)?;
         let free = device.mem_info()?.free;
         let room = device.room()?;
-        held.push(Held { device, free, room, limit });
+        let own = ares_cuda::device_use(device.info().pci).ok().map(|u| u.own);
+        held.push(Held { device, free, room, limit, own });
         describe(&held[held.len() - 1]);
     }
     Ok((ordinals, held))
