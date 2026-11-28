@@ -96,6 +96,19 @@ pub enum OpenError {
     Choice(String),
 }
 
+impl OpenError {
+    /// Whether the model cannot be opened for lack of memory (a placement
+    /// that does not fit, an allocation the driver refused): next to other
+    /// models, unloading one may make room.
+    pub fn is_no_room(&self) -> bool {
+        match self {
+            Self::Device(e) => e.is_no_room(),
+            Self::Model(e) => e.is_no_room(),
+            Self::File(_) | Self::Choice(_) => false,
+        }
+    }
+}
+
 /// A `qwen4exp` model file, placed.
 pub struct Qwen4Exp {
     gguf: Arc<Gguf>,

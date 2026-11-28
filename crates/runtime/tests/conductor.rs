@@ -1228,6 +1228,26 @@ fn a_window_of_no_rows_is_refused_at_start() {
 }
 
 #[test]
+fn a_warm_up_step_that_does_not_end_fails_the_start_by_its_watchdog() {
+    let model = model(roomy);
+    let gate = Gate::new();
+    gate.close();
+    let config = RuntimeConfig {
+        watchdog: Some(Duration::from_secs(1)),
+        warm_up: true,
+        ..config(true, 4096)
+    };
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
+        .with_gate(gate.clone());
+    let begun = std::time::Instant::now();
+    let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
+    assert!(begun.elapsed() < Duration::from_secs(20), "the start waited for the step");
+    let error = error.to_string();
+    assert!(error.contains("warm-up") && error.contains("watchdog"), "{error}");
+    gate.open();
+}
+
+#[test]
 fn a_step_that_does_not_end_fails_the_engine_by_its_watchdog() {
     use ares_api::Engine;
     let model = model(roomy);

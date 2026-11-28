@@ -29,6 +29,7 @@ impl Conductor {
             stop,
             sampling,
             draft,
+            cache: uses_cache,
             filter,
             priority,
             displace,
@@ -95,8 +96,13 @@ impl Conductor {
         let seq = self.fresh_seq();
         let room = self.context_length.saturating_sub(prompt_len);
         // What the cache has for the prompt now. A request whose first
-        // missing page another sequence is computing is held back.
-        let (chain, cached, idle, waits_for, brought_back) = match &mut self.cache {
+        // missing page another sequence is computing is held back. A request
+        // that does not use the cache asks it nothing.
+        let (chain, cached, idle, waits_for, brought_back) = match self
+            .cache
+            .as_mut()
+            .filter(|_| uses_cache)
+        {
             Some(cache) => {
                 let chain = cache.chain(&names);
                 // What RAM has of it comes back now, before the step is
@@ -169,6 +175,7 @@ impl Conductor {
                 .map(|_| Acceptance::new(self.config.window_rows as usize, 0.95))
                 .collect(),
             draft_allowed: draft,
+            cache: uses_cache,
             sampler,
             stop,
             max_tokens,
@@ -198,7 +205,8 @@ impl Conductor {
         let Some(i) = self.waiting.iter().position(|a| a.seq == seq) else { return };
         // What the cache has for it now, which may be more or less than when
         // it was put in line.
-        let probe = match &mut self.cache {
+        let uses_cache = self.waiting[i].cache;
+        let probe = match self.cache.as_mut().filter(|_| uses_cache) {
             Some(cache) => {
                 let a = &self.waiting[i];
                 Some(cache.probe(&mut self.pool, None, &a.chain, &a.names[..a.known as usize]))
@@ -290,7 +298,7 @@ impl Conductor {
     /// request's own anchor ([`Cache::save_end`]). The copy of the state runs
     /// with the next record, before anything of it writes a slot.
     pub(super) fn keep(&mut self, a: &mut Active, slot: u32) {
-        let Some(cache) = &mut self.cache else { return };
+        let Some(cache) = self.cache.as_mut().filter(|_| a.cache) else { return };
         cache.index.withdraw(a.owner);
         // A sequence that leaves before the record that restores its state
         // never had that state in its slot.
@@ -354,7 +362,7 @@ impl Conductor {
         a.waited_steps = 0;
         // What it needs to come back: the rows the cache does not hold, which
         // are claimed again step by step, as a prompt's are.
-        let (rows, idle) = match &mut self.cache {
+        let (rows, idle) = match self.cache.as_mut().filter(|_| a.cache) {
             Some(cache) => {
                 a.looked_at = cache.evictions;
                 let names = &a.names[..a.known as usize];

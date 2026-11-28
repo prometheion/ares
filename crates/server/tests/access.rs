@@ -182,6 +182,32 @@ async fn without_keys_a_page_of_another_site_is_refused() {
 }
 
 #[tokio::test]
+async fn with_keys_named_hosts_check_the_page_too() {
+    // Keys and --allowed-hosts: the names asked for the checks a server
+    // without keys makes, the page's among them.
+    let app = served(Access { hosts: Some(vec!["gpu.lan".into()]), ..locked() }).await;
+    let key = ("authorization", "Bearer first-key");
+    let foreign = [("host", "gpu.lan:8000"), ("origin", "https://attacker.example"), key];
+    let (status, _, text) =
+        send(&app, "POST", "/v1/chat/completions", &foreign, Some(CHAT_BODY)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    assert_eq!(parsed(&text)["error"]["code"], "forbidden_origin");
+    // Pages of the allowed names and of this machine pass, with the key.
+    for origin in ["http://gpu.lan:3000", "http://localhost:5173"] {
+        let headers = [("host", "gpu.lan:8000"), ("origin", origin), key];
+        let (status, _, _) = send(&app, "GET", "/v1/models", &headers, None).await;
+        assert_eq!(status, StatusCode::OK, "{origin}");
+    }
+    // The key is still wanted, and a program that sends no page passes.
+    let (status, _, _) =
+        send(&app, "GET", "/v1/models", &[("host", "gpu.lan"), ("origin", "http://gpu.lan")], None)
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = send(&app, "GET", "/v1/models", &[("host", "gpu.lan"), key], None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn cors_lets_the_listed_origins_read_answers_and_answers_their_preflight() {
     let access = Access { origins: vec!["https://chat.example.org".into()], ..locked() };
     let app = served(access).await;

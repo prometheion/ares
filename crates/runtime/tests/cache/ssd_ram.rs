@@ -2,11 +2,12 @@
 //! prefix cache on SSD.
 //!
 //! The executor is given the books of page-locked RAM
-//! ([`HostExecutor::with_ram`]) and plays the strictest device they allow: a
-//! checkpoint place loses its memory, and what it held, as soon as the
-//! conductor has called it unused. A save into such a place and a checkpoint
-//! that leaves such a place for the drive are problems the oracle writes
-//! down, and a state that is not the one its history made changes the text.
+//! ([`HostExecutor::with_ram`]): its checkpoint places lie in chunks of them,
+//! booked and given back as a device part's are, and a place loses what it
+//! held as soon as the conductor has called it unused. A save into such a
+//! place and a checkpoint that leaves such a place for the drive are problems
+//! the oracle writes down, and a state that is not the one its history made
+//! changes the text.
 //! The books follow a machine whose available memory and clock are the
 //! test's, so "the machine has no room for checkpoints" is a line of a test.
 

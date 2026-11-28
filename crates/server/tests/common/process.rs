@@ -193,6 +193,11 @@ impl Server {
         assert!(status.success());
     }
 
+    /// The process's id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The exit status, once the process has ended.
     pub fn exited(&mut self) -> Option<ExitStatus> {
         self.child.try_wait().unwrap()
@@ -215,12 +220,14 @@ impl Server {
     }
 
     /// Stops the server with one signal and checks that it left in order: a
-    /// clean exit after everything it loaded was released. Returns its log.
+    /// clean exit after everything it loaded was released, and no panic on
+    /// the way (the release build aborts on one). Returns its log.
     pub fn stop(mut self) -> Vec<String> {
         self.signal("TERM");
         let status = self.wait_exit();
         let log = std::mem::take(&mut self.log);
         assert!(status.success(), "a clean stop: {status:?}\n{log:#?}");
+        assert!(!log.iter().any(|line| line.contains("panicked")), "a panic: {log:#?}");
         assert!(log.last().is_some_and(|line| line.trim_end().ends_with("stopped")), "{log:#?}");
         log
     }

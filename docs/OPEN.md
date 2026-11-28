@@ -52,6 +52,17 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
     after the kernel pass makes steps cheaper.
   - A checkpoint at the end of every request (a place per request end), so a repeated or continued
     prompt resumes at its end, not at the last page or message boundary (to build: `fix/server-sweep`).
+    Not built yet (2026-11-25): a state one cell before the end needs a step cut there, and the
+    version that cut every prompt (measured on the 27B, both cards, an 11,125-token agent prompt,
+    A/B/A/B: the same prompt again 0.224 -> 0.098 s, but a cold prompt +0.07 s and the next turn
+    0.117 -> 0.190 s) broke the rule that nothing gets slower, so it is not on the branch. What is
+    left: the state at the prompt's very end (free at the end of its last step) with the last row's
+    logits kept, which a repeat samples from without running a row; it takes a step of no rows in
+    the record, the logits of each device's slice of the vocabulary in the place, the drafters'
+    last hidden state, and a prompt that computes nothing (larger than the sweep). A variant without
+    a step more, the anchor moved from the last page boundary to the end of the last message
+    (`/var/tmp/ares-fixserver/exact-anchor-wip.patch`), serves repeats and next turns alike but puts
+    the anchor on a tail, which the drive does not keep: a resume after a restart would replay more.
   - The RTX 3060's prompt attention takes 5 pieces a tile (about 6 % of its attention for some 25 MB
     of state slots a card); O in f16 is not taken (its error grows with the length). In the kernel pass.
   - The roles of the cards are built and tested now on the local RTX 4070 + RTX 3060, not after the
@@ -62,7 +73,8 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
     when one of them changes (built on `fix/model-sweep`, 2026-11-25: `roles.rs`, `<fingerprint>.roles`
     beside the usage profiles; "The second card's role" in `dev/architecture/devices.md`).
   - `cache_prompt` is accepted with its meaning: `true` is the normal behaviour, `false` makes the
-    request neither read nor write the prompt cache (to build: `fix/server-sweep`).
+    request neither read nor write the prompt cache (built on `fix/server-sweep`, "ares-runtime:
+    cache_prompt false keeps a request out of the prompt cache").
   - DFlash2 trees come after the few-row kernels and are decided with those costs.
 - Push day done 2026-11-25: the first push (prometheion/ares main at the scrubbed history) and
   the owner's production switched to Ares (llama-swap's two 27B entries run Ares from
@@ -194,38 +206,78 @@ marks a line that only a GPU run can settle or check.
 
 | Area | Defects | Of them GPU |
 | --- | --- | --- |
-| Server, API, cache | 5 | 1 |
-| Model, runtime, kernels | 13 | 12 |
+| Server, API, cache | 3 | 1 |
+| Model, runtime, kernels | 12 | 11 |
 
 ### From a user's report (2026-11-25; Flash-Next on one RTX 4080 16 GB, `--ram 40G`/`52G`, 4 sequences, opencode and Claude-Code-style requests): each takes the model down
 - [ ] SIGTERM ends in SIGABRT (release `panic = "abort"`): core dumps up to 32 GB and minutes of
-      hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. In work: `fix/server-sweep`.
+      hanging shutdown; llama-swap stops Ares with SIGTERM on every restart. Not reproduced on the
+      local cards by `fix/server-sweep` (2026-11-25, release build): Flash-Next IQ2_XS at `--ram` 8
+      to 16 GiB on both cards and on one (K/V beyond VRAM), and the 27B, stopped during a prompt,
+      during generation, with four sequences, with a prompt cache to write, with two and three
+      SIGTERMs, 5, 20 and 35 s into a reload after an unload, 5 and 20 s into the reload that
+      follows an engine failure (four long prompts at once take the model down, 2026-11-26), and
+      with two SIGTERMs 6, 12 and 20 s into a load: every stop clean (exit 0, or 1 for the stop at
+      once). Added: a panic is written into the log with its thread, place and stack before the
+      abort; the stop at once and, since 2026-11-26, the orderly stop after its last line
+      ("stopped") end with `_exit`, so the CUDA driver's handlers for the end of a process do not
+      run under threads that outlive the engine; every test that stops a server fails on a panic,
+      and a GPU test stops Flash-Next with SIGTERM while a request streams. Found 2026-11-26 (the
+      SIGTERM 20 s into the reload after an engine failure, while the tiers filled from the expert
+      profile; log `/var/tmp/ares-fixserver/repro/fr-20.log`): the engine's ordered stop took 35.5 s
+      and gave back neither the devices' memory (device 0: 0 B of 11.29 GiB, device 1: 132 MiB of
+      11.34 GiB) nor the RAM (11.71 GiB before and after), with no request holding the engine; the
+      old binary then returned from `main`, and the exit handlers ran beside that memory: the
+      reporter's timeline (SIGTERM shortly after an engine failure and its reload). It did not abort
+      here; the orderly `_exit` now ends the process without those handlers. Open: what keeps
+      Flash-Next's memory after its runtime is dropped when the stop meets a fill of the tiers
+      (`qwen4exp/device/runtime/parts.rs`, the expert store's threads), and why that stop takes
+      35 s. Still unexplained: what aborts on the reporter's machine. The suspects the code leaves: the
+      watch of the machine's memory upgrades Flash-Next's flow (`qwen4exp/device/runtime/parts.rs`,
+      `on_experts`) and can hold, and then free, the tier of experts on its own thread after the
+      engine's ordered stop; a device thread that did not stop in time (`GpuExecutor::shutdown`); a
+      panic in the drain of a large prompt cache. A logged "panicked" line in the reporter's log, or
+      its stacks (`coredumpctl info`), decide; an abort without such a line points at the driver.
 
 ### Server, API, cache
-- [ ] Chat and completion bodies pass over unknown members nested in a message, a tool or
-      `stream_options`, where Messages and Responses refuse them; the server's rule is that
-      nothing is dropped silently (found 2026-11-24 by `fix/help-docs`, documented as it is in
-      `docs/user/api.md`). Files: `crates/server/src/openai/request.rs` (`message()`,
-      `stream_options`), `crates/server/src/tools.rs` (`tool()`), `docs/user/api.md`.
-- [ ] Two names of one limit or count with different values let one win silently: `n_predict`
-      over `max_completion_tokens` and `max_tokens`, `n_cmpl` over `n`, `n_probs` over
-      `logprobs`; only `typical` and `repetition_penalty` against their twins are a 400
-      (`f32_alias`). Found 2026-11-24 by `fix/help-docs`. Files:
-      `crates/server/src/openai/request.rs`, `docs/user/api.md`.
-- [ ] A negative `min_keep` is accepted (only values above 1 are refused). Found 2026-11-24 by
-      `fix/help-docs`. File: `crates/server/src/openai/request.rs`.
-- [ ] With API keys the Origin check never runs, even when `--allowed-hosts` is named (written so
-      in `access.rs`; with the option named it is not what the option says). Found 2026-11-24 by
-      `fix/help-docs`. Files: `crates/server/src/access.rs`, `docs/user/options.md`.
-- [ ] GPU. `ares-server --test real_cache`
-      `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd` failed once in the
-      full suite under load (2026-11-17: after two other conversations took the pool, 4096 or
-      fewer of 9851 tokens came from the cache); alone it passes (9728 from SSD). Suspected, and
-      still possible in today's code: a page on its way from RAM to the SSD is found in neither (a
-      RAM page whose bytes are with the writer is not `ready`, and the drive reports stored
-      records only). Since 2026-11-24 the test runs with K and V beyond VRAM (`--context 20480`).
-      Files: `crates/runtime/src/cache/moves.rs` (`import_from_ram`), `cache/ram.rs`,
-      `cache/ssd/mod.rs`, `cache/ssd/pump.rs`.
+- [ ] GPU. A model unloaded and loaded again in the same process (`POST /models/unload`, then a
+      request) uploads its weights far slower than a first load: the 27B Q4_K_S on both local
+      cards (`--ram 8G --context 32768 --cache`, 2026-11-27, `fix/server-sweep` and
+      `fix/exact-anchor` alike) took 659 s for its 8.47 GiB on device 0 at the reload (16 to 28 s at
+      the first load of each process, one of them a minute after), and the other build was still
+      loading after 5 min, a device thread in state D, the machine's I/O pressure at 15 to 21 %
+      "full" from other agents' work. A fresh process loads fast meanwhile, so the reload path is
+      suspect (the page-locked staging taken anew on a machine whose memory is fragmented, the
+      model file read again). Logs `/var/tmp/ares-fixserver/bench/run2-Qwen3.8-27B--A1.log` and
+      `--B1.log`. Files: `crates/server/src/load/start.rs`, `crates/model/src/qwen35/device/`.
+- [ ] With several checkpoint places to a chunk (a device part whose checkpoint is under 16 MiB,
+      `CHUNK_BYTES` 32 MiB: the 0.8B split over two cards, the synthetic test models; the 27B and
+      Flash-Next have one place a chunk), the cache counts the places it uses and the books whole
+      chunks: the checkpoint it keeps at its floor when the machine runs short can lie in a chunk
+      of four, which then stays locked (160 of 48 allowed units in the test below) while the cache
+      believes it holds one place, so the prompt cache stays above its allowance until a later
+      request frees that place. Found 2026-11-26 by `fix/server-sweep` with the host executor on
+      `PlaceChunks`: the test `a_chunk_of_places_given_back_finds_its_room_again_beside_pages_in_ram`
+      (`/var/tmp/ares-fixserver/chunk-floor-test.patch`, for `crates/runtime/tests/cache/ram.rs`)
+      waits for the chunk to be given back and never sees it. Wanted: the cache's `held` counts the
+      chunks its places lie in (`PinnedRam::places_lock`'s geometry), or the floor's checkpoint goes
+      to place 0, which lies alone in its chunk for that reason. Files: `crates/runtime/src/cache/mod.rs`
+      (`held`), `cache/moves.rs` (`trim`), `cache/places.rs` (`free_place`), `crates/runtime/src/ram.rs`.
+- [ ] `cargo test -p ares-runtime --test cache` under CPU load (four runs of the suite at once, 32
+      rounds, 2026-11-26): `ram::a_shrink_writes_what_only_ram_holds_and_gives_the_memory_back`
+      fails 5 of 32 on main and 2 to 3 of 32 on `fix/server-sweep` (2 pages "dropped unwritten" in
+      its last part, on a machine with room for the floor alone: a precious page that found no
+      buffer while the writer was behind), `prefix::a_request_runs_between_the_pieces_of_a_paused_step`
+      1 of 32 on main; twice, in a `cargo test` beside other test binaries and builds of this
+      machine, both `ram::nothing_is_written_while_ram_holds_a_conversation_and_all_of_it_when_the_engine_ends`
+      and `ram::the_anchor_that_later_turns_share_inside_its_page_reaches_the_drive` saw no
+      records right after the engine before them was dropped, and
+      `ram::an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram` once found nothing
+      cached after the restart: the next engine's store was "in use by another process" (a
+      process forked for the full-drive test holds the lock files' descriptors until its exec);
+      fixed 2026-11-27 by the SSD level waiting a second for a locked store.
+      Alone and on an idle machine all pass. Files: `crates/runtime/tests/cache/ram.rs`,
+      `prefix.rs`, `crates/runtime/src/cache/moves.rs` (`page_room`).
 
 ### Model, runtime, kernels
 Tests that fail:
@@ -365,7 +417,7 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
 
 | Area | Small fixes |
 | --- | --- |
-| Server, API, cache | 10 |
+| Server, API, cache | 2 |
 | Model, runtime, kernels | 5 |
 
 ### Server, API, cache
@@ -374,7 +426,10 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       rules (parity, and a pure improvement on by default) Flash-Next should too, once it is
       measured to pay there (the block's VRAM is taken from the expert slots). Files:
       `crates/server/src/load/qwen4exp.rs` (`in_model`), `crates/server/src/options.rs` (help),
-      `docs/user/options.md`.
+      `docs/user/options.md`. Left by `fix/server-sweep` (2026-11-25): the measurement needs a
+      Flash-Next file that carries the block, and this machine has none (the swift IQ2_XS has no
+      `mtp.*` tensor); on the test machine, check the unsloth files for `mtp.fc_embedding.weight`
+      and measure with and without it at the owner's budget before it becomes the default.
 - [ ] Larger. The roots and left-behind checkpoints with one place in RAM (Flash-Next at
       `--ram 8G`): a root that comes back from the drive is a plain checkpoint again (the store
       keeps no mark); message checkpoints that later requests left behind are not written to the
@@ -389,33 +444,8 @@ Gaps a few hours close: a missing option, a limit, a test, a doc, a leftover of 
       index holds (the SSD level imports runs of pages with their deepest state only), or more
       places (int8 checkpoints, "Store of levers", "Checkpoints"). Files: `crates/runtime/src/cache/ssd/mod.rs`
       (`Cache::probe`), `cache/ssd/pump.rs` (`drain`), `cache/places.rs`, `crates/state/src/checkpoint.rs`
-      (`left_behind_on_pages`), `crates/store/src/lib.rs`.
-- [ ] The host executor's places: on `PlaceChunks`, and a place whose memory a device keeps locked
-      after it was given up. The host executor frees it at once (its oracle plays the strictest
-      device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
-      for a checkpoint's lock was found on the devices only. Files: `crates/runtime/src/testing.rs`,
-      `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`.
-- [ ] A test of the full drive for the SSD level (running out of room is handled, never tested).
-      Files: `crates/runtime/src/cache/ssd/mod.rs`, `crates/runtime/tests/cache/ssd.rs`.
-- [ ] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
-      TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`. Files:
-      `crates/server/src/openai/request.rs`, `crates/server/src/generate.rs`, the docs.
-- [ ] Left of the watchdog (S23, done 2026-11-22): no option for the limit (a field of
-      `RuntimeConfig`, 600 s); the steps of the warm-up are not watched (the watch starts after
-      it); the memory a stuck device holds stays taken until the process ends. Files:
-      `crates/server/src/options.rs`, `crates/server/src/plan.rs`, `crates/runtime/src/engine.rs`.
-- [ ] `/metrics` of a model that is not loaded is still 503 (its `/props` is read from its
-      preset and file since 2026-11-22). Files: `crates/server/src/metrics.rs`,
-      `crates/server/src/load/mod.rs` (`Described`), `docs/user/api.md`.
-- [ ] Router: "no room" for Flash-Next is recognised by the message's text ("does not fit",
-      "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
-      `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
-      `docs/user/`.
-- [ ] The cache's transfer time is counted twice, exported as `cache_ram_transfer_nanoseconds_total`
-      and `cache_ssd_transfer_nanoseconds_total` (cleanup phase 2: a metric's name). Files:
-      `crates/runtime/src/cache/moves.rs`, `crates/server/src/metrics.rs`.
-- [ ] The mirostat range is checked twice, by `Sampling::validate` and by the runtime's request
-      sampler. Files: `crates/api/src/sampling.rs`, `crates/runtime/src/sampling.rs`.
+      (`left_behind_on_pages`), `crates/store/src/lib.rs`. Left by `fix/server-sweep` (2026-11-25) as
+      larger than a fix.
 
 ### Model, runtime, kernels
 - [ ] Left of step 5 of the shared layer, the token rows: DFlash's newest token and mask rows are

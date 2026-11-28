@@ -83,6 +83,10 @@ const READERS: usize = 4;
 /// most: half the floor of pages in RAM, so that the other half is there for
 /// pages that leave the devices to make room for them.
 const READ_AHEAD: usize = RESERVE as usize / 2;
+/// How long the level waits for a store that is locked before it serves
+/// without it: the engine before this one may hold it a moment longer, and a
+/// process forked from this one holds its lock until it runs its program.
+const LOCKED_PATIENCE: Duration = Duration::from_secs(1);
 /// How long an engine that ends waits for the writer at most.
 const DRAIN_LIMIT: Duration = Duration::from_secs(120);
 
@@ -155,10 +159,6 @@ pub struct SsdCounters {
     /// early.
     pub imports: u64,
     pub imports_cut: u64,
-    /// Transfers between the devices and the host: calls, and the
-    /// nanoseconds the conductor waited for them.
-    pub transfers: u64,
-    pub transfer_ns: u64,
     /// Checkpoints that were due and were not written: none could be in
     /// transit (the writer held every buffer), or the checkpoint was given
     /// up before the record with its save had run, so that its place never
@@ -466,7 +466,15 @@ impl Ssd {
             ares_store::Config { max_bytes: config.max_bytes, segment_bytes: config.segment_bytes };
         std::fs::create_dir_all(&config.dir)
             .map_err(|e| format!("{}: {e}", config.dir.display()))?;
-        let store = PageStore::open(&config.dir, fingerprint, limits).map_err(|e| e.to_string())?;
+        let begun = Instant::now();
+        let store = loop {
+            match PageStore::open(&config.dir, fingerprint, limits) {
+                Err(ares_store::Error::Locked { .. }) if begun.elapsed() < LOCKED_PATIENCE => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.map_err(|e| e.to_string())?,
+            }
+        };
         let shared = Arc::new(Shared {
             store: Mutex::new(store),
             root: config.dir.clone(),

@@ -10,7 +10,9 @@
 use ares_api::Json;
 
 use super::edits::{Edit, Keep, ToolUses, Trigger, Turns};
-use crate::chat_body::{self, Chat, Purpose, known, object, refuse, string, text_member};
+use crate::chat_body::{
+    self, Chat, Purpose, cache_control, known, object, refuse, string, text_member,
+};
 use crate::error::ApiError;
 use crate::openai::request::{Fields, members, wrong_type};
 use crate::reasoning::DEFAULT_EFFORT;
@@ -156,25 +158,6 @@ fn block<'a>(at: &str, value: &'a Json, names: &[&str]) -> Result<Fields<'a>, Ap
         cache_control(&format!("{at}.cache_control"), marker)?;
     }
     Ok(fields)
-}
-
-/// A cache marker: `{"type": "ephemeral"}`, with a `ttl` of `5m` or `1h`.
-///
-/// It is accepted and changes nothing: the server keeps what it computed of
-/// every prompt and starts the next one from the longest prefix it has, with
-/// or without a marker, and it drops what it kept by its own budget and not
-/// after a time.
-fn cache_control(at: &str, value: &Json) -> Result<(), ApiError> {
-    let fields = block(at, value, &["type", "ttl"])?;
-    match fields.get("type") {
-        Some(Json::String(kind)) if kind == "ephemeral" => {}
-        _ => return Err(refuse(at, format!("{at}.type must be \"ephemeral\""))),
-    }
-    match fields.get("ttl") {
-        None => Ok(()),
-        Some(Json::String(ttl)) if ttl == "5m" || ttl == "1h" => Ok(()),
-        Some(_) => Err(refuse(at, format!("{at}.ttl must be \"5m\" or \"1h\""))),
-    }
 }
 
 /// The kind of a block, which every block names.

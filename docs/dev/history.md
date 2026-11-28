@@ -45,6 +45,19 @@ Found and fixed on `feat/jev` (2026-11-26):
       tail (`Transfer::tail`), and the exact pool takes it without settling it
       (`Forms::adopt`).
 
+### From "Questions to the owner"
+
+Answered by the owner (2026-11-26, after issue 2: the production 27B deadlocked inside a step)
+and built on `fix/server-sweep`:
+
+- [x] An engine whose device never ends a step (the watchdog, `--watchdog`) fails its requests and
+      is taken down, but its device threads and the memory they hold stay with the process until it
+      ends (a context whose kernel never ends cannot be torn down). Should the server then exit with
+      an error, so that its unit or llama-swap starts it again, or keep serving its other models?
+      (Asked 2026-11-25 by `fix/server-sweep`.)
+
+  *Done, 2026-11-26:* "ares-server: a stuck engine restarts the server in place": the server answers every request with 503 `restarting` and the reason, then `execve`s `/proc/self/exe` with the same arguments and environment and the listening socket kept (`ARES_LISTEN_FD`): the same PID and port, the devices' memory freed, the model loaded again; it exits with 75 when the exec cannot be done or a thread sits in the driver without a way out. `dev/architecture/server.md` ("The restart in place"), `tests/binary.rs` on the host (the `ares-host` model, `ARES_TEST_HOLD_STEPS_WHILE`), and once on the local cards with the 0.8B.
+
 ## 2026-11-25
 
 Done on `feat/jev` (2026-11-25 to 2026-11-26), the item verbatim and then what was done:
@@ -563,6 +576,116 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
       finding 13.
 
   *Triage, 2026-11-25:* Done parts: the server's draft vocabulary reader uses the model's (a951a913); the tools stay on `Session` (the owner, 2026-11-25). The rest is in `OPEN.md`, "Features", the cleanup.
+
+### From "Defects": "Server, API, cache"
+
+Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).
+
+- [x] A negative `min_keep` is accepted (only values above 1 are refused). Found 2026-11-24 by
+      `fix/help-docs`. File: `crates/server/src/openai/request.rs`.
+
+  *Fixed, 2026-11-25:* "ares-server: a negative min_keep is refused": `min_keep` is 0 or 1, as every cut keeps the most probable token; a test in `tests/sampling.rs`.
+
+- [x] Two names of one limit or count with different values let one win silently: `n_predict`
+      over `max_completion_tokens` and `max_tokens`, `n_cmpl` over `n`, `n_probs` over
+      `logprobs`; only `typical` and `repetition_penalty` against their twins are a 400
+      (`f32_alias`). Found 2026-11-24 by `fix/help-docs`. Files:
+      `crates/server/src/openai/request.rs`, `docs/user/api.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: two names of one parameter that differ are refused": one rule for every twin (`max_tokens`, `max_completion_tokens`, `n_predict`; `n`, `n_cmpl`; `n_probs` against `logprobs`/`top_logprobs`; `typical`, `repetition_penalty`): the same value is served, different values are a 400 naming the second name. None of the clients read (Open WebUI, opencode, Continue, LibreChat, the llama.cpp web UI) sends two names with different values; only a user's free-form extra parameters can. Test `two_names_of_one_parameter_must_agree` in `tests/sampling.rs`.
+
+- [x] With API keys the Origin check never runs, even when `--allowed-hosts` is named (written so
+      in `access.rs`; with the option named it is not what the option says). Found 2026-11-24 by
+      `fix/help-docs`. Files: `crates/server/src/access.rs`, `docs/user/options.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: with keys, named allowed hosts check the page too": with keys, `--allowed-hosts` names turn on the check of pages as well as of names (`Access::checks_pages`); `*` and no option leave the key to decide. Test `with_keys_named_hosts_check_the_page_too` in `tests/access.rs`.
+
+- [x] Chat and completion bodies pass over unknown members nested in a message, a tool or
+      `stream_options`, where Messages and Responses refuse them; the server's rule is that
+      nothing is dropped silently (found 2026-11-24 by `fix/help-docs`, documented as it is in
+      `docs/user/api.md`). Files: `crates/server/src/openai/request.rs` (`message()`,
+      `stream_options`), `crates/server/src/tools.rs` (`tool()`), `docs/user/api.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: the chat reader refuses unknown members inside messages, tools and stream_options": what the clients read send is read by its meaning (`reasoning`, `reasoning_text`, `thinking` as `reasoning_content`; `include_obfuscation` and `continuous_usage_stats` only false) or accepted where it changes nothing here (cache markers `cache_control` and `prompt_cache_breakpoint`, `image_url.detail`, a call's `index`), said in `docs/user/api.md`; anything else is a 400 that names it. Read for it: Open WebUI 0.13.4, opencode 2.4.1 and 1.19.6 (with `@ai-sdk/openai-compatible`), Continue 1.3.40, LibreChat 0.8.9 (LangChain `@langchain/openai` 1.5.8), the llama.cpp web UI, the OpenAI SDK 7.64; Claude Code has no OpenAI chat mode. Tests in `openai/request.rs`.
+
+- [x] GPU. `ares-server --test real_cache`
+      `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd` failed once in the
+      full suite under load (2026-11-17: after two other conversations took the pool, 4096 or
+      fewer of 9851 tokens came from the cache); alone it passes (9728 from SSD). Suspected, and
+      still possible in today's code: a page on its way from RAM to the SSD is found in neither (a
+      RAM page whose bytes are with the writer is not `ready`, and the drive reports stored
+      records only). Since 2026-11-24 the test runs with K and V beyond VRAM (`--context 20480`).
+      Files: `crates/runtime/src/cache/moves.rs` (`import_from_ram`), `cache/ram.rs`,
+      `cache/ssd/mod.rs`, `cache/ssd/pump.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: a prompt waits for its pages on their way from RAM to the drive": the gap was there (a RAM page whose bytes are with the writer is not `ready`, and the store has no record of it yet); the probe now waits up to 250 ms for the writer to give such pages of the prompt back (`Cache::await_transit`). `real_cache` on the local cards, three runs (05:18, 05:29, 05:40): the Flash-Next test took 9728 of 9851 tokens from the SSD after eviction in each run that reached that step; one run (built while the branch was being rewritten, with a since-dropped change of the anchor) failed earlier with "the rows of slot 0 start at cell 9728 and its sequence is at cell 9820", which the branch without that change did not show. The original shortfall was not reproduced. On the branch rebased onto main 0c4fbb60 (2026-11-26, a53cc5b0, load 7 to 21): three runs, 4 of 4 each; the Flash-Next test took 9728 of 9851 tokens from the SSD after eviction (54 pages, first token after 0.9 to 1.8 s, once 35.8 s beside other agents' work) and after a restart every time.
+
+### From "Small fixes": "Server, API, cache"
+
+Fixed on `fix/server-sweep`; each item verbatim, then what fixed it (the commit's subject).
+
+- [x] The mirostat range is checked twice, by `Sampling::validate` and by the runtime's request
+      sampler. Files: `crates/api/src/sampling.rs`, `crates/runtime/src/sampling.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: the mirostat range is Sampling::validate's alone": the request sampler trusts the check every request passes in `Runtime::submit_filtered`, and the server's reader only refuses a number that does not fit the field.
+
+- [x] The cache's transfer time is counted twice, exported as `cache_ram_transfer_nanoseconds_total`
+      and `cache_ssd_transfer_nanoseconds_total` (cleanup phase 2: a metric's name). Files:
+      `crates/runtime/src/cache/moves.rs`, `crates/server/src/metrics.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: the prompt cache's transfer time is counted once": the levels' batches of transfers are counted by the cache (`TransferCounters`), exported once as `ares_cache_transfer_nanoseconds_total`; the two old names are gone.
+
+- [x] `/metrics` of a model that is not loaded is still 503 (its `/props` is read from its
+      preset and file since 2026-11-22). Files: `crates/server/src/metrics.rs`,
+      `crates/server/src/load/mod.rs` (`Described`), `docs/user/api.md`.
+
+  *Fixed, 2026-11-25:* "ares-server: /metrics of a model that is not loaded says so with a 200": `ares_model_loaded 0` alone (and `1` before the counters of a loaded one), so a scraper does not take the server for down; the counters of an engine start again at its load. Tests in `tests/models.rs` and `tests/http.rs`.
+
+- [x] Left of the watchdog (S23, done 2026-11-22): no option for the limit (a field of
+      `RuntimeConfig`, 600 s); the steps of the warm-up are not watched (the watch starts after
+      it); the memory a stuck device holds stays taken until the process ends. Files:
+      `crates/server/src/options.rs`, `crates/server/src/plan.rs`, `crates/runtime/src/engine.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: the watchdog watches the warm-up, and --watchdog names its limit": `--watchdog <SECONDS>` (0: none, default 600), and the watch begins before the warm-up, whose stuck step now fails the load instead of holding it for ever (tests in `tests/conductor.rs` and `cli.rs`). The memory a stuck device holds is not a defect the process can fix: a context whose kernel never ends cannot be torn down, and the failure says so; whether the server should then exit so that its unit restarts it is a question to the owner (`OPEN.md`).
+
+- [x] Router: "no room" for Flash-Next is recognised by the message's text ("does not fit",
+      "memory"), not by a kind of error; the load and unload times are not in the user docs. Files:
+      `crates/server/src/load/qwen4exp.rs`, `load/start.rs`, `crates/server/src/models.rs`,
+      `docs/user/`.
+
+  *Fixed, 2026-11-25:* "ares-server: a load that finds no room says so by the kind of its error": `ModelError::NoRoom` for a placement that does not fit (Flash-Next's "do not fit" placements were not recognised by the text at all), `RuntimeError::NoRoom` for a device that could not be set up for lack of memory, and `is_no_room` on `ModelError`, `RuntimeError` and Flash-Next's `OpenError`, which `load/qwen4exp.rs` and `load/start.rs` ask instead of reading the message (test in `runtime/src/error.rs`). The load and unload times are in `docs/user/options.md`, "The preset file".
+
+- [x] Left of truncation (F18, done 2026-11-22): a cut of a prompt to its last N tokens (vLLM,
+      TGI, SGLang) is not built, see "The Responses API" in `dev/architecture/api.md`. Files:
+      `crates/server/src/openai/request.rs`, `crates/server/src/generate.rs`, the docs.
+
+  *Not a defect, 2026-11-25:* the cut is not built by design (`dev/architecture/api.md`, "truncation": in a rendered conversation a cut to the last N tokens lands anywhere, the system prompt included; conversations are cut by whole turns, `truncation: auto` on `/v1/responses`), and none of the clients read for the sweep sends `truncate_prompt_tokens` or `truncate`. What was left: the refusal now says so and names the way that is served ("ares-server: a cut of the prompt to its last tokens is refused with the way that is served"; test in `tests/sampling.rs`).
+
+- [x] A test of the full drive for the SSD level (running out of room is handled, never tested).
+      Files: `crates/runtime/src/cache/ssd/mod.rs`, `crates/runtime/tests/cache/ssd.rs`.
+
+  *Fixed, 2026-11-25:* "ares-runtime: a test of a drive that runs full under the SSD level": the store lies in a tmpfs of 700 KiB that the test mounts in a user namespace of its own (it runs itself again in one, and passes with a note where that is not allowed); the drive's ENOSPC makes the store give up its oldest segments and write on, every answer stays right, and the newest text resumes from the drive in another engine.
+
+- [x] `cargo test -p ares-runtime --test cache`: `ram::a_conversation_that_ram_gave_up_comes_back_from_ssd`
+      fails about one run in four in the full suite (alone it passes): the third ask finds the first
+      conversation's pages in RAM (288 cells cached, none read from the SSD), so its premise that RAM
+      gave them up is timing-dependent. Found 2026-11-25 by `fix/server-sweep` (fails before its
+      changes too). File: `crates/runtime/tests/cache/ram.rs`.
+
+  *Fixed, 2026-11-26:* "ares-runtime: a RAM test makes RAM give the first conversation up": RAM gives up a text's end first, and of the 8 pages the second text pushed off the devices RAM kept 5 or 6, as the checkpoint places in use at their arrival left room; with 6 the pages the next turn resumes from were all in RAM. A third text pushes 28 pages through a RAM that holds 24 at most, so the resume reads from the SSD every time (32 runs of the suite, four at once, none failed; before, 9 of 24).
+
+- [x] The host executor's places: on `PlaceChunks`, and a place whose memory a device keeps locked
+      after it was given up. The host executor frees it at once (its oracle plays the strictest
+      device, which the chunks are not), so the fault where pages in RAM left no room in `--ram`
+      for a checkpoint's lock was found on the devices only. Files: `crates/runtime/src/testing.rs`,
+      `testing/slots.rs`, `crates/runtime/tests/cache/ram.rs`. Left by `fix/server-sweep`
+      (2026-11-25): it takes `PlaceChunks` without a device (a `LockedChunk` over plain memory,
+      booked as now), the host executor's places on it in place of `host_places` and
+      `host_place_held` (the oracle still forgets what a place called unused held), and the chunks
+      given back only by `sweep_checkpoints`, as the devices give them back; then a test of a
+      checkpoint whose chunk finds no room beside pages in RAM.
+
+  *Fixed, 2026-11-26:* "ares-runtime: the host executor's checkpoint places lie in PlaceChunks": `PinnedRam::place_chunks` and `lock_checkpoints` take no device for an executor that has none (ordinary memory, booked the same), the host executor's places lie in chunks of four after place 0 (`HOST_PLACES_PER_CHUNK`), booked at a place's first copy and given back only by the books' sweep, as the devices do; `host_places` and `host_place_held` are gone. The oracle still forgets what a place called unused held. A unit test in `ram.rs` books, keeps and sweeps device-less chunks. The test of a checkpoint whose chunk finds no room beside pages in RAM found a fault of the cache's own accounting with several places to a chunk, which is in "Defects" now.
 
 ## 2026-11-24
 

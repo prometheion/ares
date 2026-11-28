@@ -193,6 +193,23 @@ pub enum ModelError {
     /// waited for will not happen.
     #[error("another device failed in the same step")]
     Aborted,
+    /// The devices have no room for what is asked of them (a placement whose
+    /// share does not fit its budget): next to other models, unloading one
+    /// may make it.
+    #[error("{0}")]
+    NoRoom(String),
+}
+
+impl ModelError {
+    /// Whether the error is a lack of memory: no room in a placement or a
+    /// budget, or an allocation the driver refused.
+    pub fn is_no_room(&self) -> bool {
+        match self {
+            Self::NoRoom(_) | Self::Memory(_) => true,
+            Self::Cuda(e) => e.is_out_of_memory(),
+            Self::Invalid(_) | Self::Aborted => false,
+        }
+    }
 }
 
 /// What a model offers the prefix cache: its device side carries out the

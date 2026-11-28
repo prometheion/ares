@@ -187,6 +187,9 @@ pub enum AcquireError {
     NotLoaded { model: String },
     /// The server is stopping.
     Stopping,
+    /// The server restarts in place: an engine is stuck in a step, and only a
+    /// new image of the process frees what it holds.
+    Restarting { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +273,8 @@ struct State {
     entries: Vec<Entry>,
     tickets: u64,
     stopping: bool,
+    /// Why the server restarts in place, once an engine is stuck.
+    restarting: Option<String>,
 }
 
 struct Shared {
@@ -284,11 +289,18 @@ struct Shared {
     /// The most RAM of all loaded models together, when the operator named
     /// it.
     ram: Option<u64>,
+    /// Why the server restarts in place, for whoever restarts it.
+    restart: watch::Sender<Option<String>>,
 }
+
+/// How often the manager looks whether a loaded model's engine is stuck in a
+/// step, while nothing else wakes it.
+const STUCK_LOOK: Duration = Duration::from_secs(1);
 
 enum Job {
     Load(usize),
     Unload(usize, String),
+    Restart(usize),
     Wait(Option<Duration>),
     Exit,
 }
@@ -366,6 +378,15 @@ impl Shared {
             if entry.phase != Phase::Loaded {
                 continue;
             }
+            // A step that does not come back: whatever holds the model, the
+            // server restarts. A stuck engine answers nobody any more.
+            if state.restarting.is_none()
+                && entry.loaded.as_ref().is_some_and(|loaded| loaded.engine.stuck())
+            {
+                return Job::Restart(index);
+            }
+            let look = now + STUCK_LOOK;
+            deadline = Some(deadline.map_or(look, |known| known.min(look)));
             // At the end nothing waits for a request: the engine ends them.
             let why = if stopping {
                 Some("the server is stopping".to_owned())
@@ -409,6 +430,37 @@ impl Shared {
             Some((_, index)) => Job::Load(index),
             None => Job::Wait(deadline),
         }
+    }
+
+    /// The engine of entry `index` is stuck in a step ([`Engine::stuck`]): its
+    /// threads and the memory of the devices stay where they are, as no unload
+    /// gives them back and the driver may not answer for any more. From now on
+    /// every request is told that the server restarts in place, which the
+    /// server's binary does (`Models::restart_asked`); the model's unit is left
+    /// as it is, for the new image to free.
+    fn restart(&self, index: usize) {
+        let mut state = self.lock();
+        let entry = &mut state.entries[index];
+        let why = entry.loaded.as_ref().and_then(|loaded| loaded.engine.failure());
+        let why = why.unwrap_or_else(|| "a step did not come back".to_owned());
+        let reason = format!("the engine of the model '{}' is stuck: {why}", entry.preset.id);
+        tracing::error!(
+            model = entry.preset.id.as_str(),
+            "{reason}; the server restarts in place, and the requests in flight and in line are \
+             answered with 503"
+        );
+        // Nothing of it is dropped: a drop would ask the driver to free it.
+        if let Some(loaded) = entry.loaded.take() {
+            std::mem::forget(loaded);
+        }
+        entry.phase = Phase::Unloaded;
+        entry.failure = Some(reason.clone());
+        self.say(entry, Some(reason.clone()));
+        state.restarting = Some(reason.clone());
+        drop(state);
+        // Kept for whoever asks later, too.
+        self.restart.send_replace(Some(reason));
+        self.changed();
     }
 
     async fn unload(&self, index: usize, why: String) {
@@ -562,6 +614,7 @@ impl Shared {
                 Job::Exit => break,
                 Job::Load(index) => self.load(index).await,
                 Job::Unload(index, why) => self.unload(index, why).await,
+                Job::Restart(index) => self.restart(index),
                 Job::Wait(None) => self.wake.notified().await,
                 Job::Wait(Some(until)) => {
                     tokio::select! {
@@ -743,13 +796,19 @@ impl Models {
             })
             .collect();
         let shared = Arc::new(Shared {
-            state: Mutex::new(State { tickets: entries.len() as u64, entries, stopping: false }),
+            state: Mutex::new(State {
+                tickets: entries.len() as u64,
+                entries,
+                stopping: false,
+                restarting: None,
+            }),
             loader,
             clock,
             wake: Notify::new(),
             version: watch::channel(0).0,
             events: broadcast::channel(256).0,
             ram: presets.ram,
+            restart: watch::channel(None).0,
         });
         let manager = tokio::spawn(shared.clone().manage());
         Self { shared, manager: Mutex::new(Some(manager)) }
@@ -796,6 +855,9 @@ impl Models {
         loop {
             {
                 let mut state = shared.lock();
+                if let Some(reason) = &state.restarting {
+                    return Err(AcquireError::Restarting { reason: reason.clone() });
+                }
                 if state.stopping {
                     return Err(AcquireError::Stopping);
                 }
@@ -946,6 +1008,23 @@ impl Models {
     /// model are told that the server is stopping; a load that runs is
     /// finished first, since the weights' way to the devices is not
     /// interrupted. Returns when everything is released.
+    /// Why the server restarts in place, once a model's engine was found
+    /// stuck in a step; `None` before.
+    pub fn restarting(&self) -> Option<String> {
+        self.shared.lock().restarting.clone()
+    }
+
+    /// Completes, with the reason, when the server is to restart in place: a
+    /// model's engine is stuck in a step ([`Engine::stuck`]).
+    pub async fn restart_asked(&self) -> String {
+        let mut asked = self.shared.restart.subscribe();
+        let reason = asked.wait_for(Option::is_some).await.ok().and_then(|reason| reason.clone());
+        match reason {
+            Some(reason) => reason,
+            None => std::future::pending().await,
+        }
+    }
+
     pub async fn shutdown(&self) {
         self.shared.lock().stopping = true;
         self.shared.changed();

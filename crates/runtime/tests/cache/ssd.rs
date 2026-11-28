@@ -7,6 +7,7 @@
 //! was written to the store, read back into another engine and restored there
 //! was the right state.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ares_runtime::{RuntimeConfig, SsdConfig, SyntheticConfig, SyntheticModel};
@@ -211,6 +212,71 @@ fn the_size_limit_gives_up_the_texts_used_least_recently() {
     e.consistent();
 }
 
+/// A drive that runs full: the store lies in a tmpfs of 700 KiB, which the
+/// test mounts in a user namespace of its own (it runs itself again in one).
+/// The store's own limit (1 GiB) never comes near; the drive's refusals
+/// (`ENOSPC`) make it give up its oldest segments and write on. Where user
+/// namespaces are not allowed the test says so and passes.
+#[test]
+fn a_full_drive_gives_up_the_oldest_segments_and_the_store_writes_on() {
+    const CHILD: &str = "ARES_TEST_FULL_DRIVE";
+    const NAME: &str = "ssd::a_full_drive_gives_up_the_oldest_segments_and_the_store_writes_on";
+    let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let dir = TempDir::new("full");
+        let script = format!(
+            "mount -t tmpfs -o size=700k none '{}' || exit 77; exec \"$0\" --exact {NAME} \
+             --test-threads=1",
+            dir.0.display()
+        );
+        let exe = std::env::current_exe().unwrap();
+        let run = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+            .arg(exe)
+            .env(CHILD, &dir.0)
+            .status();
+        match run.map(|status| status.code()) {
+            Ok(Some(0)) => {}
+            Ok(Some(77) | Some(1)) | Err(_) => {
+                eprintln!("skipped: no user namespace with a tmpfs of its own here");
+            }
+            Ok(other) => panic!("the test in its own namespace failed: {other:?}"),
+        }
+        return;
+    };
+    let model = model(1, |_| {});
+    // Segments of 160 KiB, which hold the pages of one text of 300 cells; the
+    // drive holds about three of them, the store's limit far more.
+    let at = SsdConfig { segment_bytes: 160 << 10, ..store(&dir) };
+    let texts: Vec<String> = (0..8).map(|i| text_of(60 + i, 300)).collect();
+    let e = engine(&model, config(64, 4, Some(at.clone())));
+    let mut answers = Vec::new();
+    for text in &texts {
+        let answer = e.ask(text, 8);
+        assert_eq!(answer.run.text, fresh(text, 8));
+        answers.push(answer.run.text);
+        e.written();
+    }
+    let s = e.written();
+    assert!(s.ssd_problem.is_none(), "{s}");
+    assert!(s.counters.ssd.store_bytes <= 700 << 10, "{s}");
+    // More was written than the drive holds: it made room and wrote on.
+    assert!(s.counters.ssd.bytes_written > 700 << 10, "{s}");
+    assert_eq!(s.counters.ram.pages_dropped, 0, "{s}");
+    e.consistent();
+    drop(e);
+
+    // The newest text resumes from the drive in another engine; the oldest
+    // was given up and is computed. Both say what they said.
+    let e = engine(&model, config(64, 4, Some(at)));
+    let newest = e.ask(&texts[7], 8);
+    assert!(newest.report.cached_tokens >= 256, "{:?}", newest.report);
+    assert_eq!(newest.run.text, answers[7]);
+    let oldest = e.ask(&texts[0], 8);
+    assert_eq!(oldest.report.cached_tokens, 0, "{:?}", oldest.report);
+    assert_eq!(oldest.run.text, answers[0]);
+    e.consistent();
+}
+
 #[test]
 fn damaged_and_missing_files_cost_only_time() {
     use std::os::unix::fs::FileExt;
@@ -311,6 +377,27 @@ fn pages_that_settle_late_are_written_in_the_form_they_have() {
     assert_eq!(b.run.text, fresh(&second, 20));
     assert!(b.report.cached_tokens >= 192, "{:?}", b.report);
     e.consistent();
+}
+
+#[test]
+fn a_store_that_the_engine_before_holds_a_moment_longer_is_waited_for() {
+    // The engine before lets the store go 300 ms after the next one starts
+    // (an unload and a load, a lock that a forked process holds until it
+    // runs its program): the next one waits and has its level on SSD.
+    let dir = TempDir::new("moment");
+    let model = model(1, |_| {});
+    let before = engine(&model, config(256, 8, Some(store(&dir.0))));
+    let gone = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(before);
+    });
+    let next = engine(&model, config(256, 8, Some(store(&dir.0))));
+    gone.join().unwrap();
+    let s = next.snapshot();
+    assert!(s.counters.ssd.enabled, "{:?}", s.ssd_problem);
+    let prompt = text_of(71, 100);
+    assert_eq!(next.ask(&prompt, 10).run.text, fresh(&prompt, 10));
+    next.consistent();
 }
 
 #[test]

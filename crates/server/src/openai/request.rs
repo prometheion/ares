@@ -16,6 +16,7 @@ use ares_api::{
     Role, SamplerKind, Sampling, TOP_LOGPROBS_MAX,
 };
 
+use crate::chat_body::cache_control;
 use crate::error::ApiError;
 use crate::reasoning::{self, Asked};
 use crate::structured;
@@ -216,6 +217,7 @@ const SERVED: &[&str] = &[
     "post_sampling_probs",
     "min_keep",
     "priority",
+    "cache_prompt",
     "return_progress",
     "sse_ping_interval",
     "timings_per_token",
@@ -294,6 +296,11 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
         "functions" | "function_call" => {
             "the functions of the first chat API are not served: send tools and tool_choice"
         }
+        "truncate_prompt_tokens" | "truncate" => {
+            "a prompt is not cut to its last tokens: in a conversation the cut lands anywhere, \
+             the system prompt included. /v1/responses leaves the oldest whole turns out with \
+             truncation: auto"
+        }
         name if tools::FIELDS.contains(&name) => {
             "tools belong to chat requests: /v1/completions has no chat template"
         }
@@ -347,6 +354,8 @@ pub(crate) fn from_json(
         max_tokens: max_tokens(&fields, endpoint)?,
         stop: stop(&fields)?,
         draft: fields.bool("draft")?.unwrap_or(true),
+        // llama.cpp's: `false` leaves the prompt cache out of the request.
+        cache: fields.bool("cache_prompt")?.unwrap_or(true),
         structure: structured::asked(&fields)?,
         priority: 0,
         id,
@@ -360,11 +369,7 @@ pub(crate) fn from_json(
             )
         })?),
     };
-    let include_usage = match fields.get("stream_options") {
-        None => false,
-        Some(Json::Object(members)) => Fields(members).bool("include_usage")?.unwrap_or(false),
-        Some(other) => return Err(wrong_type("stream_options", "an object", other)),
-    };
+    let include_usage = stream_options(&fields)?;
     // Where llama.cpp samples is no choice here, but the member is a boolean.
     fields.bool("backend_sampling")?;
     Ok(Parsed {
@@ -397,13 +402,54 @@ fn ping_interval(fields: &Fields<'_>) -> Result<Option<i32>, ApiError> {
     })
 }
 
+/// `stream_options`: whether a stream ends with a chunk of the usage.
+/// `include_obfuscation` (OpenAI's padding of the events) and
+/// `continuous_usage_stats` (vLLM's usage in every chunk) are not served,
+/// and may only say so.
+fn stream_options(fields: &Fields<'_>) -> Result<bool, ApiError> {
+    let members = match fields.get("stream_options") {
+        None => return Ok(false),
+        Some(Json::Object(members)) => members,
+        Some(other) => return Err(wrong_type("stream_options", "an object", other)),
+    };
+    let options = Fields(members);
+    let refuse = |name: &str, why: &str| {
+        ApiError::invalid_param(
+            "stream_options",
+            format!("stream_options.{name} is not supported: {why}"),
+        )
+    };
+    for (name, value) in members {
+        if value.is_null() {
+            continue;
+        }
+        let at = format!("stream_options.{name}");
+        let asked = match name.as_str() {
+            "include_usage" => continue,
+            "include_obfuscation" | "continuous_usage_stats" => match value {
+                Json::Bool(asked) => *asked,
+                other => return Err(wrong_type(&at, "a boolean", other)),
+            },
+            _ => return Err(refuse(name, "it is not an option of a stream this server reads")),
+        };
+        if asked {
+            return Err(refuse(
+                name,
+                match name.as_str() {
+                    "include_obfuscation" => "the events of a stream carry no padding",
+                    _ => "the usage comes once, in the last chunk (include_usage)",
+                },
+            ));
+        }
+    }
+    Ok(options.bool("include_usage")?.unwrap_or(false))
+}
+
 /// How many completions the request asks for: `n` of OpenAI or llama.cpp's
 /// `n_cmpl`.
 fn completions(fields: &Fields<'_>) -> Result<u32, ApiError> {
-    let (name, n) = match (fields.int("n_cmpl")?, fields.int("n")?) {
-        (Some(n), _) => ("n_cmpl", n),
-        (None, Some(n)) => ("n", n),
-        (None, None) => return Ok(1),
+    let Some((name, n)) = fields.alias(&["n", "n_cmpl"], Fields::int)? else {
+        return Ok(1);
     };
     u32::try_from(n).ok().filter(|n| (1..=N_MAX).contains(n)).ok_or_else(|| {
         ApiError::invalid_param(name, format!("{name} must be between 1 and {N_MAX}, got {n}"))
@@ -413,10 +459,12 @@ fn completions(fields: &Fields<'_>) -> Result<u32, ApiError> {
 /// The probabilities a request asks for, and the format of the answer.
 ///
 /// OpenAI's chat `logprobs: true` with `top_logprobs`, its completions
-/// `logprobs: n`, and llama.cpp's `n_probs` (which wins when both are there,
-/// as it does in llama-server) with `post_sampling_probs`. The probabilities
-/// are the model's own unless `post_sampling_probs` says they belong to the
-/// distribution the token is drawn from.
+/// `logprobs: n`, and llama.cpp's `n_probs` with `post_sampling_probs`. A
+/// request that asks in both forms must ask for the same (`n_probs: 0` is
+/// nothing, as `logprobs: false` is), and then gets llama.cpp's format, as
+/// llama-server answers it. The probabilities are the model's own unless
+/// `post_sampling_probs` says they belong to the distribution the token is
+/// drawn from.
 fn logprobs(
     endpoint: Endpoint,
     fields: &Fields<'_>,
@@ -431,51 +479,66 @@ fn logprobs(
         })
     };
     // llama.cpp's n_probs: 0 asks for nothing.
-    if let Some(n) = fields.int("n_probs")? {
-        if n == 0 {
-            if post {
-                return Err(ApiError::invalid_param(
-                    "post_sampling_probs",
-                    "post_sampling_probs needs n_probs to be greater than 0",
-                ));
-            }
-            return Ok((None, None));
-        }
-        let format = if post { LogprobFormat::ContentProbs } else { LogprobFormat::Content };
-        return Ok((
-            Some(LogprobRequest { top: top("n_probs", n)?, after_chain: post }),
-            Some(format),
-        ));
-    }
-    if post {
+    let llama = match fields.int("n_probs")? {
+        None => None,
+        Some(0) => Some(None),
+        Some(n) => Some(Some(top("n_probs", n)?)),
+    };
+    if post && !matches!(llama, Some(Some(_))) {
         return Err(ApiError::invalid_param(
             "post_sampling_probs",
             "post_sampling_probs needs n_probs to be greater than 0",
         ));
     }
+    let openai = openai_logprobs(endpoint, fields, top)?;
+    let nothing = |asked: Option<u32>| asked.map_or("nothing".to_owned(), |n| n.to_string());
+    match (llama, openai) {
+        (Some(asked), Some(other)) if asked != other => Err(ApiError::invalid_param(
+            "n_probs",
+            format!(
+                "n_probs asks for {} alternatives of each token and logprobs for {}: they are \
+                 the same parameter and differ, give one",
+                nothing(asked),
+                nothing(other)
+            ),
+        )),
+        (Some(Some(top)), _) => {
+            let format = if post { LogprobFormat::ContentProbs } else { LogprobFormat::Content };
+            Ok((Some(LogprobRequest { top, after_chain: post }), Some(format)))
+        }
+        (None, Some(Some(top))) => {
+            let format = match endpoint {
+                Endpoint::Chat => LogprobFormat::Content,
+                Endpoint::Completions => LogprobFormat::Legacy,
+            };
+            Ok((Some(LogprobRequest { top, after_chain: false }), Some(format)))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+/// The alternatives OpenAI's fields ask for: `None` when the request names
+/// none of them, `Some(None)` for `logprobs: false`.
+fn openai_logprobs(
+    endpoint: Endpoint,
+    fields: &Fields<'_>,
+    top: impl Fn(&str, i64) -> Result<u32, ApiError>,
+) -> Result<Option<Option<u32>>, ApiError> {
+    let without = || {
+        if fields.get("top_logprobs").is_some() {
+            return Err(ApiError::invalid_param(
+                "top_logprobs",
+                "top_logprobs requires logprobs to be set to true",
+            ));
+        }
+        Ok(())
+    };
     match (endpoint, fields.get("logprobs")) {
-        (_, None) => {
-            if fields.get("top_logprobs").is_some() {
-                return Err(ApiError::invalid_param(
-                    "top_logprobs",
-                    "top_logprobs requires logprobs to be set to true",
-                ));
-            }
-            Ok((None, None))
-        }
-        (Endpoint::Chat, Some(Json::Bool(false))) => {
-            if fields.get("top_logprobs").is_some() {
-                return Err(ApiError::invalid_param(
-                    "top_logprobs",
-                    "top_logprobs requires logprobs to be set to true",
-                ));
-            }
-            Ok((None, None))
-        }
+        (_, None) => without().map(|()| None),
+        (Endpoint::Chat, Some(Json::Bool(false))) => without().map(|()| Some(None)),
         (Endpoint::Chat, Some(Json::Bool(true))) => {
             let n = fields.int("top_logprobs")?.unwrap_or(0);
-            let request = LogprobRequest { top: top("top_logprobs", n)?, after_chain: false };
-            Ok((Some(request), Some(LogprobFormat::Content)))
+            Ok(Some(Some(top("top_logprobs", n)?)))
         }
         (Endpoint::Chat, Some(other)) => Err(wrong_type("logprobs", "a boolean", other)),
         (Endpoint::Completions, Some(_)) => {
@@ -487,8 +550,7 @@ fn logprobs(
                 ));
             }
             let n = fields.int("logprobs")?.expect("present");
-            let request = LogprobRequest { top: top("logprobs", n)?, after_chain: false };
-            Ok((Some(request), Some(LogprobFormat::Legacy)))
+            Ok(Some(Some(top("logprobs", n)?)))
         }
     }
 }
@@ -547,26 +609,35 @@ impl<'a> Fields<'a> {
         Ok(self.float(name)?.map(|v| v as f32))
     }
 
-    /// An `f32` parameter that goes by several names (llama.cpp's and
-    /// another engine's): the first one given, and a request that gives two
-    /// with different values is refused.
-    fn f32_alias(&self, names: &[&str]) -> Result<Option<f32>, ApiError> {
-        let mut found: Option<(&str, f32)> = None;
-        for name in names {
-            if let Some(value) = self.f32(name)? {
-                match found {
-                    Some((first, other)) if other != value => {
-                        return Err(ApiError::invalid_param(
-                            *name,
-                            format!("{first} and {name} are the same parameter and differ"),
-                        ));
-                    }
-                    Some(_) => {}
-                    None => found = Some((name, value)),
+    /// A parameter that goes by several names (OpenAI's, llama.cpp's and
+    /// another engine's), each read with `read`: the value and the first
+    /// name it is given under. No name wins over another: a request that
+    /// gives two of them different values is refused.
+    fn alias<T: PartialEq>(
+        &self,
+        names: &[&'static str],
+        read: impl Fn(&Self, &str) -> Result<Option<T>, ApiError>,
+    ) -> Result<Option<(&'static str, T)>, ApiError> {
+        let mut found: Option<(&'static str, T)> = None;
+        for &name in names {
+            let Some(value) = read(self, name)? else { continue };
+            match &found {
+                Some((first, other)) if *other != value => {
+                    return Err(ApiError::invalid_param(
+                        name,
+                        format!("{first} and {name} are the same parameter and differ: give one"),
+                    ));
                 }
+                Some(_) => {}
+                None => found = Some((name, value)),
             }
         }
-        Ok(found.map(|(_, value)| value))
+        Ok(found)
+    }
+
+    /// An `f32` parameter that goes by several names ([`Fields::alias`]).
+    fn f32_alias(&self, names: &[&'static str]) -> Result<Option<f32>, ApiError> {
+        Ok(self.alias(names, Self::f32)?.map(|(_, value)| value))
     }
 
     /// A whole number of at least 0.
@@ -608,7 +679,7 @@ pub(crate) fn expect_str<'a>(name: &str, value: &'a Json) -> Result<&'a str, Api
 fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
     let min_keep = fields.int("min_keep")?;
     if let Some(n) = min_keep
-        && n > 1
+        && !(0..=1).contains(&n)
     {
         return Err(ApiError::invalid_param(
             "min_keep",
@@ -635,10 +706,12 @@ fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
         xtc_threshold: fields.f32("xtc_threshold")?,
         dynatemp_range: fields.f32("dynatemp_range")?,
         dynatemp_exponent: fields.f32("dynatemp_exponent")?,
+        // Its range is `Sampling::validate`'s: here only a number that does
+        // not fit the field is refused.
         mirostat: fields
             .int("mirostat")?
             .map(|m| {
-                u8::try_from(m).ok().filter(|m| *m <= 2).ok_or_else(|| {
+                u8::try_from(m).map_err(|_| {
                     ApiError::invalid_param(
                         "mirostat",
                         format!("mirostat must be 0, 1 or 2, got {m}"),
@@ -816,18 +889,15 @@ fn seed(fields: &Fields<'_>) -> Result<Option<u64>, ApiError> {
 fn max_tokens(fields: &Fields<'_>, endpoint: Endpoint) -> Result<Option<u32>, ApiError> {
     // llama.cpp's `n_predict` is the same limit; `max_completion_tokens`
     // replaces `max_tokens` on the chat endpoint.
-    let (name, value) = match endpoint {
-        _ if fields.get("n_predict").is_some() => ("n_predict", fields.int("n_predict")?),
-        Endpoint::Chat if fields.get("max_completion_tokens").is_some() => {
-            ("max_completion_tokens", fields.int("max_completion_tokens")?)
-        }
-        _ => ("max_tokens", fields.int("max_tokens")?),
+    let names: &[&'static str] = match endpoint {
+        Endpoint::Chat => &["max_tokens", "max_completion_tokens", "n_predict"],
+        Endpoint::Completions => &["max_tokens", "n_predict"],
     };
-    match value {
+    match fields.alias(names, Fields::int)? {
         // llama.cpp clients write "no limit" as -1.
-        Some(n) if n < 0 => Ok(None),
-        Some(0) => Err(ApiError::invalid_param(name, format!("{name} must be at least 1"))),
-        Some(n) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+        Some((_, n)) if n < 0 => Ok(None),
+        Some((name, 0)) => Err(ApiError::invalid_param(name, format!("{name} must be at least 1"))),
+        Some((_, n)) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
         None => Ok(None),
     }
 }
@@ -936,6 +1006,101 @@ fn continues(fields: &Fields<'_>, messages: &[Message]) -> Result<bool, ApiError
     Ok(continues)
 }
 
+/// The members of a chat message that the server reads. The reasoning of an
+/// earlier turn goes by several names ([`REASONING`]): a client sends it back
+/// under the name a server gave it. `cache_control` is a cache marker, which
+/// changes nothing ([`cache_control`]).
+const MESSAGE: &[&str] = &[
+    "role",
+    "content",
+    "name",
+    "tool_call_id",
+    "tool_calls",
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "thinking",
+    "cache_control",
+];
+
+/// The names of the reasoning of a message: llama.cpp's and DeepSeek's,
+/// vLLM's and OpenRouter's, GitHub Copilot's and Ollama's. Two of them with
+/// different texts are refused.
+const REASONING: &[&str] = &["reasoning_content", "reasoning", "reasoning_text", "thinking"];
+
+/// Refuses a member of the object at `at` that is not one of `names`, with
+/// the reason `why` gives for its name. A member that is `null` is not set.
+fn only(
+    at: &str,
+    param: &str,
+    members: &[(String, Json)],
+    names: &[&str],
+    why: fn(&str) -> &'static str,
+) -> Result<(), ApiError> {
+    for (name, value) in members {
+        if !value.is_null() && !names.contains(&name.as_str()) {
+            return Err(ApiError::invalid_param(
+                param,
+                format!("{at}.{name} is not supported: {}", why(name)),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why a member of a message is not read.
+fn unread_in_message(name: &str) -> &'static str {
+    match name {
+        "function_call" => {
+            "the functions of the first chat API are not served: send the calls as tool_calls"
+        }
+        "audio" => "input other than text and images is not built",
+        "refusal" => "send the text of a refusal as the message's content",
+        "reasoning_details" | "reasoning_opaque" => {
+            "reasoning in this form is not read: send its text as reasoning_content"
+        }
+        _ => "it is not a member of a message this server reads",
+    }
+}
+
+/// Why a member of an object of the body is not read.
+fn unread(_: &str) -> &'static str {
+    "it is not a member this server reads"
+}
+
+/// OpenAI's marker of a cache breakpoint in a part: `{"mode": "explicit"}`,
+/// with a `ttl` of `30m` or `12h`. Like `cache_control` it changes nothing:
+/// the server starts every prompt from the longest prefix it kept.
+fn breakpoint(at: &str, value: &Json) -> Result<(), ApiError> {
+    let refuse = |message: String| ApiError::invalid_param(at, message);
+    let Json::Object(members) = value else {
+        return Err(refuse(format!("{at} must be an object, got {}", value.kind())));
+    };
+    only(at, at, members, &["mode", "ttl"], unread)?;
+    let fields = Fields(members);
+    if fields.string("mode").ok().flatten() != Some("explicit") {
+        return Err(refuse(format!("{at}.mode must be \"explicit\"")));
+    }
+    match fields.get("ttl") {
+        None => Ok(()),
+        Some(Json::String(ttl)) if ttl == "30m" || ttl == "12h" => Ok(()),
+        Some(_) => Err(refuse(format!("{at}.ttl must be \"30m\" or \"12h\""))),
+    }
+}
+
+/// The cache markers of an object at `at`: `cache_control` (Anthropic's, which
+/// clients send through to OpenAI-compatible servers) and, in a part,
+/// OpenAI's `prompt_cache_breakpoint`. Both change nothing.
+fn markers(at: &str, fields: &Fields<'_>) -> Result<(), ApiError> {
+    if let Some(marker) = fields.get("cache_control") {
+        cache_control(&format!("{at}.cache_control"), marker)?;
+    }
+    if let Some(marker) = fields.get("prompt_cache_breakpoint") {
+        breakpoint(&format!("{at}.prompt_cache_breakpoint"), marker)?;
+    }
+    Ok(())
+}
+
 fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
     let at = |field: &str| format!("messages[{index}].{field}");
     let Json::Object(members) = value else {
@@ -945,6 +1110,16 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
         ));
     };
     let fields = Fields(members);
+    let whole = format!("messages[{index}]");
+    for (name, value) in members.iter() {
+        if !value.is_null() && !MESSAGE.contains(&name.as_str()) {
+            return Err(ApiError::invalid_param(
+                at(name),
+                format!("{} is not supported: {}", at(name), unread_in_message(name)),
+            ));
+        }
+    }
+    markers(&whole, &fields)?;
 
     let role = match fields.string("role")? {
         Some("system" | "developer") => Role::System,
@@ -991,6 +1166,25 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
         }
     };
 
+    let mut reasoning: Option<(&str, String)> = None;
+    for name in REASONING {
+        let Some(text) = string_field(name)? else { continue };
+        match &reasoning {
+            Some((first, other)) if *other != text => {
+                return Err(ApiError::invalid_param(
+                    at(name),
+                    format!(
+                        "{} and {} are the same member and differ: give one",
+                        at(first),
+                        at(name)
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => reasoning = Some((name, text)),
+        }
+    }
+
     let (content, images) = content(index, fields.0)?;
     Ok(Message {
         role,
@@ -999,18 +1193,43 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
         name: string_field("name")?,
         tool_call_id: string_field("tool_call_id")?,
         tool_calls,
-        reasoning_content: string_field("reasoning_content")?,
+        reasoning_content: reasoning.map(|(_, text)| text),
     })
 }
 
 /// Checks a call of an assistant message: `{"id", "type": "function",
 /// "function": {"name", "arguments"}}`, the arguments an object as JSON text
-/// (OpenAI's form) or as it is.
+/// (OpenAI's form) or as it is. `index` (its place in a stream's deltas) and
+/// a cache marker may come with it and change nothing.
 fn tool_call(at: &str, call: &Json) -> Result<(), ApiError> {
     let refuse = |message: String| Err(ApiError::invalid_param(at, message));
-    let Some(function @ Json::Object(_)) = call.get("function") else {
+    let Json::Object(members) = call else {
+        return refuse(format!("{at} must be an object, got {}", call.kind()));
+    };
+    only(at, at, members, &["id", "type", "function", "index", "cache_control"], unread)?;
+    let fields = Fields(members);
+    markers(at, &fields)?;
+    match fields.get("type") {
+        None => {}
+        Some(Json::String(kind)) if kind == "function" => {}
+        Some(Json::String(kind)) => {
+            return refuse(format!(
+                "{at}.type '{kind}' is not supported: the calls this server reads are of \
+                 functions"
+            ));
+        }
+        Some(other) => return refuse(format!("{at}.type must be a string, got {}", other.kind())),
+    }
+    if !matches!(fields.get("id"), None | Some(Json::String(_))) {
+        return refuse(format!("{at}.id must be a string"));
+    }
+    if !matches!(fields.get("index"), None | Some(Json::Int(_) | Json::Uint(_))) {
+        return refuse(format!("{at}.index must be a whole number"));
+    }
+    let Some(function @ Json::Object(inner)) = fields.get("function") else {
         return refuse(format!("{at}.function must be an object"));
     };
+    only(&format!("{at}.function"), at, inner, &["name", "arguments"], unread)?;
     if !matches!(function.get("name"), Some(Json::String(name)) if !name.is_empty()) {
         return refuse(format!("{at}.function.name must be a string that is not empty"));
     }
@@ -1052,6 +1271,7 @@ fn content(index: usize, members: &[(String, Json)]) -> Result<(String, Vec<Imag
             let mut after_image = false;
             for (j, part) in parts.iter().enumerate() {
                 let kind = part.get("type").and_then(Json::as_str);
+                part_members(&format!("{at}[{j}]"), part, kind)?;
                 match (kind, part.get("text").and_then(Json::as_str)) {
                     (Some("text"), Some(piece)) => {
                         if has_images && !after_image && (!text.is_empty() || !images.is_empty()) {
@@ -1070,7 +1290,8 @@ fn content(index: usize, members: &[(String, Json)]) -> Result<(String, Vec<Imag
                         let place = format!("{at}[{j}].image_url");
                         let url = match part.get("image_url") {
                             Some(Json::String(url)) => url.as_str(),
-                            Some(object @ Json::Object(_)) => {
+                            Some(object @ Json::Object(members)) => {
+                                image_members(&place, members)?;
                                 object.get("url").and_then(Json::as_str).ok_or_else(|| {
                                     ApiError::invalid_param(
                                         place.clone(),
@@ -1105,6 +1326,39 @@ fn content(index: usize, members: &[(String, Json)]) -> Result<(String, Vec<Imag
         Some(other) => Err(ApiError::invalid_param(
             at.clone(),
             format!("{at} must be a string or an array of parts, got {}", other.kind()),
+        )),
+    }
+}
+
+/// Refuses a member of a part (of the type `kind`) that the server does not
+/// read; the cache markers are checked and change nothing.
+fn part_members(at: &str, part: &Json, kind: Option<&str>) -> Result<(), ApiError> {
+    let Json::Object(members) = part else { return Ok(()) };
+    let names: &[&str] = match kind {
+        Some("text") => &["type", "text", "cache_control", "prompt_cache_breakpoint"],
+        Some("image_url") => &["type", "image_url", "cache_control", "prompt_cache_breakpoint"],
+        // Refused by its type.
+        _ => return Ok(()),
+    };
+    only(at, at, members, names, unread)?;
+    markers(at, &Fields(members))
+}
+
+/// The members of an `image_url` object: its `url`, and `detail`, which
+/// changes nothing: an image is read at the size the model's vision tower
+/// takes (`--image-max-tokens` bounds it), whatever detail is asked for.
+fn image_members(at: &str, members: &[(String, Json)]) -> Result<(), ApiError> {
+    only(at, at, members, &["url", "detail"], unread)?;
+    match Fields(members).get("detail") {
+        None => Ok(()),
+        Some(Json::String(detail))
+            if ["auto", "low", "high", "original"].contains(&detail.as_str()) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(ApiError::invalid_param(
+            at,
+            format!("{at}.detail must be \"auto\", \"low\", \"high\" or \"original\""),
         )),
     }
 }
@@ -1193,6 +1447,162 @@ mod tests {
         let error = from_json(Endpoint::Chat, &parts(vec![remote]), RequestId(1)).unwrap_err();
         assert_eq!(error.param.as_deref(), Some("messages[0].content[0].image_url"));
         assert!(error.message.contains("data URL"), "{}", error.message);
+    }
+
+    fn text(body: serde_json::Value) -> Result<Parsed, ApiError> {
+        from_json(Endpoint::Chat, &read_json(body.to_string().as_bytes())?, RequestId(1))
+    }
+
+    fn body(messages: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({"model": "m", "messages": messages});
+        for (name, value) in extra.as_object().unwrap() {
+            body[name] = value.clone();
+        }
+        body
+    }
+
+    #[test]
+    fn members_that_clients_send_inside_messages_tools_and_stream_options_are_read() {
+        use serde_json::json;
+        // Members that Open WebUI, opencode, Continue, LibreChat and the
+        // llama.cpp web UI send (cache markers, an image's detail, the
+        // index of a streamed call, the reasoning under other names).
+        let marker = json!({"type": "ephemeral"});
+        let messages = json!([
+            {"role": "system", "content": "s", "cache_control": marker},
+            {"role": "user", "content": [
+                {"type": "text", "text": "a", "cache_control": marker},
+                {"type": "image_url", "image_url": {"url": PIXEL, "detail": "auto"},
+                 "prompt_cache_breakpoint": {"mode": "explicit", "ttl": "30m"}},
+            ]},
+            {"role": "assistant", "content": null, "reasoning": "thought", "refusal": null,
+             "tool_calls": [{"index": 0, "function": {"name": "f", "arguments": "{}"},
+                             "cache_control": marker}]},
+            {"role": "tool", "tool_call_id": "c", "name": "f", "content": "42"},
+            {"role": "assistant", "content": "x", "reasoning_content": "t", "reasoning": "t"},
+            {"role": "assistant", "content": "y", "reasoning_text": "u"},
+            {"role": "assistant", "content": "z", "thinking": "v"},
+        ]);
+        let tools = json!([{"type": "function", "cache_control": marker,
+            "function": {"name": "f", "description": "d", "parameters": {"type": "object"},
+                         "strict": false}}]);
+        let options = json!({"include_usage": true, "include_obfuscation": false,
+                             "continuous_usage_stats": false});
+        let parsed =
+            text(body(messages, json!({"tools": tools, "stream_options": options}))).unwrap();
+        assert!(parsed.include_usage);
+        let Prompt::Chat { messages, .. } = parsed.request.prompt else { panic!("a chat") };
+        let reasoning: Vec<_> = messages.iter().map(|m| m.reasoning_content.as_deref()).collect();
+        assert_eq!(reasoning, [None, None, Some("thought"), None, Some("t"), Some("u"), Some("v")]);
+        assert_eq!(messages[1].images.len(), 1);
+    }
+
+    #[test]
+    fn members_nobody_reads_inside_messages_tools_and_stream_options_are_refused() {
+        use serde_json::json;
+        let user = |message: serde_json::Value| body(json!([message]), json!({}));
+        let part = |part: serde_json::Value| user(json!({"role": "user", "content": [part]}));
+        let call = |call: serde_json::Value| {
+            let calls = json!([{"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "c", "content": "1"}]);
+            body(calls, json!({}))
+        };
+        let function = json!({"name": "f", "arguments": "{}"});
+        let tool = |tool: serde_json::Value| {
+            body(json!([{"role": "user", "content": "q"}]), json!({"tools": [tool]}))
+        };
+        let options = |options: serde_json::Value| {
+            body(json!([{"role": "user", "content": "q"}]), json!({"stream_options": options}))
+        };
+        let cases = [
+            (
+                user(json!({"role": "user", "content": "q", "audio": {"id": "a"}})),
+                "messages[0].audio",
+                "input other than text and images",
+            ),
+            (
+                user(json!({"role": "assistant", "content": "q", "reasoning_details": []})),
+                "messages[0].reasoning_details",
+                "send its text as reasoning_content",
+            ),
+            (
+                user(json!({"role": "assistant", "content": "q", "function_call": {}})),
+                "messages[0].function_call",
+                "tool_calls",
+            ),
+            (
+                user(json!({"role": "user", "content": "q", "made_up": 1})),
+                "messages[0].made_up",
+                "messages[0].made_up is not supported",
+            ),
+            (
+                user(json!({"role": "assistant", "content": "q", "reasoning_content": "a",
+                         "reasoning": "b"})),
+                "messages[0].reasoning",
+                "differ",
+            ),
+            (
+                user(json!({"role": "user", "content": "q", "cache_control": {"type": "always"}})),
+                "messages[0].cache_control",
+                "ephemeral",
+            ),
+            (
+                part(json!({"type": "text", "text": "a", "extra": 1})),
+                "messages[0].content[0]",
+                "messages[0].content[0].extra is not supported",
+            ),
+            (
+                part(json!({"type": "image_url", "image_url": {"url": PIXEL, "detail": "huge"}})),
+                "messages[0].content[0].image_url",
+                "detail must be",
+            ),
+            (
+                part(json!({"type": "image_url", "image_url": {"url": PIXEL, "size": 5}})),
+                "messages[0].content[0].image_url",
+                "image_url.size is not supported",
+            ),
+            (
+                part(json!({"type": "text", "text": "a",
+                         "prompt_cache_breakpoint": {"mode": "implicit"}})),
+                "messages[0].content[0].prompt_cache_breakpoint",
+                "explicit",
+            ),
+            (
+                call(json!({"id": "c", "type": "function", "function": function,
+                         "extra_content": {}})),
+                "messages[1].tool_calls[0]",
+                "tool_calls[0].extra_content is not supported",
+            ),
+            (
+                call(json!({"id": "c", "type": "custom", "custom": {"name": "f", "input": ""}})),
+                "messages[1].tool_calls[0]",
+                "not supported",
+            ),
+            (
+                call(json!({"id": "c", "function": {"name": "f", "arguments": "{}", "x": 1}})),
+                "messages[1].tool_calls[0]",
+                "tool_calls[0].function.x is not supported",
+            ),
+            (
+                tool(json!({"type": "function", "function": {"name": "f"}, "defer_loading": true})),
+                "tools",
+                "written into the prompt",
+            ),
+            (
+                tool(json!({"type": "function", "function": {"name": "f", "examples": []}})),
+                "tools",
+                "tools[0].function.examples is not supported",
+            ),
+            (options(json!({"include_obfuscation": true})), "stream_options", "no padding"),
+            (options(json!({"continuous_usage_stats": true})), "stream_options", "last chunk"),
+            (options(json!({"chunk_size": 4})), "stream_options", "chunk_size is not supported"),
+        ];
+        for (body, param, words) in cases {
+            let error = text(body.clone()).unwrap_err();
+            assert_eq!(error.param.as_deref(), Some(param), "{body}: {}", error.message);
+            assert!(error.message.contains(words), "{body}: {}", error.message);
+        }
     }
 
     #[test]

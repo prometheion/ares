@@ -246,7 +246,7 @@ impl Places {
             .transpose()?;
         Ok(Self {
             bytes: bytes as usize,
-            chunks: ram.place_chunks(device, bytes, capacity, CHUNK_BYTES),
+            chunks: ram.place_chunks(Some(device), bytes, capacity, CHUNK_BYTES),
             fresh: 0,
             clock,
         })

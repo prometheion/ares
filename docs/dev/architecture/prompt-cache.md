@@ -13,6 +13,13 @@ index through the same helpers (`run_of`, `deepest`, `run_pages`, `take_page`,
 `keeps_form`, `Cache::hang`), RAM's at once inside the look, the drive's across the
 pump's rounds.
 
+- **Who takes part.** Every request, unless it says `cache_prompt: false`
+  (`GenerateRequest::cache`): such a sequence asks the cache nothing when it
+  arrives or starts, publishes no pages, tails or checkpoints, and its pages go
+  back to the pool with it; the conductor skips the cache for it wherever it
+  would look at its chain (`Active::cache`). The parts of a decision use the
+  cache; what a fork computes does not enter it (`Active::enters_cache`, see
+  "Decisions" in [sequence-state.md](sequence-state.md)).
 - **What it holds.** A page or tail that the index gives up is copied out of
   the pool into RAM before anything writes its page of the pool again
   (`Cache::settle_leaving`, which runs before every record and at the front
@@ -81,8 +88,9 @@ pump's rounds.
 - **Counted** in `/metrics`: `ares_cache_ram_pages`, `ares_cache_ram_bytes`,
   `ares_cache_ram_pages_in_total`, `ares_cache_ram_pages_read_total`,
   `ares_cache_ram_pages_dropped_total` (pages worth keeping that went
-  unwritten: no room, or no level on SSD) and
-  `ares_cache_ram_transfer_nanoseconds_total`.
+  unwritten: no room, or no level on SSD), and for both levels at once
+  `ares_cache_transfer_nanoseconds_total` (the conductor's wait for the
+  batches of transfers, counted once whichever level a batch serves).
 - **Measured** 2026-11-16 with the server: Qwen3.8-27B Q4_K_S on the RTX 4070
   and the RTX 3060, tensor split 0.625 / 0.375, two sequence slots, the
   model's MTP block on, `--ram 3G`, `--context 32768` (so that another
@@ -136,7 +144,11 @@ and after a restart of the server. Nothing is written as it is computed.
   turns leave behind, age and go without taking pages along. The index is
   rebuilt from the record headers when the store is opened. One process uses
   a store at a time (a lock file); a second server on the same directory and
-  fingerprint runs without the level and says so.
+  fingerprint runs without the level and says so, after waiting a second for
+  the lock: the engine before may hold it a moment longer, and so does a
+  process forked from this one until it runs its program (the tests' full
+  drive, which made two cache tests of an engine after a restart fail now
+  and then, their store "in use by another process").
 - **Bytes move outside of steps.** A page is written straight from its
   buffer in RAM by one writer thread, which syncs the drive a second after its
   last record (and every ten seconds while records keep coming); the buffer
@@ -176,7 +188,10 @@ and after a restart of the server. Nothing is written as it is computed.
   the reply) and computes from there, which costs the rows of the last reply
   once.
 - **A hit.** `Cache::probe` asks the store for the pages after the ones the
-  index (and RAM) have. For a model with recurrent state the run ends at its
+  index (and RAM) have. A page of the prompt that RAM has handed the writer
+  is in neither (its bytes are with the writer, and the store has no record
+  yet): the probe waits for the writer to give such pages back first, at
+  most 250 ms, and RAM brings them back (`Cache::await_transit`). For a model with recurrent state the run ends at its
   deepest checkpoint in the store (the pages behind it would be replayed row
   by row, which takes as long as computing them), and without a checkpoint
   nothing is brought back. The run is announced in the index under an owner
