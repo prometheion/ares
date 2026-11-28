@@ -568,6 +568,13 @@ pub trait DeviceModel: Send {
     fn paused(&self) -> bool {
         false
     }
+
+    /// This part's step failed, also where the part did not see it fail (a
+    /// panic in it, or an error around it): a model whose parts wait for each
+    /// other inside a step lets the others give up now, instead of when their
+    /// own patience runs out. Called on the part's thread before the waits of
+    /// the other devices are released. The default does nothing.
+    fn step_failed(&mut self) {}
 }
 
 /// An architecture.

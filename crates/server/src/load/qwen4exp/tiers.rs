@@ -4,6 +4,7 @@
 //! machine.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -44,29 +45,43 @@ pub(super) fn profile_dir(options: &LoadOptions) -> Option<PathBuf> {
 /// Fills the tiers of experts before the first request: from the usage profile
 /// when there is one for this model file ([`Qwen4Exp::serving`]); otherwise
 /// the model reads [`WARM_UP`], and the profile is written at once from what
-/// that used. One line in the log says which.
-pub(super) fn fill_tiers(runtime: &Runtime, model: &Qwen4Exp, name: &str) -> Result<(), LoadError> {
+/// that used. One line in the log says which. Once `stop` is set (the server
+/// stops; the model was given it, [`Qwen4Exp::with_stop`]) the fill ends at
+/// its next turn and the warm-up is cancelled: the model is loaded with what
+/// its tiers hold, for the stop to unload it.
+pub(super) fn fill_tiers(
+    runtime: &Runtime,
+    model: &Qwen4Exp,
+    name: &str,
+    stop: &AtomicBool,
+) -> Result<(), LoadError> {
+    let stopped = || stop.load(Ordering::Acquire);
     let Some(ProfileReport { path, found, filled }) = model.serving() else {
-        let took = warm_up(runtime, name)?;
+        let took = warm_up(runtime, name, stop)?;
         tracing::info!(
             "warm-up: read a text of German, English and code to fill the tiers of experts, \
-             {took:.1} s (no directory for a usage profile of the experts)"
+             {took:.1} s (no directory for a usage profile of the experts){}",
+            if stopped() { "; cut short: the server stops" } else { "" }
         );
         return Ok(());
     };
     let path = path.display();
     if let (ProfileFound::Found { known }, Some((stats, time))) = (&found, filled)
-        && stats.vram + stats.ram > 0
+        && (stats.vram + stats.ram > 0 || stopped())
     {
         tracing::info!(
             "expert profile {path}: found ({known} experts with heat); the tiers were filled \
-             from it in {:.1} s, {} experts into VRAM and {} into the RAM tier, {} read; no \
-             warm-up",
+             from it in {:.1} s, {} experts into VRAM and {} into the RAM tier, {} read; {}",
             time.as_secs_f64(),
             stats.vram,
             stats.ram,
             Bytes(stats.read_bytes),
+            if stopped() { "cut short: the server stops" } else { "no warm-up" },
         );
+        return Ok(());
+    }
+    if stopped() {
+        tracing::info!("the tiers of experts are not filled: the server stops");
         return Ok(());
     }
     let why = match &found {
@@ -74,7 +89,14 @@ pub(super) fn fill_tiers(runtime: &Runtime, model: &Qwen4Exp, name: &str) -> Res
         ProfileFound::Ignored(why) => format!("ignored: {why}"),
         ProfileFound::Found { .. } => "found, and it brought nothing into the tiers".to_owned(),
     };
-    let took = warm_up(runtime, name)?;
+    let took = warm_up(runtime, name, stop)?;
+    if stopped() {
+        tracing::info!(
+            "expert profile {path}: {why}; the warm-up was cut short after {took:.1} s: the \
+             server stops"
+        );
+        return Ok(());
+    }
     let written = match model.save_profile() {
         Some(Ok(_)) => "written now".to_owned(),
         Some(Err(error)) => format!("not written: {error}"),
@@ -131,8 +153,8 @@ pub(super) fn log_expert_costs(model: &Qwen4Exp) {
 /// request comes: the slots start empty, and the first text a model reads
 /// otherwise waits for the drive at nearly every layer (a minute for a prompt
 /// of a thousand tokens, against ten seconds once the slots are filled).
-/// Returns the seconds it took.
-fn warm_up(runtime: &Runtime, model: &str) -> Result<f64, LoadError> {
+/// Returns the seconds it took; a `stop` that is set cancels it.
+fn warm_up(runtime: &Runtime, model: &str, stop: &AtomicBool) -> Result<f64, LoadError> {
     let begun = Instant::now();
     let (done, wait) = mpsc::channel();
     let sink = EventSink::new(move |event| {
@@ -160,8 +182,21 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<f64, LoadError> {
         id: RequestId(0),
     };
     runtime.submit(request, sink).map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;
-    wait.recv_timeout(WARM_UP_LIMIT)
-        .map_err(|_| LoadError::Start("the warm-up did not end in time".into()))?
-        .map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;
-    Ok(begun.elapsed().as_secs_f64())
+    loop {
+        if stop.load(Ordering::Acquire) {
+            runtime.cancel(RequestId(0));
+            return Ok(begun.elapsed().as_secs_f64());
+        }
+        match wait.recv_timeout(STOP_LOOK) {
+            Ok(done) => {
+                done.map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;
+                return Ok(begun.elapsed().as_secs_f64());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if begun.elapsed() < WARM_UP_LIMIT => {}
+            Err(_) => return Err(LoadError::Start("the warm-up did not end in time".into())),
+        }
+    }
 }
+
+/// How often the warm-up looks whether the server stops.
+const STOP_LOOK: Duration = Duration::from_millis(50);

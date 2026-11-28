@@ -51,6 +51,7 @@ repository and are not needed to build, run or test Ares.
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
 | [`host-memory.md`](experiments/host-memory.md) | the expert tier's worth, giving memory back |
 | [`server.md`](experiments/server.md) | priorities of requests |
+| [`load-and-stop.md`](experiments/load-and-stop.md) | a model loaded again in the same process, a stop while Flash-Next's tiers fill |
 | [`draft-vocab.md`](experiments/draft-vocab.md) | the ready draft vocabularies against the fork's list and none |
 | [`decisions.md`](experiments/decisions.md) | decisions (Jev mode): the answers against the CPU reference and greedy generation, decisions per second on the 27B |
 
@@ -84,6 +85,10 @@ that a running model may need. Enable them per backend:
 ARES_TEST_CUDA=1 cargo test -p ares-cuda --test gpu -- --test-threads=1
 ARES_TEST_VULKAN=1 cargo test -p ares-vulkan --test gpu -- --test-threads=1
 ```
+
+The CUDA tests of `ares-model`'s test binaries take the cards one test at a time
+(`crates/model/tests/common/gpu.rs`), so they run with the default test threads
+as well; the other crates' GPU tests still need `--test-threads=1`.
 
 Tests against real models skip with a message unless their model files are
 named, one variable for each file, the same in every crate:

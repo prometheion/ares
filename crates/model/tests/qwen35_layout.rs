@@ -682,8 +682,7 @@ fn answers(
 /// four to seven times larger: its texts are reported, not compared.
 #[test]
 fn the_text_with_drafts_and_fast_products() {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return;
     }
     let Some(model) = env_path("ARES_TEST_QWEN38_27B") else { return };

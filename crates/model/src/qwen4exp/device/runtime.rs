@@ -22,6 +22,7 @@
 //! when every device has ended; a step that misses experts is a longer step.
 //! Cancellation and new requests are handled between steps, as for any model.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -139,6 +140,9 @@ pub struct Qwen4Exp {
     mtp_watch: Arc<Mutex<Watch>>,
     /// The usage profile of the experts, for a model that keeps one.
     usage: Usage,
+    /// Set by the model's owner when it does not want the model any more:
+    /// the fills of the tiers read nothing more ([`Qwen4Exp::with_stop`]).
+    stop: Arc<AtomicBool>,
     /// Where the lines go that the owner should hear of while the model
     /// serves ([`Qwen4Exp::with_log`]).
     log: Option<Log>,
@@ -255,6 +259,7 @@ impl Qwen4Exp {
             mtp_report: Mutex::new(None),
             mtp_watch: Arc::default(),
             usage: Usage::default(),
+            stop: Arc::default(),
             log: None,
             rows,
             lone_rows: OnceLock::new(),
@@ -316,6 +321,17 @@ impl Qwen4Exp {
         self
     }
 
+    /// Ends the fills of the tiers once `stop` is set: the fill at the start
+    /// ([`Qwen4Exp::serving`], [`Qwen4Exp::fill_from_heat`]) returns at its
+    /// next turn with what it brought, and the empty slots are no longer
+    /// filled while nothing runs. For an owner that may stop wanting the
+    /// model while its tiers fill (a server that stops). Before the runtime
+    /// opens the parts.
+    pub fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.stop = stop;
+        self
+    }
+
     /// Keeps the usage profile of the model's experts in `dir` (see
     /// `usage.rs`): a profile that is there for this model file fills the
     /// tiers when the engine begins to serve ([`Qwen4Exp::serving`]), and the
@@ -335,7 +351,7 @@ impl Qwen4Exp {
     /// filled, with what was found and filled; `None` without a profile, or
     /// before the runtime has opened the parts.
     pub fn serving(&self) -> Option<ProfileReport> {
-        self.usage.serving()
+        self.usage.serving(&self.stop)
     }
 
     /// Writes the usage profile now if steps ran since it was last written:
@@ -352,7 +368,7 @@ impl Qwen4Exp {
     /// it took; `None` without a usage profile or before the engine serves.
     /// Call it while no request runs.
     pub fn fill_from_heat(&self) -> Option<(FillStats, Duration)> {
-        self.usage.fill_from_heat()
+        self.usage.fill_from_heat(&self.stop)
     }
 
     /// What the fill of the empty slots did while nothing ran, and what the

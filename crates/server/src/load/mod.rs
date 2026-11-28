@@ -36,6 +36,7 @@ mod start;
 mod vram;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ares_api::Engine;
@@ -290,9 +291,13 @@ impl Unit for Loaded {
     }
 }
 
-/// Loads models onto the devices: the server's [`Loader`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DeviceLoader;
+/// Loads models onto the devices: the server's [`Loader`]. Once the server
+/// stops ([`Loader::stop`]), a load that runs fills the tiers of experts no
+/// further and ends with what its devices hold, which the stop then unloads.
+#[derive(Debug, Default, Clone)]
+pub struct DeviceLoader {
+    stop: Arc<AtomicBool>,
+}
 
 impl Loader for DeviceLoader {
     fn load(
@@ -302,11 +307,15 @@ impl Loader for DeviceLoader {
     ) -> Result<Box<dyn Unit>, LoadFailure> {
         let mut options = preset.options.load.clone();
         options.ram = site.ram;
-        match load_at(&options, site) {
+        match load_until(&options, site, &self.stop) {
             Ok(loaded) => Ok(Box::new(loaded)),
             Err(LoadError::NoRoom(why)) => Err(LoadFailure::NoRoom(why)),
             Err(error) => Err(LoadFailure::Failed(error.to_string())),
         }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
     }
 }
 
@@ -349,6 +358,16 @@ pub(crate) fn read_described(options: &LoadOptions) -> Result<Described, LoadErr
 /// [`LoadError::NoRoom`], before its weights are read, so that one of the
 /// others can be unloaded for it.
 pub fn load_at(options: &LoadOptions, site: &Site) -> Result<Loaded, LoadError> {
+    load_until(options, site, &Arc::default())
+}
+
+/// [`load_at`], cut short once `stop` is set: the tiers of experts are filled
+/// no further.
+fn load_until(
+    options: &LoadOptions,
+    site: &Site,
+    stop: &Arc<AtomicBool>,
+) -> Result<Loaded, LoadError> {
     let begun = Instant::now();
     let gguf = Gguf::open(&options.model)?;
     let architecture = gguf.architecture().map(str::to_owned);
@@ -363,7 +382,9 @@ pub fn load_at(options: &LoadOptions, site: &Site) -> Result<Loaded, LoadError> 
     let architecture = architecture.ok_or(LoadError::NoArchitecture)?;
     match architecture.as_str() {
         ares_model::qwen35::config::ARCHITECTURE => qwen35::load(gguf, options, site, begun),
-        ares_model::qwen4exp::config::ARCHITECTURE => qwen4exp::load(gguf, options, site, begun),
+        ares_model::qwen4exp::config::ARCHITECTURE => {
+            qwen4exp::load(gguf, options, site, stop, begun)
+        }
         host::ARCHITECTURE => host::load(options, begun),
         _ => Err(LoadError::Architecture(architecture)),
     }

@@ -521,6 +521,13 @@ impl DeviceModel for Qwen4ExpDevice {
         self.paused
     }
 
+    /// The other parts' waits of the step give up at once: a step that failed where this
+    /// part did not see it (a panic in it) leaves the flow not knowing, and the other parts
+    /// waited until their step stood still for its limit.
+    fn step_failed(&mut self) {
+        self.flow.fail();
+    }
+
     fn rows_not_exact(&mut self, out: &mut Vec<u32>) {
         // The store left rows that verify drafts without an expert only the
         // file held; every part reports what the store knows when it has

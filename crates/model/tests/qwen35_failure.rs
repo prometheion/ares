@@ -27,13 +27,14 @@ use ares_runtime::testing::{Failure, Fault, Faulty};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, RuntimeError};
 use ares_tokenizer::Tokenizer;
 
+mod common;
+
 /// How long a failure may take to arrive. A hang is forever; nothing here
 /// takes more than a few seconds when the runtime works.
 const PATIENCE: Duration = Duration::from_secs(60);
 
 fn model_path() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return None;
     }
     if device_count().expect("the CUDA driver") < 2 {
