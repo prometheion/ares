@@ -311,6 +311,8 @@ pub struct AttentionKernels {
     device: Device,
     append: Function,
     convert: Function,
+    /// The blocks of the conversion kernel the device holds at once.
+    convert_blocks: u32,
     encode_tile_f32: Function,
     /// The attention kernels by head size and shape.
     attend: Vec<(u32, AttnShape, Function)>,
@@ -525,10 +527,14 @@ impl AttentionKernels {
                 direct.push((d, nv, f));
             }
         }
+        let convert = module.function("ares_attn_convert")?;
+        let convert_blocks =
+            convert.blocks_per_multiprocessor(256, 256 * 4)?.max(1) * device.info().multiprocessors;
         Ok(Self {
             device: device.clone(),
             append: module.function("ares_attn_append")?,
-            convert: module.function("ares_attn_convert")?,
+            convert,
+            convert_blocks,
             encode_tile_f32: module.function("ares_attn_encode_tile_f32")?,
             attend,
             prompt_int,
@@ -749,11 +755,12 @@ impl AttentionKernels {
             .ptr(far_pool)
             .u64(geo.config())
             .ptr(status);
+        let slices = convert_slices(n_jobs * geo.kv_heads * 2, self.convert_blocks);
         // SAFETY: the caller's contract.
         unsafe {
             self.convert.launch(
                 stream,
-                [n_jobs, geo.kv_heads, 2],
+                [n_jobs, geo.kv_heads, 2 * slices],
                 [256, 1, 1],
                 geo.head_dim * 4,
                 args,
@@ -795,6 +802,24 @@ impl AttentionKernels {
     }
 }
 
+/// Into how many slices of rows [`AttentionKernels::convert`] cuts each of its `tiles` (a
+/// job's K or V of one head) on a device that holds `resident` blocks of the kernel at
+/// once: as many as fill it, at most 128 (a row a block, a group of 32 values a warp). A
+/// block also computes the tile's mean, a sum over its 128 rows; so a step that converts
+/// tiles enough to fill the device (a prompt) keeps one block a tile, and one that converts
+/// a single tile (a decode step or a window at a tile's edge) spreads its rows over the
+/// device where it had 4 to 6 blocks (27B, one tile a layer: 0.42 ms on an RTX 4070 and
+/// 0.59 ms on an RTX 3060).
+fn convert_slices(tiles: u32, resident: u32) -> u32 {
+    let wanted = resident.div_ceil(tiles.max(1));
+    // A divisor of the 128 rows of a tile.
+    let mut slices = 1;
+    while slices < 128 && slices * 2 <= wanted {
+        slices *= 2;
+    }
+    slices
+}
+
 /// The vectors the registers of the compiled direct kernels hold.
 const DIRECT_VECS: [u32; 4] = [2, 4, 6, 8];
 /// The most vectors of an item the direct kernels take.
@@ -811,4 +836,24 @@ const fn direct_smem_bytes(head_dim: u32, warps: u32) -> u32 {
 /// Floats of partial outputs in the scratch (the log sums follow).
 fn plan_state_floats(plan: &PlanBuffers, hq: u64, d: u32) -> u64 {
     plan.state_slots * hq * u64::from(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_slices;
+
+    /// A conversion of a single tile is spread over the device, one of enough tiles to fill
+    /// it keeps a block a tile, and a slice is always a whole number of rows of a tile.
+    #[test]
+    fn conversions_are_cut_into_slices_by_the_device() {
+        // An RTX 4070 holds 46 x 6 blocks of 256 threads, an RTX 3060 28 x 6.
+        assert_eq!(convert_slices(4, 276), 64);
+        assert_eq!(convert_slices(6, 168), 16);
+        assert_eq!(convert_slices(64 * 4 * 2, 276), 1);
+        assert_eq!(convert_slices(0, 168), 128);
+        for tiles in 1..300 {
+            let slices = convert_slices(tiles, 168);
+            assert!(128 % slices == 0 && slices <= 128, "{tiles}: {slices}");
+        }
+    }
 }

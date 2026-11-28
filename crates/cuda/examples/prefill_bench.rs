@@ -281,8 +281,8 @@ fn time_type(
     let wants_layout =
         paths.iter().any(|p| matches!(p, Which::Layout(_) | Which::Kernel(_) | Which::Few(_)));
     let rearranged = if wants_layout && Kernels::has_device_layout(ty, n_in()) {
-        let plan = kernels.tune_layout(ty, n_out(), n_in())?;
-        println!("  {} few-row launch: {plan:?}", ty.name());
+        let plans = kernels.tune_layout(ty, n_out(), n_in())?;
+        println!("  {} few-row launches: {plans:?}", ty.name());
         let table = kernels.measure_layout(ty)?;
         for rows in table.rows {
             println!(

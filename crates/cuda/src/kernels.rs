@@ -21,7 +21,8 @@ mod paths;
 pub(crate) mod types;
 
 pub use layout::{
-    ActivationForm, FEW_ROWS, FewPlan, LayoutKernel, LayoutRows, LayoutTable, WeightLayout,
+    ActivationForm, FEW_ROWS, FewPlan, FewPlans, LayoutKernel, LayoutRows, LayoutTable,
+    WeightLayout,
 };
 pub use paths::PrefillChoice;
 

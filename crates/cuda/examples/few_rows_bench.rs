@@ -175,11 +175,12 @@ fn shape(
         file_bytes as f64 / 1e6
     );
     if device_bytes.is_some() {
-        let plan = kernels.tune_layout(ty, n_out, n_in)?;
+        let plans = kernels.tune_layout(ty, n_out, n_in)?;
+        let name = |p: FewPlan| format!("{}w/{}", p.block_warps, 1u32 << p.log2_warps_per_tile);
         head += &format!(
-            ", launch {} warps, {} per tile",
-            plan.block_warps,
-            1u32 << plan.log2_warps_per_tile
+            ", launches {} up to 8 rows, {} up to 16",
+            name(plans.rows_8),
+            name(plans.rows_16)
         );
     } else {
         head += ", no device layout";

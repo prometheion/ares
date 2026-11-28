@@ -491,36 +491,41 @@ fn a_row_is_the_same_bits_in_any_batch_and_launch() {
     }
 }
 
-/// Measuring the launch of a shape keeps a launch of the family and changes no bit: the product
-/// after it is the one before, and so is the product of every launch the measurement could have
-/// chosen (the untuned table's launch need not be of the same kind as the measured one).
+/// Measuring the launches of a shape keeps launches of the family and changes no bit: the
+/// product after it is the one before, and so is the product of every launch the measurement
+/// could have chosen (the untuned table's launch need not be of the same kind as the measured
+/// one), for the kernel of up to 8 rows and for the one of 9 to 16.
 #[test]
 fn tuning_a_shape_changes_no_bit() {
     let mut rng = Rng(0xbb67ae8584caa73b);
     for (n_out, n_in) in [(144usize, 2048usize), (2000, 1024)] {
         for ty in [TYPES[0], TYPES[2], TYPES[9], TYPES[10]] {
             let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
-            let x: Vec<f32> = (0..n_in * 4).map(|_| rng.activation()).collect();
+            let x: Vec<f32> = (0..n_in * 12).map(|_| rng.activation()).collect();
             for (device, kernels) in loaded() {
                 let (n_out32, n_in32) = (n_out as u32, n_in as u32);
+                let table = How::Table(Precision::Fast);
                 let before =
-                    run(device, &kernels, ty, How::Table(Precision::Fast), &w, &x, n_in, n_out, 4);
-                let plan = kernels.tune_layout(ty, n_out32, n_in32).unwrap();
-                assert!(FewPlan::all().contains(&plan));
-                assert_eq!(kernels.few_plan(ty, n_out32, n_in32).unwrap(), plan);
-                assert_eq!(kernels.tune_layout(ty, n_out32, n_in32).unwrap(), plan);
-                eprintln!("{ty} {n_out} x {n_in} on {}: {plan:?}", device.info().name);
-                let after =
-                    run(device, &kernels, ty, How::Table(Precision::Fast), &w, &x, n_in, n_out, 4);
-                assert_eq!(bits(&before), bits(&after), "{ty} {n_out} x {n_in}");
-                for candidate in FewPlan::all() {
-                    let have =
-                        run(device, &kernels, ty, How::Few(candidate), &w, &x, n_in, n_out, 4);
-                    assert_eq!(
-                        bits(&before),
-                        bits(&have),
-                        "{ty} {n_out} x {n_in}: {candidate:?} differs from the untuned table"
-                    );
+                    [4, 12].map(|rows| run(device, &kernels, ty, table, &w, &x, n_in, n_out, rows));
+                let plans = kernels.tune_layout(ty, n_out32, n_in32).unwrap();
+                assert!(FewPlan::all().contains(&plans.rows_8));
+                assert!(FewPlan::all().contains(&plans.rows_16));
+                assert_eq!(kernels.few_plan(ty, n_out32, n_in32).unwrap(), plans);
+                assert_eq!(kernels.tune_layout(ty, n_out32, n_in32).unwrap(), plans);
+                eprintln!("{ty} {n_out} x {n_in} on {}: {plans:?}", device.info().name);
+                for (before, rows) in before.iter().zip([4, 12]) {
+                    let after = run(device, &kernels, ty, table, &w, &x, n_in, n_out, rows);
+                    assert_eq!(bits(before), bits(&after), "{ty} {n_out} x {n_in}, {rows} rows");
+                    for candidate in FewPlan::all() {
+                        let how = How::Few(candidate);
+                        let have = run(device, &kernels, ty, how, &w, &x, n_in, n_out, rows);
+                        assert_eq!(
+                            bits(before),
+                            bits(&have),
+                            "{ty} {n_out} x {n_in}, {rows} rows: {candidate:?} differs from the \
+                             untuned table"
+                        );
+                    }
                 }
             }
         }

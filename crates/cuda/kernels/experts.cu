@@ -19,10 +19,16 @@ ARES_MMVF_KERNEL(ares_expert_logits, AresF32)
 
 // Gate and up, and down, for every weight type: an expert's matrices may be stored in any
 // of them (a row must be whole blocks of the type). The Rust side (src/experts.rs) makes
-// the same names from the types of src/kernels/types.rs.
-#define ARES_EXPERT_TYPE(SUFFIX, T)                                  \
-    ARES_EXPERT_GATE_UP_KERNEL(ares_expert_gate_up_##SUFFIX, T)      \
-    ARES_EXPERT_DOWN_KERNEL(ares_expert_down_##SUFFIX, T)
+// the same names from the types of src/kernels/types.rs. Each for steps of up to 8 rows,
+// and `_r1`, `_r2`, `_r4` for steps of up to 1, 2 and 4 (expert_ffn.cuh, `ares_expert_dots`).
+#define ARES_EXPERT_ROWS(SUFFIX, T, NB)                                      \
+    ARES_EXPERT_GATE_UP_KERNEL(ares_expert_gate_up_##SUFFIX, T, NB)          \
+    ARES_EXPERT_DOWN_KERNEL(ares_expert_down_##SUFFIX, T, NB)
+#define ARES_EXPERT_TYPE(SUFFIX, T)                  \
+    ARES_EXPERT_ROWS(SUFFIX, T, ARES_MAX_BATCH)      \
+    ARES_EXPERT_ROWS(SUFFIX##_r1, T, 1)              \
+    ARES_EXPERT_ROWS(SUFFIX##_r2, T, 2)              \
+    ARES_EXPERT_ROWS(SUFFIX##_r4, T, 4)
 
 ARES_EXPERT_TYPE(q4_K, EngQ4K)
 ARES_EXPERT_TYPE(q5_K, EngQ5K)

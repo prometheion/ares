@@ -19,7 +19,7 @@
 //
 //   rows     kernel            block                 a warp computes        activations
 //   1..8     ares_mmr_few      4 or 8 warps          1 tile x 1 fragment    read by each lane (L1)
-//   9..16    ares_mmr_few      4 or 8 warps          1 tile x 2 fragments   read by each lane (L1)
+//   9..16    ares_mmr_few      4 or 8 warps          1 tile x 2 fragments   cp.async per warp, ldmatrix
 //   17..32   ares_mmr          4 warps, 128 x 32     2 tiles x 4 fragments  cp.async to shared, ldmatrix
 //   33..     ares_mmr          4 warps, 128 x 64     2 tiles x 8 fragments  cp.async to shared, ldmatrix
 //
@@ -324,13 +324,48 @@ static __device__ __forceinline__ void ares_mmr(
 // is fastest (src/kernels/layout.rs).
 // Grid: ceil(n_tiles / (BW >> log2_warps)) blocks.
 //
-// The layout `T` (AresFewCodes) holds the weights of the next steps in registers; the
-// activations are read by each lane (L1), 2 x 4 bytes of each row of a slab.
+// The layout `T` (AresFewCodes) holds the weights of the next steps in registers. With one
+// fragment of activations (up to 8 rows) each lane reads its 2 x 4 bytes of each row of a slab
+// (L1). With two, the activations of a step (64 values of each row) are copied by `cp.async`
+// into a ring of ARES_MMF_STAGES stages that each warp has to itself in shared memory, one
+// step ahead, and read from there with `ldmatrix`: the registers it gives are the ones the
+// lanes would have loaded, so the result has the same bits. A load of a warp that reads 4
+// bytes of 8 rows asks L1 for 8 lines, and with 16 rows the 16 such loads of a step bound the
+// kernel, not the weights (RTX 3060, Q4_K 17408 x 5120: 231 to 247 us for 16 rows against 152
+// for one, 160 to 169 with every lane of a load reading one row; RTX 4070 113 against 107).
+// A copy of 16 bytes of 4 rows and an `ldmatrix` of 8 rows ask for 4 lines or 4 banks of
+// shared memory: a quarter of the wavefronts (with the ring, 173 us on the RTX 3060 in the
+// launch of 4 tiles a block; a launch of one tile a block reads the activations once per tile,
+// 250 us, which is why the launch of this kernel is measured with 16 rows). With one fragment
+// the ring was 2 to 5 % slower for the small matrices of the RTX 3060 at one row, where the
+// lanes of a load read one row and L1 serves it at once. Rows past the batch are not copied:
+// what their stage holds reaches only the outputs of those rows, which are not written.
 #define ARES_MMF_PARTS 8
+#define ARES_MMF_STAGES 2
 
-// The dynamic shared memory of a block of BW warps with 1 << log2_warps warps per tile.
+// A stage of the activations of a warp: NB * 8 rows of 128 bytes, the 16-byte piece c of
+// row r at r * 128 + (c ^ (r & 7)) * 16, so that an `ldmatrix` of a piece of 8 rows meets no
+// bank twice.
+static __host__ __device__ constexpr uint32_t ares_mmf_stage_bytes(int nb) {
+    return static_cast<uint32_t>(nb * 8 * 128);
+}
+
+// The ring of a block of BW warps with NB fragments: none with one.
+static __host__ __device__ constexpr uint32_t ares_mmf_ring_bytes(int bw, int nb) {
+    return nb == 1 ? 0u : static_cast<uint32_t>(bw * ARES_MMF_STAGES) * ares_mmf_stage_bytes(nb);
+}
+
+// The dynamic shared memory of a block of BW warps with 1 << log2_warps warps per tile: the
+// activations of every warp, then the parts of K the warps of a tile hand to each other.
 static __host__ __device__ constexpr uint32_t ares_mmf_smem_bytes(int bw, int nb, int log2_warps) {
-    return log2_warps == 0 ? 0 : static_cast<uint32_t>((bw >> log2_warps) * ARES_MMF_PARTS * nb * 4 * 32 * 4);
+    return ares_mmf_ring_bytes(bw, nb) +
+           (log2_warps == 0 ? 0u : static_cast<uint32_t>((bw >> log2_warps) * ARES_MMF_PARTS * nb * 4 * 32 * 4));
+}
+
+// `cp.async` of 16 bytes that keeps them in L1: the warps of a block that compute different
+// tiles over the same parts of K copy the same activations.
+static __device__ __forceinline__ void ares_cp_async16_l1(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(ares_smem_addr(dst)), "l"(src));
 }
 
 template <class T, int BW, int NB>
@@ -352,15 +387,36 @@ static __device__ __forceinline__ void ares_mmr_few(
     typename T::Tile tl;
     T::open_warp(wp, w, n_out, n_in, min(tile, n_tiles - 1), lane);
     wp.sb_end = pb * n_sb / ARES_MMF_PARTS;
-    if (pa * n_sb / ARES_MMF_PARTS < wp.sb_end) {
+    const uint32_t first_step = 4 * (pa * n_sb / ARES_MMF_PARTS), end_step = 4 * wp.sb_end;
+    if (first_step < end_step) {
         T::open(tl, wp, pa * n_sb / ARES_MMF_PARTS);
     }
-    // Lane (g, t) holds of fragment ni the values 2t, 2t + 1, 2t + 8, 2t + 9 of each slab
-    // of row 8 ni + g.
-    const __half* arow[NB];
+    // The activations: of fragment ni lane (g, t) holds the values 2t, 2t + 1, 2t + 8, 2t + 9
+    // of each slab of row 8 ni + g. With one fragment it reads them itself; with two, lane l
+    // copies the piece l % 8 of the rows l / 8 + 4 u of a step into the warp's ring and
+    // `ldmatrix` gives them.
+    constexpr bool RING = NB > 1;
+    constexpr int J = NB * 8;
+    constexpr uint32_t STAGE = ares_mmf_stage_bytes(NB);
+    const __half* const arow = ax + static_cast<size_t>(min(g, n_batch - 1)) * pitch + 2 * t;
+    uint8_t* const ring = ares_dyn_smem + static_cast<size_t>(warp) * ARES_MMF_STAGES * STAGE;
+    const uint32_t piece = lane & 7, row0 = lane >> 3;
+    const __half* const src0 = ax + static_cast<size_t>(row0) * pitch + 8 * piece;
+    auto copy_step = [&](uint32_t step) {
+        uint8_t* const stage = ring + (step % ARES_MMF_STAGES) * STAGE;
 #pragma unroll
-    for (int ni = 0; ni < NB; ni++) {
-        arow[ni] = ax + static_cast<size_t>(min(ni * 8 + g, n_batch - 1)) * pitch + 2 * t;
+        for (int u = 0; u < J / 4; u++) {
+            const uint32_t r = row0 + 4 * u;
+            if (r < n_batch) {
+                ares_cp_async16_l1(stage + r * 128 + ((piece ^ (r & 7)) << 4), src0 + static_cast<size_t>(4 * u) * pitch + 64 * step);
+            }
+        }
+    };
+    if constexpr (RING) {
+        if (first_step < end_step) {
+            copy_step(first_step);
+        }
+        ares_cp_commit();
     }
     // The rows were divided by their scale (ares_convert_f16): put it back at the end.
     // Element e of an accumulator is weight row g + 8 (e / 2), activation row 2t + e % 2 of
@@ -369,7 +425,8 @@ static __device__ __forceinline__ void ares_mmr_few(
         reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ax) + ares_act_ds_offset(static_cast<size_t>(n_batch) * pitch * 2));
 
     float total[NB][4];
-    float* const sums = reinterpret_cast<float*>(ares_dyn_smem) + static_cast<size_t>(slot) * ARES_MMF_PARTS * NB * 4 * 32;
+    float* const sums = reinterpret_cast<float*>(ares_dyn_smem + ares_mmf_ring_bytes(BW, NB)) +
+                        static_cast<size_t>(slot) * ARES_MMF_PARTS * NB * 4 * 32;
     for (uint32_t p = pa; p < pb; p++) {
         float acc[NB][4];
 #pragma unroll
@@ -385,16 +442,41 @@ static __device__ __forceinline__ void ares_mmr_few(
                 constexpr int j = decltype(jc)::value;
                 const uint32_t step = sb * 4 + j;
                 T::template begin<j>(tl, wp, step);
+                // The next step's activations go into the stage the step before read (every
+                // lane is past its `ldmatrix` of it); this step's have landed once the copies
+                // of every lane have.
+                if constexpr (RING) {
+                    if (step + 1 < end_step) {
+                        copy_step(step + 1);
+                    }
+                    ares_cp_commit();
+                    ares_cp_wait_group<1>();
+                    __syncwarp();
+                }
+                const uint8_t* const stage = ring + (step % ARES_MMF_STAGES) * STAGE;
 #pragma unroll
                 for (int kk = 0; kk < 4; kk++) {
                     // The B fragments of the slab: register 0 holds the values 2t, 2t + 1 and
                     // register 1 the values 2t + 8, 2t + 9 of activation row g of the fragment.
+                    // Lanes 8 m to 8 m + 7 name the rows of matrix m: rows 8 (m / 2) + 0..7, the
+                    // piece 2 kk + m % 2.
                     uint32_t b[NB][2];
+                    const uint32_t c = 2 * kk + ((lane >> 3) & 1);
+                    if constexpr (!RING) {
+                        const uint32_t* q = reinterpret_cast<const uint32_t*>(arow + step * 64 + kk * 16);
+                        b[0][0] = __ldg(q);
+                        b[0][1] = __ldg(q + 4);
+                    } else {
 #pragma unroll
-                    for (int ni = 0; ni < NB; ni++) {
-                        const uint32_t* q = reinterpret_cast<const uint32_t*>(arow[ni] + step * 64 + kk * 16);
-                        b[ni][0] = __ldg(q);
-                        b[ni][1] = __ldg(q + 4);
+                        for (int nj = 0; nj < NB / 2; nj++) {
+                            const uint32_t r = nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
+                            uint32_t r4[4];
+                            ares_ldmatrix_x4(r4, stage + r * 128 + ((c ^ (r & 7)) << 4));
+                            b[2 * nj][0] = r4[0];
+                            b[2 * nj][1] = r4[1];
+                            b[2 * nj + 1][0] = r4[2];
+                            b[2 * nj + 1][1] = r4[3];
+                        }
                     }
                     uint32_t af[4];
                     if (kk == 0) {
@@ -410,6 +492,10 @@ static __device__ __forceinline__ void ares_mmr_few(
                     for (int ni = 0; ni < NB; ni++) {
                         ares_mma_f16_k16(acc[ni], af, b[ni][0], b[ni][1]);
                     }
+                }
+                // Every lane has read this stage before any lane copies into it again.
+                if constexpr (RING) {
+                    __syncwarp();
                 }
             };
             step_fn(std::integral_constant<int, 0>{});

@@ -7,7 +7,7 @@
 //! prepared form of the activations a product reads, and which kernel computes it,
 //! is this module's business ([`Kernels::activation_form`], [`Kernels::product`]):
 //! for a matrix in the device layout the few-row kernels up to 16 rows (the rows of a
-//! decode step and of a window of drafts; their launch is [`FewPlan`], measured per
+//! decode step and of a window of drafts; their launches are [`FewPlans`], measured per
 //! matrix shape by [`Kernels::tune_layout`]) and a table measured on the device for more
 //! ([`Kernels::measure_layout`]), for one in the file's layout the decode kernels up to
 //! a few rows and the tile kernels above.
@@ -187,6 +187,10 @@ impl LayoutTable {
 /// The parts K is cut into by the few-row kernels (`ARES_MMF_PARTS`): their arithmetic.
 const FEW_PARTS: u32 = 8;
 
+/// The steps of activations each warp of the few-row kernel of 9 to 16 rows keeps in shared
+/// memory (`ARES_MMF_STAGES`): the one it multiplies and the one it copies.
+const FEW_STAGES: u32 = 2;
+
 /// How a few-row kernel is launched: the warps of a thread block, and how many of them
 /// compute one tile of 16 weight rows, each over its share of the `FEW_PARTS` parts of K.
 /// Which is the fastest depends on the shape of the matrix and the device (a matrix of a
@@ -236,13 +240,38 @@ impl FewPlan {
     }
 
     /// The dynamic shared memory of a block (`ares_mmf_smem_bytes` in `kernels/mmr.cuh`):
-    /// the parts of K the warps of a tile hand to each other.
+    /// with two fragments of activations every warp's ring of [`FEW_STAGES`] steps of them
+    /// (16 rows of 64 f16 values), then the parts of K the warps of a tile hand to each
+    /// other.
     const fn shared_bytes(self, nb: u32) -> u32 {
+        let ring = if nb == 1 { 0 } else { self.block_warps * FEW_STAGES * nb * 8 * 128 };
         if self.log2_warps_per_tile == 0 {
-            0
+            ring
         } else {
-            (self.block_warps >> self.log2_warps_per_tile) * FEW_PARTS * nb * 4 * 32 * 4
+            ring + (self.block_warps >> self.log2_warps_per_tile) * FEW_PARTS * nb * 4 * 32 * 4
         }
+    }
+}
+
+/// The launches of the few-row products of one matrix shape: one for each kernel, the one for
+/// up to 8 rows and the one for 9 to 16, since what is fastest differs. With 16 rows the
+/// activations of a step are as many bytes as the weights of 3 tiles of Q4_K, and the
+/// launches whose blocks hold one tile read them once for every tile, those whose blocks hold
+/// four once for four: on an RTX 3060, IQ4_XS 6656 x 5120 takes 57.7 us for one row with 8
+/// warps on a tile (the fastest there) and 103 us for 16 rows, where 4 warps of 4 tiles take
+/// 70.7. Neither changes a bit of a product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FewPlans {
+    /// The kernel for up to 8 rows, measured with one row: a decode step.
+    pub rows_8: FewPlan,
+    /// The kernel for 9 to 16 rows, measured with 16: a window of drafts.
+    pub rows_16: FewPlan,
+}
+
+impl FewPlans {
+    /// The launch of a product of `n_rows` rows (up to [`FEW_ROWS`]).
+    pub fn for_rows(self, n_rows: u32) -> FewPlan {
+        if n_rows <= MAX_BATCH { self.rows_8 } else { self.rows_16 }
     }
 }
 
@@ -259,7 +288,7 @@ struct TypeKernels {
 }
 
 /// The launches measured so far, by type and the rows and columns of the matrix.
-type Plans = HashMap<(GgmlType, u32, u32), FewPlan>;
+type Plans = HashMap<(GgmlType, u32, u32), FewPlans>;
 
 /// The kernels over the device layouts on one device, and what was measured so far.
 #[derive(Debug, Clone)]
@@ -300,7 +329,9 @@ impl Layouts {
                     ty,
                     repack: module.function(&format!("ares_repack_{ty}"))?,
                     shapes: <[Function; 4]>::try_from(shapes).expect("four shapes"),
-                    warps_per_multiprocessor: few[0][0].blocks_per_multiprocessor(128, 0)? * 4,
+                    warps_per_multiprocessor: few[0][0]
+                        .blocks_per_multiprocessor(128, FewPlan::ALL[0].shared_bytes(1))?
+                        * 4,
                     few,
                 })
             })
@@ -581,7 +612,7 @@ impl Kernels {
                 },
             },
             WeightLayout::Device if n_rows <= FEW_ROWS => {
-                let plan = self.few_plan(ty, n_out, n_in)?;
+                let plan = self.few_plan(ty, n_out, n_in)?.for_rows(n_rows);
                 // SAFETY: the caller's guarantee.
                 unsafe { self.few_launch(stream, ty, plan, w, act, y, n_in, n_out, n_rows) }
             }
@@ -715,34 +746,37 @@ impl Kernels {
         Ok(self.prefill.layouts.tuned_at.clone())
     }
 
-    /// The launch a few-row product of a matrix of `n_out` rows of `n_in` values takes:
-    /// the one [`Kernels::tune_layout`] measured for the shape, or [`FewPlan::untuned`].
-    pub fn few_plan(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlan> {
+    /// The launches the few-row products of a matrix of `n_out` rows of `n_in` values take:
+    /// those [`Kernels::tune_layout`] measured for the shape, or [`FewPlan::untuned`] for
+    /// both kernels.
+    pub fn few_plan(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlans> {
         let prefill = &self.prefill;
         let kernels = prefill.layouts.of(ty)?;
         let plans = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
         Ok(plans.get(&(ty, n_out, n_in)).copied().unwrap_or_else(|| {
             let device_warps =
                 kernels.warps_per_multiprocessor * self.device.info().multiprocessors;
-            FewPlan::untuned(n_out.div_ceil(16), device_warps)
+            let plan = FewPlan::untuned(n_out.div_ceil(16), device_warps);
+            FewPlans { rows_8: plan, rows_16: plan }
         }))
     }
 
     /// Measures which launch ([`FewPlan::all`]) is the fastest for the few-row products of
-    /// matrices of `ty` with `n_out` rows of `n_in` values on this device and keeps it for
-    /// [`Kernels::product`]; it returns the plan, and the same without measuring again if it
-    /// has been measured. A loader calls it once per shape of its model, before the weights
-    /// are placed: it walks as many copies of a matrix of that shape as make 64 MiB or twice
-    /// the L2 cache, at most 256 MiB (freed on return), in a few milliseconds. The first
-    /// call on a device that has been idle also keeps it busy for 150 ms, for its clocks to
-    /// rise.
+    /// matrices of `ty` with `n_out` rows of `n_in` values on this device, for the kernel of
+    /// up to 8 rows with one row and for the kernel of 9 to 16 rows with 16, and keeps them
+    /// for [`Kernels::product`]; it returns them, and the same without measuring again if
+    /// they have been measured. A loader calls it once per shape of its model, before the
+    /// weights are placed: it walks as many copies of a matrix of that shape as make 64 MiB
+    /// or twice the L2 cache, at most 256 MiB (freed on return), in a few milliseconds. The
+    /// first call on a device that has been idle also keeps it busy for 150 ms, for its
+    /// clocks to rise.
     ///
-    /// The plan is a matter of speed only: the product of a row is the same bits whichever
-    /// launch computes it.
+    /// The plans are a matter of speed only: the product of a row is the same bits
+    /// whichever launch computes it.
     ///
     /// The device should be idle: a product of another context that runs at the same
-    /// time is measured into the plan.
-    pub fn tune_layout(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlan> {
+    /// time is measured into the plans.
+    pub fn tune_layout(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlans> {
         self.tuned(ty, n_out, n_in, None)
     }
 
@@ -760,7 +794,7 @@ impl Kernels {
         n_out: u32,
         n_in: u32,
         region: &DeviceBuffer,
-    ) -> Result<FewPlan> {
+    ) -> Result<FewPlans> {
         self.tuned(ty, n_out, n_in, Some(region))
     }
 
@@ -770,7 +804,7 @@ impl Kernels {
         n_out: u32,
         n_in: u32,
         region: Option<&DeviceBuffer>,
-    ) -> Result<FewPlan> {
+    ) -> Result<FewPlans> {
         let prefill = &self.prefill;
         prefill.layouts.of(ty)?;
         let Some(bytes) = Self::layout_bytes(ty, WeightLayout::Device, n_out, n_in) else {
@@ -787,14 +821,15 @@ impl Kernels {
                 return Ok(*plan);
             }
         }
-        let plan = if n_out == 0 {
-            FewPlan::ALL[0]
+        let plans = if n_out == 0 {
+            FewPlans { rows_8: FewPlan::ALL[0], rows_16: FewPlan::ALL[0] }
         } else {
-            self.measure_few(ty, bytes, n_out, n_in, region)?
+            let [rows_8, rows_16] = self.measure_few(ty, bytes, n_out, n_in, region)?;
+            FewPlans { rows_8, rows_16 }
         };
-        let mut plans = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
-        plans.insert((ty, n_out, n_in), plan);
-        Ok(plan)
+        let mut known = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
+        known.insert((ty, n_out, n_in), plans);
+        Ok(plans)
     }
 
     fn measure_few(
@@ -804,7 +839,10 @@ impl Kernels {
         n_out: u32,
         n_in: u32,
         region: Option<&DeviceBuffer>,
-    ) -> Result<FewPlan> {
+    ) -> Result<[FewPlan; 2]> {
+        /// The rows each kernel is measured with: the one of a decode step, and the most
+        /// the kernel for 9 to 16 rows takes.
+        const ROWS: [u32; 2] = [1, FEW_ROWS];
         /// Every candidate is timed this many times, in turn with the others, as a run
         /// of `BURST` launches; its fastest run counts.
         const ROUNDS: usize = 4;
@@ -836,9 +874,9 @@ impl Kernels {
                 (own.ptr(), bytes * copies)
             }
         };
-        let act_bytes = Kernels::activation_bytes(ActivationForm::F16, n_in, 1);
+        let act_bytes = Kernels::activation_bytes(ActivationForm::F16, n_in, FEW_ROWS);
         let act = DeviceBuffer::new(device, act_bytes)?;
-        let y = DeviceBuffer::new(device, u64::from(n_out) * 4)?;
+        let y = DeviceBuffer::new(device, u64::from(n_out) * u64::from(FEW_ROWS) * 4)?;
         let stream = Stream::new(device, 0)?;
         // SAFETY: the whole buffer of this device.
         unsafe { stream.fill(act.ptr(), 0x3c, act_bytes as usize)? };
@@ -883,39 +921,43 @@ impl Kernels {
             }
             stream.synchronize()?;
         }
-        let mut best = [f32::INFINITY; FewPlan::ALL.len()];
-        for round in 0..=ROUNDS {
-            for (plan, best) in FewPlan::ALL.iter().zip(best.iter_mut()) {
-                start.record(&stream)?;
-                for _ in 0..BURST {
-                    // SAFETY: the region holds a matrix of n_out x n_in at every place
-                    // `place` names, `act` a row in the f16 form and `y` its products.
-                    unsafe {
-                        self.few_launch(
-                            &stream,
-                            ty,
-                            *plan,
-                            place(),
-                            act.ptr(),
-                            y.ptr(),
-                            n_in,
-                            n_out,
-                            1,
-                        )?;
+        let mut picks = [FewPlan::ALL[0]; 2];
+        for (rows, pick) in ROWS.into_iter().zip(picks.iter_mut()) {
+            let mut best = [f32::INFINITY; FewPlan::ALL.len()];
+            for round in 0..=ROUNDS {
+                for (plan, best) in FewPlan::ALL.iter().zip(best.iter_mut()) {
+                    start.record(&stream)?;
+                    for _ in 0..BURST {
+                        // SAFETY: the region holds a matrix of n_out x n_in at every place
+                        // `place` names, `act` FEW_ROWS rows in the f16 form and `y` their
+                        // products.
+                        unsafe {
+                            self.few_launch(
+                                &stream,
+                                ty,
+                                *plan,
+                                place(),
+                                act.ptr(),
+                                y.ptr(),
+                                n_in,
+                                n_out,
+                                rows,
+                            )?;
+                        }
+                    }
+                    end.record(&stream)?;
+                    end.synchronize()?;
+                    // The first round warms the caches up.
+                    if round > 0 {
+                        *best = best.min(end.elapsed_ms_since(&start)? / BURST as f32);
                     }
                 }
-                end.record(&stream)?;
-                end.synchronize()?;
-                // The first round warms the caches up.
-                if round > 0 {
-                    *best = best.min(end.elapsed_ms_since(&start)? / BURST as f32);
-                }
             }
+            // The fastest; of equals the first, which has the fewest warps on a tile.
+            let fastest = best.iter().copied().fold(f32::INFINITY, f32::min);
+            *pick = FewPlan::ALL[best.iter().position(|ms| *ms <= fastest).unwrap_or(0)];
         }
-        // The fastest; of equals the first, which has the fewest warps on a tile.
-        let fastest = best.iter().copied().fold(f32::INFINITY, f32::min);
-        let pick = best.iter().position(|ms| *ms <= fastest).unwrap_or(0);
-        Ok(FewPlan::ALL[pick])
+        Ok(picks)
     }
 
     /// The product with one launch of the few-row kernels, for benchmarks and tests that

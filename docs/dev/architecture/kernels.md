@@ -82,10 +82,33 @@ of the four launches is the fastest depends on the shape and the card:
 `Kernels::tune_layout` times them for each shape at load (the model's chooser
 does it over its probe buffer, as large as the weights, because a small matrix
 timed over a few dozen megabytes finds its address translations and the
-launches that wait for them look better than they are). None of the launches
-changes a bit: a row has the same bits alone, in a window of up to 16 rows, with
-other rows beside it, in each launch, tuned or not
-(`tests/layout.rs::a_row_is_the_same_bits_in_any_batch_and_launch`). 0.04 %
+launches that wait for them look better than they are), for the kernel of up to
+8 rows with one row and for the kernel of 9 to 16 rows with 16 (`FewPlans`). None
+of the launches changes a bit: a row has the same bits alone, in a window of up to
+16 rows, with other rows beside it, in each launch, tuned or not
+(`tests/layout.rs::a_row_is_the_same_bits_in_any_batch_and_launch`).
+
+The kernel of 9 to 16 rows takes its activations through shared memory (2026-11-28,
+#14): each warp copies the next step's 64 values of each row into a ring of two
+steps (`cp.async`, kept in L1, the 16-byte pieces of a row swizzled) and reads its
+fragments with `ldmatrix`, which gives the registers the lanes loaded themselves
+before. A load of a warp that reads 4 bytes of 8 rows asks L1 for 8 lines, and the
+16 such loads of a step of 16 rows bounded the kernel, not the weights: on the RTX
+3060 Q4_K 17408 x 5120 took 231 to 247 us for 16 rows against 152 for one (160 to
+169 with every lane of a load reading the same row), on the RTX 4070 113 against
+107. With the ring the launch of four tiles a block takes 173 us there; a launch of
+one tile a block reads the activations once a tile (they are as many bytes as the
+weights of three tiles of Q4_K at 16 rows) and stays at about 250 us, which is why
+the kernel of 9 to 16 rows has a launch measured with 16 rows (the fastest launch
+for one row is often one tile a block: IQ4_XS 6656 x 5120 on the RTX 3060 103 us
+for 16 rows in it, 70.4 in the four-tile launch). The kernel of up to 8 rows keeps
+the loads of its lanes: there the ring was 2 to 5 % slower for the small matrices
+of the RTX 3060 at one row. The products of the 27B's shapes at 16 rows took 7 to
+27 % less (RTX 3060) and 7 to 22 % less (RTX 4070, the head as before), at 1 and 8
+rows the same within 1 %; measuring the second launch adds 0.9 s (RTX 4070, 66
+shapes) and 0.5 s (RTX 3060, 59) to the chooser's probes, inside the 5.6 to 5.8 s a
+load of the 27B took before and after. Measurements and the profile of whole steps:
+[`experiments/kernel-profile.md`](../experiments/kernel-profile.md). 0.04 %
 rms from the exact f32 product, as before (the f16 operands). Against the
 integer decode kernels of the file's layout, one row, in the model's probes
 (cold address translations, 59 shapes per card), the sum over the matrices of
@@ -695,7 +718,15 @@ the many-row kernels also take the width in steps of 128 and the inner width in 
   for all 25 quantized types. The float types have a trait of the same interface
   (`EngExpertFloat`): the weights as stored times the int8 activations, so that an expert of
   any type computes `W x^` for the rounded activations `x^` and the host can compute the
-  same.
+  same. Each exists for steps of up to 1, 2, 4 and 8 rows (`_r1`, `_r2`, `_r4`, no
+  suffix; `EXPERT_ROWS` in `src/experts.rs`), since a kernel issues the loads and products
+  of all its rows for every expert, a row that picked it or not (the loop over the rows is
+  unrolled and its test of the row mask compiled into predicates; branching per row instead
+  was 30 % slower). Measured 2026-11-28 with `expert_layer_bench` on Flash-Next's real
+  experts, a layer's experts against the kernels of 8 rows: one row 25 to 29 % less time on
+  the RTX 4070 (IQ2_S / Q2_0 71.4 -> 53.6 us) and 27 to 32 % on the RTX 3060 (141 -> 102),
+  two rows 5 to 19 % and 21 to 29 %, four 8 to 10 % and 14 to 17 %, eight the same; a row
+  has the same bits in every kernel (`a_row_gets_the_same_bits_alone_and_in_a_batch`).
 - *Many-row kernels.* IQ2_S, IQ2_XXS, IQ1_M and IQ1_S as gate and up and Q2_0 as down have a
   decoder written for these kernels. Every other type and role goes through an adapter
   (`expertrows_mm.cuh`) that makes a gate and up or a down decoder of the item decoder of the
@@ -1097,6 +1128,18 @@ RTX 4070 / RTX 3060:
 | `q8` / `q8` | 50 / 90 µs | 0.28 / 0.46 ms | 2.19 / 3.48 ms | 3.14 / 5.39 ms | 2.73 / 5.95 ms |
 | `q4` / `q4` | 49 / 92 µs | 0.23 / 0.51 ms | 2.11 / 3.62 ms | 3.47 / 6.08 ms | 2.41 / 5.22 ms |
 | `f16` / `f16` | 54 / 97 µs | 0.36 / 0.53 ms | 2.76 / 3.98 ms | 3.44 / 5.84 ms | 2.43 / 5.26 ms |
+
+*Converting a tile* (`AttentionKernels::convert`, `ares_attn_convert`): a block encodes
+its rows a group of 32 values a warp (the scale search of `q7` to `q4`), and each tile
+is cut into as many slices of rows, a block each, as fill the device
+(`convert_slices`, by the occupancy of the kernel: one block a tile in a prompt step,
+which converts tiles enough, up to 128 for the one tile of a decode step); every block
+computes the tile's mean, with the loads of 8 rows ahead of the sums. It was one block
+a tile's K or V, 4 to 6 for a tile of the 27B on a device, and took 0.42 ms on the RTX
+4070 and 0.59 ms on the RTX 3060 in every attention layer of a step at a tile's edge,
+which a window of R rows of drafts meets in R - 1 of 128 steps; now 31 and 51 us (the
+same bytes: the golden files and `KvHead`). Measured 2026-11-28 in a trace of the 27B's
+windows of 16 rows.
 
 At 262144 cells `f16` reads at 77 % of the memory limit, `q8` at 52 % and
 `q4` at 29 %: the quantized formats are bound by the work of decoding, not

@@ -95,8 +95,13 @@ struct EngExpertFloat {
 
 // The dot products of `ROWS` weight rows with the activation rows named in
 // `mask`, added to `acc`: the inner loop of ares_mmvq, with the activation
-// row of batch entry b at index `arow[b]` of the arrays at `q0` and `ds0`.
-template <class T, int ROWS>
+// row of batch entry b at index `arow[b]` of the arrays at `q0` and `ds0`. The
+// mask names rows below NB: the loop over the rows is unrolled and its test of
+// the mask compiled into predicates, so every one of NB rows issues its loads
+// and products for every expert, used or not, and a step of one row runs the
+// kernels with NB = 1 (RTX 3060, a decode step of Flash-Next: the down products
+// of a layer's ten experts were 8.2 million warp instructions with NB = 8).
+template <class T, int ROWS, int NB>
 static __device__ __forceinline__ void ares_expert_dots(
     const uint8_t* const* wrow, const int8_t* __restrict__ q0, const float2* __restrict__ ds0,
     const uint32_t* arow, uint32_t mask, uint32_t n_in, uint32_t lane, const uint8_t* smem,
@@ -119,7 +124,7 @@ static __device__ __forceinline__ void ares_expert_dots(
                 }
             }
 #pragma unroll
-            for (int b = 0; b < ARES_MAX_BATCH; b++) {
+            for (int b = 0; b < NB; b++) {
                 if ((mask >> b) & 1u) {
 #pragma unroll
                     for (int u = 0; u < U; u++) {
@@ -145,7 +150,7 @@ static __device__ __forceinline__ void ares_expert_dots(
             wr[r] = T::load_w(wrow[r] + static_cast<size_t>(kb) * T::BLOCK_BYTES, slot, smem);
         }
 #pragma unroll
-        for (int b = 0; b < ARES_MAX_BATCH; b++) {
+        for (int b = 0; b < NB; b++) {
             if ((mask >> b) & 1u) {
                 const typename T::A a = T::load_a(
                     q0 + static_cast<size_t>(arow[b]) * n_in + static_cast<size_t>(kb) * T::BLOCK_VALUES,
@@ -183,7 +188,7 @@ static_assert(ARES_EXPERT_GU_WARPS * ARES_EXPERT_GU_VALUES == 32, "a block is on
 //                             (d, s) at hds + p * (n_ff / 32)
 //   host                      the layer's host share, or null: without one a
 //                             missing expert can only arrive in a slot
-template <class T>
+template <class T, int NB>
 static __device__ __forceinline__ void ares_expert_gate_up(
     const uint8_t* __restrict__ pool, uint64_t stride, uint32_t up_offset, const int32_t* slot_of,
     const uint8_t* __restrict__ record, const int8_t* __restrict__ aq, int8_t* __restrict__ hq,
@@ -258,9 +263,9 @@ static __device__ __forceinline__ void ares_expert_gate_up(
                 acc[0][b] = 0.0f;
                 acc[1][b] = 0.0f;
             }
-            ares_expert_dots<T, 2>(wrow, aq, ad, arow, mask, n_in, lane, smem, acc);
+            ares_expert_dots<T, 2, NB>(wrow, aq, ad, arow, mask, n_in, lane, smem, acc);
 #pragma unroll
-            for (int b = 0; b < ARES_MAX_BATCH; b++) {
+            for (int b = 0; b < NB; b++) {
                 if ((mask >> b) & 1u) {
                     const float g = ares_warp_sum(acc[0][b]);
                     const float u = ares_warp_sum(acc[1][b]);
@@ -299,7 +304,7 @@ static __device__ __forceinline__ void ares_expert_gate_up(
 //   hq, hds   the pairs' hidden values, as ares_expert_gate_up wrote them
 //   out       n_rows rows of n_out f32; the experts' weighted sum is added
 //   host      the layer's host share, or null
-template <class T>
+template <class T, int NB>
 static __device__ __forceinline__ void ares_expert_down(
     const uint8_t* __restrict__ pool, uint64_t stride, uint32_t down_offset, const int32_t* slot_of,
     const uint8_t* __restrict__ record, const int8_t* __restrict__ hq, const float2* __restrict__ hds,
@@ -364,12 +369,12 @@ static __device__ __forceinline__ void ares_expert_down(
             for (int b = 0; b < ARES_MAX_BATCH; b++) {
                 arow[b] = group.first_pair + ares_pair_of_row(mask, b);
             }
-            ares_expert_dots<T, ROWS>(wrow, hq, hds, arow, mask, n_ff, lane, smem, part);
+            ares_expert_dots<T, ROWS, NB>(wrow, hq, hds, arow, mask, n_ff, lane, smem, part);
         }
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
 #pragma unroll
-            for (int b = 0; b < ARES_MAX_BATCH; b++) {
+            for (int b = 0; b < NB; b++) {
                 if ((mask >> b) & 1u) {
                     acc[r][b] = fmaf(group.weight[b], part[r][b], acc[r][b]);
                 }
@@ -393,7 +398,7 @@ static __device__ __forceinline__ void ares_expert_down(
 #pragma unroll
     for (int r = 0; r < ROWS; r++) {
 #pragma unroll
-        for (int b = 0; b < ARES_MAX_BATCH; b++) {
+        for (int b = 0; b < NB; b++) {
             if (b < static_cast<int>(n_rows)) {
                 float total = ares_warp_sum(acc[r][b]);
                 if (lane == 0 && row0 + r < n_out) {
@@ -408,22 +413,22 @@ static __device__ __forceinline__ void ares_expert_down(
     }
 }
 
-// Defines the gate and up kernel `NAME` for the weight type `T`.
-#define ARES_EXPERT_GATE_UP_KERNEL(NAME, T)                                                     \
+// Defines the gate and up kernel `NAME` for the weight type `T` and steps of up to NB rows.
+#define ARES_EXPERT_GATE_UP_KERNEL(NAME, T, NB)                                                 \
     extern "C" __global__ void __launch_bounds__(ARES_EXPERT_GU_WARPS * 32) NAME(              \
         const uint8_t* pool, uint64_t stride, uint32_t up_offset, const int32_t* slot_of,       \
         const uint8_t* record, const int8_t* aq, int8_t* hq, float2* hds,                       \
         const AresHostShare* host, uint32_t n_in, uint32_t n_ff, uint32_t n_rows, uint32_t k) { \
-        ares_expert_gate_up<T>(pool, stride, up_offset, slot_of, record, aq, hq, hds, host,     \
-                               n_in, n_ff, n_rows, k);                                          \
+        ares_expert_gate_up<T, NB>(pool, stride, up_offset, slot_of, record, aq, hq, hds, host, \
+                                   n_in, n_ff, n_rows, k);                                      \
     }
 
-// Defines the down kernel `NAME` for the weight type `T`.
-#define ARES_EXPERT_DOWN_KERNEL(NAME, T)                                                        \
+// Defines the down kernel `NAME` for the weight type `T` and steps of up to NB rows.
+#define ARES_EXPERT_DOWN_KERNEL(NAME, T, NB)                                                    \
     extern "C" __global__ void __launch_bounds__(ARES_MMVQ_WARPS * 32) NAME(                   \
         const uint8_t* pool, uint64_t stride, uint32_t down_offset, const int32_t* slot_of,     \
         const uint8_t* record, const int8_t* hq, const float2* hds, float* out,                 \
         const AresHostShare* host, uint32_t n_ff, uint32_t n_out, uint32_t n_rows, uint32_t k) {\
-        ares_expert_down<T>(pool, stride, down_offset, slot_of, record, hq, hds, out, host,     \
-                            n_ff, n_out, n_rows, k);                                            \
+        ares_expert_down<T, NB>(pool, stride, down_offset, slot_of, record, hq, hds, out, host, \
+                                n_ff, n_out, n_rows, k);                                        \
     }
