@@ -45,6 +45,7 @@ repository and are not needed to build, run or test Ares.
 | [`flash-next.md`](experiments/flash-next.md) | Flash-Next's decode through the server, K and V beyond VRAM, files in any type, the usage profile, members and loans, reading ahead, the gap between 17 and 22 ms, pruning |
 | [`flash-next-prompts.md`](experiments/flash-next-prompts.md) | wide steps, their float matrices, transit, lent VRAM, passes layer by layer |
 | [`against-strata.md`](experiments/against-strata.md) | Flash-Next against Strata on the test machine, from the SSD |
+| [`ssd-decode-profile.md`](experiments/ssd-decode-profile.md) | where a decode step of Flash-Next goes with most experts off the card, and the levers of the SSD ranked by it |
 | [`against-the-fork.md`](experiments/against-the-fork.md) | the 27B against the owner's llama.cpp fork at production settings, alone and in parallel |
 | [`claude-code.md`](experiments/claude-code.md) | Claude Code against Ares |
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
@@ -65,6 +66,7 @@ repository and are not needed to build, run or test Ares.
 | [`engines-survey.md`](studies/engines-survey.md) | 2026-11-09 | Techniques of other engines worth taking, by feature |
 | [`serving-engines-code-survey.md`](studies/serving-engines-code-survey.md) | 2026-11-10 | How vLLM, SGLang, FlashInfer and others build their fast parts, read in their code |
 | [`moe-offload-survey.md`](studies/moe-offload-survey.md) | 2026-11-10 | How the engines Run My AI credits offload mixtures of experts |
+| [`prefetch.md`](studies/prefetch.md) | 2026-11-27 | Prefetching experts from the SSD: Strata-HotRod, TokenWing and Strata in their code, a design under the drive's budget, predictors measured offline, stand-ins as a cost-aware pruning rule, a ranked plan |
 | [`strata-notes.md`](studies/strata-notes.md) | 2026-11-09 | Notes from reading Strata, the reference engine for Flash-Next |
 | [`codacus-notes.md`](studies/codacus-notes.md) | 2026-11-09 | Notes from reading TheCodacus' llama.cpp fork |
 | [`kvarn-notes.md`](studies/kvarn-notes.md) | 2026-11-09 | Notes on KVarN (beellama.cpp) and TurboQuant K/V formats |

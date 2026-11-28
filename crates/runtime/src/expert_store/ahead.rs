@@ -37,6 +37,13 @@
 //! A read ahead takes only room of the RAM tier that nobody uses ([`Want::Spare`]): a free
 //! slot, a guess nobody used, a copy of an expert that VRAM holds. It never takes the place
 //! of a member a later step may need, so a read for nothing costs the drive and no more.
+//!
+//! The predictions cost the device: the routers of the next two layers at every layer, as
+//! much as a dense layer's products (1.7 ms a step of Flash-Next on the RTX 4060 Ti, a tenth
+//! of the dense part). A step whose kind has no place worth a read would only count them, so
+//! it predicts only as far ahead as a place of its kind qualifies, and every eighth step of
+//! its kind (`SAMPLE_EVERY`) as far as the parts can, so that the counts go on and a place
+//! that comes to be worth it is found ([`ExpertStore::ahead_depth`]).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -54,6 +61,11 @@ const PLACES: usize = 16;
 /// halved beyond that, so that they follow the text and the tiers.
 const MIN_SAMPLES: f32 = 16.0;
 const MAX_SAMPLES: f32 = 512.0;
+
+/// Of the steps of a kind in which no place qualifies, one in this many predicts every layer
+/// it can, to keep the counts: seven eighths of the routers' cost saved, and the counts of a
+/// place still see a sample every few steps of decode.
+const SAMPLE_EVERY: u32 = 8;
 
 /// How often an expert that no tier held and that a prediction named was then picked, per
 /// kind of step and distance of the prediction (one row or several, one layer or two: the
@@ -157,6 +169,9 @@ pub(super) struct Ahead {
     /// The reads ahead of experts that their record picked while they were on their way,
     /// with the time of the record.
     picked: HashMap<u64, Instant>,
+    /// Per kind of step (one row, several): the steps since the last that predicted as far
+    /// as the parts can.
+    unsampled: [u32; 2],
 }
 
 impl Ahead {
@@ -177,6 +192,7 @@ impl Ahead {
             step_ms: None,
             demand_mean: 0.0,
             picked: HashMap::new(),
+            unsampled: [0; 2],
         }
     }
 
@@ -206,6 +222,31 @@ impl<D: SlotDevice> ExpertStore<D> {
     pub fn ahead_odds(&self) -> [[(f32, f32); PLACES]; 4] {
         let odds = &self.ahead.odds;
         std::array::from_fn(|d| std::array::from_fn(|p| odds.tallies[d][p].counts()))
+    }
+
+    /// How many layers ahead a step of `rows` rows that begins is to predict, of the `most`
+    /// its parts can: as far as a place of that kind of step and distance is worth a read
+    /// (see the module), and as far as they can every eighth step of the kind that would
+    /// predict less, so that the counts of every place go on. 0 when no place of
+    /// the kind qualifies: the device then skips the routers of the predictions, which
+    /// change nothing the model computes.
+    pub fn ahead_depth(&mut self, rows: usize, most: usize) -> usize {
+        let kind = usize::from(rows > 1);
+        let ahead = &mut self.ahead;
+        let worth = (1..=most.min(2))
+            .rev()
+            .find(|&d| (0..PLACES).any(|p| ahead.odds.worth(Odds::class(rows, d, p))))
+            .unwrap_or(0);
+        if worth >= most {
+            ahead.unsampled[kind] = 0;
+            return most;
+        }
+        ahead.unsampled[kind] += 1;
+        if ahead.unsampled[kind] >= SAMPLE_EVERY {
+            ahead.unsampled[kind] = 0;
+            return most;
+        }
+        worth
     }
 
     /// A prediction made `distance` layers ahead (1 or 2) in a step of `rows` rows says that

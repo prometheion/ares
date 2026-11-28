@@ -40,8 +40,8 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 
 | Feature | In one line |
 | --- | --- |
-| Prefix cache | automatic, shared by all requests, with checkpoints of the recurrent state |
-| Checkpoints | at the end of the system prompt and the tools, at every message boundary, every 8192 tokens of a prompt |
+| Prefix cache | automatic, shared by all requests, with checkpoints of the recurrent state; a request with `cache_prompt: false` keeps out of it |
+| Checkpoints | at the end of the system prompt and the tools, at every message boundary, every 8192 tokens of a prompt, and at the end of its last message where that costs no step (the page boundary before it otherwise, and on Flash-Next): a repeated prompt computes only the few tokens after its last message, also from the drive |
 | Claude Code's billing stamp | pinned on `/v1/messages` as upstream llama.cpp does, so its turns hit the cache |
 | Prompt cache in RAM | inside `--ram`, the lowest user of it; one checkpoint place is always kept |
 | Prompt cache on SSD | `--cache <DIR>`, `--cache-size`; a conversation resumes after an unload and a restart |

@@ -49,8 +49,8 @@ All four are server options.
 | --- | --- | --- |
 | `--api-key <KEYS>` | Keys a request must carry one of, separated by commas, as `Authorization: Bearer <key>` or `x-api-key: <key>`; a key holds no white space. `/health` stays open. | none: no key is asked for |
 | `--api-key-file <FILE>` | More keys, one on each line; lines that begin with `#` are comments, and a line with a space is an error. A file without a key is an error when `--api-key` names none either. | none |
-| `--allowed-hosts <LIST>` | Names in a request's `Host` header that the server answers to besides its local ones (`localhost`, addresses), separated by commas, or `*` for any. Names given here are checked on every address and with keys too. | the local names only, when the server listens on a loopback address without keys; else any name |
-| `--cors-origins <LIST>` | Origins whose web pages may call the server from a browser and read its answers, such as `https://chat.example.org`, separated by commas, or `*` for any. Without keys, a request from a page of another site is refused unless the page is of this machine (`localhost`, a loopback address), of the server's own name or of an `--allowed-hosts` name; with keys pages are not checked. | none |
+| `--allowed-hosts <LIST>` | Names in a request's `Host` header that the server answers to besides its local ones (`localhost`, addresses), separated by commas, or `*` for any. Names given here are checked on every address and with keys too, and with keys they turn the check of pages (`--cors-origins`) on as well. | the local names only, when the server listens on a loopback address without keys; else any name |
+| `--cors-origins <LIST>` | Origins whose web pages may call the server from a browser and read its answers, such as `https://chat.example.org`, separated by commas, or `*` for any. Without keys, a request from a page of another site is refused unless the page is of this machine (`localhost`, a loopback address), of the server's own name or of an `--allowed-hosts` name; with keys pages are checked only when `--allowed-hosts` names hosts. | none |
 
 ## Where the model goes
 
@@ -115,6 +115,7 @@ What is left out is decided from the devices and the model, and the log says how
 | --- | --- | --- |
 | `--queue <N>` | The most requests that may wait for a sequence while `--parallel` run; one more is refused with 503 and `Retry-After`, unless it has a better priority than one waiting that has not started: then that one is refused in its place (see [api.md](api.md#priorities)). | no limit: a request waits until it runs |
 | `--generation-floor <TOKENS/S>` | The rate every generating request keeps while a prompt is read beside it; the prompt gets the rest of the devices' time, and at least half. `0` reads prompts at once. | `20` |
+| `--watchdog <SECONDS>` | The longest one step may take, the warm-up's too, before the engine is taken for stuck: every request then gets 503 `restarting` with the reason, and the server restarts in place (the same process and port, a new image that loads the model again, which frees the devices); when it cannot, it exits with code 75 for its supervisor to start it again. A warm-up that does not come back fails the load. `0` watches nothing. | `600` |
 
 ## Thinking
 
@@ -259,7 +260,12 @@ the server's limit and holds over `ram` in `[*]`.
 a request names it, unloaded when another model needs its room or when it was
 idle for its `idle-unload`, and loaded again by the next request for it. A
 request that waits for a load waits; it is not refused because another model is
-busy.
+busy. How long that is (measured 2026-11-25 on an RTX 4070 and an RTX 3060, the
+files in the page cache or not): the 27B (Q4_K_S) serves 22 to 44 s after its
+load begins, Flash-Next (IQ2_XS, `--ram` 8 to 16 GiB) 40 to 66 s, its first load
+on a machine longer by the warm-up that writes its usage profile; an unload
+takes 1 to 10 s, more when the prompt cache writes to `--cache` what only RAM
+holds.
 
 ```ini
 [*]

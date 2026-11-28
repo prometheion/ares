@@ -549,6 +549,36 @@ fn a_page_that_leaves_the_devices_goes_to_ram_and_comes_back_from_there() {
 }
 
 #[test]
+fn a_page_that_finds_no_room_in_ram_counts_as_dropped_only_when_the_drive_lacks_it() {
+    let mut f = Following::new("lost");
+    let mut devices = Devices::default();
+    // Text 0 goes into RAM and from there to the drive; text 1 stays on the devices.
+    let stored = f.text(0);
+    f.all_into_ram(&mut devices);
+    for hash in &stored {
+        f.cache.clean(Item::Page, *hash);
+    }
+    assert_eq!(f.written().pages_written, 3);
+    let only_here = f.text(1);
+    // A page of each leaves the devices and finds no room in RAM, as happens on a machine
+    // that has room for the floor alone while the floor's buffers are with the readers and
+    // the writer: only the one the drive lacks is dropped unwritten.
+    let leaving = |hashes: &[ChainHash]| Leaving {
+        page: PageId(0),
+        hash: hashes[1],
+        parent: hashes[0],
+        depth: 2,
+        tail: None,
+        checkpoint: None,
+        worth: true,
+    };
+    f.cache.lost(leaving(&stored));
+    assert_eq!(f.cache.ram_counters().pages_dropped, 0, "the drive has it");
+    f.cache.lost(leaving(&only_here));
+    assert_eq!(f.cache.ram_counters().pages_dropped, 1, "the drive lacks it");
+}
+
+#[test]
 fn what_leaves_ram_goes_to_the_drive_and_without_one_it_is_dropped() {
     for ssd in [true, false] {
         let mut f = Following::with(&format!("shrink-{ssd}"), ssd, 4 * STATE + 64 * PAGE);
@@ -613,6 +643,64 @@ fn far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive(
     assert!(ram.pages_dropped > 0, "{ram:?}");
     assert_eq!(of(&devices.asked, TransferKind::PageOut).len() as u64, ram.pages_in);
     assert_eq!(f.written().pages_written, 0, "nothing of them went to the drive");
+}
+
+#[test]
+fn the_floor_keeps_the_far_pages_of_one_request_until_running_sequences_need_them() {
+    // As above, but one request holds at most six far pages: the floor keeps that many
+    // of them on the devices (the tier of experts does not take them, so a conversation's
+    // next turn finds them), the others leave at the next trim. A running sequence's K and
+    // V outrank them: when the cache gives way, they leave too, with the pages in RAM.
+    let mut f = Following::with("keep", true, STATE + RESERVE * PAGE);
+    f.cache.far = Some(FarPages { first: 3, page_bytes: PAGE });
+    f.cache.far_keep = 6 * PAGE;
+    f.ram.keep_context_cached(6 * PAGE);
+    let mut devices = Devices::default();
+    for i in 0..12 {
+        f.text(i);
+    }
+    f.trimmed(&mut devices);
+    // The floor's place, which no checkpoint uses here, keeps a few more.
+    let kept = f.ram.context_cached();
+    assert!((6 * PAGE..36 * PAGE).contains(&kept), "the far pages of one request stay: {kept}");
+    assert!(f.cache.held() <= f.cache.allowance());
+    let (_, gone) = f.cache.give_way(&mut f.pool, &mut devices);
+    assert!(gone);
+    assert_eq!(f.ram.context_cached(), 0, "they made room for running sequences");
+    assert_eq!(f.cache.ram_counters().pages, 0, "and so did the pages in RAM");
+    assert_eq!(f.written().pages_written, 0, "nothing waited for the drive");
+}
+
+#[test]
+fn the_saves_of_a_step_whose_room_was_taken_are_given_up_before_it_runs() {
+    // The places of a step's checkpoints take their memory as the step is handed over, in
+    // room the limit had free when the cache took them. The K and V beyond VRAM of running
+    // sequences, locked just before the record is written, outrank the prompt cache and can
+    // take that room (2026-11-25, Flash-Next at `--ram 8G`: the step's lock of its one place
+    // failed, and with it the engine): the saves go then, those inside the step first, until
+    // what the others lock fits.
+    let mut f = Following::with("fit", false, 4 * STATE);
+    // The places lie in chunks of one place each, booked as a copy first
+    // writes them, as the host executor's are.
+    let _places = f.ram.place_chunks(None, STATE, 64, STATE as usize);
+    let hashes = f.hashes.clone();
+    assert!(f.cache.save(0, hashes[2], Owner(1), false).taken);
+    let place = f.cache.reserve().0.expect("a place for a save inside the step");
+    let mut inner = vec![crate::InnerSave { slot: 1, place, position: 5 }];
+    assert_eq!(f.cache.pending_locks(), 2 * STATE);
+    assert_eq!(f.cache.fit_saves(&mut inner), 0, "room enough");
+    assert_eq!(inner.len(), 1);
+    // Running sequences take all but one place's room, then that too.
+    f.ram.require(f.ram.unbooked() - STATE).unwrap();
+    assert_eq!(f.cache.fit_saves(&mut inner), 1);
+    assert!(inner.is_empty(), "the save inside the step went first");
+    assert_eq!(f.cache.pending_locks(), STATE);
+    assert!(f.cache.index.checkpoint(hashes[2]).is_some(), "the record's save stays");
+    f.ram.require(STATE).unwrap();
+    assert_eq!(f.cache.fit_saves(&mut inner), 1);
+    assert_eq!(f.cache.pending_locks(), 0);
+    assert_eq!(f.cache.index.checkpoint(hashes[2]), None, "its checkpoint is not taken");
+    assert!(written(&mut f.cache).0.is_empty(), "the record saves nothing");
 }
 
 #[test]

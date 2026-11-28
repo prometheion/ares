@@ -825,7 +825,14 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
         }
         Ok(Err(error)) => {
             model.abandon(index);
-            let _ = ready.send(Err(start_failed(error.to_string())));
+            let failed = match error.is_no_room() {
+                true => RuntimeError::NoRoom {
+                    device: index,
+                    message: format!("{name}: could not be set up: {error}"),
+                },
+                false => start_failed(error.to_string()),
+            };
+            let _ = ready.send(Err(failed));
             return;
         }
         Err(payload) => {

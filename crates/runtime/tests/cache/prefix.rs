@@ -95,18 +95,58 @@ fn the_same_prompt_twice_computes_only_what_the_cache_lacks_the_second_time() {
     assert_eq!(second.run.text, first.run.text, "the same tokens");
     assert_eq!(second.run.text, fresh(&prompt, 40), "and as with no cache at all");
     // 99 cells are looked up (the last token is always computed): 6 pages of
-    // 16. The checkpoint at the anchor, the last page boundary before the
-    // prompt's end, is at 96: nothing is replayed and the last 4 rows run.
-    assert_eq!(second.run.usage.cached_prompt_tokens, 96);
+    // 16 and a tail of 3 with the state at its end, the checkpoint one cell
+    // before the prompt's end: nothing is replayed and the last row runs.
+    assert_eq!(second.run.usage.cached_prompt_tokens, 99);
     assert_eq!(second.run.usage.prompt_tokens, 100);
     assert_eq!(
         (second.report.cached_tokens, second.report.replayed_rows, second.report.computed_rows),
-        (96, 0, 4)
+        (99, 0, 1)
     );
     let d = e.since(&before);
     assert_eq!(d["tokens"], 40);
     let c = e.snapshot().counters;
-    assert_eq!((c.prefix_hits, c.cached_cells, c.checkpoints_restored), (1, 96, 1));
+    assert_eq!((c.prefix_hits, c.cached_cells, c.checkpoints_restored), (1, 99, 1));
+    e.consistent();
+}
+
+#[test]
+fn a_request_without_the_cache_neither_starts_from_it_nor_leaves_anything_in_it() {
+    let mut rng = Rng(11);
+    let prompt = rng.prompt(100);
+    let model = model(Some(CHECKPOINT), |_| {});
+    let e = engine(&model, config(256, 16));
+    // llama.cpp's cache_prompt: false.
+    let without = |e: &Rig| {
+        let mut asked = request(&prompt, Some(40));
+        asked.cache = false;
+        let id = asked.id;
+        let run = run_one(&e.rt, asked);
+        (run, *snapshot(&e.rt).request(id).expect("the request ended"))
+    };
+    let (alone, report) = without(&e);
+    assert_eq!((report.cached_tokens, report.computed_rows), (0, 100));
+    let s = e.snapshot();
+    assert_eq!((s.cached_pages, s.counters.checkpoints_saved), (0, 0), "it left nothing");
+    assert_eq!(alone.text, fresh(&prompt, 40));
+    // One that uses the cache finds nothing, and leaves the prompt there.
+    let first = e.ask(&prompt, 40);
+    assert_eq!(first.report.cached_tokens, 0);
+    let s = e.snapshot();
+    assert!(s.cached_pages > 0);
+    // One without the cache computes the whole prompt again, and leaves the
+    // cache as it found it.
+    let (again, report) = without(&e);
+    assert_eq!((report.cached_tokens, report.computed_rows), (0, 100));
+    assert_eq!(again.text, alone.text);
+    let after = e.snapshot();
+    assert_eq!(after.cached_pages, s.cached_pages);
+    assert_eq!(after.counters.checkpoints_saved, s.counters.checkpoints_saved);
+    assert_eq!(after.counters.prefix_hits, 0);
+    // The next one that uses it resumes at the prompt's end, as without the
+    // other.
+    let second = e.ask(&prompt, 40);
+    assert_eq!((second.report.cached_tokens, second.report.computed_rows), (99, 1));
     e.consistent();
 }
 
@@ -152,12 +192,16 @@ fn a_conversation_continued_turn_by_turn_resumes_at_the_tail_checkpoint() {
             assert_eq!(u64::from(answer.report.computed_rows), tokens - cells_left, "turn {turn}");
             let d = e.since(&before);
             let copies = e.snapshot().counters.page_copies - before.counters.page_copies;
-            // The tail is a partly used page that the turn copies before it writes.
-            assert_eq!(
-                copies,
-                u64::from(!cells_left.is_multiple_of(u64::from(PAGE))),
-                "turn {turn} {d:?}"
-            );
+            // The tail is a partly used page that the turn copies before it
+            // writes. A turn that resumes before its prompt's last page
+            // boundary is cut at its anchor, one cell before its end, which
+            // leaves a tail of its own that it copies too; one that resumes
+            // past the boundary takes no cut for it.
+            let page = u64::from(PAGE);
+            let inside = |cells: u64| u64::from(!cells.is_multiple_of(page));
+            let moved = (tokens - 1) / page * page > cells_left;
+            let anchor = if moved { inside(tokens - 1) } else { 0 };
+            assert_eq!(copies, inside(cells_left) + anchor, "turn {turn} {d:?}");
         }
         cells_left = tokens + 30 - 1;
         text = format!("{text}{}{}", answer.run.text, rng.prompt(12));
@@ -286,12 +330,13 @@ fn two_equal_prompts_submitted_together_share_from_the_first_full_page_and_one_i
     let s = e.snapshot();
     let (first, second) = (s.request(a_id).unwrap(), s.request(b_id).unwrap());
     // One of them was held back until the other had published the pages of
-    // their prompt; it took all 6 and the anchor's checkpoint.
+    // their prompt; it took all 6, the tail after them and the anchor's
+    // checkpoint at its end, one cell before the prompt's end.
     assert_eq!(s.counters.requests_held, 1, "{s}");
     assert_eq!((first.cached_tokens, first.computed_rows), (0, 100));
-    assert_eq!((second.cached_tokens, second.replayed_rows, second.computed_rows), (96, 0, 4));
-    // The rows of the prompt that ran: "busy", the prompt, and the last 4 rows.
-    assert_eq!(s.counters.prefill_rows, 4 + 100 + 4);
+    assert_eq!((second.cached_tokens, second.replayed_rows, second.computed_rows), (99, 0, 1));
+    // The rows of the prompt that ran: "busy", the prompt, and its last row.
+    assert_eq!(s.counters.prefill_rows, 4 + 100 + 1);
     e.consistent();
 }
 
@@ -347,8 +392,9 @@ fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
     });
     let expected = fresh_run(|_| {}, &prompt, 20);
     gate.close();
-    let busy = start(&e.rt, request("busy", Some(1))).unwrap();
-    // The conductor is inside the step of "busy": the two prompts arrive
+    // A prompt of one token takes one step (a longer one has its end apart).
+    let busy = start(&e.rt, request("b", Some(1))).unwrap();
+    // The conductor is inside the step of "b": the two prompts arrive
     // together, after it.
     dispatched(&steps, 1);
     let (owner, held) = (request(&prompt, Some(20)), request(&prompt, Some(20)));
@@ -529,8 +575,10 @@ fn a_window_ends_where_a_checkpoint_is_due_whatever_it_drafts() {
         if speculation {
             assert!(d.drafts_accepted - before.counters.drafts_accepted > 50, "{d:?}");
         }
-        // The anchor at 16, then every 32 cells from there: 48, 80, 112, 144,
-        // 176 and 208 (the cells end at 219), and the end of the request.
+        // The anchor one cell before the prompt's end (19), in place of the
+        // page boundary at 16, then every 32 cells from that boundary: 48, 80,
+        // 112, 144, 176 and 208 (the cells end at 219), and the end of the
+        // request.
         assert_eq!(
             d.checkpoints_saved - before.counters.checkpoints_saved,
             8,
@@ -587,14 +635,16 @@ fn a_prefill_step_ends_where_a_checkpoint_is_due_and_it_is_saved_with_the_next_r
     e.ask(&prompt, 5);
     let cold: Vec<Seen> = std::mem::take(&mut *seen.lock().unwrap());
     // One step per page: the prompt's rows end at every boundary, which is
-    // where a checkpoint is due, and then at the prompt's end.
+    // where a checkpoint is due, and then at the prompt's anchor, one cell
+    // before its end (it has no messages), in place of the last page
+    // boundary, and at the end: no step more than with the anchor at 96.
     let ends: Vec<u32> = cold
         .iter()
         .flat_map(|r| r.segments.iter())
         .filter(|s| s.2 > 1 || s.1 < 100)
         .map(|s| s.1 + s.2)
         .collect();
-    assert_eq!(ends, [16, 32, 48, 64, 80, 96, 100]);
+    assert_eq!(ends, [16, 32, 48, 64, 80, 99, 100]);
     // A checkpoint taken at the commit of a step is saved with the next
     // record: the first record has none, each of the next 6 has one.
     let saves: Vec<usize> = cold
@@ -608,19 +658,17 @@ fn a_prefill_step_ends_where_a_checkpoint_is_due_and_it_is_saved_with_the_next_r
     assert_eq!(places.len(), places.iter().collect::<std::collections::HashSet<_>>().len());
 
     // The same prompt again restores the checkpoint at its anchor, before its
-    // first row. The first request left a tail of 8 cells after page 6, whose
-    // first 3 cells are the prompt's last: they are cached, and replayed from
-    // the anchor, and the last row runs.
+    // first row: the first request left a tail of the 3 cells after page 6
+    // with the state there (and one of 8 cells, of its end, beside it).
+    // Nothing is replayed, and the last row runs.
     e.ask(&prompt, 5);
     let warm: Vec<Seen> = std::mem::take(&mut *seen.lock().unwrap());
     let first = &warm[0];
-    let anchor = places[5];
+    let end = places[5];
     let restores: Vec<_> = first.states.iter().filter(|c| c.0 == StateCopyKind::Restore).collect();
     assert_eq!(restores.len(), 1);
-    assert_eq!(restores[0].2, anchor, "the checkpoint taken at 96");
-    assert_eq!((first.segments[0].1, first.segments[0].2, first.segments[0].3), (96, 3, true));
-    let next = &warm[1];
-    assert_eq!((next.segments[0].1, next.segments[0].2, next.segments[0].3), (99, 1, false));
+    assert_eq!(restores[0].2, end, "the checkpoint taken at 99");
+    assert_eq!((first.segments[0].1, first.segments[0].2, first.segments[0].3), (99, 1, false));
     // The records carry the saves (of the last request's end) before the
     // restores, as the device runs them.
     let kinds: Vec<StateCopyKind> = first.states.iter().map(|c| c.0).collect();
@@ -738,8 +786,10 @@ fn many_requests_with_shared_prefixes_edits_and_tight_memory_all_say_what_they_s
     let shapes: [(&str, Shape); 2] = [("plain", |_| {}), ("repeating", repeating)];
     let mut gave_way = 0;
     for (shape_name, shape) in shapes {
-        // A seed with which requests give way in the long runs, every time.
-        let mut rng = Rng(23_770);
+        // A seed with which requests give way in the long runs, every time
+        // (chosen again with the checkpoints at the prompts' ends, whose
+        // tails give the accounting cached pages to give up first).
+        let mut rng = Rng(3);
         let short = jobs(shape, &mut rng, 48, 60);
         let long = jobs(shape, &mut rng, 24, 150);
         // Name, pages, checkpoint places, slots, the output the accounting
@@ -1035,7 +1085,7 @@ fn the_same_prompt_asked_again_resumes_at_its_anchor_while_the_roots_keep_their_
     // tool call and a long result, asked twice, then a question about the
     // answer. The roots of the system prompt (the page boundaries at 64 and
     // 80) keep their places; the conversation has the place left over, which
-    // held the end state of the first ask instead of its anchor, so the
+    // once held the end state of the first ask instead of its anchor, so the
     // second ask replayed every row after the roots.
     for places in [2, 3] {
         let mut rng = Rng(77);
@@ -1056,7 +1106,10 @@ fn the_same_prompt_asked_again_resumes_at_its_anchor_while_the_roots_keep_their_
         let again = e.ask_chat(&messages, 12);
         assert_eq!(again.run.text, once.run.text, "{places} places");
         assert_eq!(again.run.text, fresh_run(long, &rendered(&messages), 12).text);
-        // 747 cells are looked up: 46 pages of 16, and the anchor at 736.
+        // 747 cells are looked up: 46 pages of 16 and 11 more. The tool
+        // result ends before the last page boundary (the template's tokens for
+        // the reply follow it), so the anchor is that boundary, and the
+        // second ask restores its state there and replays nothing.
         let report = &again.report;
         assert_eq!((report.cached_tokens, report.replayed_rows), (736, 0), "{places} places");
         // The next turn continues the second ask's reply from its end state.
@@ -1094,6 +1147,9 @@ fn a_paused_step_runs_again_until_its_rows_are_done() {
     e.consistent();
 }
 
+/// The steps an executor ran: per step, the slot and the rows of each of its segments.
+type Steps = Vec<Vec<(u32, u32)>>;
+
 /// A request that comes while a step of another prompt is paused runs before that step
 /// is done: the paused step waits for its turn, the new request's prompt is read in pieces
 /// of its own, and both answer as they do alone.
@@ -1108,23 +1164,50 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
     // A floor of generation that the rounds cannot reach: the short request gets half of
     // the time, a round for each piece of the long prompt.
     let config = RuntimeConfig { generation_floor: 1e6, ..paused_config() };
+    // The first piece of the long prompt is held until the short request has been asked,
+    // so that it comes while the step is paused however busy the machine is; and the steps
+    // are counted as the executor runs them, not when the test thread gets to look.
+    let gate = Gate::new();
+    let (held, first_piece) = std::sync::mpsc::channel();
+    let seen: Arc<Mutex<Steps>> = Arc::default();
+    let observed = seen.clone();
+    let closer = gate.clone();
     let e = engine_with(&model, config, |host| {
-        host.with_pauses(16, pieces).with_delay(Duration::from_millis(2))
+        host.with_pauses(16, pieces)
+            .with_delay(Duration::from_millis(2))
+            .with_gate(gate.clone())
+            .with_observer(move |view| {
+                let segments: Vec<(u32, u32)> = (0..view.segments())
+                    .map(|i| view.segment(i))
+                    .map(|s| (s.slot, s.n_rows))
+                    .collect();
+                let mut steps = observed.lock().unwrap();
+                if steps.is_empty() {
+                    closer.close();
+                    let _ = held.send(());
+                }
+                steps.push(segments);
+            })
     });
     let long_run = start(&e.rt, request(&long, Some(20))).unwrap();
-    let deadline = Instant::now() + LIMIT;
-    while e.snapshot().counters.steps_paused < 1 {
-        assert!(Instant::now() < deadline, "the step never paused");
-        std::thread::sleep(Duration::from_micros(200));
-    }
-    let at_start = e.snapshot().counters.steps_paused;
+    first_piece.recv_timeout(LIMIT).expect("the long prompt never ran");
     let short_run = start(&e.rt, request(&short, Some(5))).unwrap();
+    gate.open();
     let short_done = short_run.finish();
-    // A step of the long prompt pauses `pieces - 1` times before its rows are done; the
-    // short request ran between its pieces, a round of its own for a piece of the long one.
-    let paused = e.snapshot().counters.steps_paused - at_start;
     let long_done = long_run.finish();
-    assert!(paused < u64::from(pieces) / 2, "{paused} pauses while the short request ran");
+    // A step of the long prompt runs in `pieces` pieces; the short request ran between
+    // them, a round of its own for a piece of the long one.
+    let steps = seen.lock().unwrap().clone();
+    let first = steps[0][0];
+    assert!(first.1 > 16, "the first step is the long prompt's, which pauses: {first:?}");
+    let piece = |step: &Vec<(u32, u32)>| step.len() == 1 && step[0] == first;
+    let short_steps: Vec<usize> =
+        (0..steps.len()).filter(|&i| steps[i].iter().any(|s| s.0 != first.0)).collect();
+    let (begun, ended) = (short_steps[0], *short_steps.last().unwrap());
+    let paused = steps[begun..ended].iter().filter(|step| piece(step)).count();
+    assert!(paused < pieces as usize / 2, "{paused} pieces ran beside the short request");
+    let after = steps[ended..].iter().filter(|step| piece(step)).count();
+    assert!(after > 0, "the long prompt's step was done before the short request: {steps:?}");
     assert_eq!(short_done.text, fresh_run(shape, &short, 5).text);
     assert_eq!(long_done.text, fresh_run(shape, &long, 20).text);
     e.consistent();
@@ -1169,6 +1252,85 @@ fn a_long_prompt_beside_generation_is_read_in_wide_steps_that_pause() {
     );
     assert_eq!(long_done.text, fresh_run(shape, &long, 20).text);
     assert_eq!(format!("{head}{}", generated.text), fresh_run(shape, &first, 400).text);
+    e.consistent();
+}
+
+/// Long prompts that come together while nothing generates, on a model that reads a wide
+/// prompt layer by layer (2026-11-25: the planner put two prompts into one step as wide as
+/// a prompt read alone, which such a model refuses, and the engine failed): the prompt the
+/// planner reads first is read alone in wide steps and the other after it, and a long
+/// prompt that comes while another's wide step is paused is read in pieces of the own rows
+/// until that step is done. No step wider than the own rows holds two prompts or runs
+/// beside a paused one (the executor notes both), and every request answers as it does
+/// alone.
+#[test]
+fn long_prompts_that_come_together_are_read_one_at_a_time() {
+    let mut rng = Rng(15);
+    let (a, b, c, d) = (rng.prompt(240), rng.prompt(200), rng.prompt(220), rng.prompt(260));
+    let shape = |c: &mut SyntheticConfig| {
+        c.own_rows = 16;
+        c.pauses_wide_steps = true;
+    };
+    let model = model(Some(CHECKPOINT), shape);
+    // Per step: its rows and its segments.
+    let seen: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let observed = seen.clone();
+    let e = engine_with(&model, paused_config(), |host| {
+        host.with_pauses(16, 4).with_delay(Duration::from_millis(1)).with_observer(move |view| {
+            observed.lock().unwrap().push((view.rows(), view.segments()));
+        })
+    });
+    let first = start(&e.rt, request(&a, Some(20))).unwrap();
+    let second = start(&e.rt, request(&b, Some(20))).unwrap();
+    let (first, second) = (first.finish(), second.finish());
+    assert_eq!(first.text, fresh_run(shape, &a, 20).text);
+    assert_eq!(second.text, fresh_run(shape, &b, 20).text);
+    let steps = seen.lock().unwrap().clone();
+    assert!(steps.iter().any(|s| s.0 > 16 && s.1 == 1), "wide steps of one prompt: {steps:?}");
+    assert!(steps.iter().all(|s| s.0 <= 16 || s.1 == 1), "{steps:?}");
+
+    // A long prompt that comes while another's wide step is paused.
+    let paused = e.snapshot().counters.steps_paused;
+    let fourth = start(&e.rt, request(&d, Some(20))).unwrap();
+    let deadline = Instant::now() + LIMIT;
+    while e.snapshot().counters.steps_paused == paused {
+        assert!(Instant::now() < deadline, "the step never paused");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let third = run_one(&e.rt, request(&c, Some(20)));
+    let fourth = fourth.finish();
+    assert_eq!(third.text, fresh_run(shape, &c, 20).text);
+    assert_eq!(fourth.text, fresh_run(shape, &d, 20).text);
+    e.consistent();
+}
+
+/// Prompts that come together while nothing generates, such as the forks of a decision (one
+/// text and a question each), on a model with few rows of its own that does not pause its
+/// steps: they share steps within the own rows, and each answers as it does alone (the shape
+/// of `feat/jev`'s test of a decision's forks, which met the refusal of a wider step of
+/// several prompts on Flash-Next, 2026-11-25).
+#[test]
+fn prompts_that_come_together_share_steps_within_the_own_rows() {
+    let mut rng = Rng(21);
+    let text = rng.prompt(150);
+    let prompts: Vec<String> = (0..6).map(|_| format!("{text}{}", rng.prompt(10))).collect();
+    let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
+    let model = model(Some(CHECKPOINT), shape);
+    let seen: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let observed = seen.clone();
+    let e = engine_with(&model, config(256, 16), |host| {
+        host.with_observer(move |view| {
+            observed.lock().unwrap().push((view.rows(), view.segments()));
+        })
+    });
+    let started: Vec<_> =
+        prompts.iter().map(|prompt| start(&e.rt, request(prompt, Some(8))).unwrap()).collect();
+    for (handle, prompt) in started.into_iter().zip(&prompts) {
+        assert_eq!(handle.finish().text, fresh_run(shape, prompt, 8).text);
+    }
+    let steps = seen.lock().unwrap().clone();
+    assert!(steps.iter().any(|s| s.1 > 1), "they shared steps: {steps:?}");
+    assert!(steps.iter().all(|s| s.0 <= 16 || s.1 == 1), "{steps:?}");
     e.consistent();
 }
 
@@ -1240,8 +1402,12 @@ fn a_turn_after_saves_inside_a_step_replays_no_more_than_after_cut_steps() {
             c.inner_saves = true;
         };
         assert_eq!(run.text, fresh_run(shape, &second, 6).text, "{checkpoints} checkpoints");
+        // A model that saves inside its steps keeps its anchor at the page
+        // boundary, which a model cut at its checkpoints moves to the end of
+        // the prompt (less than a page further): the saves inside replay no
+        // more than the cuts and that.
         assert!(
-            inside <= cut,
+            inside <= cut + u64::from(PAGE),
             "{checkpoints} checkpoints: {inside} rows replayed after saves inside, {cut} after cuts"
         );
         e.consistent();
@@ -1311,13 +1477,14 @@ fn a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state
 
 /// Pages a model keeps in host memory (from page 4 on, [`FarPages`]: the K and V of a context
 /// beyond VRAM) that only the prompt cache holds once their request ended rank as prompt cache,
-/// the lowest user of the engine's RAM (the owner's rule of 2026-11-22). With a tier of experts
-/// that wants more than the limit leaves, they leave the devices as soon as the request ended,
-/// with nothing below the devices to keep them (no level on SSD here): the next request with
-/// the same prompt finds only the pages in VRAM. With a tier that wants little, they stay. The
-/// answers are the same either way.
+/// the lowest user of the engine's RAM (the owner's rule of 2026-11-22). As many of them as one
+/// request can hold are the prompt cache's floor (2026-11-25): a tier of experts that wants more
+/// than the limit leaves does not take them, and the next request with the same prompt finds
+/// them, as it does beside a tier that wants little (until 2026-11-25 they left the devices as
+/// soon as the request ended, and that request found only the pages in VRAM). The answers are
+/// the same either way.
 #[test]
-fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory() {
+fn far_pages_of_a_finished_request_stay_when_the_tier_of_experts_wants_the_memory() {
     let mut rng = Rng(31);
     let prompt = rng.prompt(10 * PAGE as usize + 3);
     let mut texts = Vec::new();
@@ -1335,13 +1502,19 @@ fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_m
         let cached_far = ram.context_cached();
         let again = e.ask(&prompt, 4);
         let found = again.run.usage.cached_prompt_tokens;
-        if hungry {
-            assert_eq!(cached_far, 0, "the far pages went");
-            assert_eq!(found, 4 * PAGE, "only the pages in VRAM stayed cached");
-        } else {
-            assert!(cached_far >= 6 << 20, "the far pages stayed: {cached_far}");
-            assert!(found >= 10 * PAGE, "the whole prompt stayed cached: {found}");
-        }
+        assert!(cached_far >= 6 << 20, "hungry {hungry}: the far pages stayed: {cached_far}");
+        assert!(found >= 10 * PAGE, "hungry {hungry}: the whole prompt stayed cached: {found}");
+        // Another prompt beside the far pages the floor keeps takes the one place for its
+        // own checkpoints (the far pages are no room for a place), so it too comes back
+        // from its last checkpoint and replays less than a page (beside a tier that wants
+        // little, the ranking of many places decides).
+        let other = Rng(32).prompt(10 * PAGE as usize + 5);
+        e.ask(&other, 4);
+        let replayed = e.snapshot().counters.replay_rows;
+        let next = e.ask(&other, 4);
+        let replayed = e.snapshot().counters.replay_rows - replayed;
+        assert!(next.run.usage.cached_prompt_tokens >= 10 * PAGE, "hungry {hungry}");
+        assert!(!hungry || replayed < u64::from(PAGE), "{replayed} rows replayed");
         assert_eq!(again.run.text, first.run.text, "hungry {hungry}");
         texts.push(first.run.text);
         e.consistent();
@@ -1391,11 +1564,11 @@ fn a_paused_pass_reports_the_share_it_has_done() {
     let (run, progress) = start(&e.rt, request(&prompt, Some(8))).unwrap().finish_with_progress();
     assert_eq!(run.text, fresh_run(shape, &prompt, 8).text, "as without pauses");
     let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
-    // The pass is the first 48 rows (the step ends at the last page before the
-    // prompt's end, where the cache keeps a checkpoint): the start, a report at
-    // each of its three pauses (a quarter of its rows more each), its end, and
-    // the end of the step of the last rows.
-    assert_eq!(said, [0, 12, 24, 36, 48, 60]);
+    // The pass is the first 59 rows (the step ends at the prompt's anchor, one
+    // cell before its end, where the cache keeps a checkpoint): the start, a
+    // report at each of its three pauses (a quarter of its rows more each,
+    // rounded), its end, and the end of the step of the last row.
+    assert_eq!(said, [0, 15, 30, 44, 59, 60]);
     e.consistent();
 }
 
@@ -1415,13 +1588,13 @@ fn a_long_step_reports_its_share_while_it_runs() {
     });
     let (_, progress) = start(&e.rt, request(&prompt, Some(4))).unwrap().finish_with_progress();
     let said: Vec<u32> = progress.iter().map(|p| p.processed).collect();
-    // The long step is the first 32 rows (it ends at the last page before the
-    // prompt's end): the start, nothing after one second (the model says nothing
-    // yet), two reports after two and three (as far as the share of its time), its
-    // end, and the end of the step of the last rows.
+    // The long step is the first 39 rows (it ends at the prompt's anchor, one
+    // cell before its end): the start, nothing after one second (the model says
+    // nothing yet), two reports after two and three (as far as the share of its
+    // time), its end, and the end of the step of the last row.
     assert_eq!(said.len(), 5, "{said:?}");
-    assert_eq!((said[0], said[3], said[4]), (0, 32, 40), "{said:?}");
-    assert!((15..=21).contains(&said[1]) && (24..=30).contains(&said[2]), "{said:?}");
+    assert_eq!((said[0], said[3], said[4]), (0, 39, 40), "{said:?}");
+    assert!((18..=25).contains(&said[1]) && (29..=36).contains(&said[2]), "{said:?}");
     let elapsed: Vec<u128> = progress.iter().map(|p| p.elapsed.as_millis()).collect();
     assert!(elapsed[1] >= 2000 && elapsed[2] >= 3000 && elapsed[3] >= 3600, "{elapsed:?}");
     e.consistent();

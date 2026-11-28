@@ -171,9 +171,27 @@ impl Runtime {
                 }
             })
             .map_err(|e| RuntimeError::Thread(format!("cannot start the conductor: {e}")))?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        // The watch begins with the warm-up's steps: a device that never ends
+        // one would hold the start for ever.
+        if let Some(limit) = watchdog {
+            watch(heartbeat, limit, running.clone(), failure.clone(), stuck.clone())?;
+        }
+        let ready = loop {
+            match ready_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ready) => break Some(ready),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(mpsc::RecvTimeoutError::Timeout) if stuck.load(Ordering::Acquire) => {
+                    // The conductor waits for the step and is left behind with
+                    // its devices, as after a step that hangs later.
+                    let why = failure.get().cloned().unwrap_or_default();
+                    return Err(RuntimeError::Thread(format!("the warm-up stopped: {why}")));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        };
+        match ready {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
                 let _ = thread.join();
                 return Err(match error {
                     ExecError::Device { device, message } => {
@@ -182,13 +200,10 @@ impl Runtime {
                     other => RuntimeError::Thread(other.to_string()),
                 });
             }
-            Err(_) => {
+            None => {
                 let _ = thread.join();
                 return Err(RuntimeError::Thread("the conductor ended while starting".into()));
             }
-        }
-        if let Some(limit) = watchdog {
-            watch(heartbeat, limit, running.clone(), failure.clone(), stuck.clone())?;
         }
         Ok(Self {
             model,
@@ -351,6 +366,7 @@ impl Runtime {
             stop: Watch::new(&request.stop, thinking),
             sampling: request.sampling,
             draft: request.draft,
+            cache: request.cache,
             filter,
             priority: request.priority,
             displace,
@@ -620,6 +636,10 @@ impl Engine for Runtime {
         self.failure.get().cloned()
     }
 
+    fn stuck(&self) -> bool {
+        self.stuck.load(Ordering::Acquire)
+    }
+
     fn end_thinking(&self, id: RequestId) -> Result<bool, EngineError> {
         self.ask(|reply| Command::EndThinking { id, reply })
             .ok_or_else(|| EngineError::Internal("the engine is not running".into()))
@@ -636,8 +656,9 @@ impl Engine for Runtime {
             drafts_accepted: c.drafts_accepted,
             requests_finished: c.requests_finished,
             requests_cancelled: c.requests_cancelled,
-            // Nothing is refused for lack of room: a request waits in line.
-            requests_refused: 0,
+            // A request waits in line for a place; it ends for lack of room
+            // only when the RAM limit has none for its K and V beyond VRAM.
+            requests_refused: c.requests_no_memory,
             requests_outranked: c.requests_outranked,
             requests_displaced: c.requests_displaced,
             prefix_hits: c.prefix_hits,
@@ -653,13 +674,13 @@ impl Engine for Runtime {
             cached_pages: snapshot.cached_pages,
             checkpoint_ram: snapshot.checkpoint_ram,
             experts: self.model.expert_stats().unwrap_or_default(),
+            cache_transfer_ns: c.cache_transfers.ns,
             ram: ares_api::RamCacheStats {
                 pages: c.ram.pages,
                 bytes: c.ram.bytes,
                 pages_in: c.ram.pages_in,
                 pages_read: c.ram.pages_read,
                 pages_dropped: c.ram.pages_dropped,
-                transfer_ns: c.ram.transfer_ns,
             },
             ssd: ares_api::SsdStats {
                 pages_written: c.ssd.pages_written,
@@ -670,7 +691,6 @@ impl Engine for Runtime {
                 checkpoints_read: c.ssd.states_read,
                 bytes_read: c.ssd.bytes_read,
                 read_ns: c.ssd.read_ns,
-                transfer_ns: c.ssd.transfer_ns,
                 store_bytes: c.ssd.store_bytes,
                 pending: c.ssd.pending,
                 checkpoints_skipped: c.ssd.states_skipped,

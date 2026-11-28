@@ -10,11 +10,29 @@ use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
+use crate::models::AcquireError;
 use crate::routes::{App, model_in_query, wanted};
+
+/// The gauge that says whether the model is loaded: the one metric of a
+/// model that is not, which has no engine to count.
+fn loaded_gauge(loaded: bool) -> String {
+    format!(
+        "# HELP ares_model_loaded Whether the model is loaded (its counters start again at a \
+         load)\n# TYPE ares_model_loaded gauge\nares_model_loaded {}\n",
+        u8::from(loaded)
+    )
+}
+
+fn text(body: String) -> Response {
+    ([(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))], body)
+        .into_response()
+}
 
 /// `GET /metrics`: what an engine has done and holds, in the text format
 /// monitoring systems scrape. The engine is the one of `?model=<id>`, or of
-/// the only model there is; a model that is not loaded has none.
+/// the only model there is. A model that is not loaded has none: it answers
+/// with `ares_model_loaded 0` alone, so that a scraper does not take the
+/// server for down.
 pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Response {
     let name = match wanted(&app, model_in_query(request.uri().query())) {
         Ok(name) => name,
@@ -22,6 +40,7 @@ pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Respons
     };
     let lease = match app.models.loaded(&name).await {
         Ok(lease) => lease,
+        Err(AcquireError::NotLoaded { .. }) => return text(loaded_gauge(false)),
         Err(error) => return ApiError::from(error).into_response(),
     };
     // The engine may wait for the end of its step before it answers.
@@ -29,11 +48,7 @@ pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Respons
     let stats = tokio::task::spawn_blocking(move || lease.engine().stats()).await.ok().flatten();
     let latency = &latency.latency;
     match stats {
-        Some(stats) => (
-            [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
-            stats_text(&stats) + &latency.render(),
-        )
-            .into_response(),
+        Some(stats) => text(loaded_gauge(true) + &stats_text(&stats) + &latency.render()),
         None => ApiError::unsupported("the engine keeps no statistics").into_response(),
     }
 }
@@ -41,7 +56,14 @@ pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Respons
 /// The counters and gauges of `GET /metrics`.
 fn stats_text(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 65] = [
+    let rows: [(&str, &str, &str, u64); 68] = [
+        (
+            "cache_transfer_nanoseconds_total",
+            "counter",
+            "Time the step loop waited while the prompt cache moved state between the devices \
+             and host memory, for RAM and the SSD alike",
+            stats.cache_transfer_ns,
+        ),
         (
             "cache_ram_pages",
             "gauge",
@@ -66,12 +88,6 @@ fn stats_text(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Pages worth keeping that the prompt cache in RAM gave up unwritten",
             ram.pages_dropped,
-        ),
-        (
-            "cache_ram_transfer_nanoseconds_total",
-            "counter",
-            "Time the step loop waited while pages moved between the devices and RAM",
-            ram.transfer_ns,
         ),
         (
             "cache_ssd_pages_written_total",
@@ -120,12 +136,6 @@ fn stats_text(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Time the prompt cache's readers spent reading and checking, summed",
             ssd.read_ns,
-        ),
-        (
-            "cache_ssd_transfer_nanoseconds_total",
-            "counter",
-            "Time the step loop waited while cached state moved between devices and host",
-            ssd.transfer_ns,
         ),
         ("cache_ssd_bytes", "gauge", "Bytes the model's store takes on SSD", ssd.store_bytes),
         (
@@ -298,6 +308,30 @@ fn stats_text(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Time layers waited for the experts they missed, summed over layers",
             stats.experts.wait_us,
+        ),
+        (
+            "expert_wait_cpu_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for the CPU's sums",
+            stats.experts.wait_last_us[0],
+        ),
+        (
+            "expert_wait_ram_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for an upload from RAM",
+            stats.experts.wait_last_us[1],
+        ),
+        (
+            "expert_wait_file_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for a read of the file",
+            stats.experts.wait_last_us[2],
+        ),
+        (
+            "expert_wait_on_its_way_microseconds_total",
+            "counter",
+            "Wait of decode steps whose layers waited last for an expert on its way",
+            stats.experts.wait_last_us[3],
         ),
         (
             "expert_predicted_total",

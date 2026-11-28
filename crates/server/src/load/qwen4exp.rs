@@ -27,9 +27,9 @@ use ares_cuda::{CacheFormat, Device};
 use ares_gguf::Gguf;
 use ares_model::qwen3vl::Projector;
 use ares_model::qwen4exp::device::{
-    ModelOptions, Options, Placement, PruneSetup, Qwen4Exp, RoleMemory, Spread, TensorChoice,
-    batch_rows, drafter_bytes, page_parts, place, profile_key, reads_layer_by_layer, slot_floors,
-    step_rows,
+    ModelOptions, OpenError, Options, Placement, PruneSetup, Qwen4Exp, RoleMemory, Spread,
+    TensorChoice, batch_rows, drafter_bytes, page_parts, place, profile_key, reads_layer_by_layer,
+    slot_floors, step_rows,
 };
 use ares_model::qwen4exp::weights::MTP_ARCHITECTURE;
 use ares_model::qwen4exp::{Config, MtpWeights};
@@ -524,14 +524,13 @@ impl Planning<'_> {
 
     /// A placement's error, named by the split that was asked; one that does
     /// not fit is, next to other models, no room.
-    fn named_split(&self, e: impl ToString) -> LoadError {
-        let e = e.to_string();
-        let fits = !e.contains("does not fit");
+    fn named_split(&self, e: OpenError) -> LoadError {
+        let no_room = e.is_no_room();
         let error = LoadError::Model(match self.options.split {
             Some(kind) => format!("--split {}: {e}", kind.name()),
-            None => e,
+            None => e.to_string(),
         });
-        if fits { error } else { short(self.site, error) }
+        if no_room { short(self.site, error) } else { error }
     }
 
     /// Where the model opened with `opts` goes, and what a page takes on each

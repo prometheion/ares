@@ -526,6 +526,7 @@ fn a_signal_lets_a_running_request_finish_and_then_stops_in_order() {
     let status = server.wait_exit();
     let log = server.logged().join("\n");
     assert!(status.success(), "{status:?}\n{log}");
+    assert!(!log.contains("panicked"), "a panic on the way: {log}");
     assert!(log.contains("released"), "the device is given back: {log}");
     assert!(log.contains("threads joined, devices released"), "{log}");
     assert!(log.contains("running=false"), "the engine's threads have ended: {log}");
@@ -557,6 +558,7 @@ fn a_second_signal_ends_a_running_request_and_still_stops_in_order() {
     let status = server.wait_exit();
     let log = server.logged().join("\n");
     assert!(status.success(), "a stop that was asked for twice is still a clean one: {log}");
+    assert!(!log.contains("panicked"), "a panic on the way: {log}");
     assert!(log.contains("the server is stopping: ending the request"), "{log}");
     assert!(log.contains("threads joined, devices released"), "{log}");
     assert!(log.contains("running=false"), "{log}");

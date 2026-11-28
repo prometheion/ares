@@ -97,6 +97,19 @@ pub enum OpenError {
     Choice(String),
 }
 
+impl OpenError {
+    /// Whether the model cannot be opened for lack of memory (a placement
+    /// that does not fit, an allocation the driver refused): next to other
+    /// models, unloading one may make room.
+    pub fn is_no_room(&self) -> bool {
+        match self {
+            Self::Device(e) => e.is_no_room(),
+            Self::Model(e) => e.is_no_room(),
+            Self::File(_) | Self::Choice(_) => false,
+        }
+    }
+}
+
 /// A `qwen4exp` model file, placed.
 pub struct Qwen4Exp {
     gguf: Arc<Gguf>,
@@ -558,6 +571,9 @@ impl Qwen4Exp {
         totals.demand_reads += stats.demand_reads;
         totals.demand_read_us += (stats.demand_read_ms * 1e3) as u64;
         totals.wait_us += (stats.wait_ms * 1e3) as u64;
+        for (total, ms) in totals.wait_last_us.iter_mut().zip(stats.wait_last_ms) {
+            *total += (ms * 1e3) as u64;
+        }
         totals.predicted += stats.predicted;
         totals.predicted_picked += stats.predicted_picked;
         // Wide steps read their predicted picks ahead through transit's guesses.
@@ -846,6 +862,13 @@ impl Model for Qwen4Exp {
 
     fn far_pages(&self) -> Option<FarPages> {
         self.far
+    }
+
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        match self.flow.get() {
+            Some(flow) => flow.make_room(live),
+            None => Ok(0),
+        }
     }
 
     fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {

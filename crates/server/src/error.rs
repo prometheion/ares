@@ -26,6 +26,10 @@ pub(crate) struct ApiError {
 }
 
 const INVALID_REQUEST: &str = "invalid_request_error";
+
+/// The seconds a client is asked to wait before it tries again while the
+/// server restarts in place (`Retry-After`): about what a load takes.
+const RESTART_RETRY_AFTER: u32 = 10;
 const SERVER_ERROR: &str = "server_error";
 
 impl ApiError {
@@ -159,6 +163,21 @@ impl ApiError {
         }
     }
 
+    /// The server found an engine stuck in a step and restarts in place: the
+    /// request is not served, and the same address answers again once the
+    /// new image of the server has loaded its model.
+    pub fn restarting(reason: &str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "the server restarts in place: {reason}; retry once it has loaded the model again"
+            ),
+            code: "restarting",
+            retry_after: Some(RESTART_RETRY_AFTER),
+            ..Self::internal("")
+        }
+    }
+
     /// The bounded event queue of the request overflowed.
     pub fn slow_client() -> Self {
         Self {
@@ -216,6 +235,14 @@ impl ApiError {
                 ..Self::internal(message)
             },
             EngineError::Unsupported(_) => Self::unsupported(message),
+            // The request found no room in the engine's memory limit (`--ram`) and
+            // ended; the model serves on.
+            EngineError::NoMemory(_) => Self {
+                status: StatusCode::INSUFFICIENT_STORAGE,
+                code: "insufficient_memory",
+                retry_after: Some(1),
+                ..Self::internal(message)
+            },
             EngineError::Internal(_) => Self::internal(message),
         }
     }
@@ -273,6 +300,7 @@ impl From<crate::models::AcquireError> for ApiError {
                 ..Self::internal(format!("the model '{model}' is not loaded"))
             },
             AcquireError::Stopping => Self::cancelled(),
+            AcquireError::Restarting { reason } => Self::restarting(&reason),
         }
     }
 }

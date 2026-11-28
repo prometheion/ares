@@ -309,6 +309,10 @@ pub struct Counters {
     /// Requests that ended because the pool had no page left for them and
     /// nobody else was left to give way.
     pub requests_exhausted: u64,
+    /// Requests that ended because the RAM limit had no room for their K and
+    /// V beyond VRAM, with the prompt cache given up and the tier of experts
+    /// as small as it goes.
+    pub requests_no_memory: u64,
     /// Draft rows that were dropped from a step because their pages did not
     /// fit.
     pub draft_rows_cut: u64,
@@ -339,6 +343,9 @@ pub struct Counters {
     /// the engine started (a reset leaves them), and what they hold.
     pub ram: crate::RamCounters,
     pub ssd: crate::SsdCounters,
+    /// The transfers between the devices and host memory both levels
+    /// carried out, counted once.
+    pub cache_transfers: crate::TransferCounters,
     /// How the conductor's waits for the devices ended.
     pub conductor_wakes: crate::sync::WakeCounts,
     /// How the device threads' waits for work ended.
@@ -629,16 +636,8 @@ impl fmt::Display for Snapshot {
             writeln!(
                 f,
                 "prefix cache in RAM: {} pages and {} checkpoints in {} bytes; {} pages came \
-                 from the devices, {} went back, {} were dropped unwritten; {} transfers took \
-                 {:.1} ms",
-                r.pages,
-                r.checkpoints,
-                r.bytes,
-                r.pages_in,
-                r.pages_read,
-                r.pages_dropped,
-                r.transfers,
-                r.transfer_ns as f64 / 1e6
+                 from the devices, {} went back, {} were dropped unwritten",
+                r.pages, r.checkpoints, r.bytes, r.pages_in, r.pages_read, r.pages_dropped,
             )?;
         }
         if let Some(why) = &self.ssd_problem {
@@ -651,7 +650,7 @@ impl fmt::Display for Snapshot {
                 "prefix cache on SSD: {} pages and {} checkpoints written ({} bytes, {} failed, \
                  {} checkpoints skipped, {} waiting), {} pages and {} checkpoints read ({} \
                  bytes) in {} runs ({} cut); the store holds {} pages and {} checkpoints in {} \
-                 bytes; {} transfers took {:.1} ms",
+                 bytes",
                 s.pages_written,
                 s.states_written,
                 s.bytes_written,
@@ -666,8 +665,15 @@ impl fmt::Display for Snapshot {
                 s.store_pages,
                 s.store_states,
                 s.store_bytes,
-                s.transfers,
-                s.transfer_ns as f64 / 1e6
+            )?;
+        }
+        if c.ram.enabled || c.ssd.enabled {
+            let t = &c.cache_transfers;
+            writeln!(
+                f,
+                "prefix cache below the devices: {} batches of transfers took {:.1} ms",
+                t.batches,
+                t.ns as f64 / 1e6
             )?;
         }
         writeln!(

@@ -25,6 +25,7 @@
 
 mod devices;
 mod files;
+mod host;
 mod products;
 mod qwen35;
 mod qwen4exp;
@@ -368,6 +369,7 @@ fn load_until(
         ares_model::qwen4exp::config::ARCHITECTURE => {
             qwen4exp::load(gguf, options, site, stop, begun)
         }
+        host::ARCHITECTURE => host::load(options, begun),
         _ => Err(LoadError::Architecture(architecture)),
     }
 }

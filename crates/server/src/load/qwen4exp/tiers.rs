@@ -176,6 +176,7 @@ fn warm_up(runtime: &Runtime, model: &str, stop: &AtomicBool) -> Result<f64, Loa
         max_tokens: Some(32),
         stop: Vec::new(),
         draft: true,
+        cache: true,
         structure: None,
         priority: 0,
         id: RequestId(0),

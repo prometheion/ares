@@ -193,6 +193,23 @@ pub enum ModelError {
     /// waited for will not happen.
     #[error("another device failed in the same step")]
     Aborted,
+    /// The devices have no room for what is asked of them (a placement whose
+    /// share does not fit its budget): next to other models, unloading one
+    /// may make it.
+    #[error("{0}")]
+    NoRoom(String),
+}
+
+impl ModelError {
+    /// Whether the error is a lack of memory: no room in a placement or a
+    /// budget, or an allocation the driver refused.
+    pub fn is_no_room(&self) -> bool {
+        match self {
+            Self::NoRoom(_) | Self::Memory(_) => true,
+            Self::Cuda(e) => e.is_out_of_memory(),
+            Self::Invalid(_) | Self::Aborted => false,
+        }
+    }
 }
 
 /// What a model offers the prefix cache: its device side carries out the
@@ -762,6 +779,22 @@ pub trait Model: Send + Sync + 'static {
     /// thread of the part that failed, once, and not for a part that is open.
     fn abandon(&self, part: usize) {
         let _ = part;
+    }
+
+    /// The K and V beyond VRAM of the pool pages `live` (a flag per pool
+    /// page: held by a sequence or by the prompt cache) are about to be in
+    /// use: the model locks what they need in host memory and gives back what
+    /// no page in use needs, before the conductor writes the next step. The
+    /// elastic users above the prompt cache give what their allowances no
+    /// longer hold (the tier of experts, down to its floor). Returns the bytes
+    /// the RAM limit still lacks, 0 when it had room: the conductor then makes
+    /// the prompt cache give up what it holds and asks again, and ends a
+    /// request when nothing more can go, so that no step fails for it. Called
+    /// on the conductor's thread while no step runs; a model without state in
+    /// host memory has nothing to do.
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        let _ = live;
+        Ok(0)
     }
 
     /// The step of `record` is about to be handed to the devices: the place

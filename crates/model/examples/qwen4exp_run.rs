@@ -9,10 +9,10 @@
 //!     [--placement] [--read-time] [--profile A.q4route,B.q4route]
 //!     [--check DIR/NAME,...] [--chat] [--generate 64]
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
-//!     [--decode-steps 64]
+//!     [--decode-steps 64] [--every 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
 //!     [--read-ahead on|off] [--predict 2] [--fingerprint FILE] [--kv q8,q8]
-//!     [--near-pages N]
+//!     [--near-pages N] [--cpu-workers N]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -41,7 +41,9 @@
 //! - `--decode-at N`: milliseconds per decode step with `N` tokens of the
 //!   text as the context; `--breakdown` adds device time by kind (the
 //!   timed events cost a part of a step themselves, so steps are measured
-//!   both ways).
+//!   both ways). `--every K` prints a line per `K` steps of the untimed ones: the
+//!   share of picks in VRAM, the misses, the reads of the file and the median step, to
+//!   see how the tiers follow the text the model writes.
 //! - `--prefill N`: reads `N` tokens of `--text` from an empty sequence and
 //!   reports tokens per second, in steps of `--rows` rows (default 8, the decode
 //!   kernels' limit; more runs the many-row kernels and reports what the wide steps
@@ -70,6 +72,9 @@
 //! - `--serve`: how an expert that is in no slot is served: `model` lets the
 //!   store's measured costs decide between an upload and the CPU (what the
 //!   engine does), `stream` uploads every one, `cpu` computes every one.
+//! - `--cpu-workers N`: `N` CPU workers that the scheduler places, instead of one
+//!   on every core but the host thread's: to measure what the workers' cores cost the
+//!   threads that drive the step and read the file.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,7 +86,7 @@ use ares_model::qwen4exp::device::{
     Spread, TensorChoice, Wanted, read_time,
 };
 use ares_model::qwen4exp::{Config, Weights};
-use ares_runtime::expert_store::{Serve, StoreStats};
+use ares_runtime::expert_store::{Serve, StoreStats, WAITED_FOR};
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
 
 type AnyError = Box<dyn std::error::Error>;
@@ -111,6 +116,7 @@ struct Args {
     text_file: Vec<String>,
     decode_at: Vec<usize>,
     decode_steps: usize,
+    every: usize,
     prefill: usize,
     repeat: usize,
     rows: u32,
@@ -123,6 +129,7 @@ struct Args {
     fingerprint: Option<String>,
     kv: (CacheFormat, CacheFormat),
     near_pages: Option<u32>,
+    cpu_workers: Option<usize>,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -150,6 +157,7 @@ fn parse() -> Result<Args, AnyError> {
         text_file: Vec::new(),
         decode_at: Vec::new(),
         decode_steps: 64,
+        every: 0,
         prefill: 0,
         repeat: 1,
         rows: 8,
@@ -162,6 +170,7 @@ fn parse() -> Result<Args, AnyError> {
         fingerprint: None,
         kv: (CacheFormat::Q8, CacheFormat::Q8),
         near_pages: None,
+        cpu_workers: None,
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -205,6 +214,7 @@ fn parse() -> Result<Args, AnyError> {
                     list(value()?).iter().map(|d| d.parse()).collect::<Result<_, _>>()?
             }
             "--decode-steps" => args.decode_steps = value()?.parse()?,
+            "--every" => args.every = value()?.parse()?,
             "--prefill" => args.prefill = value()?.parse()?,
             "--rows" => args.rows = value()?.parse()?,
             "--repeat" => args.repeat = value()?.parse()?,
@@ -234,6 +244,7 @@ fn parse() -> Result<Args, AnyError> {
                 }
             }
             "--predict" => args.predict = value()?.parse()?,
+            "--cpu-workers" => args.cpu_workers = Some(value()?.parse()?),
             "--serve" => {
                 args.serve = match value()?.as_str() {
                     "stream" => Serve::Stream,
@@ -358,6 +369,25 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
         stats.disk_miss_ms.iter().chain(&stats.ahead_miss_ms).map(|ms| f64::from(*ms)).sum::<f64>()
             / steps.max(1) as f64,
     )
+}
+
+/// What the layers that waited for misses waited for last, per step: the CPU's sums, an
+/// upload from RAM, a read of the file, an expert on its way.
+fn wait_line(stats: &StoreStats, steps: usize) -> String {
+    let per = |x: f64| x / steps.max(1) as f64;
+    let kinds: Vec<String> = WAITED_FOR
+        .iter()
+        .zip(stats.wait_last_ms.iter().zip(&stats.waits_last))
+        .map(|(name, (ms, n))| {
+            format!(
+                "{name} {:.2} ms in {:.1} layers ({:.3} ms a layer)",
+                per(*ms),
+                per(*n as f64),
+                ms / (*n).max(1) as f64
+            )
+        })
+        .collect();
+    format!("waits per step by what a layer waited for last: {}", kinds.join(", "))
 }
 
 /// Where the time of a miss from the file goes: the reader's latency of a demand read
@@ -616,6 +646,7 @@ fn run() -> Result<(), AnyError> {
         stall: Duration::from_secs(args.stall_s),
         transit: args.transit,
         read_ahead: args.read_ahead,
+        cpu_workers: args.cpu_workers,
         ..ModelOptions::default()
     };
     let opts = SessionOptions {
@@ -1062,6 +1093,8 @@ fn run() -> Result<(), AnyError> {
             let mut host = [Duration::ZERO; 4];
             let mut ms = Vec::new();
             let mut kinds: Vec<StepKind> = Vec::new();
+            // Picks and hits since the last `--every` line.
+            let mut window = (0u64, 0u64);
             let first = tokens.len() - 1;
             for _ in 0..args.decode_steps {
                 let before = session.store().stats().clone();
@@ -1082,6 +1115,24 @@ fn run() -> Result<(), AnyError> {
                     from_file: after.miss_from_disk - before.miss_from_disk,
                     rows_ms: time.rows.as_secs_f64() * 1e3,
                 });
+                window.0 += after.picks - before.picks;
+                window.1 += after.hits - before.hits;
+                if !timed && args.every > 0 && kinds.len().is_multiple_of(args.every) {
+                    let last = &kinds[kinds.len() - args.every..];
+                    let mut ms: Vec<f64> = last.iter().map(|k| k.ms).collect();
+                    let n = args.every as f64;
+                    println!(
+                        "  steps {}-{}: {:.1} % of picks in VRAM, {:.1} misses and {:.1} reads of \
+                         the file a step, median {:.2} ms",
+                        kinds.len() - args.every + 1,
+                        kinds.len(),
+                        100.0 * window.1 as f64 / window.0.max(1) as f64,
+                        last.iter().map(|k| k.misses as f64).sum::<f64>() / n,
+                        last.iter().map(|k| k.from_file as f64).sum::<f64>() / n,
+                        median(&mut ms),
+                    );
+                    window = (0, 0);
+                }
                 for (total, part) in
                     host.iter_mut().zip([time.prepare, time.rows, time.enqueue, time.wait])
                 {
@@ -1114,6 +1165,7 @@ fn run() -> Result<(), AnyError> {
                 if timed { ", with timed events" } else { "" },
             );
             println!("  store: {}", store_line(&stats, ms.len()));
+            println!("  {}", wait_line(&stats, ms.len()));
             println!("  drive: {}", drive_line(&stats, &session));
             println!("{}", step_classes(&kinds));
             if timed {

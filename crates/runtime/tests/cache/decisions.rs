@@ -212,6 +212,7 @@ fn every_question_is_answered_as_its_prompt_alone_from_one_computation_of_the_st
                 max_tokens: Some(1),
                 stop: Vec::new(),
                 draft: false,
+                cache: true,
                 structure: None,
                 priority: 0,
                 id: fresh_id(),

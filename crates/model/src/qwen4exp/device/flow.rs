@@ -263,7 +263,13 @@ impl Flow {
                 }
                 pages.get(near as usize..).unwrap_or(&[]).to_vec()
             };
-            self.lock_far(&mut feed, &live)?;
+            if let Some(short) = self.lock_far(&mut feed, &live, FAR_WAIT)? {
+                return Err(invalid(format!(
+                    "the RAM limit has no room for {} more of K and V beyond VRAM: {}",
+                    Bytes(short),
+                    self.ram.who_holds()
+                )));
+            }
         }
         // The number `begin` knows the step by (see `Qwen4ExpDevice::enqueue_step`).
         self.prepared.store(u64::from(record.step()) + 1, Ordering::Release);
@@ -271,6 +277,29 @@ impl Flow {
             feed.store.grow_ram(1).map_err(|e| invalid(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// The K and V beyond VRAM of the pool pages `live` (a flag per pool page) are
+    /// about to be in use: the pieces of the far pools they lie in are locked and the
+    /// others given back, the tier of experts giving what its allowance no longer
+    /// holds ([`Flow::lock_far`]). Returns the bytes the RAM limit still lacks (0:
+    /// room enough) for the conductor, which makes the prompt cache give way and
+    /// asks again, or ends a request ([`ares_runtime::Model::make_room`]). The pages
+    /// in use from now on are those of `live`, as a record's tables would name them.
+    pub(super) fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        let Some(near) =
+            self.far.first().map(|pool| pool.lock().unwrap_or_else(|e| e.into_inner()).near())
+        else {
+            return Ok(0);
+        };
+        let mut feed = self.lock_feed();
+        let far = {
+            let mut pages = self.pages_live.lock().unwrap_or_else(|e| e.into_inner());
+            pages.clear();
+            pages.extend_from_slice(live);
+            pages.get(near as usize..).unwrap_or(&[]).to_vec()
+        };
+        Ok(self.lock_far(&mut feed, &far, Duration::ZERO)?.unwrap_or(0))
     }
 
     /// Pool page `page` came in by a transfer: it is in use from now on,
@@ -349,17 +378,27 @@ impl Flow {
 
     /// Locks the pieces of every far pool that hold far pages in use (`live`,
     /// a flag per far slot) and gives back the others, between steps (from
-    /// [`Flow::before_step`]), with the store not in a step. The tier of
-    /// experts gives up what the RAM limit has no room for: a running
-    /// sequence's K and V rank above it (see "Host memory" in
-    /// `docs/dev/architecture/host-memory.md`).
-    fn lock_far(&self, feed: &mut Feed, live: &[bool]) -> Result<(), ModelError> {
+    /// [`Flow::make_room`] and [`Flow::before_step`]), with the store not in a
+    /// step. The tier of experts gives up what its allowance no longer holds: a
+    /// running sequence's K and V rank above it (see "Host memory" in
+    /// `docs/dev/architecture/host-memory.md`); what the prompt cache holds
+    /// beyond its allowance is the conductor's to give. Once all is locked, a
+    /// tier above its allowance gives the difference too: the K and V may have
+    /// taken room that was free for the prompt cache's floor. Returns the bytes
+    /// the limit still lacks once the tier holds no more than its allowance (or
+    /// has nothing more to give) and `wait` has passed, `None` when all is locked.
+    fn lock_far(
+        &self,
+        feed: &mut Feed,
+        live: &[bool],
+        wait: Duration,
+    ) -> Result<Option<u64>, ModelError> {
         if self.far.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut last = self.far_live.lock().unwrap_or_else(|e| e.into_inner());
         if last.as_slice() == live {
-            return Ok(());
+            return Ok(None);
         }
         let mut pools: Vec<_> =
             self.far.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner())).collect();
@@ -382,29 +421,52 @@ impl Flow {
                 None => break,
                 Some(Err(error)) => return Err(error),
                 Some(Ok(short)) => {
-                    if started.elapsed() > FAR_WAIT {
-                        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
-                        return Err(invalid(format!(
-                            "the RAM limit has no room for {} more of K and V beyond VRAM: the \
-                             tier of experts is at its floor and the prompt cache holds the rest",
-                            Bytes(short.0)
-                        )));
-                    }
-                    // The tier gives up what its allowance no longer has room for.
-                    feed.store.set_ram_target(self.ram.experts_allowance());
-                    feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
+                    // The tier gives up what its allowance no longer has room for. It
+                    // tries again what it found busy before: what is free now goes.
+                    let allowance = self.ram.experts_allowance();
+                    feed.store.set_ram_target(allowance);
+                    feed.store.retry_floor();
+                    let given = feed
+                        .store
+                        .shrink_ram(FAR_SHRINK_WAIT)
+                        .map_err(|e| invalid(e.to_string()))?;
                     drop(feed.store.take_released());
                     if feed.store.ram_at_floor() {
                         self.ram.experts_floor(feed.store.ram_bytes().0);
                     }
                     self.ram.sweep_checkpoints();
+                    // Nothing more comes from the tier: it holds no more than its
+                    // allowance, or has nothing left it can give. What the limit
+                    // lacks then is the prompt cache's to give (the conductor's), or
+                    // no one's.
+                    let settled = given == 0
+                        && (feed.store.ram_bytes().0 <= allowance || feed.store.ram_at_floor());
+                    if (settled && started.elapsed() >= wait) || started.elapsed() > FAR_WAIT {
+                        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+                        return Ok(Some(short.0));
+                    }
                 }
             }
         }
-        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+        let now: u64 = pools.iter().map(|p| p.locked()).sum();
+        self.ram.set_context_target(now);
+        // K and V that found the room they took free leave the tier above its
+        // allowance when that room was the prompt cache's floor, such as the place
+        // of a checkpoint the step locks as it is handed over: the tier gives the
+        // difference now, before that lock (it waits for none).
+        let allowance = self.ram.experts_allowance();
+        if now > locked && feed.store.ram_bytes().0 > allowance {
+            feed.store.set_ram_target(allowance);
+            feed.store.retry_floor();
+            feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
+            drop(feed.store.take_released());
+            if feed.store.ram_at_floor() {
+                self.ram.experts_floor(feed.store.ram_bytes().0);
+            }
+        }
         last.clear();
         last.extend_from_slice(live);
-        Ok(())
+        Ok(None)
     }
 
     /// Lends every device the VRAM of a step wider than the parts' own

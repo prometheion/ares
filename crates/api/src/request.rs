@@ -68,6 +68,11 @@ pub struct GenerateRequest {
     /// Whether the engine may verify drafts for this request. `false` makes
     /// the request a plain one-token-per-step generation, to compare with.
     pub draft: bool,
+    /// Whether the request uses the prompt cache: starts from what it holds
+    /// of the prompt and leaves what it computed there. `false` (llama.cpp's
+    /// `cache_prompt: false`) computes the whole prompt and leaves nothing.
+    #[serde(default = "yes")]
+    pub cache: bool,
     /// A rule the reply must follow (a grammar, a JSON schema), or `None` for
     /// text that is free.
     pub structure: Option<Structure>,
@@ -78,6 +83,10 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub priority: i32,
     pub id: RequestId,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -108,6 +117,7 @@ mod tests {
             max_tokens: Some(16),
             stop: vec!["\n\n".into()],
             draft: true,
+            cache: false,
             structure: Some(Structure {
                 shape: Shape::JsonSchema(r#"{"type":"object"}"#.into()),
                 start: Start::AfterReasoning { open: None, close: "</think>".into() },

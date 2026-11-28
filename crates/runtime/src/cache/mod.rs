@@ -80,6 +80,16 @@ mod ram;
 mod ssd;
 
 pub use ram::RamCounters;
+
+/// The batches of transfers between the devices and host memory that the
+/// levels below the devices carried out (to RAM, from it, and through the
+/// buffers of the drive), and the nanoseconds the conductor waited for them.
+/// One batch can serve both levels; it is counted once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferCounters {
+    pub batches: u64,
+    pub ns: u64,
+}
 use ram::{Class, Entry, Held, Item, RamLevel};
 pub use ssd::{SsdConfig, SsdCounters};
 
@@ -246,6 +256,8 @@ pub(crate) struct Cache {
     /// Counts what was given up, so that waiting requests can tell their
     /// numbers are out of date.
     pub evictions: u64,
+    /// The transfers the levels below the devices carried out.
+    transfers: TransferCounters,
     /// What the model offers the levels below the devices.
     durable: Option<Durable>,
     /// The level in RAM, for a model that moves its pages to the host.
@@ -278,6 +290,12 @@ pub(crate) struct Cache {
     /// [`Model::far_pages`]: crate::Model::far_pages
     far: Option<FarPages>,
     far_held: u64,
+    /// The bytes of those far pages that are part of the cache's floor
+    /// ([`PinnedRam::keep_context_cached`]).
+    far_keep: u64,
+    /// The cache gives way to running sequences ([`Cache::give_way`]): what
+    /// leaves the devices finds no buffer in RAM.
+    giving_way: bool,
 }
 
 impl Cache {
@@ -367,16 +385,29 @@ impl Cache {
             page_copies: Vec::new(),
             scratch: Vec::new(),
             evictions: 0,
+            transfers: TransferCounters::default(),
             far: None,
             far_held: 0,
+            far_keep: 0,
+            giving_way: false,
         }
     }
 
     /// The model keeps the pool pages from `far.first` on in host memory:
     /// those only the index holds count as the prompt cache's and leave the
-    /// devices first when it must give memory back ([`Cache::trim`]).
-    pub(crate) fn with_far(mut self, far: Option<FarPages>) -> Self {
+    /// devices first when it must give memory back ([`Cache::trim`]). As many
+    /// of them as one request of `cells` cells holds beyond VRAM are part of
+    /// the cache's floor, which the tier of experts leaves it: the next turn of
+    /// a conversation finds them, and its last checkpoint is of use.
+    pub(crate) fn with_far(mut self, far: Option<FarPages>, cells: u32) -> Self {
         self.far = far;
+        if let Some(far) = far {
+            let pages = cells.div_ceil(self.cells_per_page.max(1));
+            self.far_keep = u64::from(pages.saturating_sub(far.first)) * far.page_bytes;
+        }
+        if let Some(books) = &self.books {
+            books.keep_context_cached(self.far_keep);
+        }
         self
     }
 
@@ -385,6 +416,15 @@ impl Cache {
     /// it ends, and is not cut ([`CheckpointPolicy::boundary_reach`]).
     pub(crate) fn with_reach(mut self, rows: u32) -> Self {
         self.policy.boundary_reach = rows;
+        self
+    }
+
+    /// The anchor of a prompt is the end of its last message, for a model
+    /// whose steps are cut at an anchor either way; one that saves the state
+    /// inside its steps keeps the page boundary, which it saves without a
+    /// cut ([`CheckpointPolicy::exact_anchor`]).
+    pub(crate) fn with_exact_anchor(mut self, exact: bool) -> Self {
+        self.policy.exact_anchor = exact;
         self
     }
 
@@ -475,11 +515,13 @@ impl Cache {
     }
 
     /// The policy with the budget the checkpoints have now: what the books
-    /// allow but the floor of pages, and never more than the budget the
-    /// places were counted for. Pages in RAM above their floor make room for
-    /// checkpoints, not the other way round.
+    /// allow but the floor of pages and the far pages the cache holds on the
+    /// devices (the floor keeps them: they are no room for a place), and never
+    /// more than the budget the places were counted for. Pages in RAM above
+    /// their floor make room for checkpoints, not the other way round.
     fn policy_now(&self) -> CheckpointPolicy {
-        let allowed = self.allowance().saturating_sub(self.page_floor);
+        let allowed =
+            self.allowance().saturating_sub(self.page_floor).saturating_sub(self.far_held);
         CheckpointPolicy { budget_bytes: self.policy.budget_bytes.min(allowed), ..self.policy }
     }
 
@@ -536,6 +578,13 @@ impl Cache {
         let looked = &tokens[..tokens.len() - 1];
         let mut found = self.index.lookup_chain(chain, looked);
         let mut brought = 0;
+        if exec.is_some() && found.computing.is_none() && self.ssd.is_some() {
+            // Pages of the prompt on their way from RAM to the drive come back
+            // to RAM first, so that the run below finds them.
+            let total = (looked.len() / self.cells_per_page as usize).min(chain.hashes().len());
+            let have = found.pages.len().min(total);
+            self.await_transit(&chain.hashes()[have..total]);
+        }
         if let (Some(exec), None) = (exec, found.computing) {
             brought = self.import_from_ram(pool, exec, chain, tokens, &found);
             if brought > 0 {
@@ -547,8 +596,18 @@ impl Cache {
         if self.ssd.is_some() && found.computing.is_none() {
             let total = looked.len() / self.cells_per_page as usize;
             let owner = self.import_owner();
+            // Where the cache can resume already: what comes back must lie deeper.
+            let beyond = match self.recurrent {
+                true => {
+                    let resume = self.policy.resume(&found, tokens.len() as u64);
+                    if resume.restore.is_some() { resume.replay.start } else { 0 }
+                }
+                false => found.cells(self.cells_per_page),
+            };
+            let (cells, have) = (u64::from(self.cells_per_page), found.pages.len());
             let ssd = self.ssd.as_mut().expect("checked above");
-            found.computing = ssd.want(&mut self.index, chain, found.pages.len(), total, owner);
+            found.computing =
+                ssd.want(&mut self.index, chain, looked, cells, have, total, beyond, owner);
         }
         let cached = found.cells(self.cells_per_page).min(tokens.len() as u64);
         let resume = if self.recurrent {
@@ -595,6 +654,11 @@ impl Cache {
     /// tails: for the counters.
     pub(crate) fn ram_counters(&self) -> RamCounters {
         self.in_ram.as_ref().map_or_else(RamCounters::default, RamLevel::snapshot)
+    }
+
+    /// The transfers of the levels below the devices, counted once.
+    pub(crate) fn transfer_counters(&self) -> TransferCounters {
+        self.transfers
     }
 
     /// Writes the copies for this record and starts the next ones afresh.

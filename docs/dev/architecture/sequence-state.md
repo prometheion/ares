@@ -67,8 +67,24 @@ one array per part, indexed by page number.
     spacing; ExLlamaV3 has 32 768), while generating at least 2 048, measured
     from the last checkpoint on the sequence's own path; always at the
     prompt's anchor, the last page boundary at least one row before the
-    prompt's end, where the next turn of a conversation resumes; and the live
-    state at the end of a request becomes the checkpoint of its tail. The
+    prompt's end, where the next turn of a conversation resumes, or, where the
+    step that reaches that boundary is cut there and reaches the end of the
+    prompt's last message too, that end (one cell before the prompt's end for
+    a prompt without messages; the owner's decision, 2026-11-25), on a tail of
+    the cells after the boundary that the commit publishes there (the
+    sequence writes on in a copy of the page, so the tail is off its path and
+    the spacing counts on from the boundary). The exact end only takes the
+    place of a cut at the boundary, so it costs no step: a prompt shorter
+    than a page, a step that ends at the boundary anyway and a turn that
+    resumed past it are not cut for it, and a model that saves inside its
+    steps (Flash-Next reading a prompt layer by layer) keeps the boundary.
+    The same prompt again then computes only what the template writes after
+    its last message; and the live state at the end of a request becomes the
+    checkpoint of its tail. Such tails go to the drive with their states
+    (`prompt-cache.md`). A lookup that passes a page which goes on from a tail
+    with a state (`PrefixMatch::inside`) resumes from that state when it is
+    the deepest, and a tail shared whole with a state wins over a longer one
+    shared in part. The
     commit takes a checkpoint when it crosses one of these positions, and a
     step ends there. A step cut short costs a pass over the weights (for
     Flash-Next over its experts), so a prompt step that ends on a page

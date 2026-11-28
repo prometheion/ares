@@ -342,7 +342,10 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
 async fn the_count_of_a_chat_request_is_the_prompt_it_reports() {
     let Some(served) = Served::any(None).await else { return };
     let app = &served.app;
-    let chat_tools = json!([{"type": "function", "function": weather()[0]}]);
+    // The chat form of the tool: its function without the Responses form's `type`.
+    let mut function = weather()[0].clone();
+    function.as_object_mut().unwrap().remove("type");
+    let chat_tools = json!([{"type": "function", "function": function}]);
     let bodies = [
         json!({"messages": [{"role": "user", "content": QUESTION}]}),
         json!({

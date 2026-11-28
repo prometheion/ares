@@ -37,9 +37,12 @@ impl Cache {
         left_behind: &HashSet<ChainHash>,
     ) -> bool {
         let Evicted { page, checkpoint, root, hash, parent, depth, tail, .. } = evicted;
-        let full = tail.is_none();
-        let deep = full && self.deep(depth);
-        let worth = full && (self.worth.remove(&hash) || deep);
+        // A tail is kept on the drive with the state at its end (where a later
+        // prompt resumes), and only so; its number there is one more than the
+        // page it hangs under.
+        let kept = tail.is_none() || checkpoint.is_some();
+        let deep = kept && self.deep(depth + u32::from(tail.is_some()));
+        let worth = kept && (self.worth.remove(&hash) || deep);
         let stored = self.ssd.as_ref().is_some_and(|ssd| ssd.has_or_queued(Kind::State, hash));
         let held = checkpoint.map(|id| Held {
             place: id.0 as u32,
@@ -178,15 +181,20 @@ impl Cache {
     }
 
     /// A page that left the devices found no room in RAM: it is gone, and so
-    /// is its checkpoint, which goes to the drive when it is due there.
+    /// is its checkpoint, which goes to the drive when it is due there. A
+    /// page the drive has, or has been given, is not dropped: it is there.
     pub(super) fn lost(&mut self, leaving: Leaving) {
+        let on_drive =
+            self.ssd.as_ref().is_some_and(|ssd| ssd.has_or_queued(Kind::Page, leaving.hash));
         if let Some(ram) = &mut self.in_ram
             && leaving.tail.is_none()
+            && !on_drive
         {
             ram.counters.pages_dropped += 1;
         }
         if let Some(held) = leaving.checkpoint {
-            let out = self.state_out_of(&held, leaving.hash, leaving.parent, leaving.depth);
+            let depth = leaving.depth + u32::from(leaving.tail.is_some());
+            let out = self.state_out_of(&held, leaving.hash, leaving.parent, depth);
             self.give_up(held.place, out);
         }
     }
@@ -195,6 +203,10 @@ impl Cache {
     /// allowance has room, or one that something which goes for nothing gave
     /// up. Never waits.
     pub(super) fn ram_buffer(&mut self) -> Option<Vec<crate::exec::TransitPart>> {
+        // Room is being made for running sequences: nothing new comes into RAM.
+        if self.giving_way {
+            return None;
+        }
         let mut dropped = 0;
         loop {
             let ram = self.in_ram.as_mut()?;
@@ -277,7 +289,7 @@ impl Cache {
     pub(super) fn clean(&mut self, item: Item, hash: ChainHash) {
         let (Some(ram), Some(ssd)) = (&mut self.in_ram, &mut self.ssd) else { return };
         let Some(entry) = ram.get(hash) else { return };
-        let (parent, depth) = (entry.parent, entry.depth);
+        let (parent, depth) = (entry.parent, entry.stored_depth());
         match item {
             Item::Page => {
                 if ssd.has_or_queued(Kind::Page, hash) {
@@ -335,12 +347,13 @@ impl Cache {
         }
         self.settle_leaving(pool, exec);
         self.settle();
-        let target = self.allowance();
         // Far pages that only the index holds are the prompt cache's lowest:
-        // they leave the devices first, and their memory goes back to the
-        // system once the pages of a piece are all free.
+        // those beyond what its floor keeps leave the devices first, and their
+        // memory goes back to the system once the pages of a piece are all free.
+        // The ones the floor keeps go only to running sequences ([`Cache::give_way`]).
         self.count_far(pool);
-        while self.held() > target && self.far_held > 0 && self.evict_far(pool) {}
+        let target = self.allowance();
+        while self.held() > target && self.far_held > self.far_keep && self.evict_far(pool) {}
         self.settle_leaving(pool, exec);
         let mut dropped = 0;
         while self.held() > target && self.give_up_free(&mut dropped) {}
@@ -356,12 +369,17 @@ impl Cache {
                 Some((_, Item::Checkpoint, hash)) => {
                     dropped += self.ram_give_up(Item::Checkpoint, hash);
                 }
-                None if self.give_up_index_checkpoint(false) => dropped += 1,
+                None if self.give_up_toward_floor() => dropped += 1,
                 None => break,
             }
         }
-        // The checkpoints that went are copied out of their places for the
-        // drive before their places can be called unused.
+        self.release_places(pool, exec);
+        dropped
+    }
+
+    /// The checkpoints that went are copied out of their places for the drive,
+    /// and then their places are called unused, so that their memory can go.
+    fn release_places(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) {
         self.settle_leaving(pool, exec);
         // Nothing runs: a freed place that no copy of the next record uses
         // is unused already, and the others wait for that record.
@@ -375,7 +393,55 @@ impl Cache {
             }
         }
         self.settling = waiting;
-        dropped
+    }
+
+    /// Makes room in the RAM limit for the K and V beyond VRAM of running
+    /// sequences, which outrank all the prompt cache holds: the far pages only
+    /// the index holds leave the devices for nothing (the cache's floor keeps
+    /// them from the tier of experts, not from these), and the pages in RAM and
+    /// the checkpoints go at once, without a write, down to the one place of
+    /// the floor and the pages the level on SSD moves state through (a running
+    /// request waits for the memory). Returns the checkpoints that went and
+    /// whether anything went at all. Between steps.
+    pub(crate) fn give_way(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) -> (u32, bool) {
+        if self.books.is_none() {
+            return (0, false);
+        }
+        self.settle_leaving(pool, exec);
+        self.settle();
+        let mut gone = false;
+        let mut dropped = 0;
+        // The far pages leave first, and find no buffer in RAM: what they free is
+        // what the running sequences need.
+        self.giving_way = true;
+        self.count_far(pool);
+        while self.far_held > 0 && self.evict_far(pool) {
+            gone = true;
+        }
+        self.settle_leaving(pool, exec);
+        self.giving_way = false;
+        // What is in a transfer or with the writer goes when it is back.
+        let ready: Vec<ChainHash> = self.in_ram.as_ref().map_or_else(Vec::new, |ram| {
+            ram.in_order().into_iter().filter(|hash| ram.ready(*hash)).collect()
+        });
+        for hash in ready {
+            dropped += self.ram_give_up(Item::Page, hash);
+            gone = true;
+        }
+        if let Some(ram) = &mut self.in_ram
+            && ram.bytes() > self.page_floor
+            && ram.free_bytes() > 0
+        {
+            ram.shed();
+            gone = true;
+        }
+        let in_use = |cache: &Self| u64::from(cache.next_place) - cache.free_places.len() as u64;
+        while in_use(self) > 1 && self.give_up_toward_floor() {
+            dropped += 1;
+            gone = true;
+        }
+        self.release_places(pool, exec);
+        (dropped, gone)
     }
 
     /// The owner a run that comes back from RAM or the drive is announced to
@@ -462,7 +528,15 @@ impl Cache {
             let deepest = deepest(names, run, |hash| {
                 ram.get(hash).is_some_and(|entry| entry.checkpoint.is_some())
             });
-            let drive = self.ssd.as_ref().is_some_and(|ssd| ssd.reaches_state(&names[run..]));
+            // The drive goes on: pages with a state after the run, or a tail
+            // with the state at its end where the run ends (an anchor whose
+            // state RAM no longer has): RAM gives its pages, the drive the rest.
+            let after = &rest[..rest.len().min(per_page - 1)];
+            let next = chain.hashes().get(have + run).copied();
+            let drive = self.ssd.as_ref().is_some_and(|ssd| {
+                ssd.reaches_state(&names[run..])
+                    || ssd.has_tail(chain.before(have + run), next, after)
+            });
             match tail {
                 Some((_, true, true, hash)) => (run, Some(hash)),
                 _ if drive => (run, None),
@@ -551,15 +625,9 @@ impl Cache {
                 transfer.ok = false;
             }
         }
-        let ns = begun.elapsed().as_nanos() as u64;
-        if let Some(ram) = &mut self.in_ram {
-            ram.counters.transfers += 1;
-            ram.counters.transfer_ns += ns;
-        }
-        if let Some(ssd) = &mut self.ssd {
-            ssd.counters.transfers += 1;
-            ssd.counters.transfer_ns += ns;
-        }
+        // Once for the cache, whichever level the batch is for.
+        self.transfers.batches += 1;
+        self.transfers.ns += begun.elapsed().as_nanos() as u64;
         self.finish(pool, batch, notes);
     }
 

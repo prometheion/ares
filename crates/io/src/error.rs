@@ -25,6 +25,9 @@ pub enum Error {
     #[error("cannot start the I/O thread: {0}")]
     Thread(#[source] std::io::Error),
 
+    #[error("cannot bind the I/O thread to its cores: {0}")]
+    Affinity(#[source] std::io::Error),
+
     #[error("invalid configuration: {0}")]
     Config(&'static str),
 

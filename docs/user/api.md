@@ -3,9 +3,8 @@
 Ares speaks the OpenAI chat, completion and Responses APIs, Anthropic's Messages
 API, and llama.cpp's `/props`, `/tokenize` and `/detokenize`. A request is served
 in full or refused: a field the server does not serve is a 400 that names it,
-never dropped. On the chat and completion routes this holds for the members of
-the body; members inside a message, a tool or `stream_options` that the server
-does not read are passed over. `null` counts as "not set".
+never dropped, inside a message, a part, a tool or `stream_options` too.
+`null` counts as "not set".
 
 ## Routes
 
@@ -41,7 +40,8 @@ the server has one.
 | 403 | a `Host` or a web page's `Origin` the server does not answer to (see [Keys and access](#keys-and-access)) |
 | 404 / 405 | an unknown route or model / a wrong method |
 | 408 / 413 | the body did not arrive within `--timeout` / the body is larger than 64 MiB |
-| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/metrics`, and `/tokenize` and `/detokenize` without a `model`), the server is stopping |
+| 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/tokenize` and `/detokenize` without a `model`), the server is stopping, `restarting` with `Retry-After: 10` (an engine was stuck in a step and the server restarts in place, `--watchdog`) |
+| 507 | `insufficient_memory` with `Retry-After: 1`: the RAM limit (`--ram`) had no room for the request's state beyond VRAM while it ran, with the prompt cache given up; the request ended (in a stream, as an error event), the model serves on |
 
 Errors have OpenAI's shape `{"error": {"message", "type", "param", "code"}}`,
 and Anthropic's `{"type": "error", "error": {"type", "message"}}` on `/v1/messages`.
@@ -53,18 +53,19 @@ prompt and those marked "chat".
 
 | Field | Meaning | Notes |
 | --- | --- | --- |
-| `messages` | chat: the conversation | roles `system` (or `developer`), `user`, `assistant`, `tool`; `content` a string or parts `text` and `image_url`; also `name`, `tool_call_id`, `tool_calls`, `reasoning_content` |
+| `messages` | chat: the conversation | roles `system` (or `developer`), `user`, `assistant`, `tool`; `content` a string or parts `text` and `image_url`; also `name`, `tool_call_id`, `tool_calls`, `reasoning_content` (or `reasoning`, `reasoning_text`, `thinking`: the names other servers give it; two with different texts are refused) |
 | `prompt` | completions: the text | one string (or an array of one string); token ids and several prompts are refused |
-| `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; of several, `n_predict` holds, then `max_completion_tokens` |
+| `max_tokens`, `n_predict`; chat: `max_completion_tokens` | the most tokens of the reply | `-1` is no limit of its own; `0` is refused; held to `--max-tokens-limit`; names that give different values are refused |
 | `stop` | stop strings | a string or an array; not empty |
-| `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | |
+| `stream`, `stream_options.include_usage` | Server-Sent Events; a usage chunk at the end | `include_obfuscation` and `continuous_usage_stats` only `false` |
 | `return_progress` | a stream says how far the prompt has got (llama.cpp's member) | see [Prompt progress](#prompt-progress); changes nothing without `stream` |
 | `sse_ping_interval` | the seconds of silence after which a stream sends a ping (llama.cpp's member) | whole seconds; `0` or `-1`: no pings; default 15 |
 | `timings_per_token` | the last chunk of every step of a stream has `timings`, the reply's so far (llama.cpp's member) | no hash and no drafts before the end; changes nothing without `stream` |
-| `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; of both, `n_cmpl` holds |
-| `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number |
+| `n`, `n_cmpl` | completions of one prompt | 1 to 16; the prompt is read once; both with different values are refused |
+| `logprobs`, `top_logprobs`; `n_probs`, `post_sampling_probs` | probabilities of the tokens, in OpenAI's or llama.cpp's form | chat: `logprobs: true` and 0 to 20 alternatives; completions: `logprobs` is the number; `n_probs` (`0` is none) with OpenAI's fields must ask for the same, and the answer is then llama.cpp's |
 | `priority` | the request's priority | see [Priorities](#priorities) |
 | `draft` | `false` turns drafting off for this request | default `true` |
+| `cache_prompt` | `false`: the request neither starts from the prompt cache nor leaves anything in it (llama.cpp's) | default `true` |
 | `continue_final_message`, `add_generation_prompt` | chat: continue the last assistant message, or begin a new turn | a last assistant message is continued by default, unless it calls tools |
 | `user`, `metadata`, `store`, `service_tier`, `prompt_cache_key`, `safety_identifier` | bookkeeping | accepted, without effect |
 
@@ -74,15 +75,26 @@ defaults (`temperature`, `top_k`, ..., `samplers`, `seed`), and:
 
 | Field | Notes |
 | --- | --- |
-| `typical`, `repetition_penalty` | other names of `typical_p` and `repeat_penalty` |
+| `typical`, `repetition_penalty` | other names of `typical_p` and `repeat_penalty`; two names of one field with different values are refused |
 | `top_k`, `seed`, `repeat_last_n` | `top_k` `0` or `-1` is no cut; `seed: -1` draws a seed of its own; a window of `-1` (the whole context) is refused |
 | `samplers` | also llama.cpp's string of letters |
 | `logit_bias` | an object (OpenAI) or a list of `[token, bias]` pairs (llama.cpp); a token is an id or a text; `false` bans it; at most 1024 |
-| `ignore_eos`, `min_keep` | the reply does not end at the end token; a `min_keep` above 1 is refused |
+| `ignore_eos`, `min_keep` | the reply does not end at the end token; `min_keep` is 0 or 1 |
 | `backend_sampling` | llama.cpp's choice of where it samples, whose draws are the same; Ares samples on the device: a boolean, without effect |
 
+Accepted without effect, since they change nothing for this server: cache
+markers (`cache_control` on a message, a part, a call or a tool, and
+`prompt_cache_breakpoint` on a part; the server starts every prompt from the
+longest prefix it kept, with or without them), `detail` of an `image_url` (an
+image is read at the size the model's vision tower takes), and `index` of a
+call (its place in a stream). Refused by name: other members of a message
+(`audio`, `refusal`, `function_call`, `reasoning_details`, ...), of a part, a
+call (`extra_content`, calls that are not of a function) or a tool
+(`defer_loading`).
+
 Also refused: `best_of` other than 1, `echo: true`, `suffix`, the legacy
-`functions` and `function_call`, adaptive-p (`adaptive_target`,
+`functions` and `function_call`, a cut of the prompt to its last tokens
+(`truncate_prompt_tokens`, `truncate`; `/v1/responses` cuts whole turns), adaptive-p (`adaptive_target`,
 `adaptive_decay`), and tools and thinking fields on `/v1/completions`, which has
 no chat template.
 
@@ -338,7 +350,7 @@ llama.cpp (Anthropic's API has no such member; it is refused there).
 | `/props` | `model`, `build_info` (what the binary is, as `ares --version` prints it), `loaded`, `context_length`, `default_generation_settings` (`params`, `n_ctx`), `chat_template`, `chat_template_caps` (tools, reasoning, effort, `enable_thinking`, thinks by default), `reasoning` (its tags), `modalities` (`vision` true when the model was loaded with `--mmproj`, or its preset names one; `audio` false); a model that is not loaded is described from its file without a load |
 | `/tokenize` | `content` (a text, read as a completion prompt) or a chat request (`messages` and the chat fields); `parse_special: false` and `add_special` are refused; answers `{"tokens": [...]}`, with `with_pieces` `{"tokens": [{"id", "piece"}, ...]}` (the text, or its bytes where a token is not whole characters) |
 | `/detokenize` | `tokens`; answers `{"content": "..."}`; control tokens write nothing |
-| `/metrics` | the histograms `ares_request_queue_seconds`, `ares_request_prompt_seconds`, `ares_time_to_first_token_seconds`, `ares_time_per_output_token_seconds`, `ares_request_seconds`, and counters and gauges of requests, tokens, drafts, the prompt cache in RAM and on the SSD, and Flash-Next's experts |
+| `/metrics` | `ares_model_loaded` (1, or 0 alone for a model that is not loaded); the histograms `ares_request_queue_seconds`, `ares_request_prompt_seconds`, `ares_time_to_first_token_seconds`, `ares_time_per_output_token_seconds`, `ares_request_seconds`, and counters and gauges of requests, tokens, drafts, the prompt cache in RAM and on the SSD, and Flash-Next's experts |
 | `/models/load`, `/models/unload` | an unload takes new requests away and unloads the model when its running requests have ended; the next request loads it again. Also with one `--model` (see [options.md](options.md#the-preset-file) for several) |
 
 ## Keys and access
@@ -347,9 +359,9 @@ llama.cpp (Anthropic's API has no such member; it is refused there).
 | --- | --- |
 | key | with `--api-key` or `--api-key-file`, every route but `/health` wants `Authorization: Bearer <key>` or `x-api-key: <key>` |
 | `Host` | a server on a loopback address without keys answers only to `localhost` and to addresses; `--allowed-hosts` adds names |
-| `Origin` | without keys, a request a browser sends from a page of another site is refused; local pages, pages of the server's own name or of an `--allowed-hosts` name, and `--cors-origins` pass |
+| `Origin` | without keys, or with keys and `--allowed-hosts` names, a request a browser sends from a page of another site is refused; local pages, pages of the server's own name or of an `--allowed-hosts` name, and `--cors-origins` pass |
 | CORS | answers to an origin of `--cors-origins` carry the CORS headers, and its preflight is answered without a key |
 
-With keys, the key decides: pages are not checked, and names only when
-`--allowed-hosts` names hosts. A server that listens beyond this machine without
+With keys, the key decides, unless `--allowed-hosts` names hosts: then names
+and pages are checked as without keys. A server that listens beyond this machine without
 keys warns at start. [features.md](features.md) lists what Ares can do.

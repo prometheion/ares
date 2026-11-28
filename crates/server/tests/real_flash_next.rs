@@ -251,6 +251,57 @@ fn flash_next_drafts_with_its_mtp_block() {
 /// experts are in no tier and come from the file while it answers: the
 /// answers are the ones of two devices, the reference's first sentence
 /// included, and the counters say that experts were read from the file.
+/// SIGTERM with a request in flight, as llama-swap stops a model: the request
+/// runs on through the grace and is ended, the model is unloaded with its
+/// tier of experts, and the server exits 0 without a panic on the way (the
+/// release build aborts on one; a user's SIGTERM ended in SIGABRT). On the
+/// first device, with what was computed written to a prompt cache on the SSD
+/// as the model goes.
+#[test]
+fn flash_next_stops_in_order_on_sigterm_with_a_request_in_flight() {
+    let Some(model) = flash_model() else { return };
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".to_owned());
+    let device = devices.split(',').next().unwrap_or("0").to_owned();
+    let cache = std::env::temp_dir().join(format!("ares-flash-sigterm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    let ram = flash_ram();
+    let flags = [
+        "--devices",
+        &device,
+        "--ram",
+        &ram,
+        "--chat-var",
+        "enable_thinking=false",
+        "--cache",
+        cache.to_str().expect("a path"),
+    ];
+    let mut server = serve_model(&model, port(5), &flags, SLOW);
+    // A request that ends, so that the unload has a text to write.
+    let body = server.chat(GERMAN, json!({"max_tokens": 40, "temperature": 0}));
+    assert_eq!(server.post("/v1/chat/completions", &body).status, 200);
+    let question = format!("{ENGLISH} Then write a long story about the sea.");
+    let body = server.chat(&question, json!({"stream": true, "max_tokens": 4000}));
+    let mut stream = server.send("POST", "/v1/chat/completions", &body.to_string());
+    let mut raw = read_events(&mut stream, 5);
+
+    let signalled = Instant::now();
+    server.signal("TERM");
+    server.wait_for_log("no new connections");
+    std::io::Read::read_to_end(&mut stream, &mut raw).unwrap();
+    let status = server.wait_exit();
+    let took = signalled.elapsed();
+    let log = server.logged().join("\n");
+    let _ = std::fs::remove_dir_all(&cache);
+    eprintln!("RES sigterm: stopped in {:.1} s", took.as_secs_f64());
+    assert!(status.success(), "a clean stop: {status:?}\n{log}");
+    assert!(!log.contains("panicked"), "a panic on the way: {log}");
+    assert!(log.contains("threads joined, devices released"), "{log}");
+    assert!(log.trim_end().ends_with("stopped"), "{log}");
+    // Within the grace of 30 s, the unload and the write of the cache, and
+    // well within the 180 s llama-swap gives.
+    assert!(took < Duration::from_secs(150), "{took:?}\n{log}");
+}
+
 #[test]
 fn flash_next_answers_on_one_card() {
     let Some(model) = flash_model() else { return };
@@ -423,4 +474,135 @@ fn flash_next_starts_from_the_usage_profile_of_its_experts() {
     server.stop();
     assert_ne!(std::fs::read(&written[0]).unwrap(), damaged);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// About `lines` lines of a build log that differ by `seed`: some twenty tokens a line.
+fn build_log(seed: u64, lines: u32) -> String {
+    let words = ["error", "warning", "crate", "module", "linker", "test", "cache", "layer"];
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut next = |n: u64| {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) % n
+    };
+    (0..lines)
+        .map(|i| {
+            let word = words[next(words.len() as u64) as usize];
+            format!(
+                "{i:05} [{:06}] {word} in step {} of unit {}\n",
+                next(1_000_000),
+                next(97),
+                next(31)
+            )
+        })
+        .collect()
+}
+
+/// A tool list like a coding agent's: thirteen tools with their parameters.
+fn agent_tools() -> serde_json::Value {
+    let names = [
+        "Bash",
+        "Glob",
+        "Grep",
+        "Read",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "TodoWrite",
+        "Task",
+        "BashOutput",
+        "KillShell",
+    ];
+    let tools: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            json!({"type": "function", "function": {
+                "name": name,
+                "description": format!("{name}: a tool of the agent, with a long description \
+                    that says when to use it and when not to, as agents' tools have."),
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string", "description": "An absolute path."},
+                    "pattern": {"type": "string", "description": "What to look for."},
+                }, "required": ["path"]},
+            }})
+        })
+        .collect();
+    json!(tools)
+}
+
+/// Long prompts beside each other and again, with K and V beyond VRAM and a RAM limit
+/// that the tier of experts fills (2026-11-25: two prompts that came 8 ms apart were
+/// planned into one step wider than the parts' own rows, which the model refuses, and a
+/// long prompt sent again was read again and found no room in the limit for its K and V
+/// beyond VRAM: each took the model down). Two chat requests with long prompts, one with
+/// an agent's tool list, sent at once, both answer; the same long prompt sent again comes
+/// from the prompt cache (its pages in VRAM and beyond, and its last checkpoint) and
+/// replays less than two pages; the server answers after all of it.
+#[test]
+fn flash_next_reads_long_prompts_together_and_again_beyond_vram() {
+    let Some(model) = flash_model() else { return };
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    let ram = flash_ram();
+    let mut flags = vec![
+        "--devices",
+        &devices,
+        "--ram",
+        &ram,
+        "--context",
+        "262144",
+        "--parallel",
+        "4",
+        "--chat-var",
+        "enable_thinking=false",
+    ];
+    let mtp = std::env::var("ARES_TEST_FLASH_NEXT_MTP").ok();
+    if let Some(block) = &mtp {
+        flags.extend(["--drafters", block]);
+    }
+    let server = serve_model(&model, port(5), &flags, SLOW);
+    let ask = |log: &str, tools: bool, max_tokens: u32| {
+        let mut extra = json!({"max_tokens": max_tokens, "temperature": 0});
+        if tools {
+            extra["tools"] = agent_tools();
+        }
+        server.chat(&format!("{log}\nWhich unit failed most often?"), extra)
+    };
+
+    // Two at once: about 6000 tokens with the tools and 1500 without.
+    let (long, short) = (ask(&build_log(1, 300), true, 16), ask(&build_log(2, 75), false, 16));
+    let client: &Client = &server;
+    let (a, b) = thread::scope(|s| {
+        let a = s.spawn(|| client.post("/v1/chat/completions", &long));
+        thread::sleep(Duration::from_millis(8));
+        let b = s.spawn(|| client.post("/v1/chat/completions", &short));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(a.status, 200, "{}", a.body);
+    assert_eq!(b.status, 200, "{}", b.body);
+
+    // About 30 000 tokens, twice: the second time from the cache.
+    let body = ask(&build_log(3, 1500), true, 24);
+    let first = server.post("/v1/chat/completions", &body);
+    assert_eq!(first.status, 200, "{}", first.body);
+    let replayed = server.metric("replayed_rows_total");
+    let mut again = body.clone();
+    again["max_tokens"] = json!(8);
+    let second = server.post("/v1/chat/completions", &again);
+    assert_eq!(second.status, 200, "{}", second.body);
+    let replayed = server.metric("replayed_rows_total") - replayed;
+    let usage = &second.json()["usage"];
+    let prompt = usage["prompt_tokens"].as_u64().unwrap();
+    let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
+    eprintln!(
+        "RES flash again: {cached} of {prompt} prompt tokens from the cache, {replayed} rows replayed"
+    );
+    assert!(prompt > 20_000, "{usage}");
+    assert!(cached + 256 >= prompt, "the same prompt came from the cache: {usage}");
+    assert!(replayed < 256, "{replayed} rows replayed");
+
+    let reply =
+        server.post("/v1/chat/completions", &server.chat(ENGLISH, json!({"max_tokens": 8})));
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    server.stop();
 }

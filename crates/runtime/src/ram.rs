@@ -96,6 +96,10 @@ struct Books {
     /// cannot work without (its staging slots and a few slots per layer).
     experts_want: u64,
     experts_floor: u64,
+    /// What the tier held when it last found nothing more to give (its slots
+    /// busy, or at their fewest): its floor until it gives or takes a piece
+    /// again, which forgets it. 0: none.
+    experts_stuck: u64,
     /// The most the prompt cache can use: the conductor's budget. And the
     /// part of it the cache keeps whatever the machine has: one checkpoint
     /// place for a model with recurrent state, and a few pages when its level
@@ -103,6 +107,11 @@ struct Books {
     cache_want: u64,
     place_floor: u64,
     pages_floor: u64,
+    /// The most bytes of K and V beyond VRAM that only the prompt cache holds
+    /// which it keeps whatever the tier of experts wants: the far pages of a
+    /// conversation, so that its next turn finds what it computed beyond VRAM
+    /// ([`PinnedRam::keep_context_cached`]).
+    far_keep: u64,
     /// What the machine lets the tier and the prompt cache hold above their
     /// floors; no bound with a fixed limit.
     experts_allow: u64,
@@ -155,14 +164,23 @@ impl Books {
     /// Why `bytes` more for `what` do not fit: who holds the limit.
     fn refusal(&self, bytes: u64, what: &str) -> String {
         format!(
-            "the RAM limit of {} has no room for {} more of {what}: the step record and \
-             read-back hold {}, the K/V beyond VRAM {}, the tier of experts {}, the prompt \
-             cache {}",
+            "the RAM limit of {} has no room for {} more of {what}: {}",
             Bytes(self.limit),
             Bytes(bytes),
+            self.holders()
+        )
+    }
+
+    /// Who holds the limit.
+    fn holders(&self) -> String {
+        format!(
+            "the step record and read-back hold {}, the K/V beyond VRAM {} (of which the prompt \
+             cache's {}), the tier of experts {} (it cannot give up {}), the prompt cache {}",
             Bytes(self.required),
             Bytes(self.context),
+            Bytes(self.context_cached),
             Bytes(self.experts),
+            Bytes(self.experts_floor()),
             Bytes(self.cache),
         )
     }
@@ -182,9 +200,20 @@ impl Books {
         self.cache + self.context_cached
     }
 
-    /// The prompt cache's floor, never more than it can use.
+    /// What the tier of experts cannot give up now: the part it cannot work
+    /// without, or what it held when it last found nothing more to give.
+    fn experts_floor(&self) -> u64 {
+        self.experts_floor.max(self.experts_stuck)
+    }
+
+    /// The prompt cache's floor, never more than it can use: one checkpoint
+    /// place, the pages its level on SSD moves state through, and the far pages
+    /// it holds up to [`Books::far_keep`]. The tier of experts does not take
+    /// it; the K and V of running sequences beyond VRAM do (the conductor gives
+    /// such pages up first when a step finds no room for them).
     fn cache_floor(&self) -> u64 {
         (self.place_floor + self.pages_floor).min(self.cache_want)
+            + self.context_cached.min(self.far_keep)
     }
 
     /// What the tier of experts and the prompt cache may hold now, by rank:
@@ -196,7 +225,7 @@ impl Books {
         let room = self.elastic_room();
         let cache_floor = self.cache_floor();
         let experts = self
-            .experts_floor
+            .experts_floor()
             .saturating_add(self.experts_allow)
             .min(room.saturating_sub(cache_floor));
         let tier = self.experts_want.max(self.experts);
@@ -208,9 +237,9 @@ impl Books {
     /// floors within the room the limit leaves them, by the same rank: what
     /// the machine shares out.
     fn wants(&self) -> (u64, u64) {
-        let floors = self.experts_floor + self.cache_floor();
+        let floors = self.experts_floor() + self.cache_floor();
         let room = self.elastic_room().saturating_sub(floors);
-        let experts = self.experts_want.saturating_sub(self.experts_floor).min(room);
+        let experts = self.experts_want.saturating_sub(self.experts_floor()).min(room);
         (experts, self.cache_want.saturating_sub(self.cache_floor()).min(room - experts))
     }
 }
@@ -250,10 +279,6 @@ pub(crate) struct Shared {
     /// per device part; none for an executor without devices, whose pages
     /// are ordinary memory, booked all the same.
     devices: Mutex<Vec<Device>>,
-    /// For an executor without devices that books its places itself (the
-    /// host executor): the bytes of a place, and the places that hold
-    /// memory now.
-    host_places: Mutex<Option<(u64, Vec<bool>)>>,
 }
 
 impl Shared {
@@ -266,7 +291,7 @@ impl Shared {
         let (experts_want, cache_want) = books.wants();
         Wants {
             locked: books.used(),
-            experts_held: books.experts.saturating_sub(books.experts_floor),
+            experts_held: books.experts.saturating_sub(books.experts_floor()),
             experts_want,
             cache_held: books.cache_usage().saturating_sub(books.cache_floor()),
             cache_want,
@@ -372,9 +397,11 @@ impl PinnedRam {
             experts: 0,
             experts_want: 0,
             experts_floor: 0,
+            experts_stuck: 0,
             cache_want: 0,
             place_floor: 0,
             pages_floor: 0,
+            far_keep: 0,
             experts_allow: allow,
             cache_allow: allow,
             asked: None,
@@ -387,7 +414,6 @@ impl PinnedRam {
                 live: Mutex::new(Vec::new()),
                 chunks: Mutex::new(Vec::new()),
                 devices: Mutex::new(Vec::new()),
-                host_places: Mutex::new(None),
             }),
         }
     }
@@ -461,6 +487,15 @@ impl PinnedRam {
         self.books().context_cached = bytes;
     }
 
+    /// Of the K/V beyond VRAM that only the prompt cache holds, up to `bytes`
+    /// are part of its floor: the tier of experts leaves them, so that a
+    /// conversation that goes on finds the far pages of its last turn on the
+    /// devices (as much as one request can hold beyond VRAM). The K and V of
+    /// running sequences beyond VRAM still outrank them.
+    pub fn keep_context_cached(&self, bytes: u64) {
+        self.books().far_keep = bytes;
+    }
+
     /// `len` bytes of address space for the K/V of the context beyond VRAM
     /// on `device`, of which nothing is locked yet: [`ContextRegion::lock`]
     /// locks, maps and books pieces of it.
@@ -509,17 +544,19 @@ impl PinnedRam {
             let mut books = self.books();
             books.experts_want = want;
             books.experts_floor = floor.min(want);
+            books.experts_stuck = 0;
         }
         if let Some(machine) = &self.shared.machine {
             machine.claim();
         }
     }
 
-    /// The tier of experts cannot go below `floor` bytes: it found that out
-    /// when it gave up all it could.
+    /// The tier of experts found nothing more to give at `floor` bytes: that
+    /// is its floor until it gives up or locks a piece again (a slot that was
+    /// busy may be free then), not for good.
     pub fn experts_floor(&self, floor: u64) {
         let mut books = self.books();
-        books.experts_floor = floor.min(books.experts_want);
+        books.experts_stuck = floor.min(books.experts_want);
     }
 
     /// Says what the prompt cache can use at most, the conductor's budget,
@@ -572,11 +609,18 @@ impl PinnedRam {
     }
 
     fn book_experts(&self, bytes: u64) -> Result<(), String> {
-        self.book(User::Experts, bytes, "the tier of experts")
+        let mut books = self.books();
+        books
+            .grow(User::Experts, bytes)
+            .map_err(|_| books.refusal(bytes, "the tier of experts"))?;
+        books.experts_stuck = 0;
+        Ok(())
     }
 
     fn release_experts(&self, bytes: u64) {
-        self.books().shrink(User::Experts, bytes);
+        let mut books = self.books();
+        books.shrink(User::Experts, bytes);
+        books.experts_stuck = 0;
     }
 
     /// Books `bytes` for what the executor cannot run without.
@@ -595,20 +639,25 @@ impl PinnedRam {
         self.book_cache(bytes, "checkpoints").map_err(ModelError::Invalid)
     }
 
-    /// Locks `bytes` of RAM on behalf of the checkpoint cache, or says who
-    /// holds the memory that the limit does not leave. The bytes are booked
-    /// until the chunk is dropped.
+    /// Locks `bytes` of RAM for `device` on behalf of the checkpoint cache,
+    /// or says who holds the memory that the limit does not leave; without a
+    /// device (an executor that has none) the bytes are ordinary memory,
+    /// booked all the same. The bytes are booked until the chunk is dropped.
     pub fn lock_checkpoints(
         &self,
-        device: &Device,
+        device: Option<&Device>,
         bytes: usize,
     ) -> Result<LockedChunk, ModelError> {
         self.book_checkpoints(bytes as u64)?;
         // Booked from here on: a chunk that cannot be locked gives the
         // booking back as it is dropped.
         let booking = Booking { ram: self.clone(), user: Booked::Checkpoints, bytes: bytes as u64 };
-        let buffer = PinnedBuffer::new(device, bytes)?;
-        Ok(LockedChunk { buffer: Some(buffer), booking: Some(booking) })
+        let mut chunk = LockedChunk { memory: None, booking: Some(booking) };
+        chunk.memory = Some(match device {
+            Some(device) => ChunkMemory::Locked(PinnedBuffer::new(device, bytes)?),
+            None => ChunkMemory::Plain(Aligned::new(bytes), bytes),
+        });
+        Ok(chunk)
     }
 
     pub(crate) fn release_checkpoints(&self, bytes: u64) {
@@ -650,10 +699,12 @@ impl PinnedRam {
     /// The places of a device part's checkpoints: `capacity` places of
     /// `bytes` each, locked on `device` in chunks of at least `chunk` bytes
     /// as they come into use, and released again when the checkpoints must
-    /// give memory back and the conductor has none in a chunk.
+    /// give memory back and the conductor has none in a chunk. Without a
+    /// device (the host executor) the chunks are ordinary memory, booked and
+    /// given back the same way.
     pub fn place_chunks(
         &self,
-        device: &Device,
+        device: Option<&Device>,
         bytes: u64,
         capacity: u32,
         chunk: usize,
@@ -662,7 +713,7 @@ impl PinnedRam {
         let per_chunk = chunk.checked_div(bytes).unwrap_or(1).max(1) as u32;
         let chunks = Arc::new(PlaceChunks {
             ram: self.clone(),
-            device: device.clone(),
+            device: device.cloned(),
             bytes,
             capacity,
             per_chunk,
@@ -692,28 +743,11 @@ impl PinnedRam {
         places.get(place as usize).copied().unwrap_or(false)
     }
 
-    /// An executor without devices books places of `bytes` itself, and says
-    /// which hold memory ([`PinnedRam::host_place_held`]).
-    pub fn host_places(&self, bytes: u64) {
-        *self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((bytes, Vec::new()));
-    }
-
-    /// Place `place` of an executor without devices holds memory, or not.
-    pub fn host_place_held(&self, place: u32, held: bool) {
-        let mut host = self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, places)) = host.as_mut() {
-            if places.len() <= place as usize {
-                places.resize(place as usize + 1, false);
-            }
-            places[place as usize] = held;
-        }
-    }
-
     /// The bytes the devices would lock when checkpoint place `place` is
     /// used next: the chunks it lies in that are not locked now, on every
     /// device part. 0 for a place whose memory is there, and for books
-    /// whose places nobody books when they are first used.
+    /// whose places nobody books when they are first used (no
+    /// [`PinnedRam::place_chunks`]).
     pub(crate) fn place_lock(&self, place: u32) -> u64 {
         self.places_lock(&[place])
     }
@@ -722,18 +756,6 @@ impl PinnedRam {
     /// the chunks they lie in that are not locked now, each once however many
     /// of the places lie in it, on every device part.
     pub(crate) fn places_lock(&self, places: &[u32]) -> u64 {
-        if let Some((bytes, held)) =
-            &*self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner())
-        {
-            let mut new: Vec<u32> = places
-                .iter()
-                .copied()
-                .filter(|place| !held.get(*place as usize).copied().unwrap_or(false))
-                .collect();
-            new.sort_unstable();
-            new.dedup();
-            return new.len() as u64 * *bytes;
-        }
         let tables: Vec<Arc<PlaceChunks>> = {
             let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
             all.iter().filter_map(Weak::upgrade).collect()
@@ -755,6 +777,12 @@ impl PinnedRam {
                     .sum::<u64>()
             })
             .sum()
+    }
+
+    /// The limit and who holds it now, for a message.
+    pub fn who_holds(&self) -> String {
+        let books = self.books();
+        format!("the limit is {}; {}", Bytes(books.limit), books.holders())
     }
 
     /// The bytes the limit leaves unbooked now.
@@ -1043,7 +1071,7 @@ struct ExpertPieces {
 
 impl Locker for ExpertPieces {
     unsafe fn lock(&mut self, ptr: *mut u8, len: usize) -> Result<Box<dyn Any + Send>, StoreError> {
-        self.ram.book_experts(len as u64).map_err(StoreError::Plan)?;
+        self.ram.book_experts(len as u64).map_err(StoreError::NoRoom)?;
         // Given back as it is dropped when the registration fails.
         let booking = Booking { ram: self.ram.clone(), user: Booked::Experts, bytes: len as u64 };
         // SAFETY: the caller's contract is that of the registration.
@@ -1068,8 +1096,15 @@ impl Drop for ExpertPiece {
 /// the chunk, once its memory is freed (where no step runs).
 pub struct LockedChunk {
     /// Both `Some` until the chunk is dropped.
-    buffer: Option<PinnedBuffer>,
+    memory: Option<ChunkMemory>,
     booking: Option<Booking>,
+}
+
+/// The memory of a [`LockedChunk`].
+enum ChunkMemory {
+    Locked(PinnedBuffer),
+    /// Ordinary memory of an executor without devices, and its length.
+    Plain(Aligned, usize),
 }
 
 impl std::fmt::Debug for LockedChunk {
@@ -1079,26 +1114,37 @@ impl std::fmt::Debug for LockedChunk {
 }
 
 impl LockedChunk {
-    fn buffer(&self) -> &PinnedBuffer {
-        self.buffer.as_ref().expect("a chunk holds its buffer until it is dropped")
+    fn memory(&self) -> &ChunkMemory {
+        self.memory.as_ref().expect("a chunk holds its memory until it is dropped")
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.buffer.as_mut().expect("a chunk holds its buffer until it is dropped").as_mut_ptr()
+        match self.memory.as_mut().expect("a chunk holds its memory until it is dropped") {
+            ChunkMemory::Locked(buffer) => buffer.as_mut_ptr(),
+            ChunkMemory::Plain(buffer, _) => buffer.as_mut_ptr(),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.buffer().len()
+        match self.memory() {
+            ChunkMemory::Locked(buffer) => buffer.len(),
+            ChunkMemory::Plain(_, len) => *len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer().is_empty()
+        self.len() == 0
     }
 }
 
 impl Drop for LockedChunk {
     fn drop(&mut self) {
-        ares_cuda::gate::retire((self.buffer.take(), self.booking.take()));
+        let booking = self.booking.take();
+        match self.memory.take() {
+            // Freed, then unbooked, where no step runs.
+            Some(ChunkMemory::Locked(buffer)) => ares_cuda::gate::retire((Some(buffer), booking)),
+            Some(ChunkMemory::Plain(..)) | None => drop(booking),
+        }
     }
 }
 
@@ -1165,7 +1211,8 @@ impl Drop for CacheBuffer {
 #[derive(Debug)]
 pub struct PlaceChunks {
     ram: PinnedRam,
-    device: Device,
+    /// `None` for an executor without devices.
+    device: Option<Device>,
     /// The bytes of one place.
     bytes: usize,
     capacity: u32,
@@ -1222,8 +1269,9 @@ impl PlaceChunks {
         }
         let fresh = chunks[index].is_none();
         if fresh {
-            chunks[index] =
-                Some(self.ram.lock_checkpoints(&self.device, places as usize * self.bytes)?);
+            chunks[index] = Some(
+                self.ram.lock_checkpoints(self.device.as_ref(), places as usize * self.bytes)?,
+            );
         }
         let chunk = chunks[index].as_mut().expect("locked above");
         let within = (place - first) as usize * self.bytes;
@@ -1288,6 +1336,36 @@ mod tests {
         ram.release_checkpoints(40 * MIB);
         ram.book_experts(90 * MIB).unwrap();
         assert!(ram.book_checkpoints(20 * MIB).is_err());
+    }
+
+    #[test]
+    fn places_without_a_device_are_booked_a_chunk_at_a_time_and_kept_until_the_sweep() {
+        let ram = PinnedRam::new(100 * MIB);
+        // Places of 1 MiB, four to a chunk after the first, which holds place
+        // 0 alone, as the host executor has them.
+        let places = ram.place_chunks(None, MIB, 9, 4 * MIB as usize);
+        assert_eq!(ram.places_lock(&[0, 1, 2]), 5 * MIB);
+        assert!(places.pointer(0).unwrap().1, "the first copy locks the chunk");
+        assert!(places.pointer(2).unwrap().1);
+        assert!(!places.pointer(3).unwrap().1, "a place of a locked chunk takes nothing");
+        assert_eq!((ram.checkpoints(), places.locked()), (5 * MIB, 5 * MIB));
+        // Places 3 and 4 lie in a chunk that is there, 5 in one that is not.
+        assert_eq!(ram.places_lock(&[3, 4, 5]), 4 * MIB);
+        assert!(places.held(5).is_none());
+
+        // A place the conductor calls unused keeps its chunk while the prompt
+        // cache is within its allowance; the sweep gives back only chunks
+        // in which no place is in use.
+        ram.place_live(0, false);
+        ram.place_live(2, true);
+        assert_eq!(ram.sweep_checkpoints(), 0);
+        ram.want_experts(GIB, 0);
+        assert_eq!(ram.sweep_checkpoints(), MIB);
+        assert_eq!((ram.checkpoints(), places.locked()), (4 * MIB, 4 * MIB));
+        assert!(places.held(0).is_none() && places.held(2).is_some());
+        // Its next copy books the chunk again, where the limit has room.
+        assert!(places.pointer(0).unwrap().1);
+        assert_eq!(ram.checkpoints(), 5 * MIB);
     }
 
     #[test]
