@@ -210,9 +210,16 @@ and after a restart of the server. Nothing is written as it is computed.
   the pool (cached pages nobody holds make room), the devices take the bytes,
   and the pages enter the index in order, the last one with the checkpoint,
   which went into a checkpoint place; the buffers stay in RAM as copies. The
-  prompt then starts as from any cached prefix. A record that cannot be read
-  or fails its checksum ends its run and is forgotten; the prompt computes
-  from there.
+  prompt then starts as from any cached prefix. When the checkpoint finds no
+  place, what RAM holds goes for it, the first to go first and without a write
+  (`Cache::import_place`): the prompt that waits outranks texts that may come
+  again. A record that cannot be read or fails its checksum, a page of the
+  pool or a place that cannot be had end the run (it is cut), and the next look
+  for that run does not ask the store again (`Ssd::cut`): the prompt computes
+  from what the cache has, and a later look tries again. Until 2026-11-28 a cut
+  run was asked for again by the very next look, and a prompt whose run never
+  found a place waited for ever while the store read it about 17 times a
+  second (#98).
 - **Forms.** With `q7` to `q4`, and for the MTP block always, a page is an
   exact entry while it is the first tile or among the newest cells and a
   converted one later. A page goes to RAM, and from there to the store, in

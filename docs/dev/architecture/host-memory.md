@@ -40,7 +40,14 @@ replayed). The prompt cache's floor therefore holds the far pages that one
 request can hold (`PinnedRam::keep_context_cached`: the pages of the model's
 context beyond `near`, 1.29 GiB at most for 131 072 cells in the report), and
 of its checkpoints the one used last goes last (`give_up_index_checkpoint`):
-the tier of experts does not take them, a running sequence's K and V do.
+the tier of experts does not take them, a running sequence's K and V do. The
+far pages it holds beyond those are no part of the floor: the checkpoint
+budget (`Cache::policy_now`) counts only the floor's against its place, so the
+floor keeps its place whatever else the cache holds on the devices. Until
+2026-11-28 it counted all of them: four pages beyond the floor's twenty left the
+budget no place while the cache held less than its allowance, so nothing made
+them go, and a request whose run came back from the drive waited for it again
+and again (#98).
 
 **Room before a step** (`conductor/room.rs`, `Model::make_room`,
 `Flow::make_room`; 2026-11-25). Before the conductor writes a step it hands
