@@ -531,7 +531,11 @@ step once nothing is on its way into or out of the device's slots (reads from
 the file may run: they take a slot only when they have landed), also beside a
 loan that is made, and while nothing runs on the watch's thread; it takes a
 piece before each step that is not drafts only, and while nothing runs for
-40 ms at a time.
+40 ms at a time. A program that grows therefore waits at most for the step
+that runs: tens of milliseconds while a model decodes, but the whole of a step
+of a long prompt read layer by layer (up to 32 768 rows; on the local cards 43
+s of a prompt of 33 426 tokens passed before the tier gave), since a slot is
+not taken from under a step that may read it.
 
 **What never gives way**: the weights, the K and V of sequences, the
 recurrent state, the step buffers, the drafters and the image tower: what the

@@ -66,7 +66,24 @@ eviction of that expert from the next piece given at the same end of a step writ
 on the stream of uploads; nothing ordered the two, so the older entry could land last and name
 a slot that held another expert or had no memory any more. 3e22beb4 orders them
 (`SlotDevice::order`) and a host test on slots whose copies out run late fails without it.
-The runs after the fix are to be made (the cards were taken by the owner's production).
+
+**The watch after the fix** (14:24 to 14:33, the binary of 4f7731ce, load average 0 to 9).
+Five rounds of the same run under gdb (`repro2.sh`: a helper that asks for 3 GiB on device 1
+in steps of 256 MiB every half second, 15 s after the server is ready, while a prompt of 1014
+tokens and 900 tokens of greedy decode run): every round decoded its 900 tokens (20 to 33
+tokens per second), the tier gave 20 to 27 times at the ends of steps, the helper got all its
+3 GiB after one or two refused asks each round, and no step stood still and no illegal address
+was seen. With the helper asking for 2 GiB during a prompt of 33 426 tokens instead (`fin-long`), its
+asks were refused for 36 s and all granted within 3.5 s once the tier gave (3.2 GiB in 13
+gives within 8 s, from the end of the prompt's first step on): a prompt that long is read layer by layer in steps of
+up to 32 768 rows, and the tier gives only between steps, so a program that grows during such
+a step waits for its end (here 43 s into the prompt). The prompt read at 701 tokens per second
+and the server's peaks stayed 11 662 / 11 696 MiB; after the helper freed its memory the tier
+took pieces again from 6 s on, 2.6 GiB within a second.
+
+The GPU tests of the crates the order touches passed with it: `ares-runtime` `expert_store`
+(54), `ares-model` `qwen4exp_runtime` on both cards (36) and `qwen4exp_device` with both cards
+on every layer (26).
 
 **Without a cap** (A/B, the binary of 8008eae0 against the branch at 65ac1ebb on the same base,
 in turn; cards without a display, nothing else on them; 8204 tokens of prompt and 256 of
