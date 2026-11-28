@@ -121,6 +121,10 @@ pub enum StoreError {
     Ledger(#[from] LedgerError),
     #[error("expert store: {0}")]
     Plan(String),
+    /// The RAM limit has no room for a piece of the tier now: the tier holds
+    /// what it has and tries again later.
+    #[error("expert store: {0}")]
+    NoRoom(String),
 }
 
 /// The key at the reader of part `part` (a matrix) of read `read`: an expert
@@ -392,6 +396,24 @@ enum Phase {
     Passed,
 }
 
+/// What a layer waited for last, in the order of [`StoreStats::wait_last_ms`].
+pub const WAITED_FOR: [&str; 4] = ["cpu", "ram", "file", "on its way"];
+const WAITED_CPU: usize = 0;
+const WAITED_RAM: usize = 1;
+const WAITED_FILE: usize = 2;
+const WAITED_ON_ITS_WAY: usize = 3;
+
+impl Source {
+    /// Where a miss of this source is counted in [`StoreStats::wait_last_ms`].
+    fn waited(self) -> usize {
+        match self {
+            Source::Ram => WAITED_RAM,
+            Source::Disk => WAITED_FILE,
+            Source::OnItsWay => WAITED_ON_ITS_WAY,
+        }
+    }
+}
+
 /// What the store did, since the last [`ExpertStore::take_stats`].
 #[derive(Clone, Debug, Default)]
 pub struct StoreStats {
@@ -453,6 +475,12 @@ pub struct StoreStats {
     /// layers: from the arrival of a record to the last of its misses being
     /// in a slot or delivered.
     pub wait_ms: f64,
+    /// The same, by what a layer waited for last ([`WAITED_FOR`]): the CPU's sums of
+    /// experts that were in RAM, an upload from the RAM tier, an expert read from the file
+    /// (uploaded, or computed by the CPU when its bytes had landed), an expert that was on
+    /// its way when the record arrived; and how many layers waited so.
+    pub wait_last_ms: [f64; 4],
+    pub waits_last: [u64; 4],
     /// Experts uploaded into transit slots, how many of them from the RAM
     /// tier (the others from the file through staging), and their bytes.
     pub transit_uploads: u64,
@@ -556,8 +584,9 @@ pub struct ExpertStore<D: SlotDevice> {
     /// each in the order of its stream.
     device_ops: Vec<[VecDeque<(u64, DeviceOp)>; 2]>,
     wants: Vec<Wanted>,
-    /// Layers of the running step that miss something, and since when.
-    waits: Vec<(usize, Instant)>,
+    /// Layers of the running step that miss something, since when, and what they waited
+    /// for last (an index of [`WAITED_FOR`]).
+    waits: Vec<(usize, Instant, usize)>,
     hybrid: Option<hybrid::Hybrid>,
     transit: Transit,
     pieces: Pieces,
@@ -1175,7 +1204,8 @@ impl<D: SlotDevice> ExpertStore<D> {
             missing += 1;
         }
         if missing > 0 {
-            self.waits.push((layer, now));
+            let last = self.wants.last().map_or(WAITED_ON_ITS_WAY, |w| w.source.waited());
+            self.waits.push((layer, now, last));
             self.poll()?;
         }
         Ok(missing)
@@ -1201,7 +1231,9 @@ impl<D: SlotDevice> ExpertStore<D> {
         // Memory the machine wants back goes before anything new is started
         // (unlocked once the step has ended on every device). What the tier
         // may take again its owner locks between steps ([`ExpertStore::grow_ram`]):
-        // a lock waits for no step to run.
+        // a lock waits for no step to run. A tier that found nothing to give
+        // tries again after every step: what was busy then may be free now.
+        self.retry_floor();
         self.shrink_ram(elastic::STEP_WAIT)?;
         if self.config.decay_every > 0 && self.step.is_multiple_of(self.config.decay_every) {
             self.heat.decay();
@@ -1312,6 +1344,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             if self.vram.sets[layer].contains(expert) {
                 let ms = want.since.elapsed().as_secs_f32() * 1e3;
                 self.stats.miss_ms.push(ms);
+                if let Some(wait) = self.waits.iter_mut().find(|w| w.0 == layer) {
+                    wait.2 = want.source.waited();
+                }
                 match want.source {
                     Source::Disk => self.stats.disk_miss_ms.push(ms),
                     Source::Ram => self.stats.ram_miss_ms.push(ms),
@@ -1357,11 +1392,14 @@ impl<D: SlotDevice> ExpertStore<D> {
         // Layers that have everything they missed.
         let mut at = 0;
         while at < self.waits.len() {
-            let (layer, since) = self.waits[at];
+            let (layer, since, last) = self.waits[at];
             if self.wants.iter().any(|w| w.layer == layer) || self.cpu_is_open(layer) {
                 at += 1;
             } else {
-                self.stats.wait_ms += since.elapsed().as_secs_f64() * 1e3;
+                let ms = since.elapsed().as_secs_f64() * 1e3;
+                self.stats.wait_ms += ms;
+                self.stats.wait_last_ms[last] += ms;
+                self.stats.waits_last[last] += 1;
                 self.waits.swap_remove(at);
             }
         }

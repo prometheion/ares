@@ -771,6 +771,22 @@ pub trait Model: Send + Sync + 'static {
         let _ = part;
     }
 
+    /// The K and V beyond VRAM of the pool pages `live` (a flag per pool
+    /// page: held by a sequence or by the prompt cache) are about to be in
+    /// use: the model locks what they need in host memory and gives back what
+    /// no page in use needs, before the conductor writes the next step. The
+    /// elastic users above the prompt cache give what their allowances no
+    /// longer hold (the tier of experts, down to its floor). Returns the bytes
+    /// the RAM limit still lacks, 0 when it had room: the conductor then makes
+    /// the prompt cache give up what it holds and asks again, and ends a
+    /// request when nothing more can go, so that no step fails for it. Called
+    /// on the conductor's thread while no step runs; a model without state in
+    /// host memory has nothing to do.
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        let _ = live;
+        Ok(0)
+    }
+
     /// The step of `record` is about to be handed to the devices: the place
     /// where the model's page-locked memory changes (pieces locked for what
     /// the step reads, others given back). Called on the conductor's thread

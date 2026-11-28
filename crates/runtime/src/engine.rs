@@ -649,8 +649,9 @@ impl Engine for Runtime {
             drafts_accepted: c.drafts_accepted,
             requests_finished: c.requests_finished,
             requests_cancelled: c.requests_cancelled,
-            // Nothing is refused for lack of room: a request waits in line.
-            requests_refused: 0,
+            // A request waits in line for a place; it ends for lack of room
+            // only when the RAM limit has none for its K and V beyond VRAM.
+            requests_refused: c.requests_no_memory,
             requests_outranked: c.requests_outranked,
             requests_displaced: c.requests_displaced,
             prefix_hits: c.prefix_hits,

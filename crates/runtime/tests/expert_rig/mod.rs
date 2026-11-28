@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_io::{Config, ExpertMap, Reader};
-use ares_runtime::expert_store::{ExpertStore, HostRegion, LayerSpec, StoreConfig, StorePlan};
+use ares_runtime::expert_store::{
+    ExpertStore, HostRegion, LayerSpec, Locker, StoreConfig, StorePlan,
+};
 use ares_runtime::testing::HostSlots;
 
 pub const LAYERS: usize = 3;
@@ -119,6 +121,29 @@ pub fn rig_reading(
     reader: Config,
     tune: impl FnOnce(&mut StoreConfig),
 ) -> Rig {
+    build(vram_slots, ram_slots, pieces, reader, None, tune)
+}
+
+/// [`rig_in_pieces`] whose RAM tier `locker` locks, as the books of the RAM
+/// limit and a device do.
+pub fn rig_locked(
+    vram_slots: u64,
+    ram_slots: u64,
+    pieces: (usize, usize),
+    locker: Box<dyn Locker>,
+    tune: impl FnOnce(&mut StoreConfig),
+) -> Rig {
+    build(vram_slots, ram_slots, Some(pieces), Config::default(), Some(locker), tune)
+}
+
+fn build(
+    vram_slots: u64,
+    ram_slots: u64,
+    pieces: Option<(usize, usize)>,
+    reader: Config,
+    locker: Option<Box<dyn Locker>>,
+    tune: impl FnOnce(&mut StoreConfig),
+) -> Rig {
     let dir = Scratch::new();
     let gguf = model(&dir);
     let map =
@@ -155,7 +180,10 @@ pub fn rig_reading(
     assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
     assert_eq!(plan.transit_slots(0), (transit, staging));
     let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
-    let mut region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
+    let mut region = match locker {
+        Some(locker) => HostRegion::elastic(plan.ram_bytes(), plan.ram_bytes(), locker).unwrap(),
+        None => HostRegion::unpinned(plan.ram_bytes(), plan.block()),
+    };
     if let Some((per_piece, start)) = pieces {
         // A piece is whole pages.
         region = region.starting_with(start * (per_piece * ram_slot).next_multiple_of(4096));

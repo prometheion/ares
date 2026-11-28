@@ -42,6 +42,7 @@ the server has one.
 | 404 / 405 | an unknown route or model / a wrong method |
 | 408 / 413 | the body did not arrive within `--timeout` / the body is larger than 64 MiB |
 | 503 | `overloaded` with `Retry-After: 1` (the `--queue` is full), `model_load_failed`, `model_not_loaded` (`/metrics`, and `/tokenize` and `/detokenize` without a `model`), the server is stopping |
+| 507 | `insufficient_memory` with `Retry-After: 1`: the RAM limit (`--ram`) had no room for the request's state beyond VRAM while it ran, with the prompt cache given up; the request ended (in a stream, as an error event), the model serves on |
 
 Errors have OpenAI's shape `{"error": {"message", "type", "param", "code"}}`,
 and Anthropic's `{"type": "error", "error": {"type", "message"}}` on `/v1/messages`.

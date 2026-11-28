@@ -237,6 +237,10 @@ impl Model for Templated {
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {
         self.inner.page_layout(cells_per_page)
     }
+    fn make_room(&self, live: &[bool]) -> Result<u64, ModelError> {
+        self.inner.make_room(live)
+    }
+
     fn before_step(&self, record: &RecordView<'_>) -> Result<(), ModelError> {
         self.inner.before_step(record)
     }
