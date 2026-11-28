@@ -208,10 +208,14 @@ pub async fn serve_models(
     let draining = Arc::new(Notify::new());
     let begin_drain = draining.clone();
     let (stop_requests, stop) = Stop::new();
+    let loads = models.clone();
     let restarting = models.clone();
     let serving =
         listen::listen(listener, routes_over(models, config, stop), timeout, async move {
             shutdown.await;
+            // A load that runs ends as soon as it can, and requests that wait
+            // for one are told that the server stops.
+            loads.drain();
             tracing::info!("shutting down: no new connections, waiting for running requests");
             begin_drain.notify_one();
         });

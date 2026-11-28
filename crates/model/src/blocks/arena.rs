@@ -3,16 +3,15 @@
 //! columns of a matrix gathered into a matrix of their own (the same bytes per
 //! value, never decoded), or values the host made.
 //!
-//! The bytes of the model file are uploaded from its mapping; on a machine
-//! short of memory for them, the pages that are not in the page cache are read
-//! from the file with ordinary reads into the loader's memory and uploaded from
-//! there ([`MappedFiles`]).
+//! The bytes of the model file are uploaded from its mapping where its pages
+//! are in the page cache; the others are read from the file with ordinary
+//! reads into the loader's memory and uploaded from there ([`MappedFiles`]).
 
 use std::ops::Range;
 
 use ares_core::GgmlType;
 use ares_cuda::{DeviceBuffer, WeightRange};
-use ares_runtime::{MemorySource, ModelError};
+use ares_runtime::ModelError;
 
 use crate::files::Matrix;
 
@@ -115,20 +114,26 @@ const PIECE: usize = 16 << 20;
 ///
 /// The stored bytes of a matrix are a slice of a mapping of the model file.
 /// Uploading from the mapping makes the driver fault the file in page by
-/// page, and the kernel stops reading ahead on a mapping whose faults keep
-/// missing the page cache: on a machine short of memory a load of
-/// Qwen3.8-27B then read 38 MB per second from a drive that gives 900 to an
-/// ordinary read. So on a machine short of memory for a load (less than twice
-/// its bytes available), bytes whose pages are not all in the page cache are
-/// read from the file itself, a piece at a time into the loader's memory, and
-/// uploaded from there; reads of a file are read ahead whatever the page cache
-/// does. Otherwise the bytes are uploaded from the mapping, which saves that
-/// copy and is faster from a cold file too: 3.3 GiB of Flash-Next's dense
-/// weights upload in 0.3 to 0.6 s from the mapping against 0.6 to 2.0 s
-/// through the reads (RTX 4070, 2026-11-24). Which file and where is taken
-/// from the process's table of mappings, so nothing above the loader needs to
-/// know; bytes that are not a file's (a model built in memory) are uploaded
-/// from where they are.
+/// page, and Linux reads around a fault only while the faults of that file
+/// mostly find the page cache: every fault that finds nothing counts a miss,
+/// every hit takes one off, and past a hundred misses (`MMAP_LOTSAMISS` in
+/// `mm/filemap.c`) every fault reads one page. A hit on a page that was read
+/// again soon after the kernel took it back (a refault, the folio marked
+/// `workingset`) takes nothing off. So a load of Qwen3.8-27B read 38 MB per
+/// second from a drive that gives 900 to an ordinary read on a machine short
+/// of memory, and 5 to 20 MB per second (659 s for the weights of one device
+/// instead of 17) when it was loaded again in the same process soon after
+/// the kernel had taken the file's pages back from the first engine (GitHub
+/// issue #66, `docs/dev/experiments/load-and-stop.md`); a copy from a cold
+/// mapping without read-around gave 2 MB per second there, against 390 MB
+/// per second for ordinary reads and for the mapping with read-around. An
+/// ordinary read is read ahead by its own size and counts no misses, so bytes
+/// whose pages are not all in the page cache are read from the file itself, a
+/// piece at a time into the loader's memory, and uploaded from there; bytes
+/// that are all there are uploaded from the mapping, which saves that copy. Which file and where is
+/// taken from the process's table of mappings, so nothing above the loader
+/// needs to know; bytes that are not a file's (a model built in memory) are
+/// uploaded from where they are.
 #[derive(Default)]
 struct MappedFiles {
     /// The file mappings of the process: start and end address, the file's
@@ -136,16 +141,11 @@ struct MappedFiles {
     regions: Vec<(usize, usize, u64, std::path::PathBuf)>,
     /// The files opened so far, by index of their first region.
     open: Vec<(std::path::PathBuf, std::fs::File)>,
-    /// Whether the machine is short of memory for the bytes read: then the
-    /// pages that are not in the page cache are read with ordinary reads.
-    short: bool,
 }
 
 impl MappedFiles {
-    /// The file mappings of the process as they are now, for reading `bytes`
-    /// bytes of them: the machine is short of memory for them when it has
-    /// less than twice that available.
-    fn of_process(bytes: u64) -> Self {
+    /// The file mappings of the process as they are now.
+    fn of_process() -> Self {
         let mut regions = Vec::new();
         // start-end perms offset dev inode path
         for line in std::fs::read_to_string("/proc/self/maps").unwrap_or_default().lines() {
@@ -169,16 +169,15 @@ impl MappedFiles {
                 regions.push((start, end, offset, path.into()));
             }
         }
-        let available = ares_runtime::Meminfo.available();
-        let short = available.is_some_and(|available| available < 2 * bytes);
-        Self { regions, open: Vec::new(), short }
+        Self { regions, open: Vec::new() }
     }
 
-    /// The bytes of `mapped`: read from its file into `staging` when it lies
-    /// in a file mapping and the read succeeds, `mapped` itself otherwise.
+    /// The bytes of `mapped`: `mapped` itself when its pages are in memory,
+    /// otherwise read from its file into `staging` when it lies in a file
+    /// mapping and the read succeeds (and `mapped` when it does not).
     fn read<'a>(&mut self, mapped: &'a [u8], staging: &'a mut Vec<u8>) -> &'a [u8] {
         use std::os::unix::fs::FileExt;
-        if !self.short || resident(mapped) {
+        if resident(mapped) {
             return mapped;
         }
         let at = mapped.as_ptr() as usize;
@@ -228,7 +227,7 @@ fn resident(bytes: &[u8]) -> bool {
 /// Reads the stored bytes of `m` into `into`, which has their length: a
 /// piece at a time, from the mapping or with ordinary reads as the uploads do.
 pub(crate) fn read_matrix(m: &Matrix<'_>, into: &mut [u8]) {
-    let mut files = MappedFiles::of_process(m.bytes().len() as u64);
+    let mut files = MappedFiles::of_process();
     let mut staging = Vec::new();
     for (piece, to) in m.bytes().chunks(PIECE).zip(into.chunks_mut(PIECE)) {
         to.copy_from_slice(files.read(piece, &mut staging));
@@ -245,10 +244,10 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
-    /// The uploads of a load of `bytes` bytes, reading through the file
-    /// mappings the process has now.
-    pub(crate) fn new(bytes: u64) -> Self {
-        Self { files: MappedFiles::of_process(bytes), ..Self::default() }
+    /// The uploads of a load, reading through the file mappings the process
+    /// has now.
+    pub(crate) fn new() -> Self {
+        Self { files: MappedFiles::of_process(), ..Self::default() }
     }
 
     /// Uploads `bytes` to offset `at` of `arena`: at once from where they are
@@ -259,7 +258,7 @@ impl Reader {
         at: u64,
         bytes: &[u8],
     ) -> Result<(), ModelError> {
-        if !self.files.short || resident(bytes) {
+        if resident(bytes) {
             arena.write(at, bytes)?;
             return Ok(());
         }
@@ -291,8 +290,7 @@ impl Ranges {
         if let Some((_, range)) = self.known.iter().find(|(known, _)| *known == at) {
             return *range;
         }
-        let bytes = m.bytes().len() as u64;
-        let files = self.files.get_or_insert_with(|| MappedFiles::of_process(bytes));
+        let files = self.files.get_or_insert_with(MappedFiles::of_process);
         let mut range = WeightRange::Any;
         for piece in m.bytes().chunks(PIECE) {
             range = range.and(WeightRange::of(m.ty(), files.read(piece, &mut self.staging)));
@@ -334,4 +332,63 @@ pub(crate) fn value_ranges(
 /// The values of `ranges` of `values`, range after range.
 pub(crate) fn gather(values: &[f32], ranges: &[Range<usize>]) -> Vec<f32> {
     ranges.iter().flat_map(|r| values[r.clone()].iter().copied()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd;
+
+    use super::{MappedFiles, resident};
+
+    /// Bytes of a file mapping whose pages are not in the page cache are read
+    /// from the file with an ordinary read, however much memory the machine
+    /// has (a fault of the mapping may read one page at a time); bytes whose
+    /// pages are all there come from the mapping itself.
+    #[test]
+    fn bytes_not_in_the_page_cache_are_read_from_the_file() {
+        // Beside the test binary: the build's disk, where the page cache can
+        // give pages back (a tmpfs cannot).
+        let exe = std::env::current_exe().expect("the test binary");
+        let path = exe.with_file_name(format!("arena-read-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0..4usize << 20).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&path, &bytes).expect("the build directory is writable");
+        let file = std::fs::File::open(&path).expect("just written");
+        file.sync_all().expect("written to the disk");
+        // SAFETY: a shared read-only mapping of the whole file, unmapped below
+        // after its last use.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes.len(),
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        // SAFETY: the mapping holds `bytes.len()` readable bytes until the
+        // `munmap` below.
+        let mapped = unsafe { std::slice::from_raw_parts(map as *const u8, bytes.len()) };
+        // SAFETY: plain call on an open descriptor.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        let evicted = !resident(mapped);
+
+        let mut files = MappedFiles::of_process();
+        let mut staging = Vec::new();
+        let read = files.read(mapped, &mut staging);
+        assert!(read == &bytes[..], "the file's bytes");
+        let from_file = read.as_ptr() != mapped.as_ptr();
+        if evicted {
+            assert!(from_file, "pages outside the page cache are read with an ordinary read");
+        }
+        // The read brought them into the page cache: now from the mapping.
+        assert!(resident(mapped));
+        let again = files.read(mapped, &mut staging);
+        assert_eq!(again.as_ptr(), mapped.as_ptr(), "pages in the page cache come from the map");
+
+        // SAFETY: the mapping made above, not used any more.
+        unsafe { libc::munmap(map, bytes.len()) };
+        let _ = std::fs::remove_file(&path);
+    }
 }

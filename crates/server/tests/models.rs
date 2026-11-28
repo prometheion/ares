@@ -186,6 +186,10 @@ impl Loader for Loads {
         let ram = site.ram.unwrap_or(0);
         Ok(Box::new(Running { machine: machine.clone(), id, engine, taken, ram }))
     }
+
+    fn stop(&self) {
+        self.0.log.lock().unwrap().push("stop".into());
+    }
 }
 
 /// A server over the presets of `ini` on a machine with `devices`.
@@ -605,7 +609,7 @@ async fn an_engine_stuck_in_a_step_asks_for_a_restart_and_every_request_is_told_
     // an unload would ask its driver to free what it holds.
     drop(on_a);
     w.models.shutdown().await;
-    assert_eq!(w.machine.log(), ["load a", "load d", "unload d"]);
+    assert_eq!(w.machine.log(), ["load a", "load d", "stop", "unload d"]);
 }
 
 // --- start and shutdown -----------------------------------------------------------
@@ -663,16 +667,48 @@ async fn a_shutdown_unloads_everything_and_tells_the_requests_that_wait() {
         *flag.lock().unwrap() = true;
     });
     assert_eq!(waiting.await.unwrap().unwrap_err(), AcquireError::Stopping);
+    // The loader is told, so that it ends what it can end early.
+    w.until_logged("stop").await;
     assert!(!*stopped.lock().unwrap(), "the load that runs is finished first");
     weights.open();
     shutdown.await.unwrap();
 
     let mut log = w.machine.log();
-    assert_eq!(log[..3], ["load a", "load d", "load b"]);
-    log.sort();
-    assert_eq!(log[3..], ["unload a", "unload b", "unload d"]);
+    assert_eq!(log[..4], ["load a", "load d", "load b", "stop"]);
+    log[4..].sort();
+    assert_eq!(log[4..], ["unload a", "unload b", "unload d"]);
     assert_eq!(w.machine.free(), [10, 10], "everything is given back");
     assert_eq!(w.models.acquire("a").await.unwrap_err(), AcquireError::Stopping);
+}
+
+/// The first signal drains: the loader is told to end what it loads early, a
+/// request that waits for a load is told that the server stops instead of
+/// waiting for it, and a loaded model serves the requests that run (and those
+/// that come on connections that are open) until the shutdown.
+#[tokio::test]
+async fn a_drain_tells_the_requests_that_wait_for_a_load_and_serves_the_others() {
+    let w = world(THREE, &[10, 10]);
+    let running = w.models.acquire("a").await.unwrap();
+    let weights = w.machine.latch("b");
+    let waiting = w.request("b");
+    w.until_logged("load b").await;
+
+    w.models.drain();
+    assert_eq!(waiting.await.unwrap().unwrap_err(), AcquireError::Stopping);
+    assert!(w.machine.log().iter().any(|line| line == "stop"), "the loader was told");
+    assert_eq!(w.models.acquire("c").await.unwrap_err(), AcquireError::Stopping, "no new load");
+    drop(w.models.acquire("a").await.expect("a loaded model serves on"));
+    assert!(w.is("a", "loaded"), "not unloaded under its request");
+    weights.open();
+    w.until("b", "loaded").await;
+    drop(running);
+
+    w.models.shutdown().await;
+    let mut log = w.machine.log();
+    assert_eq!(log[..3], ["load a", "load b", "stop"]);
+    log[3..].sort();
+    assert_eq!(log[3..], ["stop", "unload a", "unload b"]);
+    assert_eq!(w.machine.free(), [10, 10], "everything is given back");
 }
 
 // --- the routes ---------------------------------------------------------------------

@@ -9,6 +9,7 @@
 //! as the text `t5 t9 ...` and read the answers back the same way.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -2717,6 +2718,16 @@ fn the_ram_tier_gives_its_memory_back_to_the_system_and_takes_it_again() {
 /// `dir`, whose misses are all uploaded (the CPU's arithmetic is not the
 /// device's, and a run that misses less would compute other experts there).
 fn start_profiled(placement: Placement, dir: &std::path::Path) -> (Runtime, Arc<Qwen4Exp>) {
+    start_stoppable(placement, dir, Arc::default())
+}
+
+/// [`start_profiled`] for a model whose fills of the tiers end once `stop` is
+/// set ([`Qwen4Exp::with_stop`]).
+fn start_stoppable(
+    placement: Placement,
+    dir: &std::path::Path,
+    stop: Arc<AtomicBool>,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
     let gguf = Gguf::open(gguf_path(1)).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
@@ -2724,7 +2735,8 @@ fn start_profiled(placement: Placement, dir: &std::path::Path) -> (Runtime, Arc<
     opts.serve = Serve::Stream;
     let inner = Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS)
         .unwrap()
-        .with_usage_profile(dir, Arc::new(|line| eprintln!("LOG {line}")));
+        .with_usage_profile(dir, Arc::new(|line| eprintln!("LOG {line}")))
+        .with_stop(stop);
     let inner = Arc::new(inner);
     let config = RuntimeConfig {
         pages: 16,
@@ -2794,6 +2806,43 @@ fn the_usage_profile_outlives_the_engine_and_fills_the_tiers() {
         drop(model);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A stop of the model's owner ends the fills of the tiers: a fill from the
+/// profile that finds it set reads nothing, and an idle engine fills nothing
+/// either (what a server that stops while its model loads needs: the stop does
+/// not wait for the drive). The answers stay what they were.
+#[test]
+fn a_stop_ends_the_fills_of_the_tiers() {
+    use ares_model::qwen4exp::device::{IDLE_AFTER, ProfileFound};
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(40, 5);
+    let placement = Placement::One;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("q4rt-usage-stop");
+    let _ = std::fs::remove_dir_all(&dir);
+    let (runtime, model) = start_profiled(placement, &dir);
+    model.serving().expect("the model keeps a profile");
+    let first = ask(&runtime, 1, &prompt, 16);
+    runtime.shutdown();
+    drop(runtime);
+    drop(model);
+
+    let stop = Arc::new(AtomicBool::new(true));
+    let (runtime, model) = start_stoppable(placement, &dir, stop);
+    let report = model.serving().expect("the model keeps a profile");
+    assert!(matches!(report.found, ProfileFound::Found { .. }), "{report:?}");
+    let (filled, _) = report.filled.expect("the fill was asked");
+    assert_eq!((filled.reads, filled.vram, filled.ram), (0, 0, 0), "{filled:?}");
+    std::thread::sleep(IDLE_AFTER + Duration::from_millis(500));
+    let usage = model.usage_stats().expect("the model keeps a profile");
+    assert_eq!(usage.idle.reads, 0, "nothing is filled while nothing runs: {usage:?}");
+    assert_eq!(ask(&runtime, 2, &prompt, 16), first, "the same answer from empty tiers");
+    runtime.shutdown();
+    drop(runtime);
+    drop(model);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The MTP block in the model file (what `--drafters mtp` reads) drafts as
