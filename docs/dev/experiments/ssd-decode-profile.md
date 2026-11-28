@@ -232,7 +232,7 @@ same per request in `/metrics`. Per generated token (the request's short prompt 
 - At `--ram 16G` the server waits for the file 80 to 90 % of a token, as the tool does, and its
   reads take 4.5 to 8 ms an expert.
 
-## Levers 1 and 5 on the branch `perf/io-core` (2026-11-28)
+## Levers 1 and 5 (#96, 2026-11-28)
 
 What the branch changes (see "Where the CPU workers run" and "Predicted only where a read may
 come of it" in [`experts.md`](../architecture/experts.md)):
@@ -284,9 +284,79 @@ equal; the branch's steps named 1653 experts a step against 2236.
   35.7 and 41.1 ms at the median with 89 % of their picks in VRAM, the other six 23.7 to 24.7 ms
   with 97 %).
 
-The A/B of lever 1's case, on the test machine (`qwen4exp_run` at `--ram-gib` 16 and 39.5 and
-the server at `--ram 40G`, main against the branch, alternating twice), is still to run: the
-machine was off from 2026-11-27 21:00.
+*How to leave the core, on the test machine* (2026-11-27 18:35 to 18:51; one build with four
+placements behind a switch of the experiment that is not in the code; `--ram-gib 39.5`, in the
+order main's, the rule, workers that yield, the rule without binding the I/O threads, then again;
+load 1 to 12 at the starts, the runs' own workers; the I/O threads' waits for a core over 20 s
+of decode):
+
+| Placement | Steps 1-256: median / mean | Steps 257-512, median | An expert's reads; a matrix | Waits: file / CPU | The I/O threads waited; a wake-up |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| main's: 13 workers, pinned | 67.6 / 72.0, 67.9 / 72.5 ms | 91.4, 92.7 ms | 3.48, 3.56; 2.55, 2.72 ms | 25.0, 25.7 / 11.8, 11.9 ms | 2696, 2614 ms; 232, 229 µs |
+| the rule: 12 workers, the I/O threads on cores 0 and 13 | 58.2 / 61.1, 60.3 / 63.7 | 75.3, 76.4 | 2.24, 2.28; 1.42, 1.46 | 14.7, 16.6 / 11.5, 12.2 | 32, 19 ms; 1.9, 1.1 µs |
+| 13 workers that yield every 256 spins | 61.8 / 65.3, 63.6 / 71.0 | 81.3, 81.7 | 2.64, 3.48; 1.87, 1.84 | 18.7, 24.1 / 11.6, 11.8 | 1107, 377 ms; 69, 44 µs |
+| the rule, the I/O threads not bound | 58.2 / 60.9, 59.9 / 63.5 | 74.9, 75.4 | 2.26, 2.29; 1.42, 1.47 | 14.5, 16.6 / 11.5, 12.0 | 40, 45 ms; 2.4, 2.6 µs |
+
+The rule is the fastest. Workers that yield keep about half of the loss: a woken I/O thread still
+waits for the worker on its core to reach its yield (44 to 69 µs), and the host thread, which
+spins too, does not yield. Binding the I/O threads changes nothing here, where the free core is
+there either way; it keeps them off the workers' cores whatever the scheduler does.
+
+*Main before and after, on the test machine* (2026-11-28 14:50 to 15:24; A is `main` 372763fb,
+the build of the profile with the counters, B is #96 (5718d615) alone, C the `main` of that day
+(06e48088, with #97 and #103 after #96); in the order A, B, C and then C, B, A at each size of
+the tier; the runs of "Where a step goes", 256 + 256 steps; load 10 to 14 at the starts, the runs'
+own workers; the I/O threads' waits for a core over 20 s of decode):
+
+| Run | Steps 1-256: median / mean | Steps 257-512, median | In VRAM | An expert's reads; a matrix | Waits: file (layers) / CPU | The I/O threads, a wake-up | Dense | Predicted a step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 GiB, A | 160.6 / 178.5, 154.3 / 176.7 ms | 246.9, 251.9 ms | 56.8, 58.1 % | 5.01, 5.11; 4.41, 4.53 ms | 139.9 (28.3), 137.8 (27.3) / 3.8, 4.2 ms | 270, 268 µs | 18.0, 18.0 ms | 645, 641 |
+| 16 GiB, B | 121.0 / 140.9, 111.6 / 128.4 | 194.4, 203.1 | 56.7, 59.8 % | 3.67, 3.50; 3.04, 3.42 | 102.3 (28.5), 89.6 (26.5) / 3.9, 4.2 | 2.5, 2.5 µs | 17.2, 17.2 | 468, 467 |
+| 16 GiB, C | 111.7 / 126.6, 119.3 / 141.1 | 205.8, 191.0 | 60.3, 56.8 % | 3.42, 3.68; 3.61, 3.09 | 87.8 (26.7), 102.8 (28.5) / 4.3, 3.8 | 2.1, 2.5 µs | 17.2, 17.2 | 468, 468 |
+| 39.5 GiB, A | 67.0 / 71.9, 66.6 / 72.0 | 94.0, 90.5 | 56.7, 56.7 % | 3.43, 3.48; 2.66, 2.53 | 24.9 (7.2), 25.1 (7.2) / 12.1, 11.9 | 206, 231 µs | 18.0, 18.0 | 645, 645 |
+| 39.5 GiB, B | 60.1 / 62.6, 57.5 / 60.1 | 76.0, 76.5 | 57.4, 59.7 % | 2.27, 2.22; 1.46, 1.42 | 16.1 (7.0), 14.2 (6.3) / 12.1, 11.5 | 2.1, 1.6 µs | 16.5, 16.6 | 115, 80 |
+| 39.5 GiB, C | 58.3 / 60.9, 57.1 / 59.6 | 75.2, 78.1 | 59.2, 61.6 % | 2.22, 2.35; 1.43, 1.55 | 14.6 (6.4), 13.5 (5.6) / 11.8, 11.6 | 2.4, 3.2 µs | 17.2, 17.1 | 82, 80 |
+
+- *The step.* At 40 GiB #96 takes a step in 58.8 ms against 66.8 at the median (-12 %; the means
+  61.4 against 72.0, -15 %), the later steps in 76.3 against 92.2 (-17 %); at 16 GiB in 116
+  against 157 ms (-26 %; the means 135 against 178, -24 %), the later steps in 199 against 249
+  (-20 %). That is what the profile measured with fewer workers that the scheduler places
+  (-6 to -11 and -35 to -42 ms), about.
+- *The reads.* An expert's reads take 2.2 to 2.3 ms at 40 GiB (3.4 to 3.5 before) and 3.5 to
+  3.7 ms at 16 GiB (5.0 to 5.1): the I/O threads wait 2 to 3 µs a wake-up for a core, where
+  they waited 0.2 to 0.27 ms. The CPU's share takes what it took (11.5 to 12.1 ms of waits at 40
+  GiB): the core the workers leave costs them nothing that shows.
+- *Lever 5.* At 40 GiB no place qualifies (0.1 to 0.2 experts a step were read ahead before),
+  the steps predict 80 to 115 experts where they predicted 645, and the dense part takes 16.5 to
+  16.6 ms against 18.0 (-1.4 to -1.5 ms of the 1.7 the routers cost). At 16 GiB places one layer
+  ahead qualify (2.4 to 3.7 experts read ahead a step, in both builds): the steps predict one
+  layer ahead every step and two every eighth, 468 experts against 645, and the dense part takes
+  17.2 against 18.0 ms.
+- *The main of that day* decodes as #96 does. Its dense part at 40 GiB is 0.6 ms longer than
+  #96's (17.1 against 16.5) with as few predictions; that comes from a change after #96 and is not
+  looked into here.
+
+*Through the server* (`--ram 40G`, MTP drafts, the bench's decode questions as in "Through the
+server" above, 300 tokens each and asked twice; A, B and C as above, in the order A, B, C and
+then C, B, A, 2026-11-28 15:24 to 15:41, load 7 to 14; per generated token from the requests'
+`/metrics`):
+
+| Run | Tokens/s, first asks: German / English / code | Asked again | Waits a token, first asks | Reads of the file a token, first asks | An expert's demand read |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A, 1 | 12.9 / 16.6 / 13.1 | 21.1 / 24.1 / 20.2 | 61 / 43 / 60 ms | 25 / 13 / 22 | 3.7 to 4.3 ms |
+| A, 2 | 13.3 / 17.0 / 14.1 | 21.0 / 26.4 / 21.9 | 56 / 40 / 56 | 23 / 11 / 24 | 3.7 to 4.8 |
+| B, 1 | 15.0 / 19.7 / 15.0 | 24.0 / 37.9 / 25.9 | 51 / 35 / 53 | 27 / 13 / 26 | 2.7 to 3.7 |
+| B, 2 | 14.8 / 19.2 / 15.3 | 29.5 / 27.3 / 23.6 | 49 / 35 / 51 | 23 / 14 / 25 | 2.8 to 3.8 |
+| C, 1 | 15.4 / 17.5 / 14.5 | 22.6 / 27.0 / 22.5 | 51 / 37 / 54 | 25 / 13 / 25 | 2.6 to 3.2 |
+| C, 2 | 14.9 / 19.5 / 14.8 | 28.0 / 30.5 / 24.5 | 52 / 36 / 53 | 26 / 14 / 27 | 2.8 to 4.0 |
+
+- On first asks #96 writes 14.9, 19.5 and 15.2 tokens/s against 13.1, 16.8 and 13.6 (+14, +16
+  and +11 %): a token waits 49 to 53 ms for misses against 56 to 61 on German and code, 35 against
+  40 to 43 on English, with as many reads of the file, and an expert's read takes 2.7 to 3.8 ms
+  against 3.7 to 4.8. Asked again, the drafts decide more than the reads (65 to 98 % of them
+  accepted) and the runs spread: 23.6 to 37.9 tokens/s against 20.2 to 26.4.
+- The main of that day holds 1.2 GiB less of the card after loading (14 604 MiB against 15 784)
+  and writes what #96 writes.
 
 ## The levers of #16, ranked by this profile
 
@@ -296,11 +366,11 @@ a run; the others are bounds from the parts of the step.
 
 | # | Lever | 40 GiB | 16 GiB | Grounds |
 | --- | --- | ---: | ---: | --- |
-| 1 | A core for the I/O thread (the CPU workers leave the reader a core) | -6 to -11 ms (9 to 12 %) | -35 to -42 ms (16 to 23 %) | measured with 12 and 10 workers the scheduler places: -6.3 and -35 ms on the mean step, -11 and -40 ms on the later steps; the file waits -8 to -10 and -35 to -42 ms, the CPU's waits +1.3 ms with 12 |
+| 1 | A core for the I/O thread (the CPU workers leave the reader a core) | done (#96): -8.0 ms at the median (-12 %), -10.6 on the mean | done (#96): -41 ms at the median (-26 %), -43 on the mean | measured on #96 against main, with lever 5's -1.4 and -0.8 ms (see "Levers 1 and 5"); before, with 12 and 10 workers the scheduler places: -6.3 and -35 ms on the mean step, -11 and -40 ms on the later steps |
 | 2 | The stream mixers at the card's bandwidth (#18) | up to -5.5 ms (8 %) | up to -5.5 ms (3 %) | 7.8 ms for 644 MiB that take 2.3 at 288 GB/s |
 | 3 | The CPU's share closer to the memory's bandwidth | -2 to -4 ms (3 to 6 %) | -1 ms | 4.3 experts a layer in 0.31 ms, 39 GB/s from RAM |
 | 4 | One read per expert (a file of Ares's own) | -1.5 to -3 ms (2 to 4 %) | -6 to -11 ms (3 to 6 %) | an expert alone takes 2.0 ms in three reads at depth 1; what one read of 3 MB takes is not measured |
-| 5 | No predictions where no place qualifies | -1.7 ms (2.4 %) | -1.7 ms (1 %) | measured: `--predict 0` takes 1.7 ms off the dense part and reads ahead nothing less that is used |
+| 5 | No predictions where no place qualifies | done (#96): -1.4 to -1.5 ms of the dense part | done (#96): -0.8 ms | measured on #96: at 40 GiB no place qualifies and seven steps in eight predict nothing; at 16 GiB places one layer ahead qualify and the second layer is predicted every eighth step; before, `--predict 0` took 1.7 ms off the dense part |
 | 6 | The resident experts' down product while the misses come ("reordered inference", LES, ProMoE) | -1.5 ms (2 %) | -1.5 ms (1 %) | the device computes about 0.1 ms of experts a layer, a third of it the down product; a layer waits 0.31 to 5 ms |
 | 7 | VRAM catches up faster after the text changes | not known | not known | the share in VRAM varies from 22 to 77 % by 64 steps and a slow window takes twice the step; at 40 GiB it recovers within 64 to 128 steps, at 16 GiB it stayed at 36 to 47 % for 320 steps; the server's first asks find 28 to 60 % |
 | 8 | Reading ahead on the predictions | none | none | of the experts no tier holds, 11 % (40 GiB) and 23 % (16 GiB) of the predicted are picked; the drive bounds the 16 GiB step; a prefetch waits 170 to 250 ms |
@@ -310,7 +380,9 @@ a run; the others are bounds from the parts of the step.
   step. The workers spin between the jobs of a step (20 ms before they sleep), so on a CPU without
   a second thread per core every core is busy through the step. Strata's rule on this machine is
   9 workers (the performance cores but one and half of the efficiency cores), the host on core 0
-  and its I/O threads on the four cores left.
+  and its I/O threads on the four cores left. #96 leaves one efficiency core more and binds the
+  I/O threads to the cores without a worker (12 workers in the tool, 11 in the server); that took
+  the waits of the reads where fewer workers took them.
 - *7 is not yet a lever.* The tiers do follow the text; what a change would buy is the speed at
   which they catch up after the text changes. The measurement first: the share per 64 steps after
   a change of the text, with the promotions between steps bounded by the link's time as now and
