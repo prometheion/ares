@@ -66,8 +66,8 @@ pub use experts::{
     RouteRecord, RowsItem, RowsPlan, RowsPlanLayout,
 };
 pub use kernels::{
-    ActivationForm, FEW_ROWS, FewPlan, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH,
-    Precision, PrefillChoice, PrefillPath, PrefillShape, WeightLayout, WeightRange,
+    ActivationForm, FEW_ROWS, FewPlan, FewPlans, Kernels, LayoutKernel, LayoutRows, LayoutTable,
+    MAX_BATCH, Precision, PrefillChoice, PrefillPath, PrefillShape, WeightLayout, WeightRange,
 };
 pub use layers::{
     AttentionShape, CommitSet, EmbedRows, KeptRows, LayerKernels, NormKind, OutputGate,

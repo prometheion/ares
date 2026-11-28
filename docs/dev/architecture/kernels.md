@@ -82,10 +82,32 @@ of the four launches is the fastest depends on the shape and the card:
 `Kernels::tune_layout` times them for each shape at load (the model's chooser
 does it over its probe buffer, as large as the weights, because a small matrix
 timed over a few dozen megabytes finds its address translations and the
-launches that wait for them look better than they are). None of the launches
-changes a bit: a row has the same bits alone, in a window of up to 16 rows, with
-other rows beside it, in each launch, tuned or not
-(`tests/layout.rs::a_row_is_the_same_bits_in_any_batch_and_launch`). 0.04 %
+launches that wait for them look better than they are), for the kernel of up to
+8 rows with one row and for the kernel of 9 to 16 rows with 16 (`FewPlans`). None
+of the launches changes a bit: a row has the same bits alone, in a window of up to
+16 rows, with other rows beside it, in each launch, tuned or not
+(`tests/layout.rs::a_row_is_the_same_bits_in_any_batch_and_launch`).
+
+The kernel of 9 to 16 rows takes its activations through shared memory (2026-11-28,
+#14): each warp copies the next step's 64 values of each row into a ring of two
+steps (`cp.async`, kept in L1, the 16-byte pieces of a row swizzled) and reads its
+fragments with `ldmatrix`, which gives the registers the lanes loaded themselves
+before. A load of a warp that reads 4 bytes of 8 rows asks L1 for 8 lines, and the
+16 such loads of a step of 16 rows bounded the kernel, not the weights: on the RTX
+3060 Q4_K 17408 x 5120 took 231 to 247 us for 16 rows against 152 for one (160 to
+169 with every lane of a load reading the same row), on the RTX 4070 113 against
+107. With the ring the launch of four tiles a block takes 173 us there; a launch of
+one tile a block reads the activations once a tile (they are as many bytes as the
+weights of three tiles of Q4_K at 16 rows) and stays at about 250 us, which is why
+the kernel of 9 to 16 rows has a launch measured with 16 rows (the fastest launch
+for one row is often one tile a block: IQ4_XS 6656 x 5120 on the RTX 3060 103 us
+for 16 rows in it, 70.4 in the four-tile launch). The kernel of up to 8 rows keeps
+the loads of its lanes: there the ring was 2 to 5 % slower for the small matrices
+of the RTX 3060 at one row. The products of the 27B's shapes at 16 rows took 7 to
+27 % less (RTX 3060) and 7 to 22 % less (RTX 4070, the head as before), at 1 and 8
+rows the same within 1 %; measuring the second launch adds 0.9 s (RTX 4070, 66
+shapes) and 0.5 s (RTX 3060, 59) to the chooser's probes, inside the 5.6 to 5.8 s a
+load of the 27B took before and after. 0.04 %
 rms from the exact f32 product, as before (the f16 operands). Against the
 integer decode kernels of the file's layout, one row, in the model's probes
 (cold address translations, 59 shapes per card), the sum over the matrices of
