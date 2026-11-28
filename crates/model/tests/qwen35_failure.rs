@@ -110,6 +110,7 @@ fn say(runtime: &Runtime, text: &str) -> Result<String, EngineError> {
             max_tokens: Some(20),
             stop: Vec::new(),
             draft: true,
+            cache: true,
             structure: None,
             priority: 0,
             id: RequestId(1),

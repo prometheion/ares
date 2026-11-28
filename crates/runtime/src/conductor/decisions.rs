@@ -211,6 +211,7 @@ impl Conductor {
             stop: Watch::new(&[], None),
             sampling: Sampling::default(),
             draft: false,
+            cache: true,
             filter: None,
             priority,
             displace: false,

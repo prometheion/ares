@@ -20,6 +20,10 @@ impl Conductor {
         self.after_idle = false;
         self.heartbeat.begin();
         let dispatched = self.exec.dispatch(&meta);
+        // A test holds the step as a device that does not come back would.
+        while self.hold.as_ref().is_some_and(|file| file.exists()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t_wait = Instant::now();
         // A step of one prompt that runs long: its request hears how far the
         // step has got while it runs, from a model that says so. A model may say

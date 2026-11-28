@@ -199,5 +199,7 @@ fn stored(model: &Arc<SyntheticModel>, dir: &Path) -> SsdCounters {
         ssd: Some(store(dir)),
         ..RuntimeConfig::default()
     };
-    engine(model, config).snapshot().counters.ssd
+    let s = engine(model, config).snapshot();
+    assert!(s.counters.ssd.enabled, "the store opened: {:?}", s.ssd_problem);
+    s.counters.ssd
 }

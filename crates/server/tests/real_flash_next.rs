@@ -254,6 +254,57 @@ fn flash_next_drafts_with_its_mtp_block() {
 /// experts are in no tier and come from the file while it answers: the
 /// answers are the ones of two devices, the reference's first sentence
 /// included, and the counters say that experts were read from the file.
+/// SIGTERM with a request in flight, as llama-swap stops a model: the request
+/// runs on through the grace and is ended, the model is unloaded with its
+/// tier of experts, and the server exits 0 without a panic on the way (the
+/// release build aborts on one; a user's SIGTERM ended in SIGABRT). On the
+/// first device, with what was computed written to a prompt cache on the SSD
+/// as the model goes.
+#[test]
+fn flash_next_stops_in_order_on_sigterm_with_a_request_in_flight() {
+    let Some(model) = flash_model() else { return };
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".to_owned());
+    let device = devices.split(',').next().unwrap_or("0").to_owned();
+    let cache = std::env::temp_dir().join(format!("ares-flash-sigterm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    let ram = flash_ram();
+    let flags = [
+        "--devices",
+        &device,
+        "--ram",
+        &ram,
+        "--chat-var",
+        "enable_thinking=false",
+        "--cache",
+        cache.to_str().expect("a path"),
+    ];
+    let mut server = serve_model(&model, port(5), &flags, SLOW);
+    // A request that ends, so that the unload has a text to write.
+    let body = server.chat(GERMAN, json!({"max_tokens": 40, "temperature": 0}));
+    assert_eq!(server.post("/v1/chat/completions", &body).status, 200);
+    let question = format!("{ENGLISH} Then write a long story about the sea.");
+    let body = server.chat(&question, json!({"stream": true, "max_tokens": 4000}));
+    let mut stream = server.send("POST", "/v1/chat/completions", &body.to_string());
+    let mut raw = read_events(&mut stream, 5);
+
+    let signalled = Instant::now();
+    server.signal("TERM");
+    server.wait_for_log("no new connections");
+    std::io::Read::read_to_end(&mut stream, &mut raw).unwrap();
+    let status = server.wait_exit();
+    let took = signalled.elapsed();
+    let log = server.logged().join("\n");
+    let _ = std::fs::remove_dir_all(&cache);
+    eprintln!("RES sigterm: stopped in {:.1} s", took.as_secs_f64());
+    assert!(status.success(), "a clean stop: {status:?}\n{log}");
+    assert!(!log.contains("panicked"), "a panic on the way: {log}");
+    assert!(log.contains("threads joined, devices released"), "{log}");
+    assert!(log.trim_end().ends_with("stopped"), "{log}");
+    // Within the grace of 30 s, the unload and the write of the cache, and
+    // well within the 180 s llama-swap gives.
+    assert!(took < Duration::from_secs(150), "{took:?}\n{log}");
+}
+
 #[test]
 fn flash_next_answers_on_one_card() {
     let Some(model) = flash_model() else { return };

@@ -426,6 +426,7 @@ fn ask_sampled(
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
                 draft,
+                cache: true,
                 structure: None,
                 priority: 0,
                 id: RequestId(id),
@@ -512,6 +513,7 @@ fn submit_text(
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
                 draft: true,
+                cache: true,
                 structure: None,
                 priority: 0,
                 id: RequestId(id),
@@ -872,9 +874,12 @@ fn k_and_v_beyond_vram_change_no_token() {
             }
         }
         // Every miss of the lent steps uploaded: the GPU computes every expert. Where the CPU
-        // takes a share of their misses, lent steps answer one of two first tokens here (the
-        // reference ranks them 0.43 apart), every page in VRAM or not (OPEN.md: "Lent steps
-        // with the CPU's share").
+        // takes a share of their misses, lent steps answer one of two first tokens here, every
+        // page in VRAM or not: the prompt's rows meet near ties of the routers and the attention
+        // selection that the int8 rows of the CPU's share tip in some runs (see "Two first
+        // tokens after lent steps" in `docs/dev/experiments/flash-next-prompts.md`; the test
+        // `lent_steps_with_the_cpus_share_give_the_reference_token_run_after_run` covers that
+        // share on another prompt).
         let mut lent = Vec::new();
         for near in [None, Some(1)] {
             let (runtime, model) = start_near_serving(
@@ -1027,6 +1032,54 @@ fn a_prompt_read_alone_runs_on_vram_the_expert_slots_lend() {
         );
         assert!(leading(&lent, &reference) >= 2, "{placement:?}: {lent:?} against {reference:?}");
         assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the loan");
+    }
+}
+
+/// Lent steps with the CPU's share of their misses give the CPU reference's first token run
+/// after run (#69): a prompt read alone on lent VRAM in fresh engines, the CPU computing every
+/// miss in RAM (`Serve::Cpu`) or what the costs give it (`Serve::Measured`), in every
+/// placement. The prompt is one whose first token no near tie upstream decides. After
+/// `prompt(300, 7)` one does: the reference's attention selection of row 175 in layer 3 has its
+/// third block 0.006 ahead of the next (block scores of 21), the CPU's int8 rows tip it in some
+/// runs, and from there further near ties lead to another first token (see "Two first tokens
+/// after lent steps" in `docs/dev/experiments/flash-next-prompts.md`).
+#[test]
+fn lent_steps_with_the_cpus_share_give_the_reference_token_run_after_run() {
+    if !enabled() {
+        return;
+    }
+    const RUNS: usize = 6;
+    let prompt = prompt(300, 8);
+    let lending = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let want = reference_answer_at(&lending, &prompt, 1)[0];
+    for placement in placements() {
+        for serve in [Serve::Cpu, Serve::Measured] {
+            let (mut cpu, mut loans) = (0, 0);
+            for run in 0..RUNS {
+                let (runtime, model) = start_near_serving(
+                    &lending,
+                    placement,
+                    (LENT_ROWS, MAX_ROWS),
+                    CacheFormat::Q8,
+                    None,
+                    serve,
+                );
+                let got = ask(&runtime, 1, &prompt, 1);
+                let stats = model.take_store_stats().expect("the parts are open");
+                runtime.shutdown();
+                cpu += stats.cpu_experts;
+                loans += stats.scratch_loans;
+                assert_eq!(got[0], want, "{placement:?}, {serve:?}, run {run}");
+            }
+            eprintln!(
+                "LENT CPU {placement:?} {serve:?}: {RUNS} runs gave the reference's first token; \
+                 {cpu} experts on the CPU, {loans} loans"
+            );
+            assert!(loans >= RUNS as u64, "{placement:?}, {serve:?}: a prompt ran on no loan");
+            if serve == Serve::Cpu {
+                assert!(cpu > 0, "{placement:?}: the CPU computed no expert");
+            }
+        }
     }
 }
 
@@ -1568,6 +1621,7 @@ fn submit_timed(
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
                 draft: true,
+                cache: true,
                 structure: None,
                 id: RequestId(id),
                 priority: 0,
@@ -2158,6 +2212,7 @@ fn a_cancelled_request_frees_its_place_for_the_next() {
                     max_tokens: Some(400),
                     stop: Vec::new(),
                     draft: true,
+                    cache: true,
                     structure: None,
                     priority: 0,
                     id: RequestId(2),

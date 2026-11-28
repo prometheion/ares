@@ -167,7 +167,15 @@ fn chat_body(extra: Value) -> Value {
         "logprobs": true,
         "top_logprobs": 0,
     });
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    let fields = body.as_object_mut().unwrap();
+    // `n_probs` is llama.cpp's form of `logprobs` with `top_logprobs`, and two
+    // forms that differ are refused (`logprobs: true` alone asks for no
+    // alternatives): an `extra` that asks by `n_probs` asks by it alone.
+    if extra.get("n_probs").is_some() {
+        fields.remove("logprobs");
+        fields.remove("top_logprobs");
+    }
+    fields.extend(extra.as_object().unwrap().clone());
     body
 }
 

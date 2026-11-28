@@ -149,6 +149,7 @@ fn first_token(runtime: &Runtime, id: u64, state: &Json, question: &str) -> u32 
                 max_tokens: Some(1),
                 stop: Vec::new(),
                 draft: false,
+                cache: true,
                 structure: None,
                 priority: 0,
                 id: RequestId(id),

@@ -212,7 +212,7 @@ impl Placement {
             }
         }
         if best[n_dev - 1][n_layer].0 == f64::NEG_INFINITY {
-            return Err(invalid(format!(
+            return Err(ModelError::NoRoom(format!(
                 "the dense parts of the model ({} MiB of weights, and state, K/V for {} cells and \
                  scratch) do not fit on {n_dev} device(s) with {} MiB to give",
                 (weights.iter().sum::<u64>() + head) >> 20,
@@ -264,7 +264,7 @@ impl Placement {
             .map(|(memory, pair)| {
                 let layers = pair[0]..pair[1];
                 Self::device(c, w, opts, memory, &weights, head, layers.clone())?.ok_or_else(|| {
-                    invalid(format!(
+                    ModelError::NoRoom(format!(
                         "the layers {layers:?} do not fit in {} MiB",
                         memory.budget >> 20
                     ))
@@ -337,7 +337,7 @@ impl Placement {
             let step = frame.step_bytes(opts);
             let fixed = dense + state + frame.pool_bytes() + step + MARGIN;
             let left = memory.budget.checked_sub(fixed).ok_or_else(|| {
-                invalid(format!(
+                ModelError::NoRoom(format!(
                     "the {role:?}'s share ({} MiB of weights, and state, K/V for {} cells and \
                      scratch) does not fit in {} MiB",
                     dense >> 20,

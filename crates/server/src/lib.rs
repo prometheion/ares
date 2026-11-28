@@ -87,6 +87,7 @@ use tokio::sync::{Notify, watch};
 
 pub use crate::access::Access;
 use crate::bridge::Stop;
+use crate::error::ApiError;
 use crate::models::Models;
 pub use crate::reasoning::ReasoningFormat;
 
@@ -207,6 +208,7 @@ pub async fn serve_models(
     let draining = Arc::new(Notify::new());
     let begin_drain = draining.clone();
     let (stop_requests, stop) = Stop::new();
+    let restarting = models.clone();
     let serving =
         listen::listen(listener, routes_over(models, config, stop), timeout, async move {
             shutdown.await;
@@ -227,7 +229,7 @@ pub async fn serve_models(
         result = &mut serving => return result,
         () = patience => {}
     }
-    end_requests(&stop_requests);
+    end_requests(&stop_requests, restarting.restarting());
     match tokio::time::timeout(LAST_WORDS, serving).await {
         Ok(result) => result,
         Err(_) => {
@@ -238,8 +240,10 @@ pub async fn serve_models(
 }
 
 /// Raises the signal on which every running request is cancelled in the
-/// engine and ended with an error for its client.
-fn end_requests(stop: &watch::Sender<bool>) {
+/// engine and ended with an error for its client: that the server restarts in
+/// place, when it does (`restarting`), else that it stops.
+fn end_requests(stop: &watch::Sender<Option<ApiError>>, restarting: Option<String>) {
+    let error = restarting.map_or_else(ApiError::cancelled, |why| ApiError::restarting(&why));
     // Nobody listens when no request runs, and that is fine.
-    let _ = stop.send(true);
+    let _ = stop.send(Some(error));
 }

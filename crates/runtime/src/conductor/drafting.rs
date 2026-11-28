@@ -79,7 +79,7 @@ impl Conductor {
                     as usize;
                 // The window ends where a checkpoint is due, so that the
                 // state is exactly there when all of it is accepted.
-                let cap = match &self.cache {
+                let cap = match self.cache.as_ref().filter(|_| a.cache) {
                     Some(cache) => {
                         let from = a.cells.len();
                         let to = from + 1 + cap as u64;

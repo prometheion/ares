@@ -114,6 +114,7 @@ pub fn request(prompt: &str, max_tokens: Option<u32>) -> GenerateRequest {
         max_tokens,
         stop: Vec::new(),
         draft: true,
+        cache: true,
         structure: None,
         priority: 0,
         id: fresh_id(),

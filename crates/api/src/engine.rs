@@ -148,6 +148,15 @@ pub trait Engine: Send + Sync + 'static {
         None
     }
 
+    /// Whether the failure is a step that never came back ([`Engine::failure`]
+    /// says so): the engine's threads wait in it for good and hold the memory
+    /// of the devices, which no unload gives back and the driver may not
+    /// answer for any more; only a new image of the process frees it. Must
+    /// not block.
+    fn stuck(&self) -> bool {
+        false
+    }
+
     /// What the engine has done since it started and what it holds now, or
     /// `None` for an engine that keeps no such books (or has shut down).
     ///

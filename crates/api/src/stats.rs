@@ -80,9 +80,6 @@ pub struct SsdStats {
     pub checkpoints_read: u64,
     pub bytes_read: u64,
     pub read_ns: u64,
-    /// Nanoseconds the engine's step loop waited while state moved between
-    /// the devices and host memory.
-    pub transfer_ns: u64,
     /// Bytes the model's store takes on the drive now.
     pub store_bytes: u64,
     /// Pages and checkpoints that wait to be written or are being written
@@ -110,9 +107,6 @@ pub struct RamCacheStats {
     /// Pages given up without being written although they were worth
     /// keeping: no room in RAM, or no level on SSD below it.
     pub pages_dropped: u64,
-    /// Nanoseconds the engine's step loop waited while pages moved between
-    /// the devices and RAM.
-    pub transfer_ns: u64,
 }
 
 /// Totals of an engine since it started, and what it holds right now.
@@ -171,6 +165,11 @@ pub struct EngineStats {
     pub checkpoint_ram: u64,
     /// How the experts were found, for a model that streams them.
     pub experts: ExpertStats,
+    /// Nanoseconds the engine's step loop waited while the prompt cache
+    /// moved state between the devices and host memory (for RAM and for the
+    /// drive alike, counted once).
+    #[serde(default)]
+    pub cache_transfer_ns: u64,
     /// What the prompt cache did in RAM.
     #[serde(default)]
     pub ram: RamCacheStats,

@@ -130,6 +130,13 @@ use crate::watch::Watch;
 use decisions::Decision;
 pub(crate) use decisions::{DecisionSubmission, Role};
 
+/// The variable of the environment that names a file while which the
+/// conductor holds every step between its dispatch and its collection, as a
+/// device that never finishes its work would: a test of the watchdog and of
+/// what follows it (the server's restart in place), on the host and on the
+/// cards. Nothing reads it otherwise.
+pub const HOLD_STEPS_WHILE: &str = "ARES_TEST_HOLD_STEPS_WHILE";
+
 mod commit;
 mod decisions;
 mod drafting;
@@ -255,6 +262,8 @@ pub(crate) struct Submission {
     pub sampling: Sampling,
     /// Whether drafts may be verified for the request.
     pub draft: bool,
+    /// Whether the request uses the prompt cache (`GenerateRequest::cache`).
+    pub cache: bool,
     /// A rule about which tokens the request may pick, if it has one.
     pub filter: Option<Box<dyn TokenFilter>>,
     /// Who goes first: a lower number before a higher one.
@@ -367,6 +376,10 @@ struct Active {
     model_acceptance: Vec<Acceptance>,
     /// Whether the request lets drafts be verified for it.
     draft_allowed: bool,
+    /// The sequence uses the prompt cache: it starts from what the cache
+    /// holds and leaves what it computes there. Without, its pages are its
+    /// own and go with it, and it takes no checkpoints.
+    cache: bool,
     /// How the sequence's tokens are picked, and what that keeps from step
     /// to step.
     sampler: RequestSampler,
@@ -411,13 +424,14 @@ struct Active {
 impl Active {
     /// Whether what the sequence computes enters the prefix cache: its pages
     /// as they fill, and checkpoints of its state where they are due. Not for
-    /// a fork of a decision: its state is its question's, a checkpoint would
-    /// cut its step and cost a copy of the state, and its pages without one
-    /// would shadow the parent's checkpoint for the same question asked again
-    /// (a lookup takes the longest path of pages, and then replays from the
-    /// last checkpoint on it).
+    /// a request that does not use the cache, and not for a fork of a
+    /// decision: its state is its question's, a checkpoint would cut its step
+    /// and cost a copy of the state, and its pages without one would shadow
+    /// the parent's checkpoint for the same question asked again (a lookup
+    /// takes the longest path of pages, and then replays from the last
+    /// checkpoint on it).
     fn enters_cache(&self) -> bool {
-        !matches!(self.role, Role::Fork { .. })
+        self.cache && !matches!(self.role, Role::Fork { .. })
     }
 
     fn generating(&self) -> bool {
@@ -798,6 +812,9 @@ pub(crate) struct Conductor {
     stalled: bool,
     /// When the step in flight began, for the watchdog.
     heartbeat: Arc<Heartbeat>,
+    /// A test's file while which every step is held between its dispatch and
+    /// its collection ([`HOLD_STEPS_WHILE`]).
+    hold: Option<std::path::PathBuf>,
     /// The step the model paused between two of its pieces (a long prompt read layer by
     /// layer, [`StepOutput::paused`]): its one part, which runs again, alone, when it is its
     /// turn; its sequence's cells are claimed and its state is the model's until it ends.
@@ -904,6 +921,7 @@ impl Conductor {
                 let durable = model.durable(config.cells_per_page);
                 Cache::new(&model.card().id, &spec, durable.as_ref(), &config)
                     .with_reach(model.prompt_rows().min(max_rows))
+                    .with_exact_anchor(model.saves_inside_steps() == 0)
                     .with_ram(exec.ram())
                     .with_far(model.far_pages(), model.card().context_length)
             }),
@@ -975,6 +993,7 @@ impl Conductor {
             shutting_down: false,
             stalled: false,
             heartbeat: Arc::new(Heartbeat::new()),
+            hold: std::env::var_os(HOLD_STEPS_WHILE).map(std::path::PathBuf::from),
         }
     }
 
@@ -1078,6 +1097,7 @@ impl Conductor {
                 if let Some(cache) = &mut self.cache {
                     self.stats.counters.ssd = cache.ssd_counters();
                     self.stats.counters.ram = cache.ram_counters();
+                    self.stats.counters.cache_transfers = cache.transfer_counters();
                 }
                 let copy = StatsCopy {
                     stats: self.stats.clone(),
@@ -1185,7 +1205,7 @@ impl Conductor {
     /// up, and every request after pages were evicted.
     fn refresh_waiting(&mut self) {
         let Some(cache) = &mut self.cache else { return };
-        for a in &mut self.waiting {
+        for a in self.waiting.iter_mut().filter(|a| a.cache) {
             let changed = match a.waits_for {
                 Some(hash) => !matches!(cache.index.state(hash), PageState::Computing(_)),
                 None => a.looked_at != cache.evictions,
@@ -1455,7 +1475,10 @@ impl Conductor {
                     let (mut last, mut from) = (a.checkpoint_at, step.from);
                     while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
                     {
+                        // A save inside names a page; the prompt's end inside a page
+                        // hangs on a tail, which the commit publishes at a cut.
                         if inside
+                            && at.is_multiple_of(u64::from(self.config.cells_per_page))
                             && at >= step.from + u64::from(margin)
                             && at + u64::from(margin) <= to
                         {
