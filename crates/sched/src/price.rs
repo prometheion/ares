@@ -242,6 +242,15 @@ impl Curve {
         }
     }
 
+    /// Makes every price measured so far old, as if [`OLD`] measurements had
+    /// passed without one of it: for a change that the owner knows makes them
+    /// say little about the steps from now on. Each count is then tried again
+    /// at [`Curve::trial_ms`] as soon as it could pay, and its next
+    /// measurement stands beside the old price.
+    pub fn age(&mut self) {
+        self.seen += OLD + 1;
+    }
+
     /// The price to try `n` at: its price, and for a count that is due (its
     /// price is old, or it was never measured, or it was old and has been
     /// measured once) no more than the price of the nearest smaller
@@ -286,6 +295,14 @@ impl PriceTable {
     /// context and nothing else running. Replaces what the table had.
     pub fn measured(&mut self, rows: u32, ms: f64) {
         self.rows.set(rows, ms);
+    }
+
+    /// Makes the price of every row count old ([`Curve::age`]): the tiers of
+    /// experts were filled after the prices were measured at load, on cold
+    /// tiers where every size is too dear, so that each size is tried again
+    /// from the first steps on instead of after [`OLD`] of them.
+    pub fn age(&mut self) {
+        self.rows.age();
     }
 
     /// Milliseconds a cell that a row reads adds: what attention costs per
@@ -584,6 +601,28 @@ mod tests {
         // mean is what the size gives its tokens over.
         assert!((trimmed.ms(4).unwrap() - (30.0 * 6.0 + 120.0) / 7.0).abs() < 1e-9);
         assert!((plain.ms(4).unwrap() - 52.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aged_prices_are_tried_again_from_the_next_steps() {
+        // Measured at load on cold tiers (Flash-Next on the RTX 4070 and RTX
+        // 3060, 2026-11-27): a window of two rows nearly four times a row.
+        let mut table = PriceTable::new();
+        for (rows, ms) in [(1, 30.9), (2, 114.8), (3, 135.2), (4, 81.7)] {
+            table.measured(rows, ms);
+        }
+        let trial = |table: &PriceTable, rows| table.rows.trial_ms(rows).unwrap();
+        assert_eq!(trial(&table, 2), 114.8);
+        // The tiers were filled: every price is old, and the first step of a
+        // row prices a window of two at that row's price.
+        table.age();
+        table.observe(Load::chunk(0, 1), 16.0);
+        assert_eq!(table.rows_ms(1), Some(16.0));
+        assert_eq!(trial(&table, 2), 16.0);
+        assert_eq!(trial(&table, 4), 16.0);
+        // A window that runs is measured; its warm price replaces the cold one.
+        table.observe(Load::chunk(0, 2), 18.0);
+        assert_eq!(table.rows_ms(2), Some(18.0));
     }
 
     #[test]

@@ -267,9 +267,13 @@ fn a_shrink_writes_what_only_ram_holds_and_gives_the_memory_back() {
 
     // What went is on the drive: each conversation's next turn finds it, on
     // a machine that has no room for more than the floor. The pages that
-    // leave the devices for them pass through it to the drive.
+    // leave the devices for them pass through it to the drive, and the next
+    // turn asks once the writer has them there: a page that is with the
+    // writer is in neither place yet (docs/OPEN.md), which a slow drive
+    // showed now and then.
     for (text, said) in texts.iter().zip(&answers) {
         let next = format!("{text}{said}{}", text_of(70, 20));
+        e.written();
         let answer = e.ask(&next, 10);
         assert_eq!(answer.run.text, fresh(&next, 10));
         assert!(answer.report.cached_tokens >= 256, "{:?} {}", answer.report, snapshot(&e.rt));

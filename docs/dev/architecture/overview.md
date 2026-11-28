@@ -315,11 +315,13 @@ The blocks so far:
 - **The arena of weights** (`blocks/arena.rs`): a stateless part both models
   use as it is: every tensor at a multiple of 64 bytes, the stored bytes, rows
   or columns gathered into a matrix of their own, or values the host made.
-  The bytes are uploaded from the file's mapping; on a machine short of
-  memory for a load (less than twice its bytes available), the pages that are
-  not in the page cache (one `mincore`) are read from the file with ordinary
-  reads a piece at a time and uploaded from there, because faulting in a
-  mapping that keeps missing the page cache is slow there.
+  The bytes are uploaded from the file's mapping where its pages are in the
+  page cache (one `mincore`); the others are read from the file with ordinary
+  reads a piece at a time and uploaded from there, because the kernel stops
+  reading around the faults of a mapping that keeps missing the page cache,
+  and every fault then reads one page (until 2026-11-27 only on a machine short
+  of memory for a load; a reload after the kernel had taken part of the file's
+  pages back read 5 to 20 MB per second, GitHub issue #66).
   The 27B keeps its layout chooser on top.
 
 What every model reads from its files the same way is in the module `files`:
@@ -533,8 +535,15 @@ device's flag with a token that is behind the later kernels
 values in a step nobody reads. A part that fails to build
 tells the model (`Model::abandon`) so that the parts that wait for its
 measurements (`qwen35`'s layout choice, which waited two minutes) go on at
-once. A thread that has not stopped ten seconds after it was told to is left
-behind and the shutdown ends. `ares_runtime::testing::Faulty` makes a model
+once, and a part whose step failed tells its model too (`DeviceModel::step_failed`,
+also for a panic the model did not see), so that Flash-Next's other part gives
+its waits up at once. A host thread of a step never waits in the driver for
+work that may wait for another device: Flash-Next's pass waited for the inbox of
+its next micro-batch so, with both devices on every layer, and after the other
+device failed it stood there for good, its device at 100 % (the hang after a
+failed test, #67); it now waits where a failed part or a step that stands still
+ends the wait (`Flow::wait_for`). A thread that has not stopped ten seconds
+after it was told to is left behind and the shutdown ends. `ares_runtime::testing::Faulty` makes a model
 fail on purpose, and `qwen35_failure` runs it on two cards.
 
 Measured 2026-11-10 with that model (RTX 4070 and RTX 3060, 128 tokens per

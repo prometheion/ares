@@ -35,6 +35,7 @@ use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
 use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve, StoreStats};
 use common::gpu::devices;
+use common::helpers::is_near_best;
 
 mod common;
 
@@ -156,7 +157,16 @@ fn session<'g>(
     let mut session = Session::open(gguf, c, w, devices, opts).expect("the model opens");
     let n_expert = c.experts.count as u32;
     let fill = session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
-    assert_eq!(fill.uploads as usize, c.n_layer * c.experts.count, "every expert has a slot");
+    // Whether the room or the fill was short.
+    let slots: usize = {
+        let store = session.store();
+        (0..store.n_layers()).map(|layer| store.slots(layer).0).sum()
+    };
+    assert_eq!(
+        fill.uploads as usize,
+        c.n_layer * c.experts.count,
+        "every expert has a slot: {slots} slots in VRAM, {fill:?}"
+    );
     session
 }
 
@@ -169,16 +179,6 @@ fn rel_rms(got: &[f32], want: &[f32]) -> f64 {
         size += f64::from(*w).powi(2);
     }
     (diff / size.max(1e-30)).sqrt()
-}
-
-/// Whether `pick` is the most likely token of `want` up to what the measured `error` of the
-/// logits (relative RMS) can move: a token within three times that of the largest logit,
-/// and within a hundredth of the logits' RMS (the error is a mean over the row; the logits
-/// of a made-up model's top tokens lie close together).
-fn is_near_best(pick: u32, want: &[f32], error: f64) -> bool {
-    let best = want.iter().copied().fold(f32::MIN, f32::max);
-    let rms = (want.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
-    f64::from(best - want[pick as usize]) <= (3.0 * error + 1e-2) * rms
 }
 
 fn arg_max(row: &[f32]) -> u32 {
@@ -198,17 +198,89 @@ struct Expected {
     core: Vec<f32>,
     ffn: Vec<f32>,
     picks: Vec<Vec<u32>>,
+    /// Per row of an attention layer, the cells it read and the scores of its blocks.
+    selections: Vec<Option<(Vec<u32>, Vec<f32>)>>,
+}
+
+/// Whether the reference's choice of the blocks a row reads was a near tie: two blocks next to
+/// each other in the order of their scores, where the cells the row reads change between them
+/// (the last block taken and the first left, and the last two taken when the last gives only
+/// part of its cells), score within a thousandth of each other. The device scores the blocks
+/// from f16 keys and may take the other one; the row then reads other cells, and its attention
+/// output differs from the reference's by tenths (0.45 and 0.59 in two rows of 342 with both
+/// devices on every layer, 2026-11-27, at scores 20.2737 against 20.2728 and 28.2704 against
+/// 28.2694). That is the model's near tie, not the engine's error.
+fn selection_is_a_near_tie(block: usize, cells: &[u32], scores: &[f32]) -> bool {
+    let taken = |j: usize| cells.iter().filter(|c| **c as usize / block == j).count();
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    let picked = order.iter().take_while(|j| taken(**j) > 0).count();
+    let close = |a: usize, b: usize| {
+        let (a, b) = (scores[order[a]], scores[order[b]]);
+        (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1.0)
+    };
+    let partial = picked > 0 && taken(order[picked - 1]) < block;
+    (picked > 0 && picked < scores.len() && close(picked - 1, picked))
+        || (partial && picked >= 2 && close(picked - 2, picked - 1))
 }
 
 /// Feeds every layer the reference's input and keeps the worst difference of
-/// what it gives, by kind of layer.
+/// what it gives, by kind of layer. A row of an attention layer that read other blocks than the
+/// reference at a near tie (its choice was one, [`selection_is_a_near_tie`], and its attention
+/// output differs by more than [`FLIPPED`]) is counted, and left out of the core's difference.
 struct Compare<'a> {
     expected: &'a [Expected],
     attention: &'a [bool],
+    /// Cells per block of the indexer.
+    block: usize,
     /// Recurrent and attention layers: core output, expert output, residual.
     worst: [[f64; 3]; 2],
     rows: usize,
     same_picks: usize,
+    /// Rows of attention layers, and those that read other blocks at a near tie.
+    attention_rows: usize,
+    flipped: usize,
+}
+
+/// The difference of a row's attention output from the reference's (relative RMS) above which
+/// the row read other cells: rows that read the same differ by rounding (up to 1.3e-2 with
+/// both devices on every layer), rows that read another block by tenths.
+const FLIPPED: f64 = 0.1;
+
+impl<'a> Compare<'a> {
+    fn new(expected: &'a [Expected], c: &'a Config, worst: [[f64; 3]; 2]) -> Self {
+        Self {
+            expected,
+            attention: &c.attention_layers,
+            block: c.indexer.block,
+            worst,
+            rows: 0,
+            same_picks: 0,
+            attention_rows: 0,
+            flipped: 0,
+        }
+    }
+
+    /// The relative RMS difference of the attention output of the rows that did not read other
+    /// blocks at a near tie.
+    fn core_without_flips(&mut self, got: &[f32], want: &Expected) -> f64 {
+        let n = got.len() / want.selections.len().max(1);
+        let (mut kept_got, mut kept_want) = (Vec::new(), Vec::new());
+        for (row, selection) in want.selections.iter().enumerate() {
+            self.attention_rows += 1;
+            let (ours, theirs) = (&got[row * n..(row + 1) * n], &want.core[row * n..(row + 1) * n]);
+            if let Some((cells, scores)) = selection
+                && rel_rms(ours, theirs) > FLIPPED
+                && selection_is_a_near_tie(self.block, cells, scores)
+            {
+                self.flipped += 1;
+                continue;
+            }
+            kept_got.extend_from_slice(ours);
+            kept_want.extend_from_slice(theirs);
+        }
+        if kept_want.is_empty() { 0.0 } else { rel_rms(&kept_got, &kept_want) }
+    }
 }
 
 impl Probe for Compare<'_> {
@@ -219,11 +291,11 @@ impl Probe for Compare<'_> {
     fn after(&mut self, layer: usize, out: LayerOut<'_>) {
         let want = &self.expected[layer];
         let kind = usize::from(self.attention[layer]);
-        let errors = [
-            rel_rms(out.core, &want.core),
-            rel_rms(out.ffn, &want.ffn),
-            rel_rms(out.residual, &want.output),
-        ];
+        let core = match self.attention[layer] {
+            true => self.core_without_flips(out.core, want),
+            false => rel_rms(out.core, &want.core),
+        };
+        let errors = [core, rel_rms(out.ffn, &want.ffn), rel_rms(out.residual, &want.output)];
         for (worst, error) in self.worst[kind].iter_mut().zip(errors) {
             // A maximum drops what is not a number.
             assert!(error.is_finite(), "layer {layer}: an output that is not a number");
@@ -262,6 +334,12 @@ fn expected(
                 core: rec.tensor_of(Some(layer), "attn_out").unwrap().to_vec(),
                 ffn: rec.tensor_of(Some(layer), "ffn_out").unwrap().to_vec(),
                 picks: (0..tokens.len()).map(|row| rec.routing[&(layer, row)].0.clone()).collect(),
+                selections: match c.attention_layers[layer] {
+                    true => (0..tokens.len())
+                        .map(|row| rec.selection.get(&(layer, row)).cloned())
+                        .collect(),
+                    false => Vec::new(),
+                },
             }
         })
         .collect()
@@ -286,18 +364,12 @@ fn every_layer_matches_the_reference() {
         let mut session = session(&gguf, &c, &w, devices.clone(), kv);
         let mut state = SequenceState::new(&c);
         let mut worst = [[0.0f64; 3]; 2];
-        let (mut rows, mut same_picks) = (0, 0);
+        let (mut rows, mut same_picks, mut attention_rows, mut flipped) = (0, 0, 0, 0);
         let mut at = 0;
         for &count in &steps {
             let tokens = &all[at..at + count];
             let layers = expected(&reference, &c, &w, &state, tokens);
-            let mut probe = Compare {
-                expected: &layers,
-                attention: &c.attention_layers,
-                worst,
-                rows: 0,
-                same_picks: 0,
-            };
+            let mut probe = Compare::new(&layers, &c, worst);
             session
                 .step_probed(
                     &[Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }],
@@ -307,6 +379,8 @@ fn every_layer_matches_the_reference() {
             worst = probe.worst;
             rows += probe.rows;
             same_picks += probe.same_picks;
+            attention_rows += probe.attention_rows;
+            flipped += probe.flipped;
             let window = reference.window(&state, tokens, LogitRows::None).unwrap();
             reference.commit(&mut state, &window, count).unwrap();
             at += count;
@@ -314,7 +388,8 @@ fn every_layer_matches_the_reference() {
         eprintln!(
             "  K/V {kv:?}, {} device(s): recurrent layers: core {:.2e}, experts {:.2e}, residual {:.2e}; \
              attention layers: core {:.2e}, experts {:.2e}, residual {:.2e}; \
-             {same_picks} of {rows} rows of layers with the reference's experts",
+             {same_picks} of {rows} rows of layers with the reference's experts; {flipped} of \
+             {attention_rows} rows of attention layers read other blocks at a near tie",
             devices.len(),
             worst[0][0],
             worst[0][1],
@@ -335,6 +410,7 @@ fn every_layer_matches_the_reference() {
             assert!(kind[2] < 4e-2, "residual {:.2e}", kind[2]);
         }
         assert!(same_picks * 100 >= rows * 97, "{same_picks} of {rows} routings");
+        assert!(flipped * 100 <= attention_rows, "{flipped} of {attention_rows} rows flipped");
     }
 }
 
@@ -351,7 +427,9 @@ fn every_layer_matches_the_reference() {
 /// 1.84e-2, 2734 and 2746 rows. With f16 sums instead of f32 sums for the float matrices
 /// (what the step's precision would pick on these cards) the attention core of the
 /// quantized model was 6.2e-2 and the experts of the float one 5.3e-2, which is why the
-/// float matrices sum in f32.
+/// float matrices sum in f32. A row whose choice of blocks was a near tie in the reference may
+/// read other cells on the device; it is left out of the attention core's difference
+/// ([`Compare`]), and at most one row of attention layers in a hundred may be.
 #[test]
 fn every_layer_of_wide_steps_matches_the_reference() {
     let Some(devices) = devices() else { return };
@@ -375,16 +453,11 @@ fn every_layer_of_wide_steps_matches_the_reference() {
         let mut state = SequenceState::new(&c);
         let mut worst = [[0.0f64; 3]; 2];
         let (mut rows, mut same_picks, mut at) = (0, 0, 0);
+        let (mut attention_rows, mut flipped) = (0, 0);
         for &count in &steps {
             let tokens = &all[at..at + count];
             let layers = expected(&reference, &c, &w, &state, tokens);
-            let mut probe = Compare {
-                expected: &layers,
-                attention: &c.attention_layers,
-                worst,
-                rows: 0,
-                same_picks: 0,
-            };
+            let mut probe = Compare::new(&layers, &c, worst);
             session
                 .step_probed(
                     &[Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }],
@@ -394,6 +467,8 @@ fn every_layer_of_wide_steps_matches_the_reference() {
             worst = probe.worst;
             rows += probe.rows;
             same_picks += probe.same_picks;
+            attention_rows += probe.attention_rows;
+            flipped += probe.flipped;
             let window = reference.window(&state, tokens, LogitRows::None).unwrap();
             reference.commit(&mut state, &window, count).unwrap();
             at += count;
@@ -401,7 +476,8 @@ fn every_layer_of_wide_steps_matches_the_reference() {
         eprintln!(
             "  {types:?}, {} device(s): recurrent layers: core {:.2e}, experts {:.2e}, residual \
              {:.2e}; attention layers: core {:.2e}, experts {:.2e}, residual {:.2e}; \
-             {same_picks} of {rows} rows of layers with the reference's experts",
+             {same_picks} of {rows} rows of layers with the reference's experts; {flipped} of \
+             {attention_rows} rows of attention layers read other blocks at a near tie",
             devices.len(),
             worst[0][0],
             worst[0][1],
@@ -422,6 +498,7 @@ fn every_layer_of_wide_steps_matches_the_reference() {
             assert!(kind[2] < residual, "residual {:.2e}", kind[2]);
         }
         assert!(same_picks * 100 >= rows * picks, "{same_picks} of {rows} routings");
+        assert!(flipped * 100 <= attention_rows, "{flipped} of {attention_rows} rows flipped");
     }
 }
 
@@ -713,8 +790,16 @@ fn wide_steps(devices: &[Device], precision: Precision, slots: Slots) {
             assert!(stats.transit_adopted > 0 && stats.evictions > 0, "{stats:?}");
         }
     }
-    // The quantized dense matrices cost the 8-bit activations of their products.
-    assert!(worst < 0.2, "logits {worst:.2e}");
+    // The quantized dense matrices cost the 8-bit activations of their products, and the
+    // rounding of a step is not the same from run to run: the many-row kernels add a row's
+    // experts in the order they finish, and the misses come in rounds as transit brings them.
+    // The 8-bit activation codes of the Fast precision make a difference of rounding one of
+    // tenths in this made-up model (2026-11-27, RTX 4070, six runs: the last row after the
+    // 256-row step 0.133 to 0.215 in Fast, at most 0.049 in Exact; the first step of 9 rows
+    // 3.8e-2 or 5.3e-2 in Fast, 3.8e-3 or 2.4e-2 in Exact with transit). Each pick is a near
+    // tie of the reference's at the measured error (above).
+    let bound = if precision == Precision::Fast { 0.3 } else { 0.1 };
+    assert!(worst < bound, "logits {worst:.2e}");
     // Single tokens go on from the state the wide steps left.
     for _ in 0..8 {
         let picks = session
@@ -1026,6 +1111,14 @@ fn layers_with_misses_of(
     let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
     opts.model.slot_bytes = Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap());
     opts.model.serve = serve;
+    // The CPU takes a miss only while its layer has a slot of the RAM tier for it, and uploads
+    // the others (`claim_misses` of the store's `hybrid.rs`): the tier holds a step's picks for
+    // every layer the store has, two per layer when both devices work on every layer. (The 64
+    // MiB of `options` did not for f32 and q2_K with both devices on every layer: 4 of 480
+    // misses were uploaded.)
+    let store_layers = c.n_layer * if tensor().is_some() { devices.len() } else { 1 };
+    let ram = (store_layers * slots) as u64 * shape.slot_bytes().unwrap();
+    opts.ram_tier = opts.ram_tier.map(|tier| tier.max(ram));
     let mut missing = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
     let n_expert = c.experts.count as u32;
     missing.fill(&mut |_| (0..n_expert).collect()).unwrap();
@@ -1430,13 +1523,7 @@ fn float_path_types_match_the_reference(part: usize) {
             let tokens = &all[at..at + count];
             let wide = usize::from(count > 8);
             let layers = expected(&reference, &c, &w, &state, tokens);
-            let mut probe = Compare {
-                expected: &layers,
-                attention: &c.attention_layers,
-                worst: worst[wide],
-                rows: 0,
-                same_picks: 0,
-            };
+            let mut probe = Compare::new(&layers, &c, worst[wide]);
             session
                 .step_probed(
                     &[Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }],

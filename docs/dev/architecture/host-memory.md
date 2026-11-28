@@ -411,7 +411,12 @@ engine. What that needs:
   I/O (or taken from the page cache when the file is already there) into
   page-locked staging and copied to all devices at once, each device on its
   own stream. The limits are then the SSD and each card's PCIe link, about
-  3.3 GB/s for the RTX 3060 on its x4 slot.
+  3.3 GB/s for the RTX 3060 on its x4 slot. (Today each device's thread
+  uploads its own share: from the file's mapping what is in the page cache,
+  the rest read with ordinary reads into the loader's memory first, since the
+  kernel may stop reading around the faults of a mapping, and a reload then
+  read one page a fault, GitHub issue #66; `blocks/arena.rs`. The driver
+  stages those copies itself; page-locked staging of our own is not built.)
 - **State is reserved, not prepared.** The page pool is a few large device
   allocations. Pages are never cleared, because a page table decides what is
   valid, and there are no warm-up passes, because there are no graphs to

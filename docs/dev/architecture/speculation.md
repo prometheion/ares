@@ -117,7 +117,13 @@ table (where a launch ends), and it pays the first use of every kernel. Its
 level is not trusted: on cold tiers it is too high for every size, the one row
 that runs comes down with its first steps, and the windows are tried again
 after 256 steps (`windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay`
-in `crates/runtime/tests/conductor.rs` states exactly that device).
+in `crates/runtime/tests/conductor.rs` states exactly that device). The server
+of Flash-Next fills the tiers of experts after the warm-up and then makes every
+price old (`Runtime::age_prices`), so that the windows are tried again from the
+first steps on the filled tiers
+(`windows_priced_out_on_a_cold_start_are_tried_at_once_when_the_prices_are_aged`).
+Before, a warm-up that measured two rows at 114.8 ms and one at 30.9 left a
+session shorter than 256 steps without a single draft verified.
 
 **The chain is cut by the drafter's own probability.** The acceptance per
 position is an average: it says that the third draft is right six times in

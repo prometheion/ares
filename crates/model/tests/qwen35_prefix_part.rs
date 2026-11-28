@@ -39,8 +39,7 @@ mod common;
 const PAGE: u32 = ENTRY_CELLS;
 
 fn model_path() -> Option<PathBuf> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+    if !common::gpu::enabled() {
         return None;
     }
     match std::env::var_os("ARES_TEST_QWEN35_0_8B") {

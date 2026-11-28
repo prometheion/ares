@@ -22,6 +22,10 @@
 //!   stops it at once: the store does nothing of a fill while a step runs,
 //!   and what is on its way then (two experts from the file, an upload per
 //!   device) takes its slot on its own.
+//! - **When the owner stops wanting the model** (the flag of
+//!   `Qwen4Exp::with_stop`, which a server sets when it stops): the fill at
+//!   the start ends at its next turn and nothing is filled while nothing
+//!   runs; the profile is still written when the model goes.
 //!
 //! The profile is per layer of the model and expert, whatever the placement:
 //! when both devices share every layer, an expert's heat is the larger of
@@ -29,6 +33,7 @@
 //! owned. The MTP block's experts are not in it.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -60,7 +65,7 @@ const STUCK: Duration = Duration::from_secs(2);
 
 /// How long the fill at the start may stand still before it gives up the
 /// rest: a drive that does not answer must not keep the model from serving.
-const START_STALL: Duration = Duration::from_secs(60);
+pub(super) const START_STALL: Duration = Duration::from_secs(60);
 
 /// What the start found of the profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,8 +292,11 @@ impl Usage {
     /// the steps that measured the price of a step route a made-up text), the
     /// tiers are filled from it, and the profile is kept from now on. Returns
     /// what the start made of the profile; `None` for a model that keeps none
-    /// or before the parts are open. Call it before the first request.
-    pub(super) fn serving(&self) -> Option<ProfileReport> {
+    /// or before the parts are open. Call it before the first request. Once
+    /// `stop` is set no fill reads any more (the model's owner does not want it
+    /// any more): the fill here returns with what it brought, and the keeper
+    /// fills nothing.
+    pub(super) fn serving(&self, stop: &Arc<AtomicBool>) -> Option<ProfileReport> {
         let inner = self.0.as_ref()?;
         let mut state = inner.lock();
         let (flow, map) = (state.flow.clone()?, state.map.clone()?);
@@ -297,13 +305,13 @@ impl Usage {
             let profile = state.profile.take().unwrap_or_else(|| ExpertProfile::new(inner.key));
             map.seed(&mut flow.lock_feed().store, &profile);
             if profile.known() > 0 {
-                state.filled = Some(fill_from(&flow, &map, &inner.log));
+                state.filled = Some(fill_from(&flow, &map, &inner.log, stop));
             }
             state.saved = Some(flow.lock_feed().store.clock());
-            let keeper = inner.clone();
+            let (keeper, stop) = (inner.clone(), stop.clone());
             let spawned = std::thread::Builder::new()
                 .name("ares-expert-usage".into())
-                .spawn(move || keep(&keeper));
+                .spawn(move || keep(&keeper, &stop));
             match spawned {
                 Ok(handle) => state.keeper = Some(handle),
                 Err(error) => (inner.log)(&format!(
@@ -319,8 +327,9 @@ impl Usage {
     }
 
     /// Fills the tiers from the store's heat as the start does from a
-    /// profile ([`fill_from`]); `None` before the engine serves.
-    pub(super) fn fill_from_heat(&self) -> Option<(FillStats, Duration)> {
+    /// profile ([`fill_from`]), until `stop` is set; `None` before the engine
+    /// serves.
+    pub(super) fn fill_from_heat(&self, stop: &AtomicBool) -> Option<(FillStats, Duration)> {
         let inner = self.0.as_ref()?;
         let (flow, map) = {
             let state = inner.lock();
@@ -329,7 +338,7 @@ impl Usage {
             }
             (state.flow.clone()?, state.map.clone()?)
         };
-        Some(fill_from(&flow, &map, &inner.log))
+        Some(fill_from(&flow, &map, &inner.log, stop))
     }
 
     /// Writes the profile now, if steps ran since it was last written.
@@ -397,12 +406,17 @@ pub(super) fn seed_and_fill(
 /// the file at the pace of a start, VRAM's free slots first and the RAM tier
 /// behind them, while no request runs. The store's lock is let go between
 /// the turns, so that the watch of the machine's memory can make the tier
-/// give memory back meanwhile. Returns what was brought and how long it took.
-fn fill_from(flow: &Flow, map: &LayerMap, log: &Log) -> (FillStats, Duration) {
+/// give memory back meanwhile. A `stop` that is set ends it at the next
+/// turn: what it has asked of the drive still comes and takes its slots, and
+/// nothing more is asked. Returns what was brought and how long it took.
+fn fill_from(flow: &Flow, map: &LayerMap, log: &Log, stop: &AtomicBool) -> (FillStats, Duration) {
     let begun = Instant::now();
     let mut fill = flow.lock_feed().store.plan_fill(&map.store_layers(), FillOrder::File);
     let mut seen = (usize::MAX, Instant::now());
     loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let left = {
             let mut feed = flow.lock_feed();
             if let Err(error) = feed.store.advance_fill(&mut fill, FillPace::START) {
@@ -446,9 +460,9 @@ impl Drop for Usage {
     }
 }
 
-/// The keeper's thread: fills the empty slots while nothing runs and writes
-/// the profile while steps run, until the model goes.
-fn keep(inner: &Inner) {
+/// The keeper's thread: fills the empty slots while nothing runs (until
+/// `stop` is set) and writes the profile while steps run, until the model goes.
+fn keep(inner: &Inner, stop: &AtomicBool) {
     let mut fill: Option<TierFill> = None;
     // The store's clock when it was last seen to move, and since when it
     // stands.
@@ -474,13 +488,14 @@ fn keep(inner: &Inner) {
         let mut feed = flow.lock_feed();
         let store = &mut feed.store;
         let clock = store.clock();
-        if clock != seen.0 || store.in_step() {
+        let stopped = stop.load(Ordering::Acquire);
+        if clock != seen.0 || store.in_step() || stopped {
             if fill.take().is_some_and(|f| !f.is_done()) {
                 state.stats.idle_stopped += 1;
             }
             seen = (clock, Instant::now());
         }
-        if seen.1.elapsed() >= IDLE_AFTER {
+        if seen.1.elapsed() >= IDLE_AFTER && !stopped {
             let tiers = (clock, store.ram_bytes().0);
             if fill.is_none() && planned != Some(tiers) {
                 planned = Some(tiers);
