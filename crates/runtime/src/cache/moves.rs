@@ -340,8 +340,16 @@ impl Cache {
     /// first (its memory goes when the writer is done), then the coldest
     /// checkpoints of the index. Returns the checkpoints that went. Call it
     /// between steps only, after [`Cache::pump`]: when the allowance fell,
-    /// also while nothing runs.
+    /// also while nothing runs. The runs that came back from the drive in that
+    /// pump are not taken: they are the prompts' that wait for them, which
+    /// look at the next step ([`Cache::release_landed`]).
     pub(crate) fn trim(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) -> u32 {
+        let dropped = self.trim_to_allowance(pool, exec);
+        self.release_landed(pool);
+        dropped
+    }
+
+    fn trim_to_allowance(&mut self, pool: &mut PagePool, exec: &mut dyn Executor) -> u32 {
         if self.books.is_none() {
             return 0;
         }
