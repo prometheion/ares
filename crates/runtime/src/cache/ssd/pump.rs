@@ -312,7 +312,7 @@ impl Cache {
                 let id = job.id;
                 if with_state {
                     let parts = job.state_parts.take().expect("checked above");
-                    match self.new_place().0 {
+                    match self.import_place().0 {
                         Some(place) => {
                             // The checkpoint that had the place leaves it
                             // for the drive before this one comes in.
@@ -369,7 +369,10 @@ impl Cache {
                 continue;
             }
             let mut job = ssd.jobs.remove(at).expect("it is there");
-            ssd.counters.imports_cut += u64::from(job.done < job.pages.len());
+            if job.done < job.pages.len() {
+                ssd.counters.imports_cut += 1;
+                ssd.cut(job.pages.last().map(|page| page.0));
+            }
             self.index.withdraw(job.owner);
             std::mem::take(&mut job.held).release(pool);
             for parts in std::mem::take(&mut job.ready).into_values() {
