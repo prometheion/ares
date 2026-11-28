@@ -92,3 +92,38 @@ times its first load in the same process (the 2.3 is that drive), against 0.7 to
 for main. The first loads of
 both read the cold file at 500 to 950 MiB/s when the drive was free; the fix's first loads are
 not slower (14.3 to 36.8 s against 15.4 to 39.0 s, both with the drive shared).
+
+## A stop while Flash-Next's tiers fill (GitHub issue #68)
+
+`/var/tmp/ares-reload/repro68.sh`: Flash-Next IQ2_XS on both cards at `--ram 8G --cache` with a
+usage profile of its experts there (so a load fills the tiers from it after the weights, 17 to 39 s
+of reads), SIGTERM some seconds after the process started, or 20 s into a reload that a request
+asked for after `POST /models/unload`. Main (5e494226, A) and the fix (e9483dd3, B) in turn,
+2026-11-27 23:08 to 23:15, load average 39 falling to 6, the drive's IO pressure 20 to 74 % "full".
+"Stop" is from the signal to the end of the process; every run gave back all the devices' memory
+(11.25 and 11.33 GiB) and the RAM (the process at 0.13 to 0.39 GiB after the unload).
+
+| Case | Main | Fix |
+| --- | --- | --- |
+| first load, SIGTERM at 5 s (the weights) | 23.4 s: the weights, the whole fill (17 s), the unload | 5.0 s: the weights (4.3 s), no fill, the unload |
+| first load, SIGTERM at 20 s (the fill) | 10.3 s (the fill ran 19 s) | 0.7 s (cut after 9 s) |
+| first load, SIGTERM at 20 s, earlier (18:30) | 13.2 s | 6.0 s (the signal came during the weights) |
+| reload asked for by a request, SIGTERM 20 s in | 35.5 s: the fill ran 37 s, then the request was ended | 15.8 s: the weights under IO pressure 74 %, the request answered 503 at the signal, no fill |
+| the same, again | | 0.8 s (the fill cut after 10 s) |
+
+The unload itself took 0.6 to 0.9 s in every run. The 35 s of the issue is the fill of a reload
+running to its end under a busy drive, and a request that waited for the reload running into the
+end of the drain; the fix ends the fill at the signal and answers the waiting request at once.
+PR #64's case, 23:21 to 23:26: four long prompts at once failed the engine ("the rows of slot 1
+start at cell 1070 and its sequence is at cell 6057"), the model was taken down and a request
+loaded it again, and SIGTERM came 20 s into that reload, during its fill. Main stopped in 12.7 s
+(the fill ran its 17 s, then served the request that waited, 200) and, under gdb, in 14.4 s; the fix
+in 0.7 s (the fill cut after 7 s, the request answered 503 at the signal). All the memory came back
+each time.
+
+What PR #64 saw besides (an unload of 35.5 s after which neither VRAM nor RAM came back) did not
+come back in any of nine stops of main (18:30 to 23:26; three of them with a request running, two
+after an engine failure, two under gdb): every unload took 0.6 to 0.9 s and gave back all. What held the memory
+then is not known; a device thread that does not end within `STOP_PATIENCE` (10 s) is left behind
+by `GpuExecutor::shutdown` without a word, with all it holds, which would fit both the time and
+the memory (`crates/runtime/src/gpu.rs`).
