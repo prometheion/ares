@@ -2580,6 +2580,39 @@ fn the_vram_tier_gives_beside_a_loan_and_the_loan_fits_again() {
     entries_above(&rig, dead);
 }
 
+/// Pieces given one after the other at the end of one step: what moved out of one piece may
+/// lie in the next and be evicted there. The move writes its entry on the stream of copies out
+/// of slots, the eviction on the stream of uploads; on a device that runs the first behind the
+/// second, every entry still names the slot that holds its expert.
+#[test]
+fn entries_stay_true_when_the_copies_out_of_slots_run_late() {
+    // Pieces of two slots, a pool of 24; the layers keep eight and every slot is warm.
+    let piece = 2 * SLOT_BYTES;
+    let mut rig = rig_vram_lagging(8, 16, piece, |_| {});
+    for step in 0..4 {
+        let picks: Vec<Vec<u32>> = (0..LAYERS)
+            .map(|l| (0..8).map(|e| (e * 2 + step + l as u32) % EXPERTS).collect())
+            .collect();
+        let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+        rig.step(&picks);
+    }
+    entries_above(&rig, 0);
+    let whole = 24 * SLOT_BYTES;
+    for round in 1..=3u64 {
+        rig.store.set_vram_target(0, whole.saturating_sub(round * 4 * piece));
+        let given = rig.store.shrink_vram(0, Duration::from_secs(1)).unwrap();
+        assert!(given >= 1 || rig.store.vram_at_floor(0), "round {round}");
+        rig.settle();
+        let dead = ((whole - rig.store.vram_elastic(0).0) / SLOT_BYTES) as u32;
+        entries_above(&rig, dead);
+        let few: Vec<Vec<u32>> =
+            (0..LAYERS).map(|l| vec![(round as u32 + l as u32) % EXPERTS, 15]).collect();
+        let few: Vec<&[u32]> = few.iter().map(Vec::as_slice).collect();
+        rig.step(&few);
+        entries_above(&rig, dead);
+    }
+}
+
 /// A slot across the edge of two pieces needs both: it goes with the first of them.
 #[test]
 fn a_slot_across_two_pieces_goes_with_either() {

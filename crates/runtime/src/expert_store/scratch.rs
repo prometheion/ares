@@ -327,6 +327,13 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.stats.scratch_moves += 1;
             }
         }
+        // A move wrote its expert's entry on the stream of copies out of slots:
+        // what the store writes of the same experts later (an eviction in the
+        // next piece that is vacated, an upload) runs behind it, or the older
+        // entry would win and name a slot that holds another expert or has no
+        // memory any more (seen 2026-11-28 as an illegal address on the device
+        // when the tier gave several pieces at the end of one decode step).
+        self.devices[device].order()?;
         // The numbers behind the lent slots stay given back until the loan
         // ends, whatever the layers take meanwhile.
         let in_loan: HashSet<u32> = lent.iter().copied().collect();

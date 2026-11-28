@@ -91,6 +91,15 @@ pub trait SlotDevice {
     /// `n_embd` values), and behind them the mark that lets the layer go on.
     fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError>;
 
+    /// Makes the uploads and table entries enqueued from now on run behind
+    /// the copies out of slots enqueued so far, the moves among them: a move
+    /// writes its expert's entry on the stream of copies out of slots, and a
+    /// later entry of the same expert (its eviction, a new upload) must not
+    /// overtake it on the other stream.
+    fn order(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// The pieces the memory of pool `pool` is given back and taken in: the
     /// bytes of a piece (the last one may be shorter) and how many. `(0, 0)`:
     /// the pool's memory stays as it is.
@@ -461,6 +470,14 @@ impl SlotDevice for CudaSlots {
                 4 * words,
             )?;
         }
+        Ok(())
+    }
+
+    fn order(&mut self) -> Result<(), StoreError> {
+        let event = self.event()?;
+        event.record(&self.down)?;
+        self.stream.wait_event(&event)?;
+        self.spare.push(event);
         Ok(())
     }
 
