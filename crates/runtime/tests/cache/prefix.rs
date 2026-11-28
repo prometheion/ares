@@ -151,6 +151,45 @@ fn a_request_without_the_cache_neither_starts_from_it_nor_leaves_anything_in_it(
 }
 
 #[test]
+fn a_request_without_the_cache_neither_starts_from_it_nor_leaves_anything_in_it() {
+    let mut rng = Rng(11);
+    let prompt = rng.prompt(100);
+    let model = model(Some(CHECKPOINT), |_| {});
+    let e = engine(&model, config(256, 16));
+    // llama.cpp's cache_prompt: false.
+    let without = |e: &Rig| {
+        let mut asked = request(&prompt, Some(40));
+        asked.cache = false;
+        let id = asked.id;
+        let run = run_one(&e.rt, asked);
+        (run, *snapshot(&e.rt).request(id).expect("the request ended"))
+    };
+    let (alone, report) = without(&e);
+    assert_eq!((report.cached_tokens, report.computed_rows), (0, 100));
+    let s = e.snapshot();
+    assert_eq!((s.cached_pages, s.counters.checkpoints_saved), (0, 0), "it left nothing");
+    assert_eq!(alone.text, fresh(&prompt, 40));
+    // One that uses the cache finds nothing, and leaves the prompt there.
+    let first = e.ask(&prompt, 40);
+    assert_eq!(first.report.cached_tokens, 0);
+    let s = e.snapshot();
+    assert!(s.cached_pages > 0);
+    // One without the cache computes the whole prompt again, and leaves the
+    // cache as it found it.
+    let (again, report) = without(&e);
+    assert_eq!((report.cached_tokens, report.computed_rows), (0, 100));
+    assert_eq!(again.text, alone.text);
+    let after = e.snapshot();
+    assert_eq!(after.cached_pages, s.cached_pages);
+    assert_eq!(after.counters.checkpoints_saved, s.counters.checkpoints_saved);
+    assert_eq!(after.counters.prefix_hits, 0);
+    // The next one that uses it resumes at the anchor, as without the other.
+    let second = e.ask(&prompt, 40);
+    assert_eq!((second.report.cached_tokens, second.report.computed_rows), (96, 4));
+    e.consistent();
+}
+
+#[test]
 fn without_checkpoints_a_hit_replays_every_cached_row_and_writes_none_of_them() {
     let mut rng = Rng(8);
     let prompt = rng.prompt(100);
