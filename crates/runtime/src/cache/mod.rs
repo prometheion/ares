@@ -419,6 +419,15 @@ impl Cache {
         self
     }
 
+    /// The anchor of a prompt is the end of its last message, for a model
+    /// whose steps are cut at an anchor either way; one that saves the state
+    /// inside its steps keeps the page boundary, which it saves without a
+    /// cut ([`CheckpointPolicy::exact_anchor`]).
+    pub(crate) fn with_exact_anchor(mut self, exact: bool) -> Self {
+        self.policy.exact_anchor = exact;
+        self
+    }
+
     /// The places and the pages in RAM lie in the page-locked memory of
     /// `books`: the cache keeps to its allowance and tells them which places
     /// are in use. Without books of the executor's, pages in RAM are booked
@@ -587,8 +596,18 @@ impl Cache {
         if self.ssd.is_some() && found.computing.is_none() {
             let total = looked.len() / self.cells_per_page as usize;
             let owner = self.import_owner();
+            // Where the cache can resume already: what comes back must lie deeper.
+            let beyond = match self.recurrent {
+                true => {
+                    let resume = self.policy.resume(&found, tokens.len() as u64);
+                    if resume.restore.is_some() { resume.replay.start } else { 0 }
+                }
+                false => found.cells(self.cells_per_page),
+            };
+            let (cells, have) = (u64::from(self.cells_per_page), found.pages.len());
             let ssd = self.ssd.as_mut().expect("checked above");
-            found.computing = ssd.want(&mut self.index, chain, found.pages.len(), total, owner);
+            found.computing =
+                ssd.want(&mut self.index, chain, looked, cells, have, total, beyond, owner);
         }
         let cached = found.cells(self.cells_per_page).min(tokens.len() as u64);
         let resume = if self.recurrent {

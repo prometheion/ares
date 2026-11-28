@@ -84,6 +84,43 @@ fn segments(dir: &Path, extension: &str) -> Vec<PathBuf> {
 }
 
 #[test]
+fn the_pages_under_a_parent_are_its_next_pages_and_its_tails_across_a_restart() {
+    let dir = TempDir::new("children");
+    let tokens: Vec<u64> = (200..216).collect();
+    let fp = fingerprint("a");
+    let mut store = PageStore::open(&dir.0, fp, Config::default()).unwrap();
+    let hashes = put_conversation(&mut store, &tokens);
+    // Two tails under the second page: a partly used page is stored under the
+    // hash of its tokens, one deeper than the page it goes on from.
+    let tails = [hashes[1].extend(&[7, 8]), hashes[1].extend(&[7, 9, 10])];
+    for tail in tails {
+        put_page(&mut store, tail, hashes[1], 3, &[1; 10]);
+    }
+    let children = |store: &PageStore, parent: ChainHash| {
+        let mut children: Vec<ChainHash> = store.children(parent).collect();
+        children.sort_by_key(|hash| hash.to_bytes());
+        children
+    };
+    let mut under = vec![hashes[2], tails[0], tails[1]];
+    under.sort_by_key(|hash| hash.to_bytes());
+    assert_eq!(children(&store, hashes[1]), under);
+    assert_eq!(children(&store, root_hash()), [hashes[0]]);
+    assert_eq!(children(&store, hashes[3]), []);
+    store.forget(Kind::Page, tails[0]);
+    under.retain(|hash| *hash != tails[0]);
+    assert_eq!(children(&store, hashes[1]), under);
+    store.flush().sync().unwrap();
+    drop(store);
+
+    // A restart finds them again from the records' headers (the forgotten
+    // tail's bytes are still on the drive: forgetting is the index's).
+    let store = PageStore::open(&dir.0, fp, Config::default()).unwrap();
+    let mut again = vec![hashes[2], tails[0], tails[1]];
+    again.sort_by_key(|hash| hash.to_bytes());
+    assert_eq!(children(&store, hashes[1]), again);
+}
+
+#[test]
 fn records_survive_a_restart_and_are_found_by_walking_the_prompt() {
     let dir = TempDir::new("restart");
     let tokens: Vec<u64> = (100..122).collect();

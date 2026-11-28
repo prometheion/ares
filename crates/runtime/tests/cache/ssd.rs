@@ -59,26 +59,31 @@ fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
     assert!(s.ssd_problem.is_none());
     e.consistent();
     // The engine ends: 220 cells are 13 full pages, and the checkpoints at
-    // the page boundaries of the prompt that lie deep enough go along.
+    // the page boundaries of the prompt that lie deep enough go along, with
+    // the tail of the prompt's anchor (192 to 199) and the state at its end.
+    // The request's end waits for a save with a record that does not come:
+    // it is not written.
     drop(e);
     let s = stored(&model, &dir.0);
-    assert_eq!(s.store_pages, 13, "{s:?}");
+    assert_eq!(s.store_pages, 14, "{s:?}");
     assert!(s.store_states >= 4, "{s:?}");
 
     // Another engine, whose devices hold nothing: the second turn of the
     // conversation finds the first on SSD.
     let second = format!("{first}{}{}", a.run.text, text_of(2, 40));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
-    assert_eq!(e.snapshot().counters.ssd.store_pages, 13);
+    assert_eq!(e.snapshot().counters.ssd.store_pages, 14);
     let b = e.ask(&second, 20);
     assert_eq!(b.run.text, fresh(&second, 20));
     let s = e.snapshot();
-    // The run ends at the deepest checkpoint, which is restored; nothing is
+    // The run ends at the deepest checkpoint, the anchor's at 199: the pages
+    // before it and its tail come back, the state is restored; nothing is
     // replayed, and the rest is computed.
-    assert!(b.report.cached_tokens >= 192, "{:?}", b.report);
+    assert_eq!(b.report.cached_tokens, 199, "{:?}", b.report);
     assert_eq!(b.report.replayed_rows, 0, "{:?}", b.report);
     assert_eq!(b.report.computed_rows + b.report.cached_tokens, b.report.prompt_tokens);
-    assert_eq!(u64::from(b.report.cached_tokens), s.counters.ssd.pages_read * u64::from(PAGE));
+    let read = u64::from(b.report.cached_tokens).div_ceil(u64::from(PAGE));
+    assert_eq!(read, s.counters.ssd.pages_read, "12 pages and the tail: {s}");
     assert_eq!((s.counters.ssd.states_read, s.counters.checkpoints_restored), (1, 1), "{s}");
     assert_eq!(s.counters.ssd.imports, 1);
     e.consistent();
@@ -119,9 +124,12 @@ fn what_the_devices_gave_up_comes_back_from_ssd() {
     assert!(s.counters.ssd.pages_read > 0, "{s}");
     assert!(s.counters.ssd.pages_read < 18, "what the pool still held was not read: {s}");
     e.consistent();
-    // Nothing is written twice.
+    // Nothing is written twice: the full pages of both texts, and the tails
+    // with the states at their ends that the places still held, two a text
+    // at most (the same text again ends where it ended).
     drop(e);
-    assert_eq!(stored(&model, &dir.0).store_pages, 2 * 19);
+    let pages = stored(&model, &dir.0).store_pages;
+    assert!((2 * 19..=2 * 19 + 4).contains(&pages), "{pages}");
 }
 
 #[test]
@@ -141,7 +149,8 @@ fn a_short_text_is_not_written() {
     e.ask(&long, 10);
     e.consistent();
     drop(e);
-    assert_eq!(stored(&model, &dir.0).store_pages, 6, "110 cells are 6 full pages");
+    let pages = stored(&model, &dir.0).store_pages;
+    assert_eq!(pages, 7, "110 cells are 6 full pages, and the prompt's anchor (96 to 99) a tail");
 }
 
 #[test]
@@ -370,7 +379,8 @@ fn pages_that_settle_late_are_written_in_the_form_they_have() {
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let a = e.ask(&first, 20);
     drop(e);
-    assert_eq!(stored(&model, &dir.0).store_pages, 13, "the end writes them all");
+    let pages = stored(&model, &dir.0).store_pages;
+    assert_eq!(pages, 14, "the end writes them all, and the tail of the anchor");
     let second = format!("{first}{}{}", a.run.text, text_of(61, 40));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let b = e.ask(&second, 20);
@@ -439,6 +449,7 @@ fn requests_that_share_a_run_from_ssd_wait_for_it_together() {
     }
     let s = e.snapshot();
     assert_eq!(s.counters.ssd.imports, 1, "one run serves all four: {s}");
-    assert_eq!(s.counters.ssd.pages_read, 37, "{s}");
+    // 37 pages and the tail of the prompt's anchor (592 to 599).
+    assert_eq!(s.counters.ssd.pages_read, 38, "{s}");
     e.consistent();
 }

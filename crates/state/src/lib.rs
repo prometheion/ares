@@ -45,7 +45,7 @@ pub use checkpoint::{Boundary, CheckpointPolicy, CheckpointRank, Resume};
 pub use layout::PageLayout;
 pub use pool::{PageId, PagePool};
 pub use prefix::{
-    CachedPage, Chain, ChainHash, CheckpointId, Evicted, MAX_TAILS, Owner, PageState, PrefixIndex,
-    PrefixMatch, Priority, TailMatch, best_tail,
+    CachedPage, CachedTail, Chain, ChainHash, CheckpointId, Evicted, MAX_TAILS, Owner, PageState,
+    PrefixIndex, PrefixMatch, Priority, TailMatch, best_tail,
 };
 pub use sequence::{CopyOnWrite, Grown, OutOfPages, Sequence};

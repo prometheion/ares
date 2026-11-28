@@ -148,7 +148,8 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
     assert_eq!(s.counters.ssd.pages_written, 0, "the devices hold the pages: {s}");
     e.consistent();
     drop(e);
-    assert_eq!(stored(&model, &dir.0).store_pages, 13);
+    // 13 full pages and the tail of the prompt's anchor.
+    assert_eq!(stored(&model, &dir.0).store_pages, 14);
 
     // What was written is the right state: another engine resumes from it.
     let second = format!("{first}{}{}", b.run.text, text_of(2, 40));
@@ -184,7 +185,9 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     assert!(b.report.cached_tokens >= 192, "{:?}", b.report);
     assert_eq!(b.report.replayed_rows, 0, "{:?}", b.report);
     assert_eq!((s.counters.ssd.states_read, s.counters.checkpoints_restored), (1, 1), "{s}");
-    assert_eq!(u64::from(b.report.cached_tokens), s.counters.ssd.pages_read * u64::from(PAGE));
+    // The pages before the deepest state and, where it is a tail's, the tail.
+    let read = u64::from(b.report.cached_tokens).div_ceil(u64::from(PAGE));
+    assert_eq!(read, s.counters.ssd.pages_read, "{s}");
     // The checkpoints of the rest of the text went through places too, one
     // at a time: a place whose restore is under way and the place of the
     // next save, never more.
@@ -192,12 +195,13 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     assert!(e.peak.load(Ordering::SeqCst) <= 2 * CHECKPOINT, "{}", e.peak.load(Ordering::SeqCst));
     e.consistent();
     // And they reach the drive when they leave the place, or when the engine
-    // ends (280 cells are 17 full pages, 13 of which the store had): a third
-    // turn resumes behind them, on the same machine without room.
+    // ends (280 cells are 17 full pages, 13 of which the store had, and the
+    // tails of both prompts' anchors): a third turn resumes behind them, on
+    // the same machine without room.
     let s = e.written();
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
     drop(e);
-    assert_eq!(stored(&model, &dir.0).store_pages, 17);
+    assert_eq!(stored(&model, &dir.0).store_pages, 19);
     let third = format!("{second}{}{}", b.run.text, text_of(13, 40));
     let e = engine(&model, config(Some(store(&dir.0))), memory.machine(), None);
     let c = e.ask(&third, 20);

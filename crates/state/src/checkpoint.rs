@@ -7,9 +7,9 @@
 //! are kept decides whether a prefix hit is worth anything. This module
 //! decides; storing the copies is someone else's part.
 //!
-//! **Where they go** ([`CheckpointPolicy::next_capture`]). Only at page
+//! **Where they go** ([`CheckpointPolicy::next_capture`]). At page
 //! boundaries, where the index has a name to attach them to, and at the end
-//! of a tail. A prompt of a conversation names the places where its parts
+//! of a tail: the prompt's end and the request's end are such ends. A prompt of a conversation names the places where its parts
 //! end ([`Boundary`]: the chat template knows them), because a later prompt
 //! that changes the conversation (an edited message, an older tool result
 //! cut, a new conversation with the same system prompt) shares the text up to
@@ -31,11 +31,25 @@
 //!   [`CheckpointPolicy::generation_interval`] apart: measured from the last
 //!   checkpoint on the sequence's own path and not on a fixed grid, so a
 //!   sequence that resumed from a checkpoint continues the spacing from there;
-//! - always at the prompt's anchor, the last page boundary that is at least
+//! - always at the prompt's anchor: the last page boundary that is at least
 //!   [`CheckpointPolicy::volatile_rows`] before the prompt's end (ExLlamaV3's
-//!   last page boundary, LMDeploy's skip of the volatile end): the next turn
-//!   of a conversation shares the prompt up to about there and replays from
-//!   the anchor less than a page of rows;
+//!   last page boundary, LMDeploy's skip of the volatile end), or, where the
+//!   step that reaches that boundary is cut there and would also reach the
+//!   end of the prompt's last message, that end instead
+//!   ([`CheckpointPolicy::anchor_at`]: the last [`Boundary`], or one cell
+//!   before the end of a prompt without messages, the most of it a later
+//!   prompt can take, as its last token is computed for the reply). The same
+//!   prompt asked again then shares all of it but the template's few tokens
+//!   for the reply, and the next turn shares it up to the end of its last
+//!   message whatever the template writes after it (the owner, 2026-11-25: a
+//!   repeated or continued prompt resumes at its end). The cells after the
+//!   page boundary become a tail with the state at its end (the caller
+//!   publishes it). The exact end only takes the place of a cut at the
+//!   boundary, so it never costs a step: a step that ends at the boundary
+//!   anyway, a prompt without a boundary before its end and one that resumed
+//!   past it keep the anchor (or none) as before. A model that saves the
+//!   state inside a step ([`CheckpointPolicy::exact_anchor`] off) keeps the
+//!   page boundary, which it saves inside its rows without a cut;
 //! - at the end of a request the live state is kept as the checkpoint of the
 //!   tail the request publishes, which costs no computation (LMDeploy adopts
 //!   the terminal state the same way). The caller does that; no rule decides
@@ -125,6 +139,10 @@ pub struct CheckpointPolicy {
     /// message and then renders differently). The anchor is at least this far
     /// before the prompt's end.
     pub volatile_rows: u32,
+    /// The anchor is the end of the prompt's last message (or one cell
+    /// before its end), and not the last page boundary before it: for a
+    /// model whose steps are cut at the anchor either way.
+    pub exact_anchor: bool,
     /// The size of one checkpoint.
     pub bytes_per_checkpoint: u64,
     /// The most bytes all checkpoints together may take.
@@ -166,6 +184,7 @@ impl CheckpointPolicy {
             boundary_interval: Self::BOUNDARY_INTERVAL,
             boundary_reach: 0,
             volatile_rows: 1,
+            exact_anchor: true,
             bytes_per_checkpoint,
             budget_bytes,
             fresh_requests: 0,
@@ -189,6 +208,20 @@ impl CheckpointPolicy {
     pub fn anchor(&self, prompt_len: u64) -> u64 {
         let per_page = u64::from(self.cells_per_page);
         prompt_len.saturating_sub(u64::from(self.volatile_rows)) / per_page * per_page
+    }
+
+    /// The anchor of a prompt of `prompt_len` cells whose parts end at
+    /// `boundaries` (ascending): with [`CheckpointPolicy::exact_anchor`], the
+    /// end of the last part, or one cell before the prompt's end when it has
+    /// no parts, where that lies after the page boundary
+    /// [`CheckpointPolicy::anchor`]; else that page boundary.
+    pub fn anchor_at(&self, prompt_len: u64, boundaries: &[Boundary]) -> u64 {
+        let page = self.anchor(prompt_len);
+        if !self.exact_anchor {
+            return page;
+        }
+        let exact = boundaries.last().map_or(prompt_len.saturating_sub(1), |part| part.at);
+        if exact > page && exact < prompt_len { exact } else { page }
     }
 
     /// The first position in `(from, to]` at which a checkpoint is due, for a
@@ -220,13 +253,21 @@ impl CheckpointPolicy {
         let boundary_after = |x: u64| (x / per_page + 1) * per_page;
         let boundary_at_or_after = |x: u64| x.div_ceil(per_page) * per_page;
         let anchor = self.anchor(prompt_len);
+        let exact = self.anchor_at(prompt_len, boundaries);
 
         // Sparse inside the prompt, before the anchor.
         let sparse =
             boundary_after(from).max(boundary_at_or_after(last + u64::from(self.prompt_interval)));
         let sparse = (sparse < anchor && sparse <= to).then_some(sparse);
-        // Always at the anchor.
-        let at_anchor = (anchor > from && anchor > last && anchor <= to).then_some(anchor);
+        // Always at the anchor: the page boundary, or the exact end of the
+        // last message where the step would be cut at that boundary anyway
+        // (it lies inside the rows and the exact end does too), so that the
+        // exact anchor costs no step: a step that ends at the boundary, a
+        // prompt with no boundary before its end and a prompt that resumed
+        // past it are not cut for it.
+        let page_due = anchor > from && anchor > last && anchor <= to;
+        let moved = anchor < to && exact > anchor && exact <= to;
+        let at_anchor = page_due.then_some(if moved { exact } else { anchor });
         // Dense after it.
         let dense = boundary_after(from.max(anchor))
             .max(boundary_at_or_after(last + u64::from(self.generation_interval)));
@@ -278,6 +319,13 @@ impl CheckpointPolicy {
             Some((pages, id)) => (pages as u64 * per_page, Some(id)),
             None => (0, None),
         };
+        // A tail's state inside the match that lies deeper.
+        if let Some((at, id)) = found.inside
+            && at > state_at
+            && at <= cached
+        {
+            (state_at, restore) = (at, Some(id));
+        }
         // The end of a tail that the prompt shares whole is the deepest
         // place there is.
         if let Some(id) = found.tail.and_then(|tail| tail.checkpoint) {
@@ -622,12 +670,16 @@ mod tests {
         while at < to {
             let mut end = (at + step).min(to);
             if let Some(due) = policy.next_capture(prompt_len, boundaries, last, at, end) {
-                assert!(due > at && due <= end && due % per_page == 0);
+                // On a page boundary, or the exact anchor.
+                assert!(due > at && due <= end);
+                let anchor = policy.anchor_at(prompt_len, boundaries);
+                assert!(due.is_multiple_of(per_page) || due == anchor, "{due}");
                 end = due;
             }
             if policy.next_capture(prompt_len, boundaries, last, at, end) == Some(end) {
                 taken.push(end);
-                last = end;
+                // The spacing counts from the page boundary at or before it.
+                last = end / per_page * per_page;
             }
             at = end;
         }
@@ -643,21 +695,55 @@ mod tests {
         let prompt = 70_000;
         assert_eq!(p.anchor(prompt), 69_888);
         let taken = captures(&p, prompt, 0, 0, prompt, 2048);
-        assert_eq!(taken, [32_768, 65_536, 69_888], "two sparse ones and the anchor");
+        assert_eq!(taken, [32_768, 65_536, 69_999], "two sparse ones and the anchor");
         let taken = captures(&p, prompt, 69_888, prompt, prompt + 6000, 1);
         assert_eq!(taken, [71_936, 73_984], "every 2048 cells from the anchor on");
 
-        // The chunks do not matter: one pass over the prompt, or steps of 100.
-        assert_eq!(captures(&p, prompt, 0, 0, prompt, prompt), [32_768, 65_536, 69_888]);
+        // The chunks do not matter, but for the anchor: one pass over the
+        // prompt reaches its end, and so does a step that reaches the page
+        // boundary; a step of 100 rows that is cut at the boundary ends
+        // before the end, and the anchor stays at the boundary.
+        assert_eq!(captures(&p, prompt, 0, 0, prompt, prompt), [32_768, 65_536, 69_999]);
         assert_eq!(captures(&p, prompt, 0, 0, prompt, 100), [32_768, 65_536, 69_888]);
 
         // A short prompt has the anchor and nothing else.
-        assert_eq!(captures(&p, 1000, 0, 0, 1000, 256), [896]);
-        // A prompt shorter than a page has no boundary to anchor at; the
-        // empty state before it needs no checkpoint.
+        assert_eq!(captures(&p, 1000, 0, 0, 1000, 256), [999]);
+        // A prompt shorter than a page has no page boundary to anchor at,
+        // and no anchor: one there would cost a step.
         assert_eq!(p.anchor(100), 0);
         assert_eq!(captures(&p, 100, 0, 0, 100, 100), []);
         assert_eq!(captures(&p, 100, 0, 100, 4200, 1), [2048, 4096]);
+    }
+
+    #[test]
+    fn the_anchor_is_the_end_of_the_last_message_or_one_cell_before_the_prompts_end() {
+        let p = policy();
+        // A prompt without messages: one cell before its end, and not the
+        // page boundary before it, where the step that reaches that boundary
+        // reaches it too; the steps are cut there and nowhere else.
+        assert_eq!(p.anchor_at(1000, &[]), 999);
+        assert_eq!(captures(&p, 1000, 0, 0, 1000, 256), [999]);
+        // Only in place of a cut at the boundary: a step that ends at the
+        // boundary keeps it, a step cut there that ends before the end of
+        // the prompt keeps it too, and a prompt that resumed past the
+        // boundary (the next turn of a conversation, a little longer) or has
+        // none before its end is not cut for an anchor at all.
+        assert_eq!(captures(&p, 1000, 0, 0, 1000, 128), [896]);
+        assert_eq!(captures(&p, 1000, 0, 0, 1000, 100), [896]);
+        assert_eq!(captures(&p, 1000, 900, 900, 1000, 256), []);
+        assert_eq!(captures(&p, 100, 0, 0, 100, 100), []);
+        // A conversation: the end of its last message, before what the
+        // template writes for the reply.
+        let parts = [Boundary { at: 400, root: true }, Boundary { at: 995, root: false }];
+        assert_eq!(p.anchor_at(1000, &parts), 995);
+        // An end before the last page boundary leaves the page boundary.
+        assert_eq!(p.anchor_at(1000, &[Boundary { at: 700, root: false }]), 896);
+        // One token has none, and a model that saves inside its steps keeps
+        // the page boundary.
+        assert_eq!(captures(&p, 1, 0, 0, 1, 1), []);
+        let inside = CheckpointPolicy { exact_anchor: false, ..p };
+        assert_eq!(inside.anchor_at(1000, &parts), 896);
+        assert_eq!(captures(&inside, 1000, 0, 0, 1000, 256), [896]);
     }
 
     #[test]
@@ -674,7 +760,9 @@ mod tests {
         assert_eq!(p.anchor(1283), 1280);
         // The boundary between the anchor and the end is not skipped for
         // ever: it counts as generation and gets a checkpoint when the dense
-        // interval is due.
+        // interval is due. (With the page boundary as the anchor, as a model
+        // that saves inside its steps has it.)
+        p.exact_anchor = false;
         assert_eq!(captures(&p, 1282, 1152, 1152, 1282 + 5000, 7), [3200, 5248]);
     }
 
@@ -684,7 +772,7 @@ mod tests {
         // Resumed at 40 960 (a checkpoint of an earlier request there), the
         // prompt goes on to 120 000: the next sparse one is 32 768 later.
         let taken = captures(&p, 120_000, 40_960, 40_960, 120_000, 2048);
-        assert_eq!(taken, [73_728, 106_496, 119_936]);
+        assert_eq!(taken, [73_728, 106_496, 119_999]);
         // Replaying from a checkpoint far behind: the replayed rows pass the
         // positions where checkpoints are due and take them.
         let taken = captures(&p, 120_000, 0, 0, 100_000, 4096);
@@ -731,17 +819,17 @@ mod tests {
                 13_056, // 13 100: 1024 past the root (12 500 is too close)
                 14_976, // 15 000
                 23_168, // 8192 after the last checkpoint
-                29_952, // 29 990, which is also the anchor
+                29_990, // the end of the last message: the anchor
             ]
         );
         let roots: Vec<u64> = taken.iter().copied().filter(|at| p.at_root(&parts, *at)).collect();
         assert_eq!(roots, [2944, 11_904]);
         // Without boundaries only the fixed distance and the anchor.
-        assert_eq!(captures(&p, prompt, 0, 0, prompt, 512), [8192, 16_384, 24_576, 29_952]);
+        assert_eq!(captures(&p, prompt, 0, 0, prompt, 512), [8192, 16_384, 24_576, 29_999]);
         // A prompt that resumes after the system prompt (a new conversation of
         // the same agent) goes on from its root.
         let taken = captures_at(&p, prompt, &parts, 11_904, 11_904, prompt, 512);
-        assert_eq!(taken, [13_056, 14_976, 23_168, 29_952]);
+        assert_eq!(taken, [13_056, 14_976, 23_168, 29_990]);
     }
 
     #[test]
@@ -767,10 +855,13 @@ mod tests {
         // Without reach every boundary that is due cuts its step.
         let cut = CheckpointPolicy { boundary_reach: 0, ..p };
         assert_eq!(captures_at(&cut, 6000, &parts, 0, 0, 6000, 256), [1408, 2688, 4992, 5888]);
-        // A boundary after the anchor counts as generation; one in the first
-        // page has no page boundary before it.
+        // One in the first page has no page boundary before it, and the last
+        // one would be the anchor, but the step that reaches the page
+        // boundary before it ends there: the anchor stays at the boundary,
+        // as a cut at the message's end would cost a step.
         let late = [boundary(100), boundary(5990)];
         assert_eq!(captures_at(&cut, 6000, &late, 0, 0, 6000, 256), [5888]);
+        assert_eq!(captures_at(&cut, 6000, &late, 0, 0, 6000, 300), [5990]);
         // No budget, no checkpoints.
         let none = CheckpointPolicy { budget_bytes: 0, ..p };
         assert_eq!(captures_at(&none, 6000, &parts, 0, 0, 6000, 256), []);
@@ -793,6 +884,7 @@ mod tests {
             boundary_interval: 8,
             boundary_reach: 0,
             volatile_rows: 1,
+            exact_anchor: true,
             bytes_per_checkpoint: 1,
             budget_bytes: 100,
             fresh_requests: 0,

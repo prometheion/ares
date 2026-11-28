@@ -176,16 +176,17 @@ impl Cache {
                 if unwritten && entry.tail.is_none() && writes {
                     ram.counters.pages_dropped += 1;
                 }
+                let depth = entry.stored_depth();
                 if let Some(parts) = entry.parts {
                     ram.recycle(parts);
                 }
-                (entry.checkpoint, entry.parent, entry.depth)
+                (entry.checkpoint, entry.parent, depth)
             }
             Item::Checkpoint => {
                 let mut held = None;
                 ram.update(hash, |entry| held = entry.checkpoint.take());
                 let entry = ram.get(hash).expect("the entry is there");
-                (held, entry.parent, entry.depth)
+                (held, entry.parent, entry.stored_depth())
             }
         };
         let Some(held) = held else { return 0 };

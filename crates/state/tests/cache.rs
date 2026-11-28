@@ -182,12 +182,32 @@ impl World {
             }
             live.state_at = stop;
             let Some(position) = next else { break };
-            assert!(position % u64::from(PER_PAGE) == 0 && position <= to);
-            live.last_checkpoint = position;
-            let hash = live.chain.hashes()[(position / u64::from(PER_PAGE)) as usize - 1];
+            assert!(position <= to);
+            let per_page = u64::from(PER_PAGE);
             let (text, state, owner) =
                 (live.tokens[..position as usize].to_vec(), live.state, live.owner);
-            self.capture(hash, &text, state, owner);
+            live.last_checkpoint = position / per_page * per_page;
+            if position.is_multiple_of(per_page) {
+                let hash = live.chain.hashes()[(position / per_page) as usize - 1];
+                self.capture(hash, &text, state, owner);
+                continue;
+            }
+            // The anchor of a prompt without parts, one cell before its end,
+            // inside a page: the cells after the page boundary become a tail
+            // that the state hangs on (the text goes on in a copy).
+            assert_eq!(position + 1, prompt_len, "only the anchor lies inside a page");
+            let full = (position / per_page) as usize;
+            let prior = live.chain.before(full);
+            let rest = live.tokens[full * PER_PAGE as usize..position as usize].to_vec();
+            let (page, class) = (live.seq.pages()[full], live.class);
+            // A page the index holds already (a longer text's) is one entry
+            // or one tail: the state is not kept there, as in the runtime.
+            if self.pool.is_cached(page) {
+                continue;
+            }
+            let dropped = self.index.insert_tail(&mut self.pool, prior, &rest, page, class);
+            self.forget(dropped.and_then(|d| d.checkpoint));
+            self.capture(PrefixIndex::tail_hash(prior, &rest), &text, state, owner);
         }
     }
 
@@ -458,6 +478,7 @@ fn run(seed: u64, budget: u64, stats: &mut Stats) {
             boundary_interval: 8,
             boundary_reach: 0,
             volatile_rows: 1,
+            exact_anchor: true,
             bytes_per_checkpoint: 10,
             budget_bytes: budget * 10,
             fresh_requests: 0,

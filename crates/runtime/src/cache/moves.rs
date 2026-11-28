@@ -37,9 +37,12 @@ impl Cache {
         left_behind: &HashSet<ChainHash>,
     ) -> bool {
         let Evicted { page, checkpoint, root, hash, parent, depth, tail, .. } = evicted;
-        let full = tail.is_none();
-        let deep = full && self.deep(depth);
-        let worth = full && (self.worth.remove(&hash) || deep);
+        // A tail is kept on the drive with the state at its end (where a later
+        // prompt resumes), and only so; its number there is one more than the
+        // page it hangs under.
+        let kept = tail.is_none() || checkpoint.is_some();
+        let deep = kept && self.deep(depth + u32::from(tail.is_some()));
+        let worth = kept && (self.worth.remove(&hash) || deep);
         let stored = self.ssd.as_ref().is_some_and(|ssd| ssd.has_or_queued(Kind::State, hash));
         let held = checkpoint.map(|id| Held {
             place: id.0 as u32,
@@ -186,7 +189,8 @@ impl Cache {
             ram.counters.pages_dropped += 1;
         }
         if let Some(held) = leaving.checkpoint {
-            let out = self.state_out_of(&held, leaving.hash, leaving.parent, leaving.depth);
+            let depth = leaving.depth + u32::from(leaving.tail.is_some());
+            let out = self.state_out_of(&held, leaving.hash, leaving.parent, depth);
             self.give_up(held.place, out);
         }
     }
@@ -281,7 +285,7 @@ impl Cache {
     pub(super) fn clean(&mut self, item: Item, hash: ChainHash) {
         let (Some(ram), Some(ssd)) = (&mut self.in_ram, &mut self.ssd) else { return };
         let Some(entry) = ram.get(hash) else { return };
-        let (parent, depth) = (entry.parent, entry.depth);
+        let (parent, depth) = (entry.parent, entry.stored_depth());
         match item {
             Item::Page => {
                 if ssd.has_or_queued(Kind::Page, hash) {
@@ -520,7 +524,15 @@ impl Cache {
             let deepest = deepest(names, run, |hash| {
                 ram.get(hash).is_some_and(|entry| entry.checkpoint.is_some())
             });
-            let drive = self.ssd.as_ref().is_some_and(|ssd| ssd.reaches_state(&names[run..]));
+            // The drive goes on: pages with a state after the run, or a tail
+            // with the state at its end where the run ends (an anchor whose
+            // state RAM no longer has): RAM gives its pages, the drive the rest.
+            let after = &rest[..rest.len().min(per_page - 1)];
+            let next = chain.hashes().get(have + run).copied();
+            let drive = self.ssd.as_ref().is_some_and(|ssd| {
+                ssd.reaches_state(&names[run..])
+                    || ssd.has_tail(chain.before(have + run), next, after)
+            });
             match tail {
                 Some((_, true, true, hash)) => (run, Some(hash)),
                 _ if drive => (run, None),

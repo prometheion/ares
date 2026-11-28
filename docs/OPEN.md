@@ -50,19 +50,6 @@ What was merged, and when, is in [`dev/history.md`](dev/history.md).
 - The triage's seven questions, answered 2026-11-25:
   - `--generation-floor` stays 20 tokens/s (the fork's generation beside a prompt); looked at again
     after the kernel pass makes steps cheaper.
-  - A checkpoint at the end of every request (a place per request end), so a repeated or continued
-    prompt resumes at its end, not at the last page or message boundary (to build: `fix/server-sweep`).
-    Not built yet (2026-11-25): a state one cell before the end needs a step cut there, and the
-    version that cut every prompt (measured on the 27B, both cards, an 11,125-token agent prompt,
-    A/B/A/B: the same prompt again 0.224 -> 0.098 s, but a cold prompt +0.07 s and the next turn
-    0.117 -> 0.190 s) broke the rule that nothing gets slower, so it is not on the branch. What is
-    left: the state at the prompt's very end (free at the end of its last step) with the last row's
-    logits kept, which a repeat samples from without running a row; it takes a step of no rows in
-    the record, the logits of each device's slice of the vocabulary in the place, the drafters'
-    last hidden state, and a prompt that computes nothing (larger than the sweep). A variant without
-    a step more, the anchor moved from the last page boundary to the end of the last message
-    (`/var/tmp/ares-fixserver/exact-anchor-wip.patch`), serves repeats and next turns alike but puts
-    the anchor on a tail, which the drive does not keep: a resume after a restart would replay more.
   - The RTX 3060's prompt attention takes 5 pieces a tile (about 6 % of its attention for some 25 MB
     of state slots a card); O in f16 is not taken (its error grows with the length). In the kernel pass.
   - The roles of the cards are built and tested now on the local RTX 4070 + RTX 3060, not after the
@@ -674,6 +661,14 @@ Pieces of real work, days each, in the order of work where the owner placed them
       and refuses `similar` without it; (2) slices of a prompt (wide steps) are not pruned.
 
 ### Prompt cache
+- [ ] Left of the exact anchor (`fix/exact-anchor`, 2026-11-27): Flash-Next reads a prompt layer by
+      layer and saves its anchor inside that pass, so it keeps the anchor at the page boundary; the
+      end of its last message needs a cut (a step) or a save inside a last micro-batch narrower than
+      the decode kernels take (the pass's `MAX_BATCH`). And the last request's end state is not on
+      the drive after an engine ends: its save waits for a record that does not come, so a next turn
+      after a restart resumes at its prompt's anchor and computes the reply's rows once; a record of
+      copies alone at the drain would write it. Files: `crates/model/src/qwen4exp/device/runtime.rs`
+      (`saves_inside_steps`), `crates/runtime/src/cache/ssd/pump.rs` (`drain`).
 - [ ] Reuse of K/V blocks away from the prefix, as CacheBlend does, opt-in like pruning (the owner,
       2026-11-18; approximate: the output diverges, measured and bounded by a dial, off by
       default). For a conversation whose earlier part changed (an older tool result cut, an
