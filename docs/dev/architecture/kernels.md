@@ -718,7 +718,15 @@ the many-row kernels also take the width in steps of 128 and the inner width in 
   for all 25 quantized types. The float types have a trait of the same interface
   (`EngExpertFloat`): the weights as stored times the int8 activations, so that an expert of
   any type computes `W x^` for the rounded activations `x^` and the host can compute the
-  same.
+  same. Each exists for steps of up to 1, 2, 4 and 8 rows (`_r1`, `_r2`, `_r4`, no
+  suffix; `EXPERT_ROWS` in `src/experts.rs`), since a kernel issues the loads and products
+  of all its rows for every expert, a row that picked it or not (the loop over the rows is
+  unrolled and its test of the row mask compiled into predicates; branching per row instead
+  was 30 % slower). Measured 2026-11-28 with `expert_layer_bench` on Flash-Next's real
+  experts, a layer's experts against the kernels of 8 rows: one row 25 to 29 % less time on
+  the RTX 4070 (IQ2_S / Q2_0 71.4 -> 53.6 us) and 27 to 32 % on the RTX 3060 (141 -> 102),
+  two rows 5 to 19 % and 21 to 29 %, four 8 to 10 % and 14 to 17 %, eight the same; a row
+  has the same bits in every kernel (`a_row_gets_the_same_bits_alone_and_in_a_batch`).
 - *Many-row kernels.* IQ2_S, IQ2_XXS, IQ1_M and IQ1_S as gate and up and Q2_0 as down have a
   decoder written for these kernels. Every other type and role goes through an adapter
   (`expertrows_mm.cuh`) that makes a gate and up or a down decoder of the item decoder of the

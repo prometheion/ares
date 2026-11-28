@@ -522,9 +522,18 @@ pub struct ExpertKernels {
     pick_pruned: Function,
     predict_logits: Function,
     predict_pick: Function,
-    /// Per type of [`TYPES`]: the gate and up kernel and the down kernel.
-    typed: Vec<(Function, Function)>,
+    /// Per type of [`TYPES`]: the gate and up kernel and the down kernel, for steps of up
+    /// to 1, 2, 4 and 8 rows ([`EXPERT_ROWS`]): a kernel issues the loads and products of
+    /// all its rows for every expert, whether a row picked it or not.
+    typed: Vec<[(Function, Function); 4]>,
 }
+
+/// The most rows of a step each of the decode kernels of the experts takes (`_r1`, `_r2`,
+/// `_r4` and the kernels without a suffix in `kernels/experts.cu`). They issue the work of
+/// all their rows for every expert: a step of one row on the kernels of eight took a quarter
+/// longer for the experts of a layer of Flash-Next (RTX 4070 71.4 against 53.6 us, RTX 3060
+/// 141 against 102; the same bits).
+const EXPERT_ROWS: [u32; 4] = [1, 2, 4, MAX_BATCH];
 
 impl ExpertKernels {
     /// Loads the kernels on `device`.
@@ -533,10 +542,13 @@ impl ExpertKernels {
         let typed = TYPES
             .iter()
             .map(|t| {
-                Ok((
-                    module.function(&format!("ares_expert_gate_up_{}", t.ty))?,
-                    module.function(&format!("ares_expert_down_{}", t.ty))?,
-                ))
+                let pair = |suffix: &str| -> Result<(Function, Function)> {
+                    Ok((
+                        module.function(&format!("ares_expert_gate_up_{}{suffix}", t.ty))?,
+                        module.function(&format!("ares_expert_down_{}{suffix}", t.ty))?,
+                    ))
+                };
+                Ok([pair("_r1")?, pair("_r2")?, pair("_r4")?, pair("")?])
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -1038,9 +1050,10 @@ impl ExpertKernels {
             u32::try_from(shape.up_offset().ok_or_else(geometry)?).map_err(|_| geometry())?;
         let down_offset =
             u32::try_from(shape.down_offset().ok_or_else(geometry)?).map_err(|_| geometry())?;
+        let rows = EXPERT_ROWS.iter().position(|r| n_rows <= *r).unwrap_or(EXPERT_ROWS.len() - 1);
         let kernel = |ty: GgmlType| {
             types::index(ty)
-                .map(|i| &self.typed[i])
+                .map(|i| &self.typed[i][rows])
                 .ok_or_else(|| invalid("expert shape", "no kernel for the types".into()))
         };
         let (gate_up, down) = (&kernel(shape.gate_ty)?.0, &kernel(shape.down_ty)?.1);
