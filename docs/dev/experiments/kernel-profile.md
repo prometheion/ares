@@ -176,9 +176,14 @@ up kernel of IQ2_S takes 63 us for ten experts (10.5 MB, 167 GB/s) and the down 
 RTX 3060): 128 registers a thread, so a third of the warps a multiprocessor can hold, 8.2 million
 warp instructions for 16.4 million weights, of which 62 % are integer work (LOP3 26 %, IMAD 14 %,
 SHF 13 %, IADD3 9 %) and the dot products 3.7 %; DRAM at 17 % of its peak. The gate and up
-kernel: 64 registers, 55 % of the warps, DRAM 48 %, the multiprocessors' issue at 65 %. Iterating
-over the rows of an expert's mask with a branch instead of the predicated loop over all eight was
-tried and was 30 % slower (a switch per row, and the loads of the rows no longer together).
+kernel: 64 registers, 55 % of the warps, DRAM 48 %, the multiprocessors' issue at 65 %. The
+kernels' loop over the eight rows a step can have is unrolled into predicated code, so every expert
+issued the work of eight rows; kernels built for 1, 2 and 4 rows (`kernels.md`, the experts' decode
+kernels) take a layer's experts at one row from 71.4 to 53.6 us (RTX 4070) and from 141 to 102 us
+(RTX 3060), 250 and 141 GB/s; iterating over the rows of an expert's mask with a branch instead was
+30 % slower (a switch per row, and the loads of the rows no longer together). In the model at
+`--ram 8G` the misses of the tiers spread the step by more than that gain (decode medians 22.36 /
+22.21 ms before, 21.27 / 21.62 after, alternating).
 
 ## The levers, ranked
 
@@ -191,7 +196,8 @@ cost of a step of 16 rows against one row, which #14 wants near 1.05 to 1.2.
    9.3 to about 4.5 ms at one row (the step from 22 to about 17 ms, 25 % more tokens per second)
    and from 30 to about 15 ms in a window of 8 rows. The down kernels are integer-bound (the
    2-bit codes of Q2_0 unpacked for `dp4a`, 128 registers); the gate and up kernels at half the
-   bandwidth. The way: a rearranged form of an expert in its slot (the device layout's idea: a
+   bandwidth. The kernels for one, two and four rows (done) take a quarter off one row; the RTX
+   3060 is still at 141 GB/s for one row and 121 for eight. The way: a rearranged form of an expert in its slot (the device layout's idea: a
    warp's lanes load a tile of rows in one load) and the decode in registers for the tensor
    cores, as the dense few-row kernels do, or fewer instructions per code in the `dp4a` kernels.
 2. **27B: the merges of the tensor split at 9 to 16 rows**: 3.3 to 9.5 ms on the RTX 3060,
@@ -202,7 +208,9 @@ cost of a step of 16 rows against one row, which #14 wants near 1.05 to 1.2.
    decode shape of 48 vectors and read every cell twice: at 32 768 cells a step of 9 rows costs
    11.4 ms more than one of 8 (38.4 to 49.5 ms), of which the second pass over K and V is about
    3.3 ms (RTX 4070) and 4.8 ms (RTX 3060). A decode shape of 96 vectors (six warps sharing the
-   vectors, as the 48 has three) would read them once.
+   vectors, as the 48 has three) would read them once, but as the kernel lays out its shared
+   memory (the queries, two chunks of K and V and their raw stages) it needs about 132 KB at a
+   head size of 256, where a block may have 99 KB: it needs the queries out of shared memory.
 4. **27B: the codebook i-quants in a device layout** (#18, the first lever). IQ3_S, IQ3_XXS,
    IQ2_S and IQ2_XS run on the decode kernels of the file's layout: 77 % of the RTX 3060's
    bandwidth at one row, and two launches of 8 rows above 8 (1.4 to 2.5 ms at one row, 5.3 to 8.2
@@ -223,4 +231,6 @@ cost of a step of 16 rows against one row, which #14 wants near 1.05 to 1.2.
 Done on the branch (`kernel/few-rows-pass`): the few-row kernels at 9 to 16 rows and the tile
 conversion (the tables above): the 27B's step of 16 rows from 2.21 to 1.67 times one row with
 every matrix in the device layout and from 2.30 to 1.76 with the measured layouts at 1 000
-cells, 2.22 to 2.05 at 32 768; one row and windows of up to 9 rows unchanged.
+cells, 2.22 to 2.05 at 32 768; one row and windows of up to 9 rows unchanged. The experts' decode
+kernels for 1, 2 and 4 rows: a quarter of the experts' time of a decode step of Flash-Next on
+both cards (the bench above).
