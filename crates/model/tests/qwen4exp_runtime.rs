@@ -601,6 +601,13 @@ fn reference_answer_at(path: &std::path::Path, prompt: &[u32], n: usize) -> Vec<
 /// behind: 3.393 against 3.496, the third at 2.721, the RMS 1.455.)
 const LOGIT_ERROR: f64 = 4e-2;
 
+/// [`LOGIT_ERROR`] for a draft of the MTP block: the block reads the residual after the model's
+/// last layer, whose difference from the reference's is that of every layer before it, and adds
+/// its own layer. Its first links fell up to 0.131 of the RMS behind the reference's draft at
+/// near ties (both devices on every layer, 2026-11-28), against 0.13 at [`LOGIT_ERROR`]; the
+/// tokens that were clearly worse fell 0.62 and more behind. 6e-2 lets a draft fall 0.19 behind.
+const MTP_LOGIT_ERROR: f64 = 6e-2;
+
 /// Fails the test unless `answer`, the greedy tokens an engine wrote after `prompt` on the
 /// made-up model in the file at `path`, is what the CPU reference writes up to near ties: the
 /// reference reads the prompt and then the answer's own tokens, and each token of the answer
@@ -2255,7 +2262,7 @@ struct Judged {
 /// and wrote `answer`, link by link against the CPU reference's block from the same cells: the
 /// reference follows each chain's own drafts, and says of each link whether its draft is the
 /// reference's most likely token there or a near tie of it ([`is_near_best`] at
-/// [`LOGIT_ERROR`]); the first link of every chain must be. A made-up block has near ties that
+/// [`MTP_LOGIT_ERROR`]); the first link of every chain must be. A made-up block has near ties that
 /// the device's arithmetic flips, and a chain that took the other token goes on from it; a
 /// block that is wired wrongly drafts tokens the reference ranks far down.
 fn chains_against_the_reference(
@@ -2324,7 +2331,7 @@ fn chains_against_the_reference(
                     logits[got as usize],
                     logits[want as usize],
                 );
-                match is_near_best(got, logits, LOGIT_ERROR) {
+                match is_near_best(got, logits, MTP_LOGIT_ERROR) {
                     true => judged.tied[link] += 1,
                     false => judged.far[link] += 1,
                 }
@@ -2332,7 +2339,7 @@ fn chains_against_the_reference(
                 // the device and in the reference alike, so their difference grows from link
                 // to link (link 5 of a chain once 0.136 of the RMS behind): the first links
                 // are held to the near tie.
-                if link == 0 && !is_near_best(got, logits, LOGIT_ERROR) {
+                if link == 0 && !is_near_best(got, logits, MTP_LOGIT_ERROR) {
                     judged.wrong.push(format!(
                         "a chain from cell {}: its first link drafts {got}, the reference {want}, \
                          {behind:.3} of the RMS behind",
