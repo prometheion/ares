@@ -338,7 +338,9 @@ pub(super) fn places(
 }
 
 /// The CPU workers of the store: all the cores the system reports but
-/// `reserved`, which belong to the threads that drive the step.
+/// `reserved`, which belong to the threads that drive the step, and on a CPU
+/// without a second thread per core one more, the I/O threads'
+/// ([`CpuPlacement::for_machine`]).
 pub(super) fn cpu_pool(workers: Option<usize>, reserved: usize) -> Result<CpuPool, Error> {
     let placement = match workers {
         Some(workers) => CpuPlacement::unpinned(workers.max(1)),
@@ -677,6 +679,15 @@ impl Feed {
         }
         self.guessed.fill(false);
         self.named_wide.fill(false);
+        let most = self.boards.iter().map(|board| board.ahead()).max().unwrap_or(0);
+        if rows <= MAX_BATCH && most > 0 {
+            // As far ahead as a read ahead may come of it, and now and then as far as the
+            // parts can, to keep the counts.
+            let depth = self.store.ahead_depth(rows as usize, most);
+            for board in &self.boards {
+                board.set_ahead_depth(depth);
+            }
+        }
         if rows > MAX_BATCH {
             // The next layer's picks are predicted where the step before read from the file.
             for index in 0..self.boards.len() {
@@ -914,6 +925,10 @@ pub(super) fn build_store(
     region: HostRegion,
     cpu: Option<(CpuPool, Serve)>,
 ) -> Result<ExpertStore<CudaSlots>, Error> {
+    if let Some((pool, _)) = &cpu {
+        // The I/O thread runs where no worker spins.
+        reader.run_on(pool.free_cpus())?;
+    }
     let mut store = ExpertStore::new(plan, map, reader, slots, region)?;
     if let Some((pool, serve)) = cpu {
         store.enable_cpu(pool, layout.shapes.clone(), serve)?;

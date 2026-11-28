@@ -271,6 +271,33 @@ fn reads_ahead_start_where_predictions_have_been_picked_more_often_than_not() {
 }
 
 #[test]
+fn a_step_predicts_only_as_far_as_a_place_is_worth_a_read_and_now_and_then() {
+    let mut rig = rig(4, 8, recent_first);
+    // Before any counts no place qualifies: one step in eight predicts, as far as it can.
+    let depths: Vec<usize> = (0..16).map(|_| rig.store.ahead_depth(1, 2)).collect();
+    assert_eq!(depths.iter().filter(|d| **d == 2).count(), 2);
+    assert!(depths.iter().all(|d| *d == 0 || *d == 2));
+    // Steps of several rows are counted apart.
+    assert_eq!(rig.store.ahead_depth(4, 2), 0);
+
+    // Predictions one layer ahead that are picked: every step of one row predicts one
+    // layer ahead, and every eighth two.
+    rig.predict_steps(2, 16, 1, 1);
+    let depths: Vec<usize> = (0..16).map(|_| rig.store.ahead_depth(1, 2)).collect();
+    assert!(depths.iter().all(|d| *d >= 1), "{depths:?}");
+    assert_eq!(depths.iter().filter(|d| **d == 2).count(), 2, "{depths:?}");
+    // A part that predicts one layer ahead does so every step.
+    assert!((0..16).all(|_| rig.store.ahead_depth(1, 1) == 1));
+    // The several rows have no counts yet.
+    assert_eq!(rig.store.ahead_depth(4, 2), 0);
+
+    // Once the first place is no longer picked, no place qualifies again.
+    rig.predict_steps(2, 48, 1, 0);
+    let depths: Vec<usize> = (0..16).map(|_| rig.store.ahead_depth(1, 1)).collect();
+    assert_eq!(depths.iter().filter(|d| **d == 1).count(), 2, "{depths:?}");
+}
+
+#[test]
 fn a_read_ahead_takes_only_room_that_nobody_uses() {
     let mut rig = rig(4, 8, recent_first);
     rig.predict_steps(2, 17, 1, 1);

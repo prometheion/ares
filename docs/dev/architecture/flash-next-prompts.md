@@ -221,7 +221,14 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   already, see "Wide steps"). The test `a_prompt_read_alone_runs_on_vram_the_expert_slots_lend`
   (`tests/qwen4exp_runtime.rs`) checks the answer against the CPU reference in every
   placement, as the other wide-step tests do. In one run the lent steps' answer and the own
-  scratch's agreed in all 16 tokens on one card.
+  scratch's agreed in all 16 tokens on one card. A loan leaves few experts in VRAM, so the CPU
+  computes more of a lent step's misses, from int8 rows: a near tie upstream (a router's last
+  pick, the attention's choice of blocks) can then go either way from run to run, which turned
+  the first token after one prompt of the made-up model in about 1 run of 200 (2026-11-27, see
+  "Two first tokens after lent steps" in
+  [`../experiments/flash-next-prompts.md`](../experiments/flash-next-prompts.md));
+  `lent_steps_with_the_cpus_share_give_the_reference_token_run_after_run` checks the reference's
+  token run after run on a prompt without such a tie.
 
 The estimate (`batch_rows`) counts what the drafters take of the bytes for slots on the
 device with the head (the MTP block's experts stay resident there) since 2026-11-22: without
