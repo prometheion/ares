@@ -8,7 +8,7 @@
 //!     [--decode-steps 64] [--prefill 2048] [--text FILE] [--state f32|f16]
 //!     [--pipeline-rows 256] [--no-profile] [--balance FILE] [--balance-out FILE]
 //!     [--step-rows N] [--layouts measured|file|device] [--prompt-weight 1]
-//!     [--show-layouts] [--kv q8,q8] [--fingerprint FILE]
+//!     [--show-layouts] [--kv q8,q8] [--fingerprint FILE] [--windows 1,8,16]
 //! ```
 //!
 //! - `--attention-shares A,B`: with a tensor split, the devices' shares of
@@ -29,6 +29,14 @@
 //!   with the device time by kind of kernel.
 //! - `--prefill N`: prompt tokens per second for `N` tokens, in steps of
 //!   `--step-rows` rows (default: `--max-rows`).
+//! - `--windows R,...`: with `--decode-at`, after the decode steps at each
+//!   context, `--decode-steps` steps of a window of drafts of each `R` rows
+//!   (one row: a decode step), whose first row is accepted, so every step
+//!   verifies a window at the next position: the price of a step by its rows,
+//!   as the conductor's warm-up measures it, with the device time by kind and
+//!   each count's time against one row. The device idles for 300 ms between
+//!   two counts, which marks them apart in a trace of the kernels.
+//!   `--draft-vocab FILE` orders the head as the server does.
 //! - `--layouts`: how every weight matrix gets its layout on a device:
 //!   `measured` (the default) times both layouts per matrix at load and takes
 //!   the device layout where it does not make a decode step slower, and of
@@ -181,6 +189,7 @@ struct Args {
     layouts: Layouts,
     show_layouts: bool,
     fingerprint: Option<PathBuf>,
+    windows: Vec<u32>,
 }
 
 impl Args {
@@ -230,6 +239,7 @@ fn parse() -> Args {
         layouts: Layouts::default(),
         show_layouts: false,
         fingerprint: None,
+        windows: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     let list = |v: String| v.split(',').map(str::to_owned).collect::<Vec<_>>();
@@ -302,6 +312,9 @@ fn parse() -> Args {
             }
             "--show-layouts" => args.show_layouts = true,
             "--fingerprint" => args.fingerprint = Some(value().into()),
+            "--windows" => {
+                args.windows = list(value()).iter().map(|s| s.parse().expect("rows")).collect()
+            }
             "--chat-var" => {
                 let pair = value();
                 let (name, text) = pair.split_once('=').expect("--chat-var name=value");
@@ -737,7 +750,11 @@ fn main() {
         return conversation(&args, &spread, history);
     }
     let profile = Arc::new(Profile::new());
-    let logit_rows = 16;
+    let widest = args.windows.iter().copied().max().unwrap_or(0);
+    let logit_rows = widest.max(16);
+    let vocabulary: Option<Arc<[u32]>> = args.draft_vocab.as_ref().map(|path| {
+        ares_model::files::read_draft_vocabulary(path).expect("the draft vocabulary").into()
+    });
     let options = Options {
         precision: args.precision,
         layouts: args.layouts,
@@ -745,8 +762,9 @@ fn main() {
         kv: args.kv,
         max_rows: args.rows(),
         logit_rows,
-        // The fingerprint verifies windows of drafts.
-        window_rows: if args.fingerprint.is_some() { 8 } else { 0 },
+        // The fingerprint verifies windows of drafts, and so does `--windows`.
+        window_rows: if args.fingerprint.is_some() { widest.max(8) } else { widest },
+        draft_vocabulary: vocabulary,
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
         ..Options::default()
@@ -941,6 +959,71 @@ fn main() {
         balance(&profile, model.placement(), model.config(), args.balance_out.as_deref());
         let text = tokenizer.decode(&generated, false).expect("decodable tokens");
         println!("RES text after context {context}: {:?}", String::from_utf8_lossy(&text));
+        let next = position + generated.len() - 1;
+        windows(&mut session, &profile, &args, &tokens, *generated.last().expect("a token"), next);
+    }
+}
+
+/// `--windows`: steps of draft windows of each count of rows at the position `position`
+/// on, whose first row is `first`; the drafts are the tokens of `text` that follow.
+fn windows(
+    session: &mut Session,
+    profile: &Profile,
+    args: &Args,
+    text: &[u32],
+    first: u32,
+    position: usize,
+) {
+    let (mut token, mut position) = (first, position);
+    let mut one_row = None;
+    for &rows in &args.windows {
+        // The device idles between two counts: the gap marks them in a trace.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut times = Vec::new();
+        for step in 0..args.decode_steps + 4 {
+            if step == 4 {
+                profile.reset();
+            }
+            let mut window = vec![token];
+            window.extend(text.iter().cycle().skip(position).take(rows as usize - 1));
+            let single = rows == 1;
+            let part = Rows {
+                slot: 0,
+                position: position as u32,
+                tokens: &window,
+                direct: single,
+                wanted: if single { Wanted::Last } else { Wanted::All },
+            };
+            token = session.step(&[part]).expect("a step")[0].token;
+            if !single {
+                session.accept(&[1]).expect("the window's outcome");
+            }
+            position += 1;
+            let time = session.last_time();
+            if step >= 4 {
+                times.push((time.wall.as_secs_f64() * 1e3, time.device.as_secs_f64() * 1e3));
+            }
+        }
+        // One step more commits the last window and closes the profile of the last step.
+        let part = Rows {
+            slot: 0,
+            position: position as u32,
+            tokens: &[token],
+            direct: true,
+            wanted: Wanted::Last,
+        };
+        token = session.step(&[part]).expect("a step")[0].token;
+        position += 1;
+        let mut wall: Vec<f64> = times.iter().map(|t| t.0).collect();
+        let mut device: Vec<f64> = times.iter().map(|t| t.1).collect();
+        let (wall, device) = (median(&mut wall), median(&mut device));
+        let base = *one_row.get_or_insert(wall);
+        println!(
+            "RES window of {rows} rows at position {position}: {wall:.2} ms per step wall (median of {}), {device:.2} ms on the slowest device, {:.3} times one row",
+            times.len(),
+            wall / base
+        );
+        print_profile(profile, &format!("window of {rows} rows"));
     }
 }
 

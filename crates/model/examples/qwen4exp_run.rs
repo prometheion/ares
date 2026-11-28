@@ -12,7 +12,7 @@
 //!     [--decode-steps 64] [--every 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
 //!     [--read-ahead on|off] [--predict 2] [--fingerprint FILE] [--kv q8,q8]
-//!     [--near-pages N] [--cpu-workers N]
+//!     [--near-pages N] [--cpu-workers N] [--windows 1,8]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -44,6 +44,15 @@
 //!   both ways). `--every K` prints a line per `K` steps of the untimed ones: the
 //!   share of picks in VRAM, the misses, the reads of the file and the median step, to
 //!   see how the tiers follow the text the model writes.
+//! - `--windows R,...`: with `--decode-at`, after the decode steps at each
+//!   context, `--decode-steps` steps of a window of drafts of each `R` rows
+//!   (one row: a decode step; up to `--rows`), whose first row is accepted, so
+//!   every step verifies a window at the next position: the price of a step by
+//!   its rows, with each count's time against one row. The device idles for
+//!   300 ms between two counts, which marks them apart in a trace of the
+//!   kernels. The logits of every row of a window are copied to the host, as
+//!   they are for the one row of a decode step. With `--breakdown` the measured
+//!   steps are timed by kind.
 //! - `--prefill N`: reads `N` tokens of `--text` from an empty sequence and
 //!   reports tokens per second, in steps of `--rows` rows (default 8, the decode
 //!   kernels' limit; more runs the many-row kernels and reports what the wide steps
@@ -130,6 +139,7 @@ struct Args {
     kv: (CacheFormat, CacheFormat),
     near_pages: Option<u32>,
     cpu_workers: Option<usize>,
+    windows: Vec<u32>,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -171,6 +181,7 @@ fn parse() -> Result<Args, AnyError> {
         kv: (CacheFormat::Q8, CacheFormat::Q8),
         near_pages: None,
         cpu_workers: None,
+        windows: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -245,6 +256,9 @@ fn parse() -> Result<Args, AnyError> {
             }
             "--predict" => args.predict = value()?.parse()?,
             "--cpu-workers" => args.cpu_workers = Some(value()?.parse()?),
+            "--windows" => {
+                args.windows = list(value()?).iter().map(|d| d.parse()).collect::<Result<_, _>>()?
+            }
             "--serve" => {
                 args.serve = match value()?.as_str() {
                     "stream" => Serve::Stream,
@@ -616,6 +630,7 @@ fn run() -> Result<(), AnyError> {
     for path in &args.profile {
         routing(path, &mut counts)?;
     }
+    let widest = args.windows.iter().copied().max().unwrap_or(0);
     let model = ModelOptions {
         part: Options {
             cells: args.cells,
@@ -624,9 +639,10 @@ fn run() -> Result<(), AnyError> {
             kv: args.kv,
             near_pages: args.near_pages,
             profile: profile.clone(),
-            // The fingerprint verifies windows of four rows of drafts.
-            logit_rows: if args.fingerprint.is_some() { 4 } else { 1 },
-            window_rows: if args.fingerprint.is_some() { 8 } else { 0 },
+            // The fingerprint verifies windows of four rows of drafts, `--windows`
+            // windows of its rows.
+            logit_rows: widest.max(if args.fingerprint.is_some() { 4 } else { 1 }),
+            window_rows: widest.max(if args.fingerprint.is_some() { 8 } else { 0 }),
             predict: args.predict,
             ..Options::default()
         },
@@ -1173,9 +1189,75 @@ fn run() -> Result<(), AnyError> {
             }
         }
         at = context + tokens.len() - 1;
-        let text = tokenizer.decode(&tokens, true).unwrap_or_default();
-        let text = String::from_utf8_lossy(&text);
-        println!("  text: {:?}", text.chars().take(200).collect::<String>());
+        let text_out = tokenizer.decode(&tokens, true).unwrap_or_default();
+        let text_out = String::from_utf8_lossy(&text_out);
+        println!("  text: {:?}", text_out.chars().take(200).collect::<String>());
+        if !args.windows.is_empty() {
+            windows(&mut session, &args, profile.as_deref(), &text, tokens[tokens.len() - 1])?;
+            at = session.position(0) as usize;
+        }
+    }
+    Ok(())
+}
+
+/// `--windows`: steps of draft windows of each count of rows from the sequence's
+/// position on, whose first row is `first`; the drafts are the tokens of `text` that
+/// follow.
+fn windows(
+    session: &mut Session<'_>,
+    args: &Args,
+    profile: Option<&Profile>,
+    text: &[u32],
+    first: u32,
+) -> Result<(), AnyError> {
+    let mut token = first;
+    let mut one_row = None;
+    for &rows in &args.windows {
+        // The device idles between two counts: the gap marks them in a trace.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut ms = Vec::new();
+        for step in 0..args.decode_steps + 4 {
+            let position = session.position(0) as usize;
+            let mut window = vec![token];
+            window.extend(text.iter().cycle().skip(position).take(rows as usize - 1));
+            let single = rows == 1;
+            session.expect(&[(0, &window)])?;
+            let part = Rows {
+                slot: 0,
+                tokens: &window,
+                direct: single,
+                wanted: if single { Wanted::Last } else { Wanted::All },
+            };
+            token = session.step(&[part])?[0];
+            if !single {
+                session.accept(&[1])?;
+            }
+            if step >= 4 {
+                ms.push(session.last_time().wall.as_secs_f64() * 1e3);
+            }
+            // With `--breakdown` the measured steps are timed by kind.
+            if let (Some(profile), 3) = (profile, step) {
+                profile.reset();
+                profile.pause(false);
+            }
+        }
+        if let Some(profile) = profile {
+            profile.pause(true);
+        }
+        // One step more commits the last window.
+        let part = Rows { slot: 0, tokens: &[token], direct: true, wanted: Wanted::Last };
+        token = session.step(&[part])?[0];
+        let wall = median(&mut ms.clone());
+        let base = *one_row.get_or_insert(wall);
+        println!(
+            "window of {rows} rows at position {}: {wall:.2} ms per step (median of {}), {:.3} \
+             times one row (load average {})",
+            session.position(0),
+            ms.len(),
+            wall / base,
+            load_average()
+        );
+        breakdown(profile, session);
     }
     Ok(())
 }
