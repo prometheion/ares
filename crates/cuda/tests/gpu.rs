@@ -11,7 +11,7 @@
 
 use ares_cuda::vram::{VramLimit, set_vram_limit};
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, Kernels, PinnedBuffer, Stream, Wait,
+    Device, DeviceBuffer, DevicePtr, DeviceRegion, Event, Kernels, PinnedBuffer, Stream, Wait,
     device_count, device_use, devices, driver_version, peer_access,
 };
 use common::{Rng, f32_bytes, gpus, read_f32, upload_f32};
@@ -75,6 +75,70 @@ fn an_allocation_that_cannot_fit_is_reported_as_out_of_memory() {
     let Some(gpus) = gpus() else { return };
     let error = DeviceBuffer::new(&gpus[0], 1 << 40).unwrap_err();
     assert!(error.is_out_of_memory(), "{error}");
+}
+
+/// NVML counts what this process holds on a device, the context included, and a region
+/// gives pieces of its memory back and takes them again while the others keep theirs; the
+/// peer of the device writes into it when the two have peer access.
+#[test]
+fn a_region_gives_pieces_back_and_nvml_sees_it() {
+    let Some(gpus) = gpus() else { return };
+    let mib = 1u64 << 20;
+    let device = &gpus[0];
+    let peers: Vec<Device> = gpus
+        .iter()
+        .filter(|d| {
+            d.ordinal() != device.ordinal() && peer_access(d.ordinal(), device.ordinal()).unwrap().0
+        })
+        .cloned()
+        .collect();
+    let own = || device_use(device.info().pci).unwrap().own;
+    let before = own();
+    assert!(before > 0, "the context counts for the process");
+    let mut region = DeviceRegion::new(device, 250 * mib, 64 * mib, &peers).unwrap();
+    assert_eq!((region.n_pieces(), region.piece_bytes()), (4, 64 * mib));
+    assert_eq!(region.span(3), (192 * mib, 58 * mib), "the last piece is what is left");
+    assert_eq!(region.mapped_bytes(), 250 * mib);
+    assert!(own() >= before + 250 * mib, "{} after {}", own(), before);
+    let stream = Stream::new(device, 0).unwrap();
+    for k in 0..4 {
+        let (start, len) = region.span(k);
+        // SAFETY: the piece is mapped and of `len` bytes.
+        unsafe { stream.fill(region.ptr().offset(start), k as u8 + 1, len as usize).unwrap() };
+    }
+    stream.synchronize().unwrap();
+    // Piece 1 goes back to the driver: no job runs, so at once.
+    region.unmap(1);
+    assert!(!region.is_mapped(1));
+    assert_eq!(region.mapped_bytes(), 186 * mib);
+    assert!(own() < before + 200 * mib, "{} after {}", own(), before);
+    assert!(region.map(1).unwrap());
+    assert!(own() >= before + 250 * mib);
+    // The other pieces kept their bytes.
+    let mut back = vec![0u8; 4096];
+    for k in [0usize, 2, 3] {
+        let at = region.ptr().offset(region.span(k).0 + 4096);
+        let mut pinned = PinnedBuffer::new(device, 4096).unwrap();
+        // SAFETY: a mapped range of the region and a pinned buffer of its size.
+        unsafe { stream.copy_to_host(pinned.as_mut_ptr(), at, 4096).unwrap() };
+        stream.synchronize().unwrap();
+        back.copy_from_slice(&pinned[..]);
+        assert!(back.iter().all(|b| *b == k as u8 + 1), "piece {k}");
+    }
+    if let Some(peer) = peers.first() {
+        let on_peer = Stream::new(peer, 0).unwrap();
+        let at = region.ptr().offset(region.span(1).0);
+        // SAFETY: the piece is mapped and the peer may write it.
+        unsafe { on_peer.fill(at, 0x5a, 1 << 20).unwrap() };
+        on_peer.synchronize().unwrap();
+        let mut pinned = PinnedBuffer::new(device, 4096).unwrap();
+        // SAFETY: as above.
+        unsafe { stream.copy_to_host(pinned.as_mut_ptr(), at, 4096).unwrap() };
+        stream.synchronize().unwrap();
+        assert!(pinned.iter().all(|b| *b == 0x5a), "the peer's write");
+    }
+    drop(region);
+    assert!(own() < before + 16 * mib, "{} after {}", own(), before);
 }
 
 /// What a plan may take of a device: all that is free, that less a reserve, or what a cap

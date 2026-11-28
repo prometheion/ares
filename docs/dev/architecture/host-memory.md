@@ -89,7 +89,9 @@ prompt cache what the tier does not want, at least its floor; an engine that
 follows the machine holds each to the share the machine gives it above its
 floor as well (the machine shares out by the same rank, see *Dividing*
 below). VRAM is handled the same way in spirit but is planned ahead (ledgers),
-because moving things there is costly. (Until 2026-11-24 a general broker in
+because moving things there is costly; what a plan may take of a device, and
+how the expert slots give VRAM back when other programs need it, is "VRAM" in
+[`devices.md`](devices.md). (Until 2026-11-24 a general broker in
 `ares-core`, with priorities, floors and reclaim plans, sat under these books;
 the runtime turned every plan into a refusal and kept its own policy on top,
 so the broker went.)

@@ -73,6 +73,7 @@ mod synthetic;
 pub mod testing;
 mod text;
 mod timing;
+pub mod vram;
 mod watch;
 
 pub use ares_state::Boundary;

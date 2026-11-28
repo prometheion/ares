@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use ares_core::Ledger;
 use ares_cuda::{ENTRY_CELLS, MAX_BATCH};
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertStore, HostRegion, PIECE, RamShrink, Serve, StoreError, StorePlan,
+    CudaSlots, ExpertStore, HostRegion, PIECE, RamShrink, Serve, StoreError, StorePlan, VRAM_PIECE,
+    VramShrink,
 };
 use ares_runtime::{DeviceContext, DeviceModel, Model, ModelError, PinnedRam};
 
@@ -41,6 +42,9 @@ pub(super) struct Build {
     room: Vec<u64>,
     peers: Vec<Peer>,
     boards: Vec<Option<Arc<Board>>>,
+    /// Per part: its device, which the pools of slots of the others let write
+    /// into their memory while it is lent.
+    devices: Vec<Option<ares_cuda::Device>>,
     plan: Option<PlanBox>,
     slots: Vec<Option<CudaSlots>>,
     places: Vec<Vec<ExpertAt>>,
@@ -64,6 +68,9 @@ pub(super) struct Build {
     /// lend (what the scratch was laid out in).
     lent_pieces: Vec<Vec<u64>>,
     lendable: Vec<Vec<u64>>,
+    /// Per part: the most bytes of each piece that a loan takes, the lent steps' or a pass's:
+    /// what the tier keeps when it gives VRAM back to the device.
+    kept: Vec<Vec<u64>>,
     multiprocessors: Vec<u32>,
     lone_rows: u32,
     /// The most rows of a prompt read layer by layer (0: none).
@@ -81,6 +88,7 @@ impl Build {
             room: vec![0; n],
             peers: vec![Peer::default(); n],
             boards: vec![None; n],
+            devices: vec![None; n],
             plan: None,
             slots: (0..n).map(|_| None).collect(),
             places: vec![Vec::new(); n],
@@ -95,6 +103,7 @@ impl Build {
             lent_raw: vec![0; n],
             lent_pieces: vec![Vec::new(); n],
             lendable: vec![Vec::new(); n],
+            kept: vec![Vec::new(); n],
             multiprocessors: vec![0; n],
             lone_rows: 0,
             pass_rows: 0,
@@ -157,6 +166,7 @@ impl Qwen4Exp {
                 build.room[index] = room;
                 build.peers[index] = peer;
                 build.boards[index] = Some(board);
+                build.devices[index] = Some(cx.device.clone());
                 build.mtp |= holds_mtp;
                 Ok(())
             },
@@ -164,16 +174,26 @@ impl Qwen4Exp {
         )?;
 
         // The slots of this device; the last to arrive builds the store.
-        let pools = {
+        let (pools, devices) = {
             let build = self.meeting.lock();
             let planned = build.value.plan.as_ref().ok_or_else(|| invalid("no plan was made"))?;
-            planned.plan.device_pools(index)
+            let devices: Vec<ares_cuda::Device> =
+                build.value.devices.iter().flatten().cloned().collect();
+            (planned.plan.device_pools(index), devices)
         };
         let mut pinned = Ledger::new("pinned RAM (booked by the engine)", u64::MAX / 2);
         let rows = o.max_rows.min(MAX_BATCH);
         let layout = &self.layout;
-        let slots =
-            device_slots(cx.device, cx.ledger, &mut pinned, &pools, layout, self.opts.serve, rows)?;
+        let slots = device_slots(
+            cx.device,
+            &devices,
+            cx.ledger,
+            &mut pinned,
+            &pools,
+            layout,
+            self.opts.serve,
+            rows,
+        )?;
         self.meeting.meet(
             n,
             |build| {
@@ -446,9 +466,14 @@ impl Qwen4Exp {
         let cpu = (serve != Serve::Stream)
             .then(|| cpu_pool(self.opts.cpu_workers, 1 + n).map(|pool| (pool, serve)))
             .transpose()?;
-        let store = build_store(plan, layout, map, reader, slots, tier, cpu)?;
+        let mut store = build_store(plan, layout, map, reader, slots, tier, cpu)?;
         let ram_fixed = store.ram_fixed_bytes();
         self.lend(build, &store)?;
+        // The slots that the steps on lent VRAM take stay when the tier gives
+        // VRAM back to the device.
+        for d in 0..n {
+            store.keep_for_loans(d, &build.kept[d]);
+        }
         for d in 0..n {
             let PartPlan { first, shares, .. } = self.placement.part(c, d);
             let layers = first..first + shares.len();
@@ -472,8 +497,14 @@ impl Qwen4Exp {
         let (mut feed, mask) =
             open::open_feed(store, boards, &self.placement, layout, c, &self.opts, device)?;
         build.prune_mask = mask;
+        let ordinals: Vec<u32> = build.devices.iter().flatten().map(|d| d.ordinal()).collect();
         if let Some(log) = self.log.clone() {
+            let vram_log = log.clone();
             feed.store.on_shrink(Box::new(move |shrink| log(&shrink_line(&shrink))));
+            let names = ordinals.clone();
+            feed.store.on_vram_shrink(Box::new(move |shrink| {
+                vram_log(&vram_shrink_line(&shrink, names.get(shrink.device).copied()))
+            }));
         }
         if build.mtp {
             feed.set_mtp();
@@ -489,8 +520,13 @@ impl Qwen4Exp {
             pass_rows: build.pass_rows,
             pass_sizes: std::mem::take(&mut build.pass_sizes),
             far: build.far.iter().flatten().cloned().collect(),
+            ordinals,
             ..Flow::new(feed, ngram, n, self.opts.stall, o.own_rows(), used, ram.clone())
         });
+        // The tier of experts gives VRAM back when other programs need the
+        // devices' memory.
+        let weak: std::sync::Weak<dyn ares_runtime::vram::VramUser> = Arc::downgrade(&flow) as _;
+        ares_runtime::vram::VramWatch::system().admit(weak);
         let _ = self.flow.set(flow.clone());
         self.usage.attach(&flow, layout, &self.placement);
         // From here on the tier follows what it is allowed: its
@@ -564,12 +600,31 @@ impl Qwen4Exp {
         if build.pass_rows <= own {
             build.pass_rows = 0;
         }
+        // What a pass of the most rows takes of each piece, laid out without cuts; a cut adds
+        // a chunk, so a piece more of each pool is kept beside it.
+        for d in 0..n {
+            let pass = match build.pass_rows {
+                0 => Vec::new(),
+                rows => {
+                    pass::pass_held(&build.pass_sizes[d], &build.lendable[d], own, rows, far_slots)
+                        .unwrap_or_default()
+                }
+            };
+            build.kept[d] =
+                pass.iter().map(|bytes| if *bytes > 0 { bytes + VRAM_PIECE } else { 0 }).collect();
+        }
         for d in 0..n {
             let (pieces, raw) = match rows > own {
                 true => lent_of(build, d, rows)?
                     .ok_or_else(|| invalid("the slots lend less than they said"))?,
                 false => (Vec::new(), 0),
             };
+            for (k, bytes) in pieces.iter().enumerate() {
+                match build.kept[d].get_mut(k) {
+                    Some(kept) => *kept = (*kept).max(*bytes),
+                    None => build.kept[d].push(*bytes),
+                }
+            }
             build.lent[d] = pieces.iter().sum();
             build.lent_raw[d] = raw;
             build.lent_at[d] = None;
@@ -597,6 +652,27 @@ impl Qwen4Exp {
         }
         Ok(())
     }
+}
+
+/// The log line of a shrink of the tier of experts in VRAM, on the device of
+/// `ordinal`.
+fn vram_shrink_line(shrink: &VramShrink, ordinal: Option<u32>) -> String {
+    use ares_core::units::Bytes;
+    let VramShrink { device, pieces, bytes, held, target, at_floor } = *shrink;
+    let floor = if at_floor {
+        "; it is at its floor (the slots each layer keeps and those the steps on lent VRAM take) \
+         and keeps the rest"
+    } else {
+        ""
+    };
+    format!(
+        "device {}: the expert slots gave {pieces} piece(s), {}, back to the device for other \
+         programs: they hold {} and may hold {}{floor}",
+        ordinal.unwrap_or(device as u32),
+        Bytes(bytes),
+        Bytes(held),
+        Bytes(target),
+    )
 }
 
 /// The log line of a shrink of the tier of experts in RAM.

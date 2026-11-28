@@ -86,7 +86,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// The pools of the tier a loan of `device` takes its slots from, with the
     /// layers each serves: those of the device whose layers can give slots,
     /// the one with the most bytes first.
-    fn scratch_pools(&self, device: usize) -> Vec<(usize, Vec<usize>)> {
+    pub(super) fn scratch_pools(&self, device: usize) -> Vec<(usize, Vec<usize>)> {
         let pools = &self.vram.pools;
         let mut found: Vec<(usize, Vec<usize>)> = (0..pools.len())
             .filter(|p| pools[*p].place == device)
@@ -105,7 +105,9 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// The most bytes each pool of `device` can lend, in the order of the
     /// pieces of a loan: whole slots of the pool above the floor of a loan of
-    /// each of its layers.
+    /// each of its layers, and no more than the last slots that have memory
+    /// behind them (the tier gives memory back from the low end of a pool,
+    /// `vram.rs`).
     pub fn lendable_pieces(&self, device: usize) -> Vec<u64> {
         self.scratch_pools(device)
             .iter()
@@ -114,7 +116,8 @@ impl<D: SlotDevice> ExpertStore<D> {
                     .iter()
                     .map(|l| self.vram.slots(*l).saturating_sub(self.scratch_floor(*l)))
                     .sum();
-                spare as u64 * self.vram.pools[*pool].stride
+                let spare = (spare as u64).min(u64::from(self.live_tail(*pool)));
+                spare * self.vram.pools[*pool].stride
             })
             .collect()
     }
@@ -160,7 +163,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// Whether nothing touches the VRAM slots of `device` now: no expert is
     /// wanted or read, nothing is on its way to or from the device.
-    fn vram_quiet(&self, device: usize) -> bool {
+    pub(super) fn vram_quiet(&self, device: usize) -> bool {
         self.wants.is_empty()
             && self.reads.is_empty()
             && self.device_ops[device].iter().all(|ops| ops.is_empty())
@@ -255,7 +258,27 @@ impl<D: SlotDevice> ExpertStore<D> {
         let pool = self.vram.pools[tier_pool];
         let lent: Vec<u32> = (first..pool.slots).collect();
         let floor: Vec<usize> = members.iter().map(|l| self.scratch_floor(*l)).collect();
-        let vacated = self.vram.vacate(members, &lent, &floor, self.step, |l| self.heat.layer(l));
+        self.vacate_on_device(device, members, &lent, &floor)
+    }
+
+    /// Takes `slots` of the pool whose layers are `members` on `device` out of
+    /// use ([`Tier::vacate`](super::tier::Tier::vacate)): every layer
+    /// gives its coldest in proportion to what it has above `floor` (one for
+    /// each of `members`), what they held is evicted, what lies in `slots`
+    /// and stays moves on the device into the slots given, and the numbers
+    /// behind `slots` stay set aside until [`Tier::reopen`](super::tier::Tier::reopen)
+    /// brings them back: for a loan of VRAM, and for memory that goes back to
+    /// the device (`vram.rs`). `false` when a slot was busy after all;
+    /// nothing is taken then.
+    pub(super) fn vacate_on_device(
+        &mut self,
+        device: usize,
+        members: &[usize],
+        slots: &[u32],
+        floor: &[usize],
+    ) -> Result<bool, StoreError> {
+        let lent = slots;
+        let vacated = self.vram.vacate(members, lent, floor, self.step, |l| self.heat.layer(l));
         // What the slots given held leaves as any evicted expert does.
         for (layer, expert, slot) in vacated.evicted {
             self.evict_vram(layer, expert, slot)?;

@@ -28,6 +28,12 @@ pub struct HostShareState {
 /// says so, as a device runs it some time later.
 pub struct HostSlots {
     pools: Vec<(Vec<u8>, u64)>,
+    /// The bytes of a piece of a pool's memory (0: the memory stays), per
+    /// pool and piece whether memory is behind it, and how many pieces more
+    /// the device has room to take (`None`: any).
+    piece: u64,
+    mapped: Vec<Vec<bool>>,
+    room: Option<usize>,
     tables: Vec<Vec<i32>>,
     shares: Vec<HostShareState>,
     queue: VecDeque<(u64, HostOp)>,
@@ -50,6 +56,9 @@ impl HostSlots {
                 .iter()
                 .map(|(stride, slots)| (vec![0; (*stride * u64::from(*slots)) as usize], *stride))
                 .collect(),
+            piece: 0,
+            mapped: vec![Vec::new(); pools.len()],
+            room: None,
             tables: vec![vec![-1; n_experts as usize]; n_layers],
             shares: vec![HostShareState::default(); n_layers],
             queue: VecDeque::new(),
@@ -58,11 +67,58 @@ impl HostSlots {
         }
     }
 
+    /// The same, with the memory of every pool in pieces of `piece` bytes
+    /// that the store gives back and takes again.
+    pub fn with_pieces(mut self, piece: u64) -> Self {
+        self.piece = piece;
+        self.mapped = self
+            .pools
+            .iter()
+            .map(|(bytes, _)| vec![true; (bytes.len() as u64).div_ceil(piece) as usize])
+            .collect();
+        self
+    }
+
+    /// Whether piece `piece` of pool `pool` has memory behind it.
+    pub fn is_mapped(&self, pool: usize, piece: usize) -> bool {
+        self.mapped[pool].get(piece).copied().unwrap_or(self.piece == 0)
+    }
+
+    /// The device has room to take `pieces` pieces more (`None`: any).
+    pub fn set_room(&mut self, pieces: Option<usize>) {
+        self.room = pieces;
+    }
+
+    /// Panics when `len` bytes at `at` of pool `pool` lie in a piece without
+    /// memory: what a device would fault on.
+    fn check_mapped(&self, pool: usize, at: usize, len: usize) {
+        if self.piece == 0 || len == 0 {
+            return;
+        }
+        let (first, last) = (at as u64 / self.piece, (at + len - 1) as u64 / self.piece);
+        for k in first..=last {
+            assert!(
+                self.mapped[pool][k as usize],
+                "pool {pool}: bytes {at}+{len} in piece {k}, which has no memory"
+            );
+        }
+    }
+
     /// Runs up to `n` of the enqueued operations, in order; returns how many ran.
     pub fn run(&mut self, n: usize) -> usize {
         let mut ran = 0;
         while ran < n {
             let Some((id, op)) = self.queue.pop_front() else { break };
+            match &op {
+                HostOp::Upload { pool, at, len, .. } | HostOp::Download { pool, at, len, .. } => {
+                    self.check_mapped(*pool, *at, *len);
+                }
+                HostOp::Copy { from_pool, from, pool, at, len } => {
+                    self.check_mapped(*from_pool, *from, *len);
+                    self.check_mapped(*pool, *at, *len);
+                }
+                _ => {}
+            }
             match op {
                 HostOp::Upload { pool, at, src, len } => {
                     // SAFETY: `upload`'s caller keeps the source valid until
@@ -187,5 +243,40 @@ impl SlotDevice for HostSlots {
     fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError> {
         self.push(HostOp::Deliver { layer, token, sums: sums.to_vec() });
         Ok(())
+    }
+
+    fn pieces(&self, pool: usize) -> (u64, usize) {
+        if self.piece == 0 { (0, 0) } else { (self.piece, self.mapped[pool].len()) }
+    }
+
+    fn give_piece(&mut self, pool: usize, piece: usize) {
+        // Nothing that was enqueued may still touch it.
+        let (start, end) = (piece as u64 * self.piece, (piece as u64 + 1) * self.piece);
+        for (_, op) in &self.queue {
+            let touches = |p: usize, at: usize, len: usize| {
+                p == pool && (at as u64) < end && (at + len) as u64 > start
+            };
+            let busy = match op {
+                HostOp::Upload { pool, at, len, .. } | HostOp::Download { pool, at, len, .. } => {
+                    touches(*pool, *at, *len)
+                }
+                HostOp::Copy { from_pool, from, pool, at, len } => {
+                    touches(*from_pool, *from, *len) || touches(*pool, *at, *len)
+                }
+                _ => false,
+            };
+            assert!(!busy, "piece {piece} of pool {pool} is given back while a copy touches it");
+        }
+        self.mapped[pool][piece] = false;
+    }
+
+    fn take_piece(&mut self, pool: usize, piece: usize) -> Result<bool, StoreError> {
+        match &mut self.room {
+            Some(0) => return Ok(false),
+            Some(room) => *room -= 1,
+            None => {}
+        }
+        self.mapped[pool][piece] = true;
+        Ok(true)
     }
 }

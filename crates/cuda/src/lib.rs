@@ -10,7 +10,7 @@
 //!   the tested ones; other GPUs are for the Vulkan backend);
 //!   [`Device::room`] is what the engine may take of it ([`vram`]: a cap or a
 //!   reserve), and [`device_use`] what NVML says of its memory and displays.
-//!   [`DeviceBuffer`]
+//!   [`DeviceBuffer`] and [`DeviceRegion`] (memory that gives back pieces)
 //!   and [`PinnedBuffer`] own memory on it and next to it; [`gate`] says when
 //!   page-locked memory may change (never while a device runs a step).
 //! - [`Stream`] and [`Event`] order work on a device and between devices.
@@ -38,6 +38,7 @@ mod mesh;
 mod module;
 mod nvml;
 mod q4;
+mod region;
 mod sampler;
 mod stream;
 mod sys;
@@ -81,6 +82,7 @@ pub use q4::{
     Arrival, Departure, HAND_OVER_MAX_PIECES, IndexerShape, KeyFormat, ListHandOver, MixerMatrix,
     NgramShape, Q4Kernels, ReadWrite, SELECT_MAX_BLOCKS, SelectionRule,
 };
+pub use region::DeviceRegion;
 pub use sampler::{
     Descent, PassMode, Phase, SAMPLE_MAX_VOCAB, SampleBatch, SamplePlan, SampleStep, SamplerKernels,
 };

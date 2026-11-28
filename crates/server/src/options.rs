@@ -321,7 +321,9 @@ pub const OPTIONS: &[Opt] = &[
          number (0:10G,1:11G; a device not named has no cap). Every plan keeps under it: \
          weights, K and V, the expert slots of a mixture of experts, step buffers, drafters and \
          the image tower. A device with a cap keeps no reserve [default: no cap; a device that \
-         drives a display, or on which other programs hold memory, keeps a reserve for them]",
+         drives a display, or on which other programs hold memory, keeps a reserve for them, \
+         and the engine gives the expert slots of a mixture of experts back when their memory \
+         grows]",
     )
     .heading("Device memory."),
     Opt::model(

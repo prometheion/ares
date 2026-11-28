@@ -161,6 +161,14 @@ impl Loaded {
     pub(crate) fn new(runtime: Runtime, name: String, held: Vec<Held>, ram: u64) -> Self {
         let free_loaded =
             held.iter().map(|h| h.device.mem_info().map_or(h.free, |memory| memory.free)).collect();
+        // While the model is served, the watch over the devices' memory looks
+        // at its devices: the expert slots give way when other programs need
+        // the memory, and the log says when nothing can.
+        let watch = ares_runtime::vram::VramWatch::system();
+        watch.on_log(Arc::new(|line| tracing::warn!("{line}")));
+        for h in &held {
+            watch.hold(h.device.info());
+        }
         Self { runtime: Arc::new(runtime), name, held, ram, free_loaded }
     }
 
@@ -243,6 +251,10 @@ impl Loaded {
                 (_, Err(error)) => tracing::warn!("device {}: {error}", info.ordinal),
                 (None, _) => {}
             }
+        }
+        let watch = ares_runtime::vram::VramWatch::system();
+        for h in &held {
+            watch.release(h.device.ordinal());
         }
         // These handles go last; a device no other model is on closes with
         // its driver context.

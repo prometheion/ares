@@ -25,7 +25,7 @@ repository and are not needed to build, run or test Ares.
 | [`sampling.md`](architecture/sampling.md) | The sampler on the device, request fields, probabilities, cost |
 | [`structured-output.md`](architecture/structured-output.md) | Grammars, schemas, tool-call rules and drafts under a rule |
 | [`weights.md`](architecture/weights.md) | Dense weights, expert tiers, K/V offload |
-| [`devices.md`](architecture/devices.md) | GPU classes, several devices, the 27B on two cards, the second card's role |
+| [`devices.md`](architecture/devices.md) | GPU classes, several devices, the 27B on two cards, the second card's role, the VRAM cap, reserve and watch |
 | [`kernels.md`](architecture/kernels.md) | Weight kernels for decode and prefill, float matrices, expert, layer and attention kernels, the tensor-core cap |
 | [`flash-next.md`](architecture/flash-next.md) | Flash-Next through the runtime: its MTP block, steps that wait for experts, the plan, K and V beyond VRAM, the prefix cache |
 | [`experts.md`](architecture/experts.md) | The experts' usage profile, members and loans, reading ahead, pruning |
@@ -184,6 +184,7 @@ the old file moves its text into the file below.
 | &nbsp;&nbsp;Qwen3.8-27B on the two cards | [`architecture/devices.md`](architecture/devices.md) |
 | &nbsp;&nbsp;Qwen3.8-Flash-Next on the two cards | [`experiments/two-cards.md`](experiments/two-cards.md) |
 | &nbsp;&nbsp;What the second card is for | [`architecture/devices.md`](architecture/devices.md) |
+| &nbsp;&nbsp;VRAM: the cap, the reserve, the watch | [`architecture/devices.md`](architecture/devices.md) |
 | &nbsp;&nbsp;Qwen3.8-Flash-Next through the runtime | [`architecture/flash-next.md`](architecture/flash-next.md); "Wide steps" and from "Where a faster prompt path goes next" to "Long prompts layer by layer" in [`architecture/flash-next-prompts.md`](architecture/flash-next-prompts.md); from "The usage profile of the experts" to "Pruning as a fourth level" in [`architecture/experts.md`](architecture/experts.md) |
 | &nbsp;&nbsp;Vulkan | [`architecture/vulkan.md`](architecture/vulkan.md) |
 | The image tower | [`architecture/images.md`](architecture/images.md) |

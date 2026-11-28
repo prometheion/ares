@@ -223,6 +223,14 @@ impl Follow {
         &self.rule
     }
 
+    /// Sets what is kept free whatever was seen, and the most the headroom
+    /// may be: the watch over a device's memory follows the reserve its state
+    /// asks for at every look (`crate::vram`).
+    pub fn set_reserve(&mut self, reserve: u64, most: u64) {
+        self.rule.reserve = reserve;
+        self.rule.most = most;
+    }
+
     /// What the engine leaves available now.
     pub fn headroom(&self) -> u64 {
         let reaction = self.rule.period.as_secs_f64() + self.latency;

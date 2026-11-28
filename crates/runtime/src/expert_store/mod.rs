@@ -85,6 +85,7 @@ mod region;
 mod scratch;
 mod tier;
 mod transit;
+mod vram;
 mod windows;
 
 use std::collections::{HashMap, VecDeque};
@@ -96,7 +97,7 @@ use ares_weights::{
     ExpertHeat, GuessQueue, LayerNeed, SlotSet, SplitRule, Start, Swap, Want, split_slots,
 };
 
-pub use device::{CudaSlots, SlotDevice};
+pub use device::{CudaSlots, SlotDevice, VRAM_PIECE};
 pub use elastic::RamShrink;
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
@@ -109,6 +110,7 @@ pub use tier::Pool;
 use tier::Tier;
 pub use transit::Named;
 use transit::{Transit, TransitPlan};
+pub use vram::VramShrink;
 
 /// Why the store could not be built or could not go on.
 #[derive(Debug, thiserror::Error)]
@@ -522,6 +524,9 @@ pub struct StoreStats {
     pub pieces_released: u64,
     pub pieces_locked: u64,
     pub piece_evictions: u64,
+    /// Pieces of the VRAM tier given back to the device and taken again (`vram.rs`).
+    pub vram_pieces_released: u64,
+    pub vram_pieces_taken: u64,
     /// The read-ahead of predicted picks ([`ExpertStore::ahead`]): experts a prediction
     /// named for a layer before its router ran (each once per step), and of them those the
     /// router then picked.
@@ -602,6 +607,9 @@ pub struct ExpertStore<D: SlotDevice> {
     stats: StoreStats,
     /// Told of every shrink of the RAM tier ([`ExpertStore::on_shrink`]).
     on_shrink: Option<Box<dyn FnMut(RamShrink) + Send>>,
+    /// The pieces of the VRAM tier's pools and what the tier may hold (`vram.rs`).
+    vram_pieces: vram::VramPieces,
+    on_vram_shrink: Option<Box<dyn FnMut(VramShrink) + Send>>,
 }
 
 impl<D: SlotDevice> std::fmt::Debug for ExpertStore<D> {
@@ -995,6 +1003,8 @@ impl<D: SlotDevice> ExpertStore<D> {
             scratch: devices.iter().map(|_| None).collect(),
             stats: StoreStats::default(),
             on_shrink: None,
+            vram_pieces: vram::VramPieces::default(),
+            on_vram_shrink: None,
             block,
             config,
             map,
@@ -1007,6 +1017,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             heat,
         };
         store.settle_pieces()?;
+        store.settle_vram_pieces();
         Ok(store)
     }
 
@@ -1235,6 +1246,14 @@ impl<D: SlotDevice> ExpertStore<D> {
         // tries again after every step: what was busy then may be free now.
         self.retry_floor();
         self.shrink_ram(elastic::STEP_WAIT)?;
+        // The same for the VRAM tier on every device whose memory other
+        // programs want.
+        for device in 0..self.devices.len() {
+            if let Some(floor) = self.vram_pieces_floor_mut(device) {
+                *floor = false;
+            }
+            self.shrink_vram(device, elastic::STEP_WAIT)?;
+        }
         if self.config.decay_every > 0 && self.step.is_multiple_of(self.config.decay_every) {
             self.heat.decay();
             self.worth_stale.fill(true);
@@ -1265,6 +1284,8 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// and reads for what is wanted. Call it whenever the owner's loop comes
     /// around; it never waits.
     pub fn poll(&mut self) -> Result<(), StoreError> {
+        // Memory of the VRAM tier whose slots have been moved out goes back.
+        self.settle_vram()?;
         // Reads that finished.
         self.reader.poll(&mut self.completions);
         for done in std::mem::take(&mut self.completions) {

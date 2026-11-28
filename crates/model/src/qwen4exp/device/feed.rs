@@ -291,9 +291,12 @@ pub(super) fn plan_transit(
 
 /// The slots of one device: its pools and tables, and the host shares that
 /// let the CPU compute what a layer misses, reserved in the device's ledger
-/// and in `pinned`.
+/// and in `pinned`; `devices` are the model's, which may write into the
+/// pools' memory while it is lent.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn device_slots(
     device: &Device,
+    devices: &[Device],
     ledger: &mut Ledger,
     pinned: &mut Ledger,
     pools: &[(u64, u32)],
@@ -303,6 +306,7 @@ pub(super) fn device_slots(
 ) -> Result<CudaSlots, Error> {
     let mut slots = CudaSlots::new(
         device,
+        devices,
         ledger,
         pinned,
         pools,

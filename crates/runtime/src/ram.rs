@@ -60,6 +60,7 @@ use ares_core::units::Bytes;
 use ares_cuda::{Device, DevicePtr, HostRegistration, PinnedBuffer};
 use ares_store::Aligned;
 
+pub(crate) use machine::{Follow, share};
 pub use machine::{Look, Machine, Meminfo, MemorySource, Rule, Verdict};
 
 use crate::error::RuntimeError;

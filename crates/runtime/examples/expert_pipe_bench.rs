@@ -1082,6 +1082,7 @@ fn main() -> Result<(), AnyError> {
         let mut ledger = Ledger::new(format!("CUDA{ordinal}"), device.mem_info()?.free);
         let mut device_slots = CudaSlots::new(
             &device,
+            &[],
             &mut ledger,
             &mut pinned,
             &plan.device_pools(index),

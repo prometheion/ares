@@ -1273,9 +1273,16 @@ mod device {
 
         let mut vram = Ledger::new("CUDA", 1 << 30);
         let mut pinned = Ledger::new("pinned RAM", 1 << 30);
-        let mut slots =
-            CudaSlots::new(device, &mut vram, &mut pinned, &plan.device_pools(0), LAYERS, EXPERTS)
-                .unwrap();
+        let mut slots = CudaSlots::new(
+            device,
+            &[],
+            &mut vram,
+            &mut pinned,
+            &plan.device_pools(0),
+            LAYERS,
+            EXPERTS,
+        )
+        .unwrap();
         slots.add_host_shares(&mut vram, &mut pinned, SHAPE.host_share_bytes(MAX_ROWS)).unwrap();
         let region = HostRegion::pinned(device, &mut pinned, plan.ram_bytes()).unwrap();
         let mut store = ExpertStore::new(plan, map, reader, vec![slots], region).unwrap();
@@ -2442,6 +2449,132 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     let stats = rig.store.take_stats();
     assert_eq!(stats.scratch_loans, 1);
     assert!(stats.scratch_moves > 0, "what stayed in the lent slots moved");
+}
+
+/// Every expert whose table entry names a slot is usable there, and no entry names a slot
+/// below `dead`; returns how many experts VRAM holds.
+fn entries_above(rig: &Rig, dead: u32) -> usize {
+    let mut held = 0;
+    for layer in 0..LAYERS {
+        for expert in 0..EXPERTS {
+            let entry = rig.store.device(0).entry(layer, expert);
+            if entry >= 0 {
+                assert!(entry as u32 >= dead, "layer {layer} expert {expert} in {entry}");
+                rig.assert_usable(layer, expert);
+                held += 1;
+            }
+        }
+    }
+    held
+}
+
+/// The VRAM tier gives the memory of pieces back from the low end of its pool when it may hold
+/// less, moves what stays into the slots the layers give, keeps the slots a loan takes, and
+/// takes the pieces again, empty, when it may hold more.
+#[test]
+fn the_vram_tier_gives_pieces_back_and_takes_them_again() {
+    // Eight slots per layer, one pool of 24; pieces of four slots.
+    let piece = 4 * SLOT_BYTES;
+    let mut rig = rig_vram_in_pieces(8, 16, piece, |_| {});
+    let whole = 24 * SLOT_BYTES;
+    assert_eq!(rig.store.vram_elastic(0), (whole, whole));
+    for step in 0..3 {
+        let picks: Vec<Vec<u32>> = (0..LAYERS)
+            .map(|l| (0..8).map(|e| (e + step * 3 + l as u32) % EXPERTS).collect())
+            .collect();
+        let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+        rig.step(&picks);
+    }
+    // Every layer keeps a slot free for an expert that arrives before its layer runs.
+    assert_eq!(entries_above(&rig, 0), 21);
+    // Two pieces less: slots 0 to 7 go, the layers give eight slots, the coldest, and what
+    // lay in the first eight moves into the slots given.
+    rig.store.set_vram_target(0, whole - 2 * piece);
+    assert_eq!(rig.store.shrink_vram(0, Duration::from_secs(1)).unwrap(), 2);
+    assert_eq!(rig.store.vram_elastic(0), (whole - 2 * piece, whole));
+    assert_eq!((0..LAYERS).map(|l| rig.store.slots(l).0).sum::<usize>(), 16);
+    // The memory goes back once the device has done the moves.
+    assert!(rig.store.device(0).is_mapped(0, 0), "the moves have not run");
+    rig.settle();
+    assert!(!rig.store.device(0).is_mapped(0, 0) && !rig.store.device(0).is_mapped(0, 1));
+    assert!(rig.store.device(0).is_mapped(0, 2));
+    assert_eq!(entries_above(&rig, 8), 16);
+    // Steps go on in what is left (the device faults on a slot without memory).
+    for step in 0..3 {
+        let picks: Vec<Vec<u32>> =
+            (0..LAYERS).map(|l| vec![(step + l as u32) % EXPERTS, 15 - step]).collect();
+        let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+        rig.step(&picks);
+    }
+    entries_above(&rig, 8);
+    // A loan takes the last slots, as far as they have memory: 16 live, ten above the floor of
+    // a loan (two a layer).
+    assert_eq!(rig.store.lendable_pieces(0), [10 * SLOT_BYTES]);
+    // What loans take stays: with six slots kept for them, the tier gives until the layers'
+    // floor would not leave them.
+    rig.store.keep_for_loans(0, &[6 * SLOT_BYTES]);
+    rig.store.set_vram_target(0, 0);
+    let given = rig.store.shrink_vram(0, Duration::from_secs(1)).unwrap();
+    rig.settle();
+    assert!(given >= 1 && rig.store.vram_at_floor(0), "{given}");
+    let (held, _) = rig.store.vram_elastic(0);
+    assert!(held >= 6 * SLOT_BYTES + 6 * SLOT_BYTES, "the floors and the loan: {held}");
+    let dead = ((whole - held) / SLOT_BYTES) as u32;
+    entries_above(&rig, dead);
+    let loan = lend_one(&mut rig.store, 6 * SLOT_BYTES).unwrap().expect("the loan still fits");
+    assert!(loan.first >= dead, "{loan:?} below {dead}");
+    rig.settle();
+    rig.store.return_scratch(0).unwrap();
+    // Room again: the pieces come back, the highest first, as far as the device has room.
+    rig.store.set_vram_target(0, u64::MAX);
+    rig.store.device_mut(0).set_room(Some(1));
+    assert_eq!(rig.store.grow_vram(0, 10).unwrap(), 1);
+    rig.store.device_mut(0).set_room(None);
+    let left = (whole - rig.store.vram_elastic(0).0) / piece;
+    assert_eq!(rig.store.grow_vram(0, 10).unwrap() as u64, left);
+    assert_eq!(rig.store.vram_elastic(0), (whole, whole));
+    assert_eq!((0..LAYERS).map(|l| rig.store.slots(l).0).sum::<usize>(), 24);
+    let picks: Vec<Vec<u32>> = (0..LAYERS).map(|_| (8..16).collect()).collect();
+    let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+    rig.step(&picks);
+    entries_above(&rig, 0);
+    let stats = rig.store.take_stats();
+    assert_eq!(stats.vram_pieces_taken, stats.vram_pieces_released);
+}
+
+/// A slot across the edge of two pieces needs both: it goes with the first of them.
+#[test]
+fn a_slot_across_two_pieces_goes_with_either() {
+    // Pieces of 1000 bytes over slots of 352: slot 2 lies in pieces 0 and 1.
+    let mut rig = rig_vram_in_pieces(8, 16, 1000, |_| {});
+    let picks: Vec<Vec<u32>> =
+        (0..LAYERS).map(|l| (0..8).map(|e| e + l as u32).collect()).collect();
+    let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+    rig.step(&picks);
+    rig.store.set_vram_target(0, 24 * SLOT_BYTES - 1000);
+    assert_eq!(rig.store.shrink_vram(0, Duration::from_secs(1)).unwrap(), 1);
+    rig.settle();
+    // Slots 0, 1 and 2 have no memory now.
+    assert_eq!((0..LAYERS).map(|l| rig.store.slots(l).0).sum::<usize>(), 21);
+    entries_above(&rig, 3);
+    let few: Vec<Vec<u32>> = (0..LAYERS).map(|l| vec![9 + l as u32, 15]).collect();
+    let few: Vec<&[u32]> = few.iter().map(Vec::as_slice).collect();
+    rig.step(&few);
+    entries_above(&rig, 3);
+    // Taken again, all three come back.
+    rig.store.set_vram_target(0, u64::MAX);
+    assert_eq!(rig.store.grow_vram(0, 1).unwrap(), 1);
+    assert_eq!((0..LAYERS).map(|l| rig.store.slots(l).0).sum::<usize>(), 24);
+}
+
+/// A pool whose memory stays as it is gives nothing back.
+#[test]
+fn a_pool_without_pieces_gives_nothing_back() {
+    let mut rig = rig(8, 16, |_| {});
+    assert_eq!(rig.store.vram_elastic(0), (0, 0));
+    rig.store.set_vram_target(0, 0);
+    assert_eq!(rig.store.shrink_vram(0, Duration::ZERO).unwrap(), 0);
+    assert_eq!((0..LAYERS).map(|l| rig.store.slots(l).0).sum::<usize>(), 24);
 }
 
 /// Lends `bytes` of device 0 in one piece, of its largest pool.
