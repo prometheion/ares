@@ -232,6 +232,62 @@ same per request in `/metrics`. Per generated token (the request's short prompt 
 - At `--ram 16G` the server waits for the file 80 to 90 % of a token, as the tool does, and its
   reads take 4.5 to 8 ms an expert.
 
+## Levers 1 and 5 on the branch `perf/io-core` (2026-11-28)
+
+What the branch changes (see "Where the CPU workers run" and "Predicted only where a read may
+come of it" in [`experts.md`](../architecture/experts.md)):
+
+- *Lever 1, a core for the I/O threads.* On a CPU with one thread per core the CPU workers
+  leave one core more free, an efficiency core where there are any, and the I/O threads of the
+  store's reader and of the n-gram table's rows are bound to the cores without a worker. On the
+  test machine the tool's workers go from 13 to 12 (cores 1 to 12) and its I/O threads to cores
+  0 and 13; the server's from 12 to 11 (cores 2 to 12), its I/O threads to 0, 1 and 13. A CPU
+  with a second thread per core keeps its workers: on the development machine the tool's nine
+  stay on CPUs 2, 4, 6, 8, 10 and 12 to 15, and the I/O threads (and the ring's `iou-wrk`
+  threads, which take their affinity) are bound to 0, 1, 3, 5, 7, 9 and 11.
+- *Lever 5, no predictions where no place qualifies.* A step of the decode kernels applies the
+  next layers' routers only as far ahead as a place of the read-ahead's odds for its kind of
+  step qualifies, and as far as the parts can every eighth step of a kind that would predict
+  less, so the counts go on.
+
+*The text is unchanged.* The tool's fingerprint on the two local cards (`--fingerprint`, `--ram-gib
+8 --cells 4096 --spread tensor --core-share 0.76 --shared worker --serve stream`, the text of the
+profile) is `67fbce287c08c750` for `main` (372763fb) and for the branch (159207c7), the files
+equal; the branch's steps named 1653 experts a step against 2236.
+
+*The two local cards* (RTX 4070 and RTX 3060, Swift IQ2_XS, `--ram-gib 8 --cells 8192 --rows 512
+--decode-at 4000 --decode-steps 256 --breakdown --serve model --every 64`; A is `main`
+372763fb, B the branch; in pairs under one hold of the GPU lock, 2026-11-27 23:35 to 2026-11-28
+03:41, other agents on the machine between the pairs):
+
+| Run (load at its start) | Steps 1-256: median / mean | In VRAM | Waits: file (layers) / CPU | An expert's reads | Predicted a step | Dense on the 4070, timed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A1 (8.5) | 23.46 / 24.77 ms | 96.5 % | 5.0 (2.4) / 1.0 ms | 2.09 ms | 638 | 7.40 ms |
+| B1 (5.8) | 23.67 / 24.69 | 96.5 % | 5.0 (2.4) / 1.0 | 1.99 | 80 | 6.41 |
+| B2 (10.4) | 25.61 / 27.55 | 95.4 % | 6.5 (2.8) / 2.0 | 2.28 | 81 | 6.42 |
+| A2 (10.4) | 23.83 / 25.16 | 96.6 % | 5.5 (2.6) / 1.0 | 2.05 | 638 | 7.40 |
+| A3 (11.6) | 24.08 / 25.98 | 96.7 % | 6.1 (2.5) / 1.1 | 2.34 | 636 | 7.41 |
+| B3 (7.6) | 23.75 / 24.93 | 96.4 % | 5.1 (2.5) / 1.1 | 1.94 | 81 | 6.41 |
+| B4 (3.7) | 23.23 / 24.46 | 96.8 % | 4.8 (2.4) / 0.9 | 1.93 | 81 | 6.42 |
+| A4 (3.7) | 24.29 / 25.31 | 96.5 % | 5.3 (2.6) / 1.2 | 1.98 | 638 | 7.40 |
+
+- *No loss on a CPU with a second thread per core.* A's steps take 23.5 to 24.3 ms at the
+  median, B's 23.2 to 23.8 and once 25.6. That run (B2) found fewer of its picks in VRAM and read
+  the file in more layers: with `--serve model` the CPU's sums round differently from run to
+  run, so the runs write different continuations (five among the eight, A3's the same as
+  B4's) and pick different experts. Over 8 s of decode (A4 against B3 and B4) the I/O threads waited 12.9 ms for a core
+  in A (2.3 µs a wake-up) and none in B; the workers waited 1.9 against 0.6 and 1.7 ms.
+- *Lever 5* takes the dense part of the timed steps on the RTX 4070 from 7.40 to 6.41 ms: the
+  cards hold 96 % of the picks, two to three experts a step are in no tier, and no place of the
+  odds qualifies (nothing is read ahead in A either), so seven steps in eight predict nothing.
+- The steps 257 to 512 are not compared: they vary by more than the builds (A1 and B2 took
+  35.7 and 41.1 ms at the median with 89 % of their picks in VRAM, the other six 23.7 to 24.7 ms
+  with 97 %).
+
+The A/B of lever 1's case, on the test machine (`qwen4exp_run` at `--ram-gib` 16 and 39.5 and
+the server at `--ram 40G`, main against the branch, alternating twice), is still to run: the
+machine was off from 2026-11-27 21:00.
+
 ## The levers of #16, ranked by this profile
 
 What each would save of the measured steps above (one row a step, the engine as it serves:

@@ -401,6 +401,13 @@ impl<D: SlotDevice> ExpertStore<D> {
         Ok(())
     }
 
+    /// The logical CPUs the CPU half's workers leave to the I/O threads
+    /// ([`CpuPool::free_cpus`]): none without a CPU half, or where the
+    /// workers are left to the scheduler.
+    pub fn io_cpus(&self) -> &[usize] {
+        self.hybrid.as_ref().map_or(&[], |h| h.pool.free_cpus())
+    }
+
     /// How misses are served: [`Serve::Stream`] without a CPU half.
     pub fn serve(&self) -> Serve {
         self.hybrid.as_ref().map_or(Serve::Stream, |h| h.serve)

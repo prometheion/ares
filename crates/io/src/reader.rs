@@ -578,6 +578,32 @@ impl Reader {
     pub fn started(&self) -> Vec<(Key, usize)> {
         self.shared.lock().trace()
     }
+
+    /// Binds the I/O thread to the logical CPUs `cpus`; none leaves it where
+    /// the scheduler puts it. The I/O thread wakes for every completion and
+    /// works for microseconds: the engine keeps it on the cores its CPU
+    /// workers leave free, so that it does not wait for a core behind a
+    /// worker that spins.
+    pub fn run_on(&self, cpus: &[usize]) -> Result<()> {
+        use std::os::unix::thread::JoinHandleExt;
+        let Some(thread) = self.thread.as_ref().filter(|_| !cpus.is_empty()) else {
+            return Ok(());
+        };
+        // SAFETY: an all-zero set is a valid `cpu_set_t`; only CPUs below its
+        // size are set, and the call reads the set only. The thread is alive:
+        // it is joined only when the reader is dropped.
+        let result = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &cpu in cpus.iter().filter(|cpu| **cpu < libc::CPU_SETSIZE as usize) {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            libc::pthread_setaffinity_np(thread.as_pthread_t(), size_of::<libc::cpu_set_t>(), &set)
+        };
+        match result {
+            0 => Ok(()),
+            error => Err(Error::Affinity(std::io::Error::from_raw_os_error(error))),
+        }
+    }
 }
 
 impl Drop for Reader {
@@ -664,5 +690,35 @@ mod tests {
         }
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data(), &[7u8; 100][..]);
+    }
+
+    #[test]
+    fn the_io_thread_runs_on_the_cpus_it_is_given() {
+        use std::os::unix::thread::JoinHandleExt;
+        let dir =
+            Scratch(std::env::temp_dir().join(format!("ares-io-cpus-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("data.bin");
+        std::fs::write(&path, [7u8; 4096]).unwrap();
+        let reader = Reader::open(&[&path], Config::default()).unwrap();
+        let allowed = |reader: &Reader| -> Vec<usize> {
+            let thread = reader.thread.as_ref().unwrap().as_pthread_t();
+            // SAFETY: an all-zero set is valid and the call writes at most its size.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_getaffinity_np(thread, size_of::<libc::cpu_set_t>(), &mut set),
+                    0
+                );
+                (0..libc::CPU_SETSIZE as usize).filter(|cpu| libc::CPU_ISSET(*cpu, &set)).collect()
+            }
+        };
+        let before = allowed(&reader);
+        // None leaves it as it is.
+        reader.run_on(&[]).unwrap();
+        assert_eq!(allowed(&reader), before);
+        let last = *before.last().unwrap();
+        reader.run_on(&[last]).unwrap();
+        assert_eq!(allowed(&reader), vec![last]);
     }
 }
