@@ -265,8 +265,10 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Gives up pieces of `device` until the tier holds no more there than
-    /// its target, if no step runs, no loan is out and nothing is on its way
-    /// into or out of the device's slots; waits up to `wait` for what is. Returns the
+    /// its target, if no step runs, no loan is being made and nothing is on
+    /// its way into or out of the device's slots; waits up to `wait` for what
+    /// is. Beside a loan that is made it gives: the loan's slots lie at the
+    /// end of the pool, which never goes. Returns the
     /// pieces given up; their memory goes back to the device once the device
     /// has done the moves out of them ([`ExpertStore::poll`]).
     pub fn shrink_vram(&mut self, device: usize, wait: Duration) -> Result<usize, StoreError> {
@@ -276,7 +278,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         if held <= target || self.vram_at_floor(device) {
             return Ok(0);
         }
-        if self.in_step || self.has_scratch(device) {
+        if self.in_step || self.lending(device) {
             return Ok(0);
         }
         let begun = Instant::now();
@@ -367,9 +369,13 @@ impl<D: SlotDevice> ExpertStore<D> {
             self.slots_in_piece(pool, k).filter(|slot| self.slot_alive(pool, *slot)).collect();
         let members: Vec<usize> =
             (0..self.layers.len()).filter(|l| self.vram.pool_of[*l] == pool).collect();
-        // What loans take must stay lendable above the floors of a loan.
-        let kept_slots =
-            self.vram_pieces.pools[pool].kept.div_ceil(self.vram.pools[pool].stride.max(1));
+        // What loans take must stay lendable above the floors of a loan; a loan
+        // that is out holds its part of it already (its slots are set aside, and
+        // lie at the end of the pool, which never goes).
+        let kept_slots = self.vram_pieces.pools[pool]
+            .kept
+            .div_ceil(self.vram.pools[pool].stride.max(1))
+            .saturating_sub(self.lent_slots(device, pool));
         let spare: u64 = members
             .iter()
             .map(|l| self.vram.slots(*l).saturating_sub(self.scratch_floor(*l)) as u64)

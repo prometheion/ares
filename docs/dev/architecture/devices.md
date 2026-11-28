@@ -520,8 +520,11 @@ rows laid out without cuts, with a piece more for the cuts) never go
 (`ExpertStore::keep_for_loans`); a pool lends no more than the slots at its
 end that have memory. A drafter's experts, which every link of a chain needs,
 are a pool of their own that never gives way. The tier gives at the end of a
-step, and while nothing runs on the watch's thread; it takes a piece before
-each step that is not drafts only, and while nothing runs for 40 ms at a time.
+step once nothing is on its way into or out of the device's slots (reads from
+the file may run: they take a slot only when they have landed), also beside a
+loan that is made, and while nothing runs on the watch's thread; it takes a
+piece before each step that is not drafts only, and while nothing runs for
+40 ms at a time.
 
 **What never gives way**: the weights, the K and V of sequences, the
 recurrent state, the step buffers, the drafters and the image tower: what the

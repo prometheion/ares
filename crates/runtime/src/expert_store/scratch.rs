@@ -155,6 +155,22 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.scratch.get(device).is_some_and(Option::is_some)
     }
 
+    /// Whether a loan of `device` is under way: lent in part, or lent and its
+    /// moves not yet done. The VRAM tier gives nothing back meanwhile
+    /// (`vram.rs`); beside a loan that is whole and ready it may.
+    pub(super) fn lending(&self, device: usize) -> bool {
+        self.scratch
+            .get(device)
+            .and_then(Option::as_ref)
+            .is_some_and(|lent| !lent.whole() || !lent.ready)
+    }
+
+    /// The slots of tier pool `pool` that the loan of `device` holds now.
+    pub(super) fn lent_slots(&self, device: usize, pool: usize) -> u64 {
+        let Some(lent) = self.scratch.get(device).and_then(Option::as_ref) else { return 0 };
+        lent.loans.iter().filter(|(_, p)| *p == pool).map(|(loan, _)| u64::from(loan.slots)).sum()
+    }
+
     /// The pieces of the loan of `device`, once it is ready.
     pub fn scratch_loans(&self, device: usize) -> Option<Vec<ScratchLoan>> {
         let lent = self.scratch.get(device)?.as_ref().filter(|l| l.ready)?;

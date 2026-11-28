@@ -2542,6 +2542,44 @@ fn the_vram_tier_gives_pieces_back_and_takes_them_again() {
     assert_eq!(stats.vram_pieces_taken, stats.vram_pieces_released);
 }
 
+/// Beside a loan that is made the tier gives too: the loan's slots stay, and once it is back
+/// the same loan fits again.
+#[test]
+fn the_vram_tier_gives_beside_a_loan_and_the_loan_fits_again() {
+    let piece = 4 * SLOT_BYTES;
+    let mut rig = rig_vram_in_pieces(8, 16, piece, |_| {});
+    let whole = 24 * SLOT_BYTES;
+    let picks: Vec<Vec<u32>> =
+        (0..LAYERS).map(|l| (0..6).map(|e| e + l as u32).collect()).collect();
+    let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+    rig.step(&picks);
+    rig.store.keep_for_loans(0, &[6 * SLOT_BYTES]);
+    let loan = lend_one(&mut rig.store, 6 * SLOT_BYTES).unwrap().expect("a loan");
+    // Being made, it holds the tier back.
+    rig.store.set_vram_target(0, whole - piece);
+    assert_eq!(rig.store.shrink_vram(0, Duration::ZERO).unwrap(), 0);
+    rig.settle();
+    assert!(rig.store.scratch_ready(0).unwrap());
+    // Made: a piece goes from the low end, away from the loan.
+    assert_eq!(rig.store.shrink_vram(0, Duration::from_secs(1)).unwrap(), 1);
+    rig.settle();
+    assert!(!rig.store.device(0).is_mapped(0, 0));
+    assert_eq!(rig.store.scratch_loans(0), Some(vec![loan]));
+    entries_above(&rig, 4);
+    // As far as the floors and the next loan allow: what the loan will need again stays.
+    rig.store.set_vram_target(0, 0);
+    rig.store.shrink_vram(0, Duration::from_secs(1)).unwrap();
+    rig.settle();
+    rig.store.return_scratch(0).unwrap();
+    let dead = ((whole - rig.store.vram_elastic(0).0) / SLOT_BYTES) as u32;
+    let again = lend_one(&mut rig.store, 6 * SLOT_BYTES).unwrap().expect("the loan fits again");
+    assert_eq!(again, loan);
+    assert!(again.first >= dead, "{again:?} below {dead}");
+    rig.settle();
+    rig.store.return_scratch(0).unwrap();
+    entries_above(&rig, dead);
+}
+
 /// A slot across the edge of two pieces needs both: it goes with the first of them.
 #[test]
 fn a_slot_across_two_pieces_goes_with_either() {
