@@ -102,6 +102,10 @@ fn stored_tail(
 
 /// Checkpoints in transit at once.
 const STATE_BUFFERS: usize = 3;
+
+/// The most runs whose import was cut that the level remembers ([`Ssd::cut`]).
+const CUT_RUNS: usize = 64;
+
 /// How long the step loop waits for the writer to give a buffer back, for a
 /// checkpoint that must leave its place now or a page that would be lost
 /// otherwise, before it gives that up.
@@ -447,6 +451,11 @@ pub(crate) struct Ssd {
     readers: Vec<JoinHandle<()>>,
     jobs: VecDeque<Import>,
     next_job: u64,
+    /// The last pages of runs whose import was cut (no place for the run's
+    /// checkpoint, no page of the pool, a read that failed): the next look
+    /// for such a run does not ask the drive for it again, and the prompt
+    /// goes on with what the cache has ([`Ssd::want`]).
+    cut: HashSet<ChainHash>,
     pub(super) counters: SsdCounters,
 }
 
@@ -545,6 +554,7 @@ impl Ssd {
             readers,
             jobs: VecDeque::new(),
             next_job: 0,
+            cut: HashSet::new(),
             counters: SsdCounters { enabled: true, ..SsdCounters::default() },
         })
     }
@@ -721,6 +731,12 @@ impl Ssd {
             looked[at..at + n].to_vec()
         });
         let first = *announced.first()?;
+        // A run whose import was cut is not asked for again by the next look
+        // for it: a prompt that waited for it starts with what the cache has,
+        // and does not wait for the same import again and again (#98).
+        if announced.last().is_some_and(|last| self.cut.remove(last)) {
+            return None;
+        }
         self.jobs.push_back(Import {
             id: self.next_job,
             owner,
@@ -740,6 +756,16 @@ impl Ssd {
         self.counters.imports += 1;
         index.announce(owner, &announced);
         Some((first, owner))
+    }
+
+    /// The import of the run that ends at `last` was cut ([`Ssd::want`]).
+    /// Runs that nobody looks for again are forgotten as more are cut.
+    pub(super) fn cut(&mut self, last: Option<ChainHash>) {
+        let Some(last) = last else { return };
+        if self.cut.len() >= CUT_RUNS {
+            self.cut.clear();
+        }
+        self.cut.insert(last);
     }
 
     /// Stops the threads, after the writer has written what it was given.

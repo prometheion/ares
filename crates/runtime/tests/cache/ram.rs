@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use ares_runtime::testing::TestMachine;
-use ares_runtime::{Machine, PinnedRam, RuntimeConfig, SsdConfig, SyntheticConfig, SyntheticModel};
+use ares_runtime::{
+    FarPages, Machine, PinnedRam, RuntimeConfig, SsdConfig, SyntheticConfig, SyntheticModel,
+};
 
 use super::*;
 
@@ -168,6 +170,48 @@ fn a_conversation_that_ram_gave_up_comes_back_from_ssd() {
     let s = snapshot(&e.rt);
     assert!(c.report.cached_tokens >= 256, "{:?}", c.report);
     assert!(s.counters.ssd.pages_read > 0, "{s}");
+    e.consistent();
+}
+
+/// The same beside far pages: the model keeps the pages from page 4 on in host memory, one
+/// request holds at most 20 of them (a context of 24 pages) and the pool has 28, and a tier of
+/// experts that wants all the limit leaves the prompt cache its floor (one place, the pages the
+/// drive moves through RAM and one request's far pages). The conversation comes back from the
+/// drive, and its run is asked for once (#98 needed the cards to show its loop: the cache unit
+/// tests `far_pages_beyond_the_floor_leave_the_floor_its_place` and
+/// `a_run_whose_import_was_cut_is_not_asked_for_by_the_next_look` show its two causes).
+#[test]
+fn a_conversation_with_far_pages_comes_back_from_ssd_beside_a_hungry_tier() {
+    let dir = TempDir::new("far-floor");
+    // A checkpoint larger than a page in RAM, as a real model's (112.6 MiB against a page's
+    // 0.8 MiB on Flash-Next): far pages beyond the floor's fit in the room of a place.
+    let checkpoint = 16 * PAGE_BYTES;
+    let mut shape = SyntheticConfig::small(Split::Single, 1);
+    shape.context_length = 24 * PAGE;
+    shape.prefix_cache = Some(checkpoint);
+    shape.durable = Some(1);
+    shape.far_pages = Some(FarPages { first: 4, page_bytes: 256 });
+    let model = Arc::new(SyntheticModel::new(shape).unwrap());
+    let ram = PinnedRam::new(1 << 30);
+    ram.want_experts(1 << 40, 0);
+    let books = ram.clone();
+    let config =
+        RuntimeConfig { cache_ram: 8 * checkpoint + FLOOR, ..config(32, 0, Some(store(&dir.0))) };
+    let e = engine_with(&model, config, move |host| host.with_ram(books));
+    let (one, two, three) = (text_of(30, 300), text_of(31, 300), text_of(33, 300));
+    let a = e.ask(&one, 10);
+    for text in [&two, &three] {
+        assert_eq!(e.ask(text, 10).run.text, fresh(text, 10));
+    }
+    let s = e.written();
+    assert!(s.counters.ssd.pages_written > 0, "what left RAM was written: {s}");
+
+    let second = format!("{one}{}{}", a.run.text, text_of(32, 40));
+    let c = e.ask(&second, 10);
+    assert_eq!(c.run.text, fresh(&second, 10));
+    let s = snapshot(&e.rt);
+    assert!(s.counters.ssd.imports_cut <= 1, "the run was not asked for again and again: {s}");
+    assert!(c.report.cached_tokens >= 256, "{:?}", c.report);
     e.consistent();
 }
 
