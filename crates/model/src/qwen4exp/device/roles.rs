@@ -354,12 +354,7 @@ fn faster(times: &[RoleTime]) -> Option<TensorChoice> {
 }
 
 fn is_out_of_memory(e: &Error) -> bool {
-    match e {
-        Error::Cuda(e) => e.is_out_of_memory(),
-        Error::Memory(_) => true,
-        Error::Model(ares_runtime::ModelError::Cuda(e)) => e.is_out_of_memory(),
-        _ => false,
-    }
+    e.is_no_room()
 }
 
 /// The median decode step and the fastest wide step of `placement`'s parts,

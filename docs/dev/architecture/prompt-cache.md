@@ -13,6 +13,13 @@ index through the same helpers (`run_of`, `deepest`, `run_pages`, `take_page`,
 `keeps_form`, `Cache::hang`), RAM's at once inside the look, the drive's across the
 pump's rounds.
 
+- **Who takes part.** Every request, unless it says `cache_prompt: false`
+  (`GenerateRequest::cache`): such a sequence asks the cache nothing when it
+  arrives or starts, publishes no pages, tails or checkpoints, and its pages go
+  back to the pool with it; the conductor skips the cache for it wherever it
+  would look at its chain (`Active::cache`). The parts of a decision use the
+  cache; what a fork computes does not enter it (`Active::enters_cache`, see
+  "Decisions" in [sequence-state.md](sequence-state.md)).
 - **What it holds.** A page or tail that the index gives up is copied out of
   the pool into RAM before anything writes its page of the pool again
   (`Cache::settle_leaving`, which runs before every record and at the front
@@ -38,10 +45,10 @@ pump's rounds.
   requests that wait would otherwise take each other's pages at every step.
 - **What goes first.** By class, then the least recently used: copies of
   pages that the devices hold; what the drive holds and what is not worth
-  writing (a text shorter than the level on SSD's least, a tail, a
-  checkpoint that later requests have left behind at deeper page
-  boundaries), and everything when there is no level on SSD; then the rest,
-  which is written first. A page is
+  writing (a text shorter than the level on SSD's least, a tail without the
+  state at its end, a checkpoint that later requests have left behind at
+  deeper page boundaries), and everything when there is no level on SSD; then
+  the rest, which is written first. A page is
   the most recently used of what left the devices when it arrives, and the
   devices give a text up from its end, so a text goes from its end here too.
   A checkpoint goes on its own or with its page. When the cache gives memory
@@ -82,8 +89,9 @@ pump's rounds.
   `ares_cache_ram_pages_in_total`, `ares_cache_ram_pages_read_total`,
   `ares_cache_ram_pages_dropped_total` (pages worth keeping that went
   unwritten: no room, or no level on SSD; a page the drive has, or that the
-  writer has been given, is not one of them) and
-  `ares_cache_ram_transfer_nanoseconds_total`.
+  writer has been given, is not one of them), and for both levels at once
+  `ares_cache_transfer_nanoseconds_total` (the conductor's wait for the
+  batches of transfers, counted once whichever level a batch serves).
 - **Measured** 2026-11-16 with the server: Qwen3.8-27B Q4_K_S on the RTX 4070
   and the RTX 3060, tensor split 0.625 / 0.375, two sequence slots, the
   model's MTP block on, `--ram 3G`, `--context 32768` (so that another
@@ -137,7 +145,11 @@ and after a restart of the server. Nothing is written as it is computed.
   turns leave behind, age and go without taking pages along. The index is
   rebuilt from the record headers when the store is opened. One process uses
   a store at a time (a lock file); a second server on the same directory and
-  fingerprint runs without the level and says so.
+  fingerprint runs without the level and says so, after waiting a second for
+  the lock: the engine before may hold it a moment longer, and so does a
+  process forked from this one until it runs its program (the tests' full
+  drive, which made two cache tests of an engine after a restart fail now
+  and then, their store "in use by another process").
 - **Bytes move outside of steps.** A page is written straight from its
   buffer in RAM by one writer thread, which syncs the drive a second after its
   last record (and every ten seconds while records keep coming); the buffer
@@ -165,22 +177,34 @@ and after a restart of the server. Nothing is written as it is computed.
   that deep when it leaves RAM, unless later requests have left it behind at
   deeper page boundaries (`PrefixIndex::left_behind_on_pages`: a deeper
   checkpoint at a page boundary on its one branch is where a prompt resumes
-  from the drive; the state at the end of a tail is no such checkpoint,
-  since the drive keeps no tails). When an engine
+  from the drive). When an engine
   ends (a clean stop, an unload in router mode) everything worth writing that
   the drive does not have is written, the checkpoints first, then what only
   RAM holds, the coldest first, then the pages of the devices; the engine
   waits for the writer up to two minutes. A record the store has is not
-  written again. The partly used last page of a sequence and the state at its
-  end are never written: after a restart the next turn restores the
-  checkpoint before them (the anchor of the last prompt, or a later one from
-  the reply) and computes from there, which costs the rows of the last reply
-  once.
+  written again. A tail with the state at its end (a prompt's anchor at the
+  end of its last message, a request's end) is written like a page: a page
+  record under its tail hash, one deeper than the page it hangs under, and a
+  state record beside it; a tail whose state has gone is not. The drain
+  skips a state whose save still waits for a record, which at the end never
+  runs: a request's end state is saved with the next record, so the last
+  request's end is not written, and its next turn after a restart resumes at
+  its prompt's anchor and computes the reply's rows once.
 - **A hit.** `Cache::probe` asks the store for the pages after the ones the
-  index (and RAM) have. For a model with recurrent state the run ends at its
+  index (and RAM) have. A page of the prompt that RAM has handed the writer
+  is in neither (its bytes are with the writer, and the store has no record
+  yet): the probe waits for the writer to give such pages back first, at
+  most 250 ms, and RAM brings them back (`Cache::await_transit`). For a model with recurrent state the run ends at its
   deepest checkpoint in the store (the pages behind it would be replayed row
   by row, which takes as long as computing them), and without a checkpoint
-  nothing is brought back. The run is announced in the index under an owner
+  nothing is brought back. The deepest may be the state at the end of a
+  stored tail the prompt goes on from, under a page of the run: the store
+  lists the pages under each parent (`PageStore::children`), and only a page
+  that has one besides the next page of the text is tried, every length of
+  the prompt's cells after it in one pass (`ChainHash::extensions`). The run
+  is then the pages before the tail and the tail, which enters the index as
+  one with its state; a tail the index holds already is passed over, and a
+  prompt that finds one a run brings back waits for it. The run is announced in the index under an owner
   of its own, so the prompt, and any other prompt that shares it, is held as
   for a page that another sequence computes. The readers bring the pages and
   the checkpoint into host memory, the conductor gives each page a page of

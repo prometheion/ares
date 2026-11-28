@@ -76,8 +76,8 @@ mod timing;
 mod watch;
 
 pub use ares_state::Boundary;
-pub use cache::{RamCounters, SsdConfig, SsdCounters};
-pub use conductor::{SequenceInfo, token_hash};
+pub use cache::{RamCounters, SsdConfig, SsdCounters, TransferCounters};
+pub use conductor::{HOLD_STEPS_WHILE, SequenceInfo, token_hash};
 pub use config::RuntimeConfig;
 pub use engine::Runtime;
 pub use error::RuntimeError;

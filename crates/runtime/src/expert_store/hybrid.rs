@@ -42,7 +42,10 @@ use ares_cuda::{ExpertShape, RouteGroup};
 use ares_weights::{SPARE_WORTH, Start, Swap, SwapRule, Want};
 
 use super::cpu::{CpuExpert, CpuPool, LayerJob, MAX_ROWS, act_bytes};
-use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted, classify_miss};
+use super::{
+    DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, WAITED_CPU, WAITED_FILE, Wanted,
+    classify_miss,
+};
 
 mod wide;
 
@@ -313,8 +316,10 @@ struct Claims {
     token: u32,
     n_rows: usize,
     act: Vec<u8>,
-    /// Claimed experts whose bytes are still being read.
+    /// Claimed experts whose bytes are still being read, and whether there were any when the
+    /// layer was claimed.
     late: Vec<Late>,
+    read: bool,
     jobs: Vec<Arc<LayerJob>>,
     /// Experts held in RAM for the jobs.
     held: Vec<u32>,
@@ -394,6 +399,13 @@ impl<D: SlotDevice> ExpertStore<D> {
             sums: Vec::new(),
         });
         Ok(())
+    }
+
+    /// The logical CPUs the CPU half's workers leave to the I/O threads
+    /// ([`CpuPool::free_cpus`]): none without a CPU half, or where the
+    /// workers are left to the scheduler.
+    pub fn io_cpus(&self) -> &[usize] {
+        self.hybrid.as_ref().map_or(&[], |h| h.pool.free_cpus())
     }
 
     /// How misses are served: [`Serve::Stream`] without a CPU half.
@@ -679,7 +691,14 @@ impl<D: SlotDevice> ExpertStore<D> {
             claimed.push(*g as u32);
             claimed_experts.push(groups[*g].expert);
         }
-        self.waits.push((layer, now));
+        let last = if !late.is_empty() {
+            WAITED_FILE
+        } else if !ready.is_empty() {
+            WAITED_CPU
+        } else {
+            self.wants.last().filter(|w| w.layer == layer).map_or(WAITED_CPU, |w| w.source.waited())
+        };
+        self.waits.push((layer, now, last));
         if !claimed.is_empty() {
             self.devices[device].claim(layer, token, &claimed)?;
             let mut claims = Claims {
@@ -687,6 +706,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 token,
                 n_rows,
                 act: act[..act_bytes(shape.n_embd as usize, n_rows)].to_vec(),
+                read: !late.is_empty(),
                 late,
                 jobs: Vec::new(),
                 held,
@@ -790,6 +810,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
             let device = self.layers[claims.layer].device;
             self.devices[device].deliver(claims.layer, claims.token, &sums)?;
+            if let Some(wait) = self.waits.iter_mut().find(|w| w.0 == claims.layer) {
+                wait.2 = if claims.read { WAITED_FILE } else { WAITED_CPU };
+            }
             hybrid.sums = sums;
             for expert in &claims.held {
                 self.ram.sets[claims.layer].release(*expert);

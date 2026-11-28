@@ -680,7 +680,9 @@ fn the_saves_of_a_step_whose_room_was_taken_are_given_up_before_it_runs() {
     // failed, and with it the engine): the saves go then, those inside the step first, until
     // what the others lock fits.
     let mut f = Following::with("fit", false, 4 * STATE);
-    f.ram.host_places(STATE);
+    // The places lie in chunks of one place each, booked as a copy first
+    // writes them, as the host executor's are.
+    let _places = f.ram.place_chunks(None, STATE, 64, STATE as usize);
     let hashes = f.hashes.clone();
     assert!(f.cache.save(0, hashes[2], Owner(1), false).taken);
     let place = f.cache.reserve().0.expect("a place for a save inside the step");

@@ -30,6 +30,33 @@ with two places are the time until one of the generations ends (one ran
 3000 tokens in under a second where the greedy text loops and the n-gram
 drafts take it).
 
+## The restart in place, measured (2026-11-26 and 27)
+
+On the local cards (RTX 4070 + RTX 3060), `fix/server-sweep` (debug builds of bc6f3eac and
+653e45e1), a step held by `ARES_TEST_HOLD_STEPS_WHILE` after a first request was served
+(`/var/tmp/ares-fixserver/repro/restart-gpu.sh` and `restart-gpu-fn.sh`). The free memory is what
+the new image's load found; "right after the exec" is taken a moment after the line that says it
+restarts (the old image's memory is going then).
+
+| | the 0.8B, `--watchdog 5` (load 6 to 10) | Flash-Next IQ2_XS, `--ram 8G --watchdog 60` (load 40) |
+| --- | --- | --- |
+| VRAM of the process before | 2470 MiB (device 0) | 11 662 and 11 696 MiB |
+| `VmRSS` and threads before | 1.16 GB, 26 | 9.65 GB (the tier of 8 GiB in page-locked RAM), 65 |
+| right after the exec | no VRAM of the process, device 0 at 18 MiB; 181 MB, 21 threads | the new image starting: 20 kB, 1 thread, the VRAM still being given back |
+| free when the new image loaded | 11.52 of 11.68 GiB (device 0), as at the first load | 11.52 and 11.57 GiB, as at the first load |
+| the 503 of the held request | 7 s after it came | 60 s of the watchdog and its look |
+| ERROR line to exec | 0.5 ms | 6 ms |
+| exec to the new image's first line | | 1.5 s (the old image's memory torn down) |
+| exec to listening again | 1.8 s | 70 s (the load, the tier filled without a profile) |
+| afterwards | 200, same PID and port; at its stop 2.26 of 2.26 GiB released | 200, same PID and port; at its stop 11.25 of 11.25 GiB released |
+
+`VmLck` and `VmPin` stay 0 throughout: the driver's page-locked memory does not show in them, so
+`VmRSS` is the measure. On the host (`tests/binary.rs`, the `ares-host` model, `--watchdog 2`): the
+stuck step was found 3 s after it was held, the exec came 40 ms after the ERROR line, and the new
+image listened 140 ms later. The first Flash-Next run had `--watchdog 10`: Flash-Next's own first
+step after the load, the step prices with experts from the drive, outlasted it, and the server
+(still waiting for its one model) exited with 75, as it does since 39274398.
+
 ## Prompt progress and the log on the step's path (2026-11-27)
 
 `feat/progress-logs` against main (8acd73a4, the same code as 83408e52), on the local cards

@@ -12,6 +12,12 @@
 //! last prediction of the step before ([`Part::predictions_done`]), which has ended long
 //! before.
 //!
+//! A step predicts only as many layers ahead as the board says ([`Board::ahead_depth`]): the
+//! store's read-ahead takes the predictions only at the places of a list where they have been
+//! picked at least half the time, and a step of a kind with no such place skips the routers
+//! but now and then (`ExpertStore::ahead_depth`), which saves the device their 1.7 ms a step
+//! on the RTX 4060 Ti where the tiers hold what the text uses.
+//!
 //! A wide step (a slice of a prompt) predicts the next layer only, where the board says the
 //! feed wants it (where the step before read that layer's experts from the file): the next
 //! layer's router as a float product on the f16 form of the rows, and its picks for every
@@ -20,6 +26,7 @@
 //! which the next layer overwrites.
 //!
 //! [`Board::ahead_list`]: super::super::board::Board::ahead_list
+//! [`Board::ahead_depth`]: super::super::board::Board::ahead_depth
 
 use ares_core::GgmlType;
 use ares_cuda::{DeviceBuffer, DevicePtr, Event, PrefillPath, Stream};
@@ -76,7 +83,8 @@ impl Part {
     /// Enqueues the prediction of the picks of the layers after layer `i` of the part for the
     /// `rows` rows of a decode step: `act` holds the rows the router of layer `i` read, and
     /// the router's event has been recorded on the step's stream. Nothing for a part without
-    /// predictions, a layer without a layer behind it, or a step of the many-row kernels.
+    /// predictions, a layer without a layer behind it, a step of the many-row kernels, or a
+    /// step the board says to predict nothing in.
     pub(super) fn enqueue_prediction(
         &mut self,
         i: usize,
@@ -85,9 +93,10 @@ impl Part {
         token: u32,
     ) -> Result<(), ModelError> {
         let ahead = self.f.ahead_layers as usize;
+        let depth = self.board.ahead_depth().min(ahead);
         let Some(state) = self.predict.as_mut() else { return Ok(()) };
         let layers = self.w.layers.len();
-        let routers: Vec<DevicePtr> = (i + 1..layers.min(i + 1 + ahead))
+        let routers: Vec<DevicePtr> = (i + 1..layers.min(i + 1 + depth))
             .map(|at| {
                 let router = self.w.layers[at].moe.router;
                 router.map(|r| self.w.at(r)).ok_or_else(|| invalid("a layer without its router"))

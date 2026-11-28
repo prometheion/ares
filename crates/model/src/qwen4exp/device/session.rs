@@ -410,7 +410,8 @@ impl<'g> Session<'g> {
                 part.set_prune_mask(mask.clone());
             }
         }
-        let ngram = NgramFeed::open(gguf, c, model.row_cache, model.part.max_slots)?;
+        let io_cpus = feed.store.io_cpus().to_vec();
+        let ngram = NgramFeed::open(gguf, c, model.row_cache, model.part.max_slots, &io_cpus)?;
         let used = c.experts.used as u32;
         let own = model.part.own_rows();
         let flow = Flow::new(feed, ngram, parts.len(), model.stall, own, used, ram);

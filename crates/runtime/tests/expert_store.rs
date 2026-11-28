@@ -38,6 +38,9 @@ fn a_missing_pick_comes_from_the_file_into_a_slot() {
     assert_eq!((stats.demand_reads, stats.uploads), (2, 2));
     assert_eq!(stats.miss_ms.len(), 2);
     assert_eq!(stats.upload_bytes, 2 * 352);
+    // The layer waited once, and last for an expert from the file.
+    assert_eq!(stats.waits_last, [0, 0, 1, 0]);
+    assert_eq!(stats.wait_last_ms[2], stats.wait_ms);
 
     // The next step finds them.
     rig.store.begin_step();
@@ -153,6 +156,7 @@ fn an_evicted_expert_goes_down_to_ram_and_comes_back_without_a_read() {
     let stats = rig.store.take_stats();
     assert_eq!((stats.miss_from_ram, stats.miss_from_disk, stats.demand_reads), (2, 0, 0));
     assert_eq!(stats.uploads, 2);
+    assert_eq!(stats.waits_last, [0, 1, 0, 0], "the layer waited for an upload from RAM");
 }
 
 #[test]
@@ -264,6 +268,33 @@ fn reads_ahead_start_where_predictions_have_been_picked_more_often_than_not() {
     let stats = rig.store.take_stats();
     assert_eq!((stats.predicted, stats.predicted_picked), (2, 1), "one was in VRAM");
     assert_eq!((stats.ahead_reads, stats.ahead_used, stats.miss_from_ram), (1, 1, 1));
+}
+
+#[test]
+fn a_step_predicts_only_as_far_as_a_place_is_worth_a_read_and_now_and_then() {
+    let mut rig = rig(4, 8, recent_first);
+    // Before any counts no place qualifies: one step in eight predicts, as far as it can.
+    let depths: Vec<usize> = (0..16).map(|_| rig.store.ahead_depth(1, 2)).collect();
+    assert_eq!(depths.iter().filter(|d| **d == 2).count(), 2);
+    assert!(depths.iter().all(|d| *d == 0 || *d == 2));
+    // Steps of several rows are counted apart.
+    assert_eq!(rig.store.ahead_depth(4, 2), 0);
+
+    // Predictions one layer ahead that are picked: every step of one row predicts one
+    // layer ahead, and every eighth two.
+    rig.predict_steps(2, 16, 1, 1);
+    let depths: Vec<usize> = (0..16).map(|_| rig.store.ahead_depth(1, 2)).collect();
+    assert!(depths.iter().all(|d| *d >= 1), "{depths:?}");
+    assert_eq!(depths.iter().filter(|d| **d == 2).count(), 2, "{depths:?}");
+    // A part that predicts one layer ahead does so every step.
+    assert!((0..16).all(|_| rig.store.ahead_depth(1, 1) == 1));
+    // The several rows have no counts yet.
+    assert_eq!(rig.store.ahead_depth(4, 2), 0);
+
+    // Once the first place is no longer picked, no place qualifies again.
+    rig.predict_steps(2, 48, 1, 0);
+    let depths: Vec<usize> = (0..16).map(|_| rig.store.ahead_depth(1, 1)).collect();
+    assert_eq!(depths.iter().filter(|d| **d == 1).count(), 2, "{depths:?}");
 }
 
 #[test]
@@ -679,6 +710,8 @@ mod hybrid {
         );
         assert!(rig.store.in_ram(0, 3) && rig.store.in_ram(0, 5));
         assert_eq!(rig.store.stats().cpu_experts, 2);
+        // The CPU's sums waited for the reads of their experts.
+        assert_eq!(rig.store.stats().waits_last, [0, 0, 1, 0]);
         rig.store.end_step().unwrap();
 
         // Between the steps the heat promotes them: the bytes, then the entry.

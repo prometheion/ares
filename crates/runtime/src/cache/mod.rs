@@ -80,6 +80,16 @@ mod ram;
 mod ssd;
 
 pub use ram::RamCounters;
+
+/// The batches of transfers between the devices and host memory that the
+/// levels below the devices carried out (to RAM, from it, and through the
+/// buffers of the drive), and the nanoseconds the conductor waited for them.
+/// One batch can serve both levels; it is counted once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferCounters {
+    pub batches: u64,
+    pub ns: u64,
+}
 use ram::{Class, Entry, Held, Item, RamLevel};
 pub use ssd::{SsdConfig, SsdCounters};
 
@@ -246,6 +256,8 @@ pub(crate) struct Cache {
     /// Counts what was given up, so that waiting requests can tell their
     /// numbers are out of date.
     pub evictions: u64,
+    /// The transfers the levels below the devices carried out.
+    transfers: TransferCounters,
     /// What the model offers the levels below the devices.
     durable: Option<Durable>,
     /// The level in RAM, for a model that moves its pages to the host.
@@ -373,6 +385,7 @@ impl Cache {
             page_copies: Vec::new(),
             scratch: Vec::new(),
             evictions: 0,
+            transfers: TransferCounters::default(),
             far: None,
             far_held: 0,
             far_keep: 0,
@@ -403,6 +416,15 @@ impl Cache {
     /// it ends, and is not cut ([`CheckpointPolicy::boundary_reach`]).
     pub(crate) fn with_reach(mut self, rows: u32) -> Self {
         self.policy.boundary_reach = rows;
+        self
+    }
+
+    /// The anchor of a prompt is the end of its last message, for a model
+    /// whose steps are cut at an anchor either way; one that saves the state
+    /// inside its steps keeps the page boundary, which it saves without a
+    /// cut ([`CheckpointPolicy::exact_anchor`]).
+    pub(crate) fn with_exact_anchor(mut self, exact: bool) -> Self {
+        self.policy.exact_anchor = exact;
         self
     }
 
@@ -556,6 +578,13 @@ impl Cache {
         let looked = &tokens[..tokens.len() - 1];
         let mut found = self.index.lookup_chain(chain, looked);
         let mut brought = 0;
+        if exec.is_some() && found.computing.is_none() && self.ssd.is_some() {
+            // Pages of the prompt on their way from RAM to the drive come back
+            // to RAM first, so that the run below finds them.
+            let total = (looked.len() / self.cells_per_page as usize).min(chain.hashes().len());
+            let have = found.pages.len().min(total);
+            self.await_transit(&chain.hashes()[have..total]);
+        }
         if let (Some(exec), None) = (exec, found.computing) {
             brought = self.import_from_ram(pool, exec, chain, tokens, &found);
             if brought > 0 {
@@ -567,8 +596,18 @@ impl Cache {
         if self.ssd.is_some() && found.computing.is_none() {
             let total = looked.len() / self.cells_per_page as usize;
             let owner = self.import_owner();
+            // Where the cache can resume already: what comes back must lie deeper.
+            let beyond = match self.recurrent {
+                true => {
+                    let resume = self.policy.resume(&found, tokens.len() as u64);
+                    if resume.restore.is_some() { resume.replay.start } else { 0 }
+                }
+                false => found.cells(self.cells_per_page),
+            };
+            let (cells, have) = (u64::from(self.cells_per_page), found.pages.len());
             let ssd = self.ssd.as_mut().expect("checked above");
-            found.computing = ssd.want(&mut self.index, chain, found.pages.len(), total, owner);
+            found.computing =
+                ssd.want(&mut self.index, chain, looked, cells, have, total, beyond, owner);
         }
         let cached = found.cells(self.cells_per_page).min(tokens.len() as u64);
         let resume = if self.recurrent {
@@ -615,6 +654,11 @@ impl Cache {
     /// tails: for the counters.
     pub(crate) fn ram_counters(&self) -> RamCounters {
         self.in_ram.as_ref().map_or_else(RamCounters::default, RamLevel::snapshot)
+    }
+
+    /// The transfers of the levels below the devices, counted once.
+    pub(crate) fn transfer_counters(&self) -> TransferCounters {
+        self.transfers
     }
 
     /// Writes the copies for this record and starts the next ones afresh.

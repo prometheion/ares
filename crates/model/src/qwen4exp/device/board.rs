@@ -8,9 +8,10 @@
 //! The device side belongs to the part, which enqueues the copies. The host
 //! side belongs to whoever feeds the expert store ([`super::feed::Feed`]),
 //! possibly another thread, so the board is shared and holds nothing that
-//! changes except through the device's copies and two flags per layer of a
-//! wide step: whether the feed wants a prediction there, and the rows of the
-//! one the part has enqueued.
+//! changes except through the device's copies, how many layers ahead the
+//! step of the decode kernels predicts, and two flags per layer of a wide
+//! step: whether the feed wants a prediction there, and the rows of the one
+//! the part has enqueued.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -32,6 +33,8 @@ pub struct Board {
     predicted: PinnedBuffer,
     predicted_copied: Vec<Event>,
     ahead: usize,
+    /// How many of the `ahead` layers the step being begun predicts: the feed's word.
+    ahead_depth: AtomicU32,
     list_bytes: usize,
     /// In wide steps: per layer the picks of every row by the next layer's router
     /// (`wide_bytes` per layer), the event behind their copy, the rows of the
@@ -78,6 +81,7 @@ impl Board {
                 .map(|_| Event::new(device))
                 .collect::<Result<_, _>>()?,
             ahead,
+            ahead_depth: AtomicU32::new(ahead as u32),
             list_bytes,
             wide: PinnedBuffer::new(device, (wide_bytes * layers).max(64))?,
             wide_copied: (0..wide_layers).map(|_| Event::new(device)).collect::<Result<_, _>>()?,
@@ -152,6 +156,17 @@ impl Board {
     /// predicts nothing.
     pub fn ahead(&self) -> usize {
         self.ahead
+    }
+
+    /// How many layers ahead the step of the decode kernels being begun is to
+    /// predict, at most [`Board::ahead`].
+    pub fn ahead_depth(&self) -> usize {
+        (self.ahead_depth.load(Ordering::Acquire) as usize).min(self.ahead)
+    }
+
+    /// The feed's word on how many layers ahead the step being begun predicts.
+    pub fn set_ahead_depth(&self, depth: usize) {
+        self.ahead_depth.store(depth.min(self.ahead) as u32, Ordering::Release);
     }
 
     /// Where the device copies the predicted picks of the layers after layer `i`.

@@ -161,14 +161,14 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
         "tool_choice": "none",
         "temperature": 0.5, "top_p": 0.75, "top_k": 40, "min_p": 0.0625,
         "presence_penalty": 0.5, "frequency_penalty": -0.25, "repeat_penalty": 1.5, "seed": 42,
-        "max_tokens": 100, "max_completion_tokens": 50,
+        "max_tokens": 50, "max_completion_tokens": 50,
         "stop": ["\n\n", "END"],
         "response_format": {"type": "text"}, "user": "u"
     }"#;
     let request = received(CHAT, body).await;
 
     assert_eq!(request.model, "mock");
-    assert_eq!(request.max_tokens, Some(50), "max_completion_tokens replaces max_tokens");
+    assert_eq!(request.max_tokens, Some(50), "one limit under two names that agree");
     assert_eq!(request.stop, ["\n\n", "END"]);
     let sampling = &request.sampling;
     assert_eq!(sampling.temperature, Some(0.5));
@@ -241,6 +241,21 @@ async fn conventions_of_other_servers_are_understood() {
             .await;
     assert_eq!(request.prompt, Prompt::Text("only one".into()));
     assert_eq!(request.stop, ["x"]);
+}
+
+#[tokio::test]
+async fn cache_prompt_says_whether_the_request_uses_the_prompt_cache() {
+    // llama.cpp's member: true is what a request does anyway.
+    assert!(received(CHAT, &chat_body(json!({}))).await.cache);
+    assert!(received(CHAT, &chat_body(json!({"cache_prompt": true}))).await.cache);
+    assert!(!received(CHAT, &chat_body(json!({"cache_prompt": false}))).await.cache);
+    let body = completion_body(json!({"cache_prompt": false}));
+    assert!(!received(COMPLETIONS, &body).await.cache);
+    let (status, value) =
+        json(post(&app(&instant()).await, CHAT, &chat_body(json!({"cache_prompt": "no"}))).await)
+            .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"]["param"], "cache_prompt");
 }
 
 // --- streaming ---------------------------------------------------------------
@@ -814,11 +829,13 @@ async fn metrics_are_the_engines_statistics_as_text() {
             uploads: 8,
             read_bytes: 5_000_000,
             wait_us: 12_000,
+            wait_last_us: [3_000, 0, 9_000, 0],
             predicted: 300,
             ahead_reads: 3,
             ahead_used: 2,
             ..ExpertStats::default()
         },
+        cache_transfer_ns: 1_500_000,
         ram: ares_api::RamCacheStats {
             pages: 20,
             bytes: 92_405_760,
@@ -837,8 +854,11 @@ async fn metrics_are_the_engines_statistics_as_text() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/plain"));
     let text = body_text(response).await;
+    // The transfers serve both levels and are counted once, under one name.
+    assert_eq!(text.matches("transfer_nanoseconds").count(), 3, "{text}");
     for line in [
         "ares_requests_finished_total 2",
+        "ares_model_loaded 1",
         "ares_cache_ram_pages 20",
         "ares_cache_ram_bytes 92405760",
         "ares_cache_ram_pages_in_total 25",
@@ -850,6 +870,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
         "ares_cache_ssd_bytes 0",
         "ares_cache_ssd_pending 0",
         "ares_cache_ssd_checkpoints_skipped_total 0",
+        "ares_cache_transfer_nanoseconds_total 1500000",
         "ares_requests_cancelled_total 1",
         "ares_requests_refused_total 0",
         "ares_requests_outranked_total 0",
@@ -879,6 +900,8 @@ async fn metrics_are_the_engines_statistics_as_text() {
         "ares_expert_uploads_total 8",
         "ares_expert_read_bytes_total 5000000",
         "ares_expert_wait_microseconds_total 12000",
+        "ares_expert_wait_cpu_microseconds_total 3000",
+        "ares_expert_wait_file_microseconds_total 9000",
         "ares_expert_predicted_total 300",
         "ares_expert_ahead_reads_total 3",
         "ares_expert_ahead_used_total 2",

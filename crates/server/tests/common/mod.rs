@@ -160,6 +160,8 @@ struct Book {
     counting: bool,
     /// Why the engine serves no more requests, once a test broke it.
     failure: Option<String>,
+    /// The failure is a step that never came back.
+    stuck: bool,
     /// Whether `mock` reads images.
     images: bool,
 }
@@ -333,6 +335,12 @@ impl MockEngine {
     pub fn set_failure(&self, why: &str) {
         self.shared.book.lock().unwrap().failure = Some(why.to_owned());
     }
+
+    /// Breaks the engine with a step that never came back.
+    pub fn set_stuck(&self, why: &str) {
+        let mut book = self.shared.book.lock().unwrap();
+        (book.failure, book.stuck) = (Some(why.to_owned()), true);
+    }
 }
 
 impl Engine for MockEngine {
@@ -403,6 +411,10 @@ impl Engine for MockEngine {
 
     fn failure(&self) -> Option<String> {
         self.shared.book.lock().unwrap().failure.clone()
+    }
+
+    fn stuck(&self) -> bool {
+        self.shared.book.lock().unwrap().stuck
     }
 }
 

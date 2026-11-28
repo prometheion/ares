@@ -251,17 +251,17 @@ pub const OPTIONS: &[Opt] = &[
          (localhost, addresses), separated by commas, or * for any. A server on a loopback \
          address without keys answers only to its local names, against web pages that \
          rebind a name of theirs to it; with these names the check holds for every address \
-         and with keys too [default: the local names on a loopback address without keys, \
-         else any]",
+         and with keys too, and with keys the page a request comes from is checked as well \
+         [default: the local names on a loopback address without keys, else any]",
     ),
     Opt::server(
         "--cors-origins",
         "<LIST>",
         "Origins whose web pages may call the server from a browser and read its answers \
          (CORS), such as https://chat.example.org, separated by commas, or * for any. Without \
-         keys a request from a page of any other site is refused, unless the page is of this \
-         machine (localhost, a loopback address), of the server's own name or of an allowed \
-         host [default: none]",
+         keys (or with keys and allowed hosts) a request from a page of any other site is \
+         refused, unless the page is of this machine (localhost, a loopback address), of the \
+         server's own name or of an allowed host [default: none]",
     ),
     Opt::model(
         "--devices",
@@ -458,6 +458,13 @@ pub const OPTIONS: &[Opt] = &[
         "The rate every generating request keeps while a prompt is read beside it; the \
          prompt gets the rest of the devices' time, and at least half. 0 reads prompts at \
          once (a request that generates then gets a token per step of prompt) [default: 20]",
+    ),
+    Opt::model(
+        "--watchdog",
+        "<SECONDS>",
+        "The longest one step may take, the warm-up's too, before the engine is taken for \
+         stuck: its requests end with the reason and the model is taken down; 0 watches \
+         nothing [default: 600]",
     ),
     Opt::model(
         "--reasoning",
@@ -1095,6 +1102,10 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
                 return Err(invalid("--generation-floor", value, expected));
             }
             load.generation_floor = Some(floor);
+        }
+        "--watchdog" => {
+            let expected = "a number of seconds, 0 or more (0 watches nothing)";
+            load.watchdog = Some(number("--watchdog", value, expected)?);
         }
         "--expert-prune" => load.expert_prune = expert_prune(value)?,
         "--chat-var" => {

@@ -649,6 +649,10 @@ mod tests {
         let load = run(&["--model=m", "--cache", "/var/cache/ares", "--cache-size=64G"]).model.load;
         assert_eq!(load.cache, Some(PathBuf::from("/var/cache/ares")));
         assert_eq!(load.cache_size, Some(64 << 30));
+        // The watchdog: the runtime's limit unless named, 0 for none.
+        assert_eq!(run(&["--model=m"]).model.load.watchdog, None);
+        assert_eq!(run(&["--model=m", "--watchdog", "1200"]).model.load.watchdog, Some(1200));
+        assert_eq!(run(&["--model=m", "--watchdog=0"]).model.load.watchdog, Some(0));
         // The formats that keep exact cells are accepted, for K and V apart.
         let load = run(&["--model=m", "--kv", "q5,q4"]).model.load;
         assert_eq!(load.kv, Some((CacheFormat::Q5, CacheFormat::Q4)));

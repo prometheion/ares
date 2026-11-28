@@ -341,3 +341,62 @@ fn a_preset_file_is_served_with_a_failed_load_listed_and_stops_in_order() {
     assert!(list.contains(r#""value":"failed""#) && list.contains("not a GGUF file"), "{list}");
     server.stop();
 }
+
+/// A model the binary serves without a GPU: the runtime's host executor over
+/// its synthetic model, whose text means nothing (architecture `ares-host`).
+fn host_model(dir: &str) -> PathBuf {
+    let path = scratch(dir).join("host.gguf");
+    GgufBuilder::new()
+        .str("general.architecture", "ares-host")
+        .tensor_f32("w", &[1], &[0.0])
+        .write(&path)
+        .unwrap();
+    path
+}
+
+#[test]
+fn a_step_that_does_not_come_back_restarts_the_server_in_place_on_its_port() {
+    let dir = scratch("restart");
+    let hold = dir.join("hold");
+    let _ = std::fs::remove_file(&hold);
+    let model = host_model("restart-model");
+    let mut command = common::process::ares();
+    command
+        .args(["--port", "0", "--model", model.to_str().unwrap(), "--watchdog", "2"])
+        .env(ares_runtime::HOLD_STEPS_WHILE, &hold);
+    let mut server = Server::start(command, LIMIT);
+    let (pid, address) = (server.pid(), server.address.clone());
+    let body = json!({"model": server.model, "prompt": "hello", "max_tokens": 4});
+    assert_eq!(server.post("/v1/completions", &body).status, 200);
+
+    // The steps are held: the watchdog finds one that does not come back
+    // after 2 s. The request in flight is answered that the server restarts
+    // in place, with the reason, and so is the one that waited behind it.
+    std::fs::write(&hold, b"").unwrap();
+    let client: &common::process::Client = &server;
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| client.post("/v1/completions", &body));
+        std::thread::sleep(Duration::from_millis(300));
+        let second = scope.spawn(|| client.post("/v1/completions", &body));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    for reply in [&first, &second] {
+        assert_eq!(reply.status, 503, "{}", reply.body);
+        let error = &reply.json()["error"];
+        assert_eq!(error["code"], "restarting", "{}", reply.body);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("stuck") && message.contains("watchdog"), "{message}");
+    }
+    server.wait_for_log("restarting in place");
+    std::fs::remove_file(&hold).unwrap();
+
+    // The same process serves on the same port again, the model loaded anew.
+    let taken = server.wait_for_log("listening socket is taken over");
+    assert!(taken.contains("restarted in place"), "{taken}");
+    server.wait_for_log("listening");
+    assert_eq!((server.pid(), server.address.clone()), (pid, address));
+    assert!(server.exited().is_none(), "{:#?}", server.logged());
+    assert_eq!(server.post("/v1/completions", &body).status, 200);
+    let log = server.stop();
+    assert!(log.iter().any(|line| line.contains("ERROR") && line.contains("stuck")), "{log:#?}");
+}

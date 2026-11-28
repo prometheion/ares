@@ -107,6 +107,17 @@ impl Error {
     fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid(message.into())
     }
+
+    /// Whether the error is a lack of memory: no room in a placement or a
+    /// budget, or an allocation the driver refused.
+    pub fn is_no_room(&self) -> bool {
+        match self {
+            Self::Cuda(e) => e.is_out_of_memory(),
+            Self::Memory(_) => true,
+            Self::Model(e) => e.is_no_room(),
+            _ => false,
+        }
+    }
 }
 
 /// What the runtime hears of an error of the model on its devices: the part's

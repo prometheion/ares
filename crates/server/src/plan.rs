@@ -150,6 +150,9 @@ pub struct LoadOptions {
     /// prompts are read (`RuntimeConfig::generation_floor`). `None`: the
     /// runtime's default.
     pub generation_floor: Option<f64>,
+    /// The longest one step may take, in seconds (`RuntimeConfig::watchdog`;
+    /// 0: no watch). `None`: the runtime's default.
+    pub watchdog: Option<u64>,
     /// Pruning of the picks of a mixture of experts that only the SSD holds.
     /// `None`: none, the output as the model gives it.
     pub expert_prune: Option<ExpertPrune>,
@@ -205,6 +208,7 @@ impl LoadOptions {
             chat_template: None,
             queue: None,
             generation_floor: None,
+            watchdog: None,
             expert_prune: None,
             mmproj: None,
             mmproj_weights: ProjectorWeights::Ram,

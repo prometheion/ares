@@ -279,10 +279,6 @@ pub(crate) struct Shared {
     /// per device part; none for an executor without devices, whose pages
     /// are ordinary memory, booked all the same.
     devices: Mutex<Vec<Device>>,
-    /// For an executor without devices that books its places itself (the
-    /// host executor): the bytes of a place, and the places that hold
-    /// memory now.
-    host_places: Mutex<Option<(u64, Vec<bool>)>>,
 }
 
 impl Shared {
@@ -418,7 +414,6 @@ impl PinnedRam {
                 live: Mutex::new(Vec::new()),
                 chunks: Mutex::new(Vec::new()),
                 devices: Mutex::new(Vec::new()),
-                host_places: Mutex::new(None),
             }),
         }
     }
@@ -644,20 +639,25 @@ impl PinnedRam {
         self.book_cache(bytes, "checkpoints").map_err(ModelError::Invalid)
     }
 
-    /// Locks `bytes` of RAM on behalf of the checkpoint cache, or says who
-    /// holds the memory that the limit does not leave. The bytes are booked
-    /// until the chunk is dropped.
+    /// Locks `bytes` of RAM for `device` on behalf of the checkpoint cache,
+    /// or says who holds the memory that the limit does not leave; without a
+    /// device (an executor that has none) the bytes are ordinary memory,
+    /// booked all the same. The bytes are booked until the chunk is dropped.
     pub fn lock_checkpoints(
         &self,
-        device: &Device,
+        device: Option<&Device>,
         bytes: usize,
     ) -> Result<LockedChunk, ModelError> {
         self.book_checkpoints(bytes as u64)?;
         // Booked from here on: a chunk that cannot be locked gives the
         // booking back as it is dropped.
         let booking = Booking { ram: self.clone(), user: Booked::Checkpoints, bytes: bytes as u64 };
-        let buffer = PinnedBuffer::new(device, bytes)?;
-        Ok(LockedChunk { buffer: Some(buffer), booking: Some(booking) })
+        let mut chunk = LockedChunk { memory: None, booking: Some(booking) };
+        chunk.memory = Some(match device {
+            Some(device) => ChunkMemory::Locked(PinnedBuffer::new(device, bytes)?),
+            None => ChunkMemory::Plain(Aligned::new(bytes), bytes),
+        });
+        Ok(chunk)
     }
 
     pub(crate) fn release_checkpoints(&self, bytes: u64) {
@@ -699,10 +699,12 @@ impl PinnedRam {
     /// The places of a device part's checkpoints: `capacity` places of
     /// `bytes` each, locked on `device` in chunks of at least `chunk` bytes
     /// as they come into use, and released again when the checkpoints must
-    /// give memory back and the conductor has none in a chunk.
+    /// give memory back and the conductor has none in a chunk. Without a
+    /// device (the host executor) the chunks are ordinary memory, booked and
+    /// given back the same way.
     pub fn place_chunks(
         &self,
-        device: &Device,
+        device: Option<&Device>,
         bytes: u64,
         capacity: u32,
         chunk: usize,
@@ -711,7 +713,7 @@ impl PinnedRam {
         let per_chunk = chunk.checked_div(bytes).unwrap_or(1).max(1) as u32;
         let chunks = Arc::new(PlaceChunks {
             ram: self.clone(),
-            device: device.clone(),
+            device: device.cloned(),
             bytes,
             capacity,
             per_chunk,
@@ -741,28 +743,11 @@ impl PinnedRam {
         places.get(place as usize).copied().unwrap_or(false)
     }
 
-    /// An executor without devices books places of `bytes` itself, and says
-    /// which hold memory ([`PinnedRam::host_place_held`]).
-    pub fn host_places(&self, bytes: u64) {
-        *self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((bytes, Vec::new()));
-    }
-
-    /// Place `place` of an executor without devices holds memory, or not.
-    pub fn host_place_held(&self, place: u32, held: bool) {
-        let mut host = self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, places)) = host.as_mut() {
-            if places.len() <= place as usize {
-                places.resize(place as usize + 1, false);
-            }
-            places[place as usize] = held;
-        }
-    }
-
     /// The bytes the devices would lock when checkpoint place `place` is
     /// used next: the chunks it lies in that are not locked now, on every
     /// device part. 0 for a place whose memory is there, and for books
-    /// whose places nobody books when they are first used.
+    /// whose places nobody books when they are first used (no
+    /// [`PinnedRam::place_chunks`]).
     pub(crate) fn place_lock(&self, place: u32) -> u64 {
         self.places_lock(&[place])
     }
@@ -771,18 +756,6 @@ impl PinnedRam {
     /// the chunks they lie in that are not locked now, each once however many
     /// of the places lie in it, on every device part.
     pub(crate) fn places_lock(&self, places: &[u32]) -> u64 {
-        if let Some((bytes, held)) =
-            &*self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner())
-        {
-            let mut new: Vec<u32> = places
-                .iter()
-                .copied()
-                .filter(|place| !held.get(*place as usize).copied().unwrap_or(false))
-                .collect();
-            new.sort_unstable();
-            new.dedup();
-            return new.len() as u64 * *bytes;
-        }
         let tables: Vec<Arc<PlaceChunks>> = {
             let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
             all.iter().filter_map(Weak::upgrade).collect()
@@ -1123,8 +1096,15 @@ impl Drop for ExpertPiece {
 /// the chunk, once its memory is freed (where no step runs).
 pub struct LockedChunk {
     /// Both `Some` until the chunk is dropped.
-    buffer: Option<PinnedBuffer>,
+    memory: Option<ChunkMemory>,
     booking: Option<Booking>,
+}
+
+/// The memory of a [`LockedChunk`].
+enum ChunkMemory {
+    Locked(PinnedBuffer),
+    /// Ordinary memory of an executor without devices, and its length.
+    Plain(Aligned, usize),
 }
 
 impl std::fmt::Debug for LockedChunk {
@@ -1134,26 +1114,37 @@ impl std::fmt::Debug for LockedChunk {
 }
 
 impl LockedChunk {
-    fn buffer(&self) -> &PinnedBuffer {
-        self.buffer.as_ref().expect("a chunk holds its buffer until it is dropped")
+    fn memory(&self) -> &ChunkMemory {
+        self.memory.as_ref().expect("a chunk holds its memory until it is dropped")
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.buffer.as_mut().expect("a chunk holds its buffer until it is dropped").as_mut_ptr()
+        match self.memory.as_mut().expect("a chunk holds its memory until it is dropped") {
+            ChunkMemory::Locked(buffer) => buffer.as_mut_ptr(),
+            ChunkMemory::Plain(buffer, _) => buffer.as_mut_ptr(),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.buffer().len()
+        match self.memory() {
+            ChunkMemory::Locked(buffer) => buffer.len(),
+            ChunkMemory::Plain(_, len) => *len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer().is_empty()
+        self.len() == 0
     }
 }
 
 impl Drop for LockedChunk {
     fn drop(&mut self) {
-        ares_cuda::gate::retire((self.buffer.take(), self.booking.take()));
+        let booking = self.booking.take();
+        match self.memory.take() {
+            // Freed, then unbooked, where no step runs.
+            Some(ChunkMemory::Locked(buffer)) => ares_cuda::gate::retire((Some(buffer), booking)),
+            Some(ChunkMemory::Plain(..)) | None => drop(booking),
+        }
     }
 }
 
@@ -1220,7 +1211,8 @@ impl Drop for CacheBuffer {
 #[derive(Debug)]
 pub struct PlaceChunks {
     ram: PinnedRam,
-    device: Device,
+    /// `None` for an executor without devices.
+    device: Option<Device>,
     /// The bytes of one place.
     bytes: usize,
     capacity: u32,
@@ -1277,8 +1269,9 @@ impl PlaceChunks {
         }
         let fresh = chunks[index].is_none();
         if fresh {
-            chunks[index] =
-                Some(self.ram.lock_checkpoints(&self.device, places as usize * self.bytes)?);
+            chunks[index] = Some(
+                self.ram.lock_checkpoints(self.device.as_ref(), places as usize * self.bytes)?,
+            );
         }
         let chunk = chunks[index].as_mut().expect("locked above");
         let within = (place - first) as usize * self.bytes;
@@ -1343,6 +1336,36 @@ mod tests {
         ram.release_checkpoints(40 * MIB);
         ram.book_experts(90 * MIB).unwrap();
         assert!(ram.book_checkpoints(20 * MIB).is_err());
+    }
+
+    #[test]
+    fn places_without_a_device_are_booked_a_chunk_at_a_time_and_kept_until_the_sweep() {
+        let ram = PinnedRam::new(100 * MIB);
+        // Places of 1 MiB, four to a chunk after the first, which holds place
+        // 0 alone, as the host executor has them.
+        let places = ram.place_chunks(None, MIB, 9, 4 * MIB as usize);
+        assert_eq!(ram.places_lock(&[0, 1, 2]), 5 * MIB);
+        assert!(places.pointer(0).unwrap().1, "the first copy locks the chunk");
+        assert!(places.pointer(2).unwrap().1);
+        assert!(!places.pointer(3).unwrap().1, "a place of a locked chunk takes nothing");
+        assert_eq!((ram.checkpoints(), places.locked()), (5 * MIB, 5 * MIB));
+        // Places 3 and 4 lie in a chunk that is there, 5 in one that is not.
+        assert_eq!(ram.places_lock(&[3, 4, 5]), 4 * MIB);
+        assert!(places.held(5).is_none());
+
+        // A place the conductor calls unused keeps its chunk while the prompt
+        // cache is within its allowance; the sweep gives back only chunks
+        // in which no place is in use.
+        ram.place_live(0, false);
+        ram.place_live(2, true);
+        assert_eq!(ram.sweep_checkpoints(), 0);
+        ram.want_experts(GIB, 0);
+        assert_eq!(ram.sweep_checkpoints(), MIB);
+        assert_eq!((ram.checkpoints(), places.locked()), (4 * MIB, 4 * MIB));
+        assert!(places.held(0).is_none() && places.held(2).is_some());
+        // Its next copy books the chunk again, where the limit has room.
+        assert!(places.pointer(0).unwrap().1);
+        assert_eq!(ram.checkpoints(), 5 * MIB);
     }
 
     #[test]

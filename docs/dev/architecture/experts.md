@@ -111,6 +111,20 @@ beside the CPU where that is sooner:
 - *At the start and while nothing runs* the fill makes VRAM the hottest of every layer
   without that margin (see the usage profile above): no step waits then.
 
+**Where the CPU workers run** (`expert_store/cpu/pool.rs`, `Placement::for_machine`). The
+store's CPU workers are bound one to a core: to the first thread of every performance core but
+those of the threads that drive the step (the conductor and one per device, which spin through
+a step), and to every efficiency core. A worker spins between the jobs of a step (20 ms before
+it sleeps), so through a step every core with a worker is busy. The second threads of the
+performance cores get none; on a CPU that has them, the I/O threads run there. On a CPU with
+one thread per core one core more is left free, an efficiency core where there are any (the
+cheapest a worker gives up), and the I/O threads of the expert store's reader and of the n-gram
+table's rows are bound to the cores without a worker (`ares_io::Reader::run_on`). Without it,
+on the test machine's Core Ultra 5 235HX (6 performance and 8 efficiency cores, one thread
+each), the I/O thread waited 0.2 ms for a core each time a completion woke it, a tenth of the
+time, and an expert's reads in decode took 3.6 to 5 ms against the drive's 2.0
+([`ssd-decode-profile.md`](../experiments/ssd-decode-profile.md), 2026-11-27).
+
 **Reading experts ahead of their router.** A pick that no tier holds is read from the file
 when its layer's record reaches the host, and the layer waits for it. The routers of the
 next layers applied to the rows the router of this layer reads name most of what those
@@ -155,6 +169,15 @@ runs), so their reads can start a layer or two before their records
   halved beyond 512, so they follow the text and the tiers): then a read for nothing costs
   the drive no more than the reads that are used save. Where the tiers hold little (one
   card, a small RAM tier, a larger file) more places qualify.
+- *Predicted only where a read may come of it* (`ExpertStore::ahead_depth`,
+  `Board::ahead_depth`). The routers of the predictions cost the device as much as a dense
+  layer's products, 1.7 ms a step of Flash-Next UD-Q4_K_XL on the RTX 4060 Ti, also in steps
+  whose kind has no place worth a read, where they only count. So each step of the decode
+  kernels predicts only as many layers ahead as a place of its kind (one row or several) and
+  distance qualifies, and every eighth step of a kind that would predict less predicts as far
+  as the parts can, so that the counts go on and a place that comes to be worth a read is
+  found. What the model computes does not change: a list of a step that made none carries
+  another step's token and is ignored.
 - *Bounds from the drive and the step.* At most as many experts on their way ahead as the
   drives take of prefetches at once (`Reader::prefetch_room`: four chunks of 512 KiB per
   drive, two experts of Flash-Next), and per step at most what the drive could read in the
@@ -224,7 +247,13 @@ runs), so their reads can start a layer or two before their records
 - *Counted* (`StoreStats`, `/metrics`): experts predicted and of them those picked
   (`ares_expert_predicted_total`, `ares_expert_predicted_picked_total`), reads ahead and
   their bytes, those the record picked and those it did not (`ares_expert_ahead_*`, the
-  wide steps' guesses included).
+  wide steps' guesses included). A layer's wait for its misses in a step of up to eight
+  rows (from its record to the last miss in a slot or delivered) is also counted by what
+  came last (`StoreStats::wait_last_ms`, `ares_expert_wait_{cpu,ram,file,on_its_way}_microseconds_total`):
+  the CPU's sums of experts in RAM, an upload from RAM, an expert read from the file
+  (uploaded, or computed by the CPU once its bytes landed), one on its way already; so a
+  profile of decode says which source the device waited for (`qwen4exp_run`'s `waits`
+  line).
 
 **Pruning as a fourth level** (`device/prune.rs`, `ExpertKernels::route_pruned`,
 `kernels/expert_router.cuh`). Next to VRAM, RAM and the file, a pick may also be
