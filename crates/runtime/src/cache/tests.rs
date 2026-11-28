@@ -704,6 +704,72 @@ fn the_saves_of_a_step_whose_room_was_taken_are_given_up_before_it_runs() {
 }
 
 #[test]
+fn far_pages_beyond_the_floor_leave_the_floor_its_place() {
+    // The floor keeps the far pages of one request (six here) and one place. A seventh far
+    // page, which the allowance does not count, was counted against that place (#98,
+    // 2026-11-28): while the cache held less than its allowance nothing made the far page go,
+    // the budget held no checkpoint at all, and a run that came back from the drive for a
+    // request that waited found no place for its checkpoint, again and again.
+    let mut f = Following::with("beyond", true, STATE + RESERVE * PAGE);
+    f.cache.far = Some(FarPages { first: 3, page_bytes: PAGE });
+    f.cache.far_keep = 6 * PAGE;
+    f.ram.keep_context_cached(6 * PAGE);
+    f.machine.has(0);
+    f.cache.far_held = 7 * PAGE;
+    f.ram.set_context_cached(7 * PAGE);
+    assert!(f.cache.held() + STATE > f.cache.allowance(), "the place needs the far page's room");
+    assert!(f.cache.held() < f.cache.allowance(), "so the cache's trim does not make it go");
+    let hashes = f.hashes.clone();
+    assert!(f.cache.save(0, hashes[2], Owner(1), false).taken, "the floor's place is there");
+}
+
+#[test]
+fn a_run_whose_import_was_cut_is_not_asked_for_by_the_next_look() {
+    // A text with its checkpoint goes to the drive and leaves RAM.
+    let mut f = Following::new("cut");
+    let mut devices = Devices::default();
+    let hashes = f.hashes.clone();
+    assert!(f.cache.save(0, hashes[2], Owner(1), false).taken);
+    written(&mut f.cache);
+    for i in 1..10 {
+        f.text(i);
+    }
+    f.all_into_ram(&mut devices);
+    f.machine.has(0);
+    for _ in 0..3 {
+        f.trimmed(&mut devices);
+        f.written();
+        f.pumped(&mut devices);
+    }
+    assert!(f.cache.in_ram.as_ref().is_some_and(|ram| ram.get(hashes[0]).is_none()));
+    assert!(f.cache.ssd_counters().states_written > 0);
+
+    // It comes back into a pool with no page to give: the import is cut.
+    let tokens: Vec<u64> = (0..13).collect();
+    let chain = f.cache.chain(&tokens);
+    let mut pool = PagePool::new(1, PER_PAGE);
+    let mut busy = Sequence::new();
+    busy.append(&mut pool, u64::from(PER_PAGE)).unwrap();
+    let probe = f.cache.probe(&mut pool, Some(&mut devices), &chain, &tokens);
+    assert!(probe.found.computing.is_some(), "the run is brought back");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while f.cache.ssd_counters().imports_cut == 0 {
+        assert!(std::time::Instant::now() < deadline, "the import neither came nor was cut");
+        f.cache.pump(&mut pool, &mut devices);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The prompt that waited for it looks again: it goes on with what the cache has, and
+    // does not wait for the same import again (#98: it waited again and again, and never
+    // started). A later look asks the drive again.
+    let again = f.cache.probe(&mut pool, Some(&mut devices), &chain, &tokens);
+    assert!(again.found.computing.is_none(), "asked for again at once");
+    let later = f.cache.probe(&mut pool, Some(&mut devices), &chain, &tokens);
+    assert!(later.found.computing.is_some());
+    assert_eq!(f.cache.ssd_counters().imports, 2);
+    busy.release(&mut pool);
+}
+
+#[test]
 fn the_coldest_of_a_full_ram_is_written_ahead_and_the_rest_waits() {
     // Room for the floor and four pages more: RAM writes what is beyond
     // room for its reserve of sixteen pages.

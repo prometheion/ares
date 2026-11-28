@@ -515,13 +515,16 @@ impl Cache {
     }
 
     /// The policy with the budget the checkpoints have now: what the books
-    /// allow but the floor of pages and the far pages the cache holds on the
-    /// devices (the floor keeps them: they are no room for a place), and never
+    /// allow but the floor of pages and the far pages of the floor (as many as
+    /// one request holds beyond VRAM: they are no room for a place), and never
     /// more than the budget the places were counted for. Pages in RAM above
-    /// their floor make room for checkpoints, not the other way round.
+    /// their floor make room for checkpoints, not the other way round, and so
+    /// do the far pages beyond the floor's: the allowance does not count them,
+    /// and until 2026-11-28 they took the place of the floor while the cache
+    /// held less than its allowance, so that nothing made them go (#98).
     fn policy_now(&self) -> CheckpointPolicy {
-        let allowed =
-            self.allowance().saturating_sub(self.page_floor).saturating_sub(self.far_held);
+        let far = self.far_held.min(self.far_keep);
+        let allowed = self.allowance().saturating_sub(self.page_floor).saturating_sub(far);
         CheckpointPolicy { budget_bytes: self.policy.budget_bytes.min(allowed), ..self.policy }
     }
 

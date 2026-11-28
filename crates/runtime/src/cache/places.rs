@@ -24,6 +24,31 @@ impl Cache {
         (place, dropped)
     }
 
+    /// The place for the checkpoint of a run that comes back from the drive
+    /// for a request that waits for it ([`Cache::new_place`]). When there is
+    /// none, what RAM holds goes for it, the first to go first and without a
+    /// write (pages only RAM holds among them): the request that waits
+    /// outranks texts that may come again, and the prompt cache gives way by
+    /// dropping, never by writing while a request waits. `None` when RAM has
+    /// nothing more to give.
+    pub(super) fn import_place(&mut self) -> (Option<u32>, u32) {
+        let mut dropped = 0;
+        loop {
+            let (place, more) = self.new_place();
+            dropped += more;
+            if place.is_some() {
+                return (place, dropped);
+            }
+            let next = (self.in_ram.as_ref())
+                .and_then(|ram| ram.in_order().into_iter().find(|hash| ram.ready(*hash)));
+            let Some(hash) = next else { return (None, dropped) };
+            dropped += self.ram_give_up(Item::Page, hash);
+            if self.in_ram.as_ref().is_some_and(|ram| ram.get(hash).is_some()) {
+                return (None, dropped);
+            }
+        }
+    }
+
     /// Gives checkpoints up until the index and RAM hold one fewer than the
     /// budget allows, those of pages that left the devices before those of the
     /// index; returns how many went.
