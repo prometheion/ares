@@ -55,7 +55,7 @@ ARES_KERNEL ares_attn_append(
 template <class Src>
 static __device__ void convert_side(
     const Src& src, int rows, int D, int fmt, int use_mean, uint8_t* mean_out, uint8_t* rows_out,
-    float* mean_s, uint32_t* status) {
+    float* mean_s, uint32_t* status, int row_begin, int row_end) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = blockDim.x >> 5;
     const int groups = D / 32, gb = fmt_group_bytes(fmt);
     const int rb = groups * gb;
@@ -63,20 +63,36 @@ static __device__ void convert_side(
     if (mean) {
         for (int g = warp; g < groups; g += nwarps) {
             float sum = 0.0f;
-            for (int i = 0; i < rows; ++i) {
+            // The loads of 8 rows ahead of their sums: one load at a time waited for
+            // memory 128 times (a tile's mean took most of the 65 us of a conversion
+            // spread over the device, RTX 3060). The sum is in the order of the rows.
+            int i = 0;
+            for (; i + 8 <= rows; i += 8) {
+                float v[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) v[u] = src.at(i + u, g * 32 + lane);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) sum = __fadd_rn(sum, rotate32(v[u], lane));
+            }
+            for (; i < rows; ++i) {
                 const float v = src.at(i, g * 32 + lane);
                 const float r = rotate32(v, lane);
                 sum = __fadd_rn(sum, r);
             }
             const float m = fminf(fmaxf(__fdiv_rn(sum, (float)rows), -65504.0f), 65504.0f);
             const unsigned bits = f2h_bits(m);
-            *reinterpret_cast<unsigned short*>(mean_out + 2 * (g * 32 + lane)) = (unsigned short)bits;
+            // Every block of a tile computes the mean; the one of its first rows stores it.
+            if (row_begin == 0) {
+                *reinterpret_cast<unsigned short*>(mean_out + 2 * (g * 32 + lane)) = (unsigned short)bits;
+            }
             mean_s[g * 32 + lane] = h2f_bits(bits);
         }
         __syncthreads();
     }
-    for (int i = warp; i < rows; i += nwarps) {
-        for (int g = 0; g < groups; ++g) {
+    // The (row, group) pairs of the block's rows, a pair a warp at a time.
+    for (int pair = warp; pair < (row_end - row_begin) * groups; pair += nwarps) {
+        {
+            const int i = row_begin + pair / groups, g = pair % groups;
             const float v = src.at(i, g * 32 + lane);
             uint8_t* dst = rows_out + (size_t)i * rb + g * gb;
             if (fmt == FMT_F16) {
@@ -105,8 +121,13 @@ struct F32Src {
 };
 
 // Converts exact entries into converted ones. jobs: pairs (exact slot, converted
-// slot, with ATTN_FAR_BIT for one in the far pool). Grid (n_jobs, H, 2): z = 0 is K,
-// 1 is V. Block 256.
+// slot, with ATTN_FAR_BIT for one in the far pool). Grid (n_jobs, H, 2 * S): z % 2 = 0 is
+// K, 1 is V, and z / 2 the slice of the tile's rows the block encodes (rows
+// [128 s / S, 128 (s + 1) / S)), S a divisor of 128. Block 256. A group of 32 values of a
+// row is encoded by one warp, a search of up to 33 scales (q4): a tile's 128 rows in one block
+// took 0.42 ms on an RTX 4070 and 0.59 ms on an RTX 3060 for the 4 to 6 blocks of one tile of
+// the 27B's heads on a device, which the step that crosses a tile's edge waits for in every
+// attention layer. Each block computes the tile's mean (the same sums, in the same order).
 ARES_KERNEL ares_attn_convert(
     const uint32_t* jobs, const uint8_t* exact_pool, uint8_t* conv_pool, uint8_t* far_pool,
     uint64_t cfg, uint32_t* status) {
@@ -114,15 +135,17 @@ ARES_KERNEL ares_attn_convert(
     const AttnGeo g = attn_geo(cfg);
     const size_t from = jobs[2 * blockIdx.x];
     const uint32_t to = jobs[2 * blockIdx.x + 1];
-    const int h = blockIdx.y, side = blockIdx.z;
+    const int h = blockIdx.y, side = (int)(blockIdx.z & 1);
     const uint8_t* e = exact_pool + from * g.entry_e + (size_t)h * g.head_e +
                        (size_t)side * ATTN_TILE_CELLS * 2 * g.D;
     uint8_t* head = conv_entry(conv_pool, far_pool, to, g.entry_c) + (size_t)h * g.head_c;
     const int fmt = side == 0 ? g.kf : g.vf;
     ExactSrc src{reinterpret_cast<const unsigned short*>(e), g.D};
+    const int slices = (int)(gridDim.z >> 1), slice = (int)(blockIdx.z >> 1);
     convert_side(
         src, ATTN_TILE_CELLS, g.D, fmt, 1, head + (side == 0 ? 0 : g.v_mean_off),
-        head + (side == 0 ? g.k_rows_off : g.v_rows_off), mean_s, status);
+        head + (side == 0 ? g.k_rows_off : g.v_rows_off), mean_s, status,
+        ATTN_TILE_CELLS * slice / slices, ATTN_TILE_CELLS * (slice + 1) / slices);
 }
 
 // The codec on f32 input, for tests: encodes `rows` rows of D values as one tile
@@ -133,5 +156,5 @@ ARES_KERNEL ares_attn_encode_tile_f32(
     uint8_t* mean_out, uint8_t* rows_out, uint32_t* status) {
     extern __shared__ float mean_s[];
     F32Src s{src, (int)D};
-    convert_side(s, (int)rows, (int)D, (int)fmt, (int)use_mean, mean_out, rows_out, mean_s, status);
+    convert_side(s, (int)rows, (int)D, (int)fmt, (int)use_mean, mean_out, rows_out, mean_s, status, 0, (int)rows);
 }

@@ -1120,6 +1120,18 @@ RTX 4070 / RTX 3060:
 | `q4` / `q4` | 49 / 92 µs | 0.23 / 0.51 ms | 2.11 / 3.62 ms | 3.47 / 6.08 ms | 2.41 / 5.22 ms |
 | `f16` / `f16` | 54 / 97 µs | 0.36 / 0.53 ms | 2.76 / 3.98 ms | 3.44 / 5.84 ms | 2.43 / 5.26 ms |
 
+*Converting a tile* (`AttentionKernels::convert`, `ares_attn_convert`): a block encodes
+its rows a group of 32 values a warp (the scale search of `q7` to `q4`), and each tile
+is cut into as many slices of rows, a block each, as fill the device
+(`convert_slices`, by the occupancy of the kernel: one block a tile in a prompt step,
+which converts tiles enough, up to 128 for the one tile of a decode step); every block
+computes the tile's mean, with the loads of 8 rows ahead of the sums. It was one block
+a tile's K or V, 4 to 6 for a tile of the 27B on a device, and took 0.42 ms on the RTX
+4070 and 0.59 ms on the RTX 3060 in every attention layer of a step at a tile's edge,
+which a window of R rows of drafts meets in R - 1 of 128 steps; now 31 and 51 us (the
+same bytes: the golden files and `KvHead`). Measured 2026-11-28 in a trace of the 27B's
+windows of 16 rows.
+
 At 262144 cells `f16` reads at 77 % of the memory limit, `q8` at 52 % and
 `q4` at 29 %: the quantized formats are bound by the work of decoding, not
 by memory, so they are not yet faster than `f16` although they read a half
