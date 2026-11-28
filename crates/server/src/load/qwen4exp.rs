@@ -19,6 +19,7 @@ mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use ares_core::units::Bytes;
@@ -77,11 +78,13 @@ const DRAFT_WINDOW: u32 = 4;
 const TRIAL_CONTEXT: u32 = 8192;
 
 /// Loads the model of `options`, whose file `gguf` is open, at `site`, and
-/// starts the runtime over it; `begun` is when the load began.
+/// starts the runtime over it; `begun` is when the load began. Once `stop` is
+/// set (the server stops) the tiers of experts are filled no further.
 pub(super) fn load(
     gguf: Gguf,
     options: &LoadOptions,
     site: &Site,
+    stop: &Arc<AtomicBool>,
     begun: Instant,
 ) -> Result<Loaded, LoadError> {
     let config = Config::from_gguf(&gguf).map_err(model_error)?;
@@ -185,7 +188,8 @@ pub(super) fn load(
     let (chat, template) = chat_options(options, &tokenizer)?;
     let model = Qwen4Exp::new(gguf, tokenizer, name.clone(), &devices, opts, longest)
         .map_err(model_error)?
-        .with_chat_options(chat);
+        .with_chat_options(chat)
+        .with_stop(stop.clone());
     let (window, drafts) = (asked.window, asked.drafts());
     let model = Arc::new(asked.attach(model, options, &held, tower_at)?);
 
@@ -217,7 +221,7 @@ pub(super) fn load(
     let runtime = start::start(&model, devices, options, site, &budget, engine, template, begun)?;
     log_steps_taken(&model, own_rows, max_rows, pass_rows);
     log_started(&runtime, budget.ssd.as_ref(), &model.drafters());
-    fill_tiers(&runtime, &model, &name)?;
+    fill_tiers(&runtime, &model, &name, stop)?;
     // The warm-up measured the prices of steps while the tiers were cold, which makes every
     // window dear (one row 30.9 ms, two rows 114.8 ms on two cards, 2026-11-27): they are tried
     // again from the first steps on, on the filled tiers.
