@@ -253,7 +253,8 @@ impl HostSlots {
     fn down_touching(&self, pool: usize, at: usize, len: usize) -> Option<u64> {
         self.down
             .iter()
-            .filter(|(_, op)| match op {
+            .rev()
+            .find(|(_, op)| match op {
                 HostOp::Download { pool: p, at: a, len: l, .. } => {
                     *p == pool && *a < at + len && a + l > at
                 }
@@ -264,7 +265,6 @@ impl HostSlots {
                 _ => false,
             })
             .map(|(id, _)| *id)
-            .last()
     }
 }
 
