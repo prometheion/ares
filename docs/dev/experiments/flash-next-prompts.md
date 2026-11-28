@@ -286,7 +286,8 @@ CPU's share tips.
 (load 34), 0 of 192 (load 30 to 40; 64 each with the misses served as measured, by the CPU and
 uploaded), 0 of 96 (load 0.1 to 0.6, measured and CPU); on main 29c277e0 0 of 192 (load 34 to
 58), 3 of 250 with a read of every wide layer behind a wait for the device (load 34 to 48), 2 of
-400 with no wait (load 23 to 28). With every miss uploaded never. In those runs the CPU computed
+400 with no wait (load 23 to 28); on main 372763fb 2 of 400 (load 3 to 5). With every miss
+uploaded never. In those runs the CPU computed
 1 to 101 (row, expert) pairs of the lent steps (30 to 170 experts by the store's count with the
 token after); when the item was found (main 2340ca0 8 of 12 runs, acb2587 6 of 8) it computed
 230 to 450 experts of the prompt.
@@ -335,7 +336,7 @@ arithmetic is the decode steps' by design (int8 rows). The test
 instead (16 first by 1.06 logits over 70; none of its 51 router decisions below 0.01 turns the token in
 the reference, nor do int8 rows on half the pairs in 40 seeds) on lent steps, the CPU taking
 every miss it can and as the costs say, six fresh engines each, in every placement: 3 rounds of
-36 runs gave the reference's token (load 1 to 2; 354 to 1936 experts on the CPU per placement and
-mode). The debug code of this search (the reads, the checks, the forced split, the reference's
+36 runs on main 29c277e0 and 3 on 372763fb gave the reference's token (load 1 to 2.7; 323 to
+1943 experts on the CPU per placement and mode). The debug code of this search (the reads, the checks, the forced split, the reference's
 injected int8 rows and turned decisions) is not in the tree; `fix/lent-cpu-share`'s notes say
 where it was kept.
