@@ -107,7 +107,8 @@ of the RTX 3060 at one row. The products of the 27B's shapes at 16 rows took 7 t
 27 % less (RTX 3060) and 7 to 22 % less (RTX 4070, the head as before), at 1 and 8
 rows the same within 1 %; measuring the second launch adds 0.9 s (RTX 4070, 66
 shapes) and 0.5 s (RTX 3060, 59) to the chooser's probes, inside the 5.6 to 5.8 s a
-load of the 27B took before and after. 0.04 %
+load of the 27B took before and after. Measurements and the profile of whole steps:
+[`experiments/kernel-profile.md`](../experiments/kernel-profile.md). 0.04 %
 rms from the exact f32 product, as before (the f16 operands). Against the
 integer decode kernels of the file's layout, one row, in the model's probes
 (cold address translations, 59 shapes per card), the sum over the matrices of
