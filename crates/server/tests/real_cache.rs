@@ -296,7 +296,9 @@ fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
     let name = name_of(&model);
     // About 8k tokens of facts; a context that holds two such conversations.
     let lines = 660;
-    let flags = ["--devices", "0,1", "--ram", "8G", "--context", "20480", "--parallel", "2"];
+    // The devices as `real_flash_next` takes them: `ARES_TEST_DEVICES`, else both cards.
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    let flags = ["--devices", &devices, "--ram", "8G", "--context", "20480", "--parallel", "2"];
     let with_cache: Vec<&str> = flags.iter().copied().chain(["--cache", &cache]).collect();
     let first = format!("{}{}", facts(1, lines), question(7));
     let report = |what: &str, said: &Said| {
