@@ -70,6 +70,12 @@ What is left out is decided from the devices and the model, and the log says how
 | `--parallel <N>` | Sequences that run at once. Each takes VRAM for its recurrent state; further requests wait. At least 1; Flash-Next at most 8. | `4` |
 | `--kv <FORMAT>` | Storage format of K and V: `f16`, `q8`, `q7`, `q6`, `q5` or `q4`, or two names `K,V` such as `q8,f16`. See [models.md](models.md). | `q8` |
 
+## Device memory
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--vram <SIZE>` | Server option. The most VRAM the engine may hold on a device, all loaded models together and everything the driver counts for the process there (its context and the kernels' code too, what `nvidia-smi` shows): one size for every device it uses (`10G`), or a size for each device by the driver's number (`0:10G,1:11G`; a device not named has no cap). Every plan keeps under it: weights, K and V, the expert slots of Flash-Next, step buffers, drafters and the image tower; the shares of a split and the context follow from what is left. A device with a cap keeps no reserve. A size of 0, a device the driver does not report or that `--devices` leaves out, a device named twice and a size above what a device has are errors. Needs NVML (`libnvidia-ml.so.1`, part of the NVIDIA driver). | no cap. A device that drives a display, or on which other programs hold memory, keeps a reserve for them (see [hardware.md](hardware.md#vram)) |
+
 ## Host memory
 
 | Option | Meaning | Default |

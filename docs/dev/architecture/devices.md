@@ -418,3 +418,131 @@ for context or slots, which the attention heads (27B) and the expert slots
 pays only with a pipeline that drafts the next window there while the first
 card verifies this one (Strata's `--pipeline-windows`), which Ares does not
 have.
+
+### VRAM
+
+A load plans what it takes of a device against what the device has free when
+it is planned. Until 2026-11-28 that was the free memory less 256 MiB, and a
+tester's display showed artifacts while Ares ran: the card was used to its
+end and the desktop had no room left (GitHub issue #36). Now the server sets
+what the engine leaves on every device it opens (`ares_cuda::vram`,
+`load/vram.rs`), before anything is planned there, and every plan asks
+`Device::room` instead of the driver's free memory: the server's choice of
+devices, split, shares and context, Flash-Next's placement (`placement.rs`,
+which sizes the expert slots from what is left), the runtime's ledger of each
+device (`gpu.rs`, which every reservation of a part goes through: weights, K
+and V, recurrent state, step buffers, drafters, the image tower, the slots)
+and the probes of the weight layouts (`choose.rs`). The 256 MiB for the
+driver beside the engine's buffers stay on top.
+
+**The cap** (`--vram 10G`, or `--vram 0:10G,1:11G` by the driver's
+ordinals) is the server's, for all loaded models together, and counts what
+the driver counts for the process on the device: NVML's memory of the
+process (`nvmlDeviceGetComputeRunningProcesses_v3`), the number `nvidia-smi`
+shows, which includes the context and the kernels' code that no allocation of
+the engine names (154 MiB for a bare context on the RTX 4070). The room under
+a cap is the free memory, and no more than the cap less what the process
+holds there now, so a second model planned beside a first one sees what the
+first took. A cap replaces the reserve on its device: the operator decided
+what is left. Without NVML a cap is refused, since nothing else counts the
+context. A value that cannot be is refused when the server starts: 0, a device
+the driver does not report or that `--devices` leaves out, one named twice, a
+size above what NVML says the card has (12 282 MiB for the RTX 4070, the
+driver's own 326 MiB included).
+
+**The reserve** (`ares_cuda::vram::reserve`) is what a device without a cap
+keeps free for other programs, decided from its state when a model is placed:
+
+- *A device that drives a display*: NVML says a display is active on it
+  (`nvmlDeviceGetDisplayActive`, or `nvmlDeviceGetDisplayMode`, which newer
+  drivers no longer answer), or Linux's DRM lists a connected connector of the
+  card (`/sys/class/drm/card<N>-<connector>/status`, the card found by its PCI
+  address). It keeps a sixteenth of the device's memory, or 32 frames of its
+  displays, whichever is more: a frame is four bytes a pixel of the display's
+  preferred mode (the first line of its `modes`; the mode in use is not in
+  sysfs). A compositor keeps three frames of every display it drives (one
+  shown, one drawn, one queued) and every window draws into two or three
+  buffers of its own, so 32 frames hold windows that cover the screen ten
+  times over; the sixteenth is what a display keeps whose size nothing says,
+  and the share the RAM watch's headroom has at most of the machine's RAM.
+  With 1080p on a 12 GiB card that is 747 MiB (the sixteenth), with 4K on an
+  8 GiB card 1012 MiB (the frames).
+- *A device on which other processes hold memory* (NVML's lists, every
+  process but this one): as much as they hold, at most a sixteenth. A program
+  that allocates on a card grows by what it has, or stays.
+
+The two are not added: a desktop's programs are the other processes. The log
+of the load says for every device what is left, why, and what a plan may
+take. On the development machine neither card drives a display (all eight
+connectors disconnected, NVML's display inactive) and nothing else holds
+memory there between runs, so the reserve is 0 and the plans are what they
+were.
+
+**The watch** (`ares_runtime::vram::VramWatch`, one per process). A program
+on the card may grow after the load: a compositor, a browser, another
+engine. The driver takes no device memory back from anyone, so a program that
+finds the card full fails. The watch looks at every device a loaded model uses
+through NVML, which needs no context and costs about 20 microseconds a call:
+every 50 ms, every 5 ms while memory is being given back. It keeps the RAM
+watch's rule (`Rule`, `Follow`; see "Host memory"), with the device's numbers:
+
+- *The headroom* is the reserve the device's state asks for at this look
+  (none under a cap), plus the fastest growth of the others seen (what is free
+  and what the process holds, over the last four looks) times the time the
+  engine takes to react. Nothing is assumed of the growth until one is seen,
+  and the part above the reserve is at most a sixteenth of the device.
+- *Giving back*: when less than the headroom is free, the elastic users of the
+  device together may hold that much less, at once.
+- *Taking*: when more than the headroom and a band (two pieces, or a quarter
+  of the headroom) has been free for 3 s, doubled for every give soon after a
+  take up to 5 minutes, they may hold the surplus; under a cap never more than
+  the cap leaves.
+
+**What gives way.** The slots of Flash-Next's tier of experts in VRAM, and
+nothing else. A pool of slots lies in one range of device addresses whose
+memory is in pieces of 64 MiB (`ares_cuda::DeviceRegion`: `cuMemAddressReserve`
+once, `cuMemCreate` and `cuMemMap` for every piece, `cuMemSetAccess` for the
+device and the peers that write into lent memory): a kernel finds a slot at
+the pool's address plus its number times its size, so the range stays and only
+the memory behind a piece goes. The tier gives the pieces at the low end of a
+pool first (`expert_store/vram.rs`), between steps: every layer of the pool
+gives slots in proportion to what it has above its floor, each its coldest,
+the experts that lie in the piece and stay move on the device into the slots
+given, and the memory goes back to the driver once the device has done the
+moves and the copies down of what was evicted, where no job runs
+(`gate::retire`). The numbers of the slots without memory stay set aside
+until the memory comes back; then they come back empty and fill as empty
+slots do. That is the bookkeeping of a loan of VRAM to a wide step's scratch
+(`Tier::vacate`, `ExpertStore::vacate_on_device`). A move writes its expert's
+table entry on the stream of copies out of slots, and every vacate ends with
+the stream of uploads waiting for that stream (`SlotDevice::order`): an
+eviction of the same expert from the next piece given at the same end of a
+step would otherwise overtake the move's entry, which then names a slot that
+holds another expert or has no memory (seen on the local cards as an illegal
+address and as steps that stood still, `experiments/vram.md`). The two keep
+apart:
+a loan takes the last slots of a pool, and the slots that the steps on lent
+VRAM were sized for at load (the lent steps' pieces, and a pass of the most
+rows laid out without cuts, with a piece more for the cuts) never go
+(`ExpertStore::keep_for_loans`); a pool lends no more than the slots at its
+end that have memory. A drafter's experts, which every link of a chain needs,
+are a pool of their own that never gives way. The tier gives at the end of a
+step once nothing is on its way into or out of the device's slots (reads from
+the file may run: they take a slot only when they have landed), also beside a
+loan that is made, and while nothing runs on the watch's thread; it takes a
+piece before each step that is not drafts only, and while nothing runs for
+40 ms at a time. A program that grows therefore waits at most for the step
+that runs: tens of milliseconds while a model decodes, but the whole of a step
+of a long prompt read layer by layer (up to 32 768 rows; on the local cards 43
+s of a prompt of 33 426 tokens passed before the tier gave), since a slot is
+not taken from under a step that may read it.
+
+**What never gives way**: the weights, the K and V of sequences, the
+recurrent state, the step buffers, the drafters and the image tower: what the
+model runs on. The pages of the prompt cache in the device pool do not give
+way either: the pool is one planned reservation whose pages lie anywhere in
+it, so giving its memory back would need the pool in pieces and the pages
+moved out of them, which is not built. Measurements: [`../experiments/vram.md`](../experiments/vram.md). When less than the headroom is free and
+nothing more can go (a dense model, or the tier at its floor), the watch says
+so in the log, once until memory is free again, and the engine runs on.
+

@@ -20,6 +20,8 @@
 //! - `devices.rs` opens and describes the devices and their links.
 //! - `ram.rs` is the host RAM of both: one limit, what the engine needs to
 //!   run, and the machine it follows (`Budget`).
+//! - `vram.rs` is what the engine leaves on each device: the cap of `--vram`,
+//!   or a reserve for other programs where the device shows the need.
 //! - `start.rs` is the tail both share: the runtime's settings, the start,
 //!   what the engine found when it started.
 
@@ -31,6 +33,7 @@ mod qwen35;
 mod qwen4exp;
 mod ram;
 mod start;
+mod vram;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +47,7 @@ use ares_runtime::Runtime;
 pub(crate) use devices::Held;
 pub(crate) use files::chat_options;
 pub use ram::{follow, machine};
+pub use vram::set_vram_cap;
 
 use crate::models::{LoadFailure, Loader, Site, Unit};
 use crate::plan::LoadOptions;
@@ -158,6 +162,14 @@ impl Loaded {
     pub(crate) fn new(runtime: Runtime, name: String, held: Vec<Held>, ram: u64) -> Self {
         let free_loaded =
             held.iter().map(|h| h.device.mem_info().map_or(h.free, |memory| memory.free)).collect();
+        // While the model is served, the watch over the devices' memory looks
+        // at its devices: the expert slots give way when other programs need
+        // the memory, and the log says when nothing can.
+        let watch = ares_runtime::vram::VramWatch::system();
+        watch.on_log(Arc::new(|line| tracing::warn!("{line}")));
+        for h in &held {
+            watch.hold(h.device.info());
+        }
         Self { runtime: Arc::new(runtime), name, held, ram, free_loaded }
     }
 
@@ -227,12 +239,19 @@ impl Loaded {
                         Bytes(release.taken),
                         Bytes(after.free),
                     );
-                    // Allocation granularity aside, all of it comes back.
-                    if back + 16 * MIB < release.taken {
+                    // Allocation granularity aside, all of it comes back: what the
+                    // process holds is what it held before the load, by NVML's count
+                    // (the expert slots gave and took VRAM while the model ran), or
+                    // by what the device has free without it.
+                    let kept = match (held.own, ares_cuda::device_use(info.pci)) {
+                        (Some(before), Ok(now)) => now.own.saturating_sub(before),
+                        _ => release.taken.saturating_sub(back),
+                    };
+                    if kept > 16 * MIB {
                         tracing::warn!(
                             "device {}: {} of what the model took did not come back",
                             info.ordinal,
-                            Bytes(release.taken - back)
+                            Bytes(kept)
                         );
                     }
                     devices.push(release);
@@ -240,6 +259,10 @@ impl Loaded {
                 (_, Err(error)) => tracing::warn!("device {}: {error}", info.ordinal),
                 (None, _) => {}
             }
+        }
+        let watch = ares_runtime::vram::VramWatch::system();
+        for h in &held {
+            watch.release(h.device.ordinal());
         }
         // These handles go last; a device no other model is on closes with
         // its driver context.

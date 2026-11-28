@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use ares_api::ExpertStats;
 use ares_core::units::Bytes;
 use ares_cuda::{Event, Stream};
+use ares_runtime::vram::{VramHeld, VramUser};
 use ares_runtime::{ModelError, PinnedRam, RecordView};
 
 use super::feed::Feed;
@@ -126,6 +127,13 @@ pub(super) struct Flow {
     /// begins without it would read far pages whose pieces nobody locked.
     pub(super) prepared: AtomicU64,
     pub(super) ram: PinnedRam,
+    /// Per part: its device's ordinal, and the bytes the tier of experts may
+    /// hold of its memory, as the watch over the devices' memory allows
+    /// (`ares_runtime::vram`); `u64::MAX` until it says. What the tier held
+    /// there when someone last looked, for a look that finds the store busy.
+    pub(super) ordinals: Vec<u32>,
+    pub(super) vram_allowed: Vec<AtomicU64>,
+    pub(super) vram_seen: Mutex<Vec<VramHeld>>,
 }
 
 impl Flow {
@@ -177,6 +185,9 @@ impl Flow {
             pages_live: Mutex::new(Vec::new()),
             prepared: AtomicU64::new(0),
             ram,
+            ordinals: Vec::new(),
+            vram_allowed: (0..parts).map(|_| AtomicU64::new(u64::MAX)).collect(),
+            vram_seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -239,6 +250,55 @@ impl Flow {
         }
     }
 
+    /// What the tier of experts holds of every device's memory, by the
+    /// devices' ordinals, read from `feed`.
+    fn vram_of(&self, feed: &Feed) -> Vec<VramHeld> {
+        let held: Vec<VramHeld> = (0..self.ordinals.len())
+            .map(|d| {
+                let (held, most) = feed.store.vram_elastic(d);
+                let at_floor = feed.store.vram_at_floor(d);
+                VramHeld { ordinal: self.ordinals[d], held, most, at_floor }
+            })
+            .collect();
+        *self.vram_seen.lock().unwrap_or_else(|e| e.into_inner()) = held.clone();
+        held
+    }
+
+    /// The tier of experts in VRAM follows what the watch over the devices'
+    /// memory allows: the targets go to the store, and when no step runs the
+    /// tier gives what is above them now and takes pieces for a while, as
+    /// [`Flow::follow_ram`] does; while a step runs, its end gives
+    /// ([`Flow::finish`]) and the conductor takes before the next one
+    /// ([`Flow::before_step`]).
+    fn follow_vram(&self, feed: &mut Feed) {
+        for d in 0..self.vram_allowed.len() {
+            feed.store.set_vram_target(d, self.vram_allowed[d].load(Ordering::Acquire));
+        }
+        if feed.store.in_step() || feed.store.waiting() > 0 {
+            return;
+        }
+        for d in 0..self.vram_allowed.len() {
+            if feed.store.shrink_vram(d, Duration::ZERO).is_err() {
+                self.fail();
+                return;
+            }
+        }
+        let begun = Instant::now();
+        for d in 0..self.vram_allowed.len() {
+            while begun.elapsed() < GROW_SLICE && !feed.store.in_step() {
+                // Only while no step runs, without waiting for one: a step
+                // that begins would wait for the store, which this thread
+                // holds.
+                if !matches!(
+                    ares_cuda::gate::try_change(|| feed.store.grow_vram(d, 1)),
+                    Some(Ok(1))
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+
     /// The step of `record` is about to be handed to the devices (on the
     /// conductor's thread, while no step runs): the far pools lock the
     /// pieces of the far pages the step's tables name and give back the
@@ -275,6 +335,11 @@ impl Flow {
         self.prepared.store(u64::from(record.step()) + 1, Ordering::Release);
         if !record.drafts_only() {
             feed.store.grow_ram(1).map_err(|e| invalid(e.to_string()))?;
+            // A piece of VRAM more when the watch allows it, for each device.
+            for d in 0..self.vram_allowed.len() {
+                feed.store.set_vram_target(d, self.vram_allowed[d].load(Ordering::Acquire));
+                feed.store.grow_vram(d, 1).map_err(|e| invalid(e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -680,6 +745,11 @@ impl Flow {
         if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() {
             let mut feed = self.lock_feed();
             if store {
+                // What the watch over the devices' memory allows now: the end
+                // of the step gives what is above it.
+                for d in 0..self.vram_allowed.len() {
+                    feed.store.set_vram_target(d, self.vram_allowed[d].load(Ordering::Acquire));
+                }
                 feed.end_step()?;
                 // What the tier gave up at the end of this step is unlocked
                 // here, where every device has ended the step and none has
@@ -895,6 +965,29 @@ impl Routing {
     /// Whether both devices work on every layer.
     pub(super) fn shared(&self) -> bool {
         self.owned.is_some()
+    }
+}
+
+/// The tier of experts gives VRAM back when other programs need the devices'
+/// memory, and takes it again (`ares_runtime::vram`).
+impl VramUser for Flow {
+    fn vram(&self) -> Vec<VramHeld> {
+        match self.feed.try_lock() {
+            Ok(feed) => self.vram_of(&feed),
+            // A step holds the store: what it held when last seen.
+            Err(_) => self.vram_seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
+
+    fn allow_vram(&self, ordinal: u32, bytes: u64) {
+        let Some(d) = self.ordinals.iter().position(|o| *o == ordinal) else { return };
+        self.vram_allowed[d].store(bytes, Ordering::Release);
+        // At every look: what was given up goes back to the device once the
+        // device has moved what stays out of it, also while nothing runs.
+        if let Ok(mut feed) = self.feed.try_lock() {
+            self.follow_vram(&mut feed);
+            self.vram_of(&feed);
+        }
     }
 }
 

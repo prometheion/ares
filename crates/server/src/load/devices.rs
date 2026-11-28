@@ -9,10 +9,18 @@ use ares_model::qwen3vl;
 use super::{LoadError, join, refuse};
 use crate::plan::LoadOptions;
 
-/// A device that was opened, and what it had free then.
+/// A device that was opened, what it had free then, and what a plan may take
+/// of it ([`Device::room`]: the free memory less a reserve, or under a cap).
 pub(crate) struct Held {
     pub(crate) device: Device,
     pub(crate) free: u64,
+    pub(crate) room: u64,
+    /// What the engine leaves on the device, for the log.
+    pub(crate) limit: String,
+    /// What the process held there by NVML's count, when NVML says: an
+    /// unload checks against it what came back, since the expert slots give
+    /// and take VRAM while the model runs.
+    pub(crate) own: Option<u64>,
 }
 
 /// Opens the devices the operator named, or all the driver reports, and says
@@ -58,8 +66,11 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
     let mut held = Vec::new();
     for ordinal in &ordinals {
         let device = Device::open(*ordinal, Wait::Block)?;
+        let limit = super::vram::limit(&device)?;
         let free = device.mem_info()?.free;
-        held.push(Held { device, free });
+        let room = device.room()?;
+        let own = ares_cuda::device_use(device.info().pci).ok().map(|u| u.own);
+        held.push(Held { device, free, room, limit, own });
         describe(&held[held.len() - 1]);
     }
     Ok((ordinals, held))
@@ -143,7 +154,7 @@ pub(crate) fn describe(held: &Held) {
     let info = held.device.info();
     tracing::info!(
         "device {}: {}, compute capability {}.{}, {} of {} free, memory interface {} bit at {} \
-         MHz, PCI {}{}",
+         MHz, PCI {}{}; {}: a plan may take {}",
         info.ordinal,
         info.name,
         info.compute_capability.0,
@@ -154,6 +165,8 @@ pub(crate) fn describe(held: &Held) {
         info.memory_clock_khz / 1000,
         info.pci,
         pci_link(info).map(|link| format!(" ({link})")).unwrap_or_default(),
+        held.limit,
+        Bytes(held.room),
     );
 }
 
@@ -198,9 +211,9 @@ pub(crate) fn ordinals(held: &[Held]) -> String {
     join(held.iter().map(|h| h.device.ordinal()), ", ")
 }
 
-/// What each of `held` has free, in their order.
-pub(crate) fn free_of(held: &[Held]) -> Vec<u64> {
-    held.iter().map(|h| h.free).collect()
+/// What a plan may take of each of `held`, in their order.
+pub(crate) fn room_of(held: &[Held]) -> Vec<u64> {
+    held.iter().map(|h| h.room).collect()
 }
 
 /// The multiprocessors of each of `held`, in their order.

@@ -635,7 +635,8 @@ pub(super) fn choose(
     let (part, bounds) = (&opts.part, opts.bounds.as_deref());
     let mut memory = Vec::with_capacity(devices.len());
     for device in devices {
-        let free = device.mem_info()?.free;
+        // What the engine may take of the device (`ares_cuda::vram`).
+        let free = device.room()?;
         memory.push(DeviceMemory {
             budget: free.saturating_sub(opts.headroom),
             multiprocessors: device.info().multiprocessors,

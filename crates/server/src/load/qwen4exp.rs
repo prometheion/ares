@@ -170,7 +170,7 @@ pub(super) fn load(
         tracing::info!(
             "estimate, device {}: dense weights {}, recurrent state {}, K and V {} per 1000 \
              tokens, step buffers {}; room for expert slots {}, {:.1} % of the {} of experts it \
-             owns",
+             owns; of the {} a plan may take",
             h.device.ordinal(),
             Bytes(plan.weights),
             Bytes(plan.state),
@@ -179,6 +179,7 @@ pub(super) fn load(
             Bytes(plan.slots),
             100.0 * plan.slot_share(),
             Bytes(plan.experts),
+            Bytes(h.room),
         );
     }
 
@@ -441,7 +442,7 @@ fn hold_and_spread(options: &LoadOptions, asked: &Asked) -> Result<OnDevices, Lo
     }
     if options.split == Some(SplitKind::Single) && held.len() > 1 {
         // The device with the most room: that is what holds experts.
-        let most = (0..held.len()).max_by_key(|i| held[*i].free).unwrap_or(0);
+        let most = (0..held.len()).max_by_key(|i| held[*i].room).unwrap_or(0);
         let keep = held.swap_remove(most);
         held = vec![keep];
     }
@@ -460,7 +461,7 @@ fn hold_and_spread(options: &LoadOptions, asked: &Asked) -> Result<OnDevices, Lo
     };
     let tower_at = asked.projector.as_ref().map(|p| tower_of(&held, p.home()));
     if let (Some(t), Some(projector)) = (tower_at, &asked.projector) {
-        held[t].free = held[t].free.saturating_sub(projector.vram_bytes());
+        held[t].room = held[t].room.saturating_sub(projector.vram_bytes());
     }
     describe_links(&held)?;
     Ok(OnDevices { held, spread, why_split, tower_at })

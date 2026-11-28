@@ -312,6 +312,20 @@ pub const OPTIONS: &[Opt] = &[
          models take every format. The formats from q7 on store a tile of 128 cells relative \
          to its mean and keep the first tile and the newest cells exact [default: q8]",
     ),
+    Opt::server(
+        "--vram",
+        "<SIZE>",
+        "The most VRAM the engine may hold on a device, all loaded models together and \
+         everything the driver counts for it there (its context and the kernels' code too): \
+         one size for every device it uses (10G), or a size for each device by the driver's \
+         number (0:10G,1:11G; a device not named has no cap). Every plan keeps under it: \
+         weights, K and V, the expert slots of a mixture of experts, step buffers, drafters and \
+         the image tower. A device with a cap keeps no reserve [default: no cap; a device that \
+         drives a display, or on which other programs hold memory, keeps a reserve for them, \
+         and the engine gives the expert slots of a mixture of experts back when their memory \
+         grows]",
+    )
+    .heading("Device memory."),
     Opt::model(
         "--ram",
         "<SIZE>",

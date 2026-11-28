@@ -453,6 +453,94 @@ pub fn parse_size(text: &str) -> Option<u64> {
     (bytes.is_finite() && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
+/// The most VRAM the engine may hold on each device (`--vram`): everything the
+/// driver counts for the process there, its context and the kernels' code
+/// too, for all loaded models together. A device with a cap keeps no reserve
+/// for other programs: the operator decided what is left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VramCap {
+    /// The same cap on every device the engine uses (`--vram 10G`).
+    Every(u64),
+    /// A cap on each device named by the driver's ordinal (`--vram
+    /// 0:10G,1:11G`); a device not named has none.
+    Each(Vec<(u32, u64)>),
+}
+
+impl VramCap {
+    /// Reads the value of `--vram`: one size, or `device:size` pairs
+    /// separated by commas. `Err` says what is wrong.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let size = |text: &str| -> Result<u64, String> {
+            match parse_size(text) {
+                Some(0) => Err("a cap of 0 bytes leaves the engine nothing".into()),
+                Some(bytes) => Ok(bytes),
+                None => Err(format!("'{}' is not a size such as 10G or 512M", text.trim())),
+            }
+        };
+        if !text.contains(':') {
+            return size(text).map(Self::Every);
+        }
+        let mut each: Vec<(u32, u64)> = Vec::new();
+        for pair in text.split(',') {
+            let (device, bytes) = pair
+                .split_once(':')
+                .ok_or_else(|| format!("'{}' is not device:size, such as 0:10G", pair.trim()))?;
+            let device: u32 = device
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{}' is not a device number", device.trim()))?;
+            if each.iter().any(|(known, _)| *known == device) {
+                return Err(format!("device {device} is named twice"));
+            }
+            each.push((device, size(bytes)?));
+        }
+        Ok(Self::Each(each))
+    }
+
+    /// The cap of device `ordinal`.
+    pub fn of(&self, ordinal: u32) -> Option<u64> {
+        match self {
+            Self::Every(bytes) => Some(*bytes),
+            Self::Each(each) => each.iter().find(|(d, _)| *d == ordinal).map(|(_, bytes)| *bytes),
+        }
+    }
+
+    /// Whether the cap fits the devices the driver reports (`ordinal`, the
+    /// bytes it has) and the devices the models may use (`None`: all of them).
+    /// A cap on a device that is not there or that no model uses does
+    /// nothing, and one above what a device has cannot be: they are errors.
+    /// A cap of all a device has is one: the device keeps no reserve.
+    pub fn check(&self, devices: &[(u32, u64)], used: Option<&[u32]>) -> Result<(), String> {
+        let named: Vec<u32> = match self {
+            Self::Every(_) => {
+                used.map_or_else(|| devices.iter().map(|d| d.0).collect(), <[u32]>::to_vec)
+            }
+            Self::Each(each) => each.iter().map(|(d, _)| *d).collect(),
+        };
+        for ordinal in named {
+            let Some((_, total)) = devices.iter().find(|(d, _)| *d == ordinal) else {
+                let known: Vec<String> = devices.iter().map(|d| d.0.to_string()).collect();
+                return Err(format!(
+                    "there is no device {ordinal}; the driver reports {}",
+                    if known.is_empty() { "none".to_owned() } else { known.join(", ") }
+                ));
+            };
+            if used.is_some_and(|used| !used.contains(&ordinal)) {
+                return Err(format!("device {ordinal} is not one the engine uses (--devices)"));
+            }
+            let cap = self.of(ordinal).unwrap_or(0);
+            if cap > *total {
+                return Err(format!(
+                    "{} for device {ordinal} is more than the {} it has ({total} bytes)",
+                    Bytes(cap),
+                    Bytes(*total)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Parses a K/V format name.
 pub fn cache_format(name: &str) -> Option<CacheFormat> {
     CacheFormat::ALL.into_iter().find(|format| format_name(*format) == name)
@@ -619,6 +707,96 @@ mod tests {
         assert_eq!(near_pages(&[gib], &[gib - 100 * mib], &parts, 2049), None);
         // At least two pages stay in VRAM.
         assert_eq!(near_pages(&[2 * gib], &[gib], &[(gib, 1)], 2049), Some(2));
+    }
+
+    #[test]
+    fn a_vram_cap_is_one_size_or_a_size_per_device() {
+        let gib = 1u64 << 30;
+        assert_eq!(VramCap::parse("10G"), Ok(VramCap::Every(10 * gib)));
+        assert_eq!(
+            VramCap::parse("0:10G,1:11G"),
+            Ok(VramCap::Each(vec![(0, 10 * gib), (1, 11 * gib)]))
+        );
+        assert_eq!(VramCap::parse(" 1 : 512M "), Ok(VramCap::Each(vec![(1, 512 << 20)])));
+        assert_eq!(VramCap::parse("0:10G").unwrap().of(1), None);
+        assert_eq!(VramCap::parse("10G").unwrap().of(7), Some(10 * gib));
+        for (bad, why) in [
+            ("", "is not a size"),
+            ("lots", "is not a size"),
+            ("0", "leaves the engine nothing"),
+            ("1:0", "leaves the engine nothing"),
+            ("0:10G,0:11G", "device 0 is named twice"),
+            ("x:10G", "'x' is not a device number"),
+            ("0:10G,11G", "'11G' is not device:size"),
+            ("0:", "is not a size"),
+            ("-1:4G", "is not a device number"),
+        ] {
+            let said = VramCap::parse(bad).expect_err(bad);
+            assert!(said.contains(why), "{bad:?}: {said}");
+        }
+    }
+
+    #[test]
+    fn a_vram_cap_must_hold_something_back_on_a_device_the_engine_uses() {
+        let gib = 1u64 << 30;
+        let cards = [(0, 12 * gib), (1, 12 * gib)];
+        assert_eq!(VramCap::Every(10 * gib).check(&cards, None), Ok(()));
+        assert_eq!(VramCap::Every(12 * gib).check(&cards, None), Ok(()));
+        let said = VramCap::Every(13 * gib).check(&cards, None).unwrap_err();
+        assert_eq!(
+            said,
+            "13.00 GiB for device 0 is more than the 12.00 GiB it has (12884901888 bytes)"
+        );
+        let each = VramCap::Each(vec![(1, 8 * gib)]);
+        assert_eq!(each.check(&cards, None), Ok(()));
+        assert_eq!(each.check(&cards, Some(&[0, 1])), Ok(()));
+        let said = each.check(&cards, Some(&[0])).unwrap_err();
+        assert_eq!(said, "device 1 is not one the engine uses (--devices)");
+        let said = VramCap::Each(vec![(2, gib)]).check(&cards, None).unwrap_err();
+        assert_eq!(said, "there is no device 2; the driver reports 0, 1");
+        // One size for every device holds for the devices that are used.
+        assert_eq!(VramCap::Every(gib).check(&cards, Some(&[1])), Ok(()));
+    }
+
+    /// A plan under a cap is the plan of devices that have what the cap leaves: the pages of
+    /// context follow the fullest device, and the shares of a split leave the capped device
+    /// no more than it holds.
+    #[test]
+    fn a_plan_under_a_cap_keeps_to_what_the_cap_leaves_on_every_device() {
+        use ares_cuda::vram::{VramLimit, room_under};
+        let (gib, mib) = (1u64 << 30, 1u64 << 20);
+        let headroom = 256 * mib;
+        // Two cards with 11.5 GiB free; the process holds 150 MiB on each (its contexts).
+        let free = 11 * gib + 512 * mib;
+        let own = Some(150 * mib);
+        let room = |limit| room_under(free, limit, own).unwrap();
+        assert_eq!(room(None), free);
+        let capped = room(Some(VramLimit::Cap(9 * gib)));
+        assert_eq!(capped, 9 * gib - 150 * mib);
+        // The 27B's shape on two cards: weights and step 6 GiB and 4 GiB, 30 MiB a page.
+        let rooms = |usable: [u64; 2]| {
+            [(usable[0], 6 * gib), (usable[1], 4 * gib)].map(|(usable, fixed)| Room {
+                usable: usable - headroom,
+                fixed,
+                per_sequence: 150 * mib,
+                per_page: 30 * mib,
+            })
+        };
+        let all = pages_that_fit(&rooms([free, free]), 2);
+        let under = pages_that_fit(&rooms([capped, free]), 2);
+        assert!(under < all, "{under} of {all}");
+        // What the pages take on the capped card fits what the cap leaves.
+        let taken = 6 * gib + 2 * 150 * mib + u64::from(under) * 30 * mib + headroom;
+        assert!(taken <= capped && capped - taken < 30 * mib, "{taken} of {capped}");
+        // A reserve of a display comes off what is free the same way.
+        assert_eq!(room(Some(VramLimit::Reserve(768 * mib))), free - 768 * mib);
+        // Shares by bandwidth (0.6 / 0.4 of 16 GiB of weights) are lowered where the cap leaves
+        // a device less than its share.
+        let wanted = [0.6, 0.4];
+        let most = [(capped - headroom) as f64 / (16 * gib) as f64, 1.0];
+        let shares = ares_model::qwen35::device::fit_shares(&wanted, &most).unwrap();
+        assert!(shares[0] < 0.6 && (shares[0] - most[0]).abs() < 1e-9, "{shares:?}");
+        assert!((shares[0] + shares[1] - 1.0).abs() < 1e-9);
     }
 
     #[test]

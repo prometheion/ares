@@ -611,7 +611,7 @@ impl<'a> Chooser<'a> {
         };
 
         // The probes of every group, on weights as large as the device's.
-        let free = self.device.mem_info()?.free;
+        let free = self.device.room()?;
         let l2 = u64::from(self.device.info().l2_cache_bytes);
         let least = PROBE_WEIGHT_BYTES.max(2 * l2);
         let room = weight_bytes.min(free.saturating_sub(PROBE_HEADROOM_BYTES)).max(least);

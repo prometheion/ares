@@ -350,6 +350,25 @@ impl Device {
         Ok(MemInfo { free: free as u64, total: total as u64 })
     }
 
+    /// What the engine may still take of this device: what the driver reports
+    /// free, less the reserve the server keeps there for other programs, and
+    /// under a cap no more than the cap leaves beside what the process holds
+    /// there ([`crate::vram`]). Every plan asks this, not [`Device::mem_info`].
+    /// A cap needs NVML, which counts what the process holds.
+    pub fn room(&self) -> Result<u64> {
+        let free = self.mem_info()?.free;
+        let limit = crate::vram::vram_limit(self.ordinal());
+        let own = match limit {
+            Some(crate::vram::VramLimit::Cap(_)) => {
+                Some(crate::nvml::device_use(self.info().pci)?.own)
+            }
+            _ => None,
+        };
+        crate::vram::room_under(free, limit, own).ok_or_else(|| {
+            Error::Nvml("the cap of a device needs what the process holds there".into())
+        })
+    }
+
     /// Waits until everything submitted to the device has finished.
     pub fn synchronize(&self) -> Result<()> {
         let driver = self.bind()?;

@@ -21,6 +21,40 @@ pub(crate) type CUfunction = *mut c_void;
 pub(crate) type CUstream = *mut c_void;
 pub(crate) type CUevent = *mut c_void;
 
+pub(crate) type CUmemGenericAllocationHandle = u64;
+
+/// `CUmemLocation`: a device by its ordinal (`CU_MEM_LOCATION_TYPE_DEVICE`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CUmemLocation {
+    pub kind: c_int,
+    pub id: c_int,
+}
+
+/// `CUmemAllocationProp`: memory of one device, no handle to share it.
+#[repr(C)]
+pub(crate) struct CUmemAllocationProp {
+    pub kind: c_int,
+    pub requested_handle_types: c_int,
+    pub location: CUmemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    /// `allocFlags`: compression type, RDMA, usage, reserved; all 0.
+    pub alloc_flags: [u8; 8],
+}
+
+/// `CUmemAccessDesc`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CUmemAccessDesc {
+    pub location: CUmemLocation,
+    pub flags: c_int,
+}
+
+pub(crate) const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 1;
+pub(crate) const CU_MEM_LOCATION_TYPE_DEVICE: c_int = 1;
+pub(crate) const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_int = 3;
+pub(crate) const CU_MEM_ALLOC_GRANULARITY_MINIMUM: c_int = 0;
+
 pub(crate) const CUDA_SUCCESS: CUresult = 0;
 pub(crate) const CUDA_ERROR_NOT_READY: CUresult = 600;
 pub(crate) const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CUresult = 704;
@@ -119,6 +153,19 @@ driver_api! {
     fn mem_host_get_device_pointer = "cuMemHostGetDevicePointer_v2"(
         *mut CUdeviceptr, *mut c_void, c_uint
     );
+
+    fn mem_get_allocation_granularity = "cuMemGetAllocationGranularity"(
+        *mut usize, *const CUmemAllocationProp, c_int
+    );
+    fn mem_address_reserve = "cuMemAddressReserve"(*mut CUdeviceptr, usize, usize, CUdeviceptr, u64);
+    fn mem_address_free = "cuMemAddressFree"(CUdeviceptr, usize);
+    fn mem_create = "cuMemCreate"(
+        *mut CUmemGenericAllocationHandle, usize, *const CUmemAllocationProp, u64
+    );
+    fn mem_release = "cuMemRelease"(CUmemGenericAllocationHandle);
+    fn mem_map = "cuMemMap"(CUdeviceptr, usize, usize, CUmemGenericAllocationHandle, u64);
+    fn mem_unmap = "cuMemUnmap"(CUdeviceptr, usize);
+    fn mem_set_access = "cuMemSetAccess"(CUdeviceptr, usize, *const CUmemAccessDesc, usize);
 
     fn memcpy_htod = "cuMemcpyHtoD_v2"(CUdeviceptr, *const c_void, usize);
     fn memcpy_dtoh = "cuMemcpyDtoH_v2"(*mut c_void, CUdeviceptr, usize);

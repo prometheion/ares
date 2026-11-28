@@ -380,6 +380,7 @@ impl<'g> Session<'g> {
         for (index, device) in devices.iter().enumerate() {
             slots.push(device_slots(
                 device,
+                &devices,
                 &mut ledgers[index],
                 &mut pinned,
                 &plan.device_pools(index),

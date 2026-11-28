@@ -98,6 +98,20 @@ pub(super) fn pass_fits(
     sizes.iter().zip(lendable).all(|(s, l)| PassLayout::new(s, &chunks, l, far_slots).is_some())
 }
 
+/// The bytes of each piece of a loan that a pass of `rows` rows without cuts keeps on a part
+/// that keeps `sizes`, in what its device can lend (`lendable`), beside a copy of `far_slots`
+/// far slots; `None` when it does not fit.
+pub(super) fn pass_held(
+    sizes: &PassSizes,
+    lendable: &[u64],
+    own: u32,
+    rows: u32,
+    far_slots: u32,
+) -> Option<Vec<u64>> {
+    let (_, chunks) = shape_of(rows, own, &[]);
+    PassLayout::new(sizes, &chunks, lendable, far_slots).map(|layout| layout.held)
+}
+
 /// The most rows up to `asked` (and above `own`) that `fits`, which holds for fewer rows
 /// wherever it holds for more; `own` when no more rows fit.
 pub(super) fn pass_span(own: u32, asked: u32, fits: impl Fn(u32) -> bool) -> u32 {

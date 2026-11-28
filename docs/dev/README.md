@@ -25,7 +25,7 @@ repository and are not needed to build, run or test Ares.
 | [`sampling.md`](architecture/sampling.md) | The sampler on the device, request fields, probabilities, cost |
 | [`structured-output.md`](architecture/structured-output.md) | Grammars, schemas, tool-call rules and drafts under a rule |
 | [`weights.md`](architecture/weights.md) | Dense weights, expert tiers, K/V offload |
-| [`devices.md`](architecture/devices.md) | GPU classes, several devices, the 27B on two cards, the second card's role |
+| [`devices.md`](architecture/devices.md) | GPU classes, several devices, the 27B on two cards, the second card's role, the VRAM cap, reserve and watch |
 | [`kernels.md`](architecture/kernels.md) | Weight kernels for decode and prefill, float matrices, expert, layer and attention kernels, the tensor-core cap |
 | [`flash-next.md`](architecture/flash-next.md) | Flash-Next through the runtime: its MTP block, steps that wait for experts, the plan, K and V beyond VRAM, the prefix cache |
 | [`experts.md`](architecture/experts.md) | The experts' usage profile, members and loans, reading ahead, pruning |
@@ -50,6 +50,7 @@ repository and are not needed to build, run or test Ares.
 | [`claude-code.md`](experiments/claude-code.md) | Claude Code against Ares |
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
 | [`host-memory.md`](experiments/host-memory.md) | the expert tier's worth, giving memory back |
+| [`vram.md`](experiments/vram.md) | both models under a VRAM cap, the expert slots giving VRAM to a program that grows on the card, plans and speed without a cap |
 | [`server.md`](experiments/server.md) | priorities of requests |
 | [`load-and-stop.md`](experiments/load-and-stop.md) | a model loaded again in the same process, a stop while Flash-Next's tiers fill |
 | [`draft-vocab.md`](experiments/draft-vocab.md) | the ready draft vocabularies against the fork's list and none |
@@ -189,6 +190,7 @@ the old file moves its text into the file below.
 | &nbsp;&nbsp;Qwen3.8-27B on the two cards | [`architecture/devices.md`](architecture/devices.md) |
 | &nbsp;&nbsp;Qwen3.8-Flash-Next on the two cards | [`experiments/two-cards.md`](experiments/two-cards.md) |
 | &nbsp;&nbsp;What the second card is for | [`architecture/devices.md`](architecture/devices.md) |
+| &nbsp;&nbsp;VRAM: the cap, the reserve, the watch | [`architecture/devices.md`](architecture/devices.md) |
 | &nbsp;&nbsp;Qwen3.8-Flash-Next through the runtime | [`architecture/flash-next.md`](architecture/flash-next.md); "Wide steps" and from "Where a faster prompt path goes next" to "Long prompts layer by layer" in [`architecture/flash-next-prompts.md`](architecture/flash-next-prompts.md); from "The usage profile of the experts" to "Pruning as a fourth level" in [`architecture/experts.md`](architecture/experts.md) |
 | &nbsp;&nbsp;Vulkan | [`architecture/vulkan.md`](architecture/vulkan.md) |
 | The image tower | [`architecture/images.md`](architecture/images.md) |

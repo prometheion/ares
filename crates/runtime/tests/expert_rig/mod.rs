@@ -121,7 +121,29 @@ pub fn rig_reading(
     reader: Config,
     tune: impl FnOnce(&mut StoreConfig),
 ) -> Rig {
-    build(vram_slots, ram_slots, pieces, reader, None, tune)
+    build(vram_slots, ram_slots, pieces, reader, None, None, tune)
+}
+
+/// [`rig`] whose device has the memory of its pools in pieces of `piece`
+/// bytes, which the VRAM tier gives back and takes again.
+pub fn rig_vram_in_pieces(
+    vram_slots: u64,
+    ram_slots: u64,
+    piece: u64,
+    tune: impl FnOnce(&mut StoreConfig),
+) -> Rig {
+    build(vram_slots, ram_slots, None, Config::default(), None, Some((piece, false)), tune)
+}
+
+/// [`rig_vram_in_pieces`] whose device runs the copies out of slots behind the uploads and
+/// table entries wherever nothing orders the two ([`HostSlots::lagging`]).
+pub fn rig_vram_lagging(
+    vram_slots: u64,
+    ram_slots: u64,
+    piece: u64,
+    tune: impl FnOnce(&mut StoreConfig),
+) -> Rig {
+    build(vram_slots, ram_slots, None, Config::default(), None, Some((piece, true)), tune)
 }
 
 /// [`rig_in_pieces`] whose RAM tier `locker` locks, as the books of the RAM
@@ -133,7 +155,7 @@ pub fn rig_locked(
     locker: Box<dyn Locker>,
     tune: impl FnOnce(&mut StoreConfig),
 ) -> Rig {
-    build(vram_slots, ram_slots, Some(pieces), Config::default(), Some(locker), tune)
+    build(vram_slots, ram_slots, Some(pieces), Config::default(), Some(locker), None, tune)
 }
 
 fn build(
@@ -142,6 +164,7 @@ fn build(
     pieces: Option<(usize, usize)>,
     reader: Config,
     locker: Option<Box<dyn Locker>>,
+    vram_piece: Option<(u64, bool)>,
     tune: impl FnOnce(&mut StoreConfig),
 ) -> Rig {
     let dir = Scratch::new();
@@ -180,6 +203,11 @@ fn build(
     assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
     assert_eq!(plan.transit_slots(0), (transit, staging));
     let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
+    let device = match vram_piece {
+        Some((piece, false)) => device.with_pieces(piece),
+        Some((piece, true)) => device.with_pieces(piece).lagging(),
+        None => device,
+    };
     let mut region = match locker {
         Some(locker) => HostRegion::elastic(plan.ram_bytes(), plan.ram_bytes(), locker).unwrap(),
         None => HostRegion::unpinned(plan.ram_bytes(), plan.block()),

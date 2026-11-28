@@ -9,7 +9,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use ares_core::Ledger;
-use ares_cuda::{Device, DeviceBuffer, DevicePtr, Event, HostShare, PinnedBuffer, Stream};
+use ares_cuda::{
+    Device, DeviceBuffer, DevicePtr, DeviceRegion, Event, HostShare, PinnedBuffer, Stream,
+};
 
 use super::StoreError;
 
@@ -88,7 +90,40 @@ pub trait SlotDevice {
     /// Enqueues the host's sums for the record `token` of `layer` (rows of
     /// `n_embd` values), and behind them the mark that lets the layer go on.
     fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError>;
+
+    /// Makes the uploads and table entries enqueued from now on run behind
+    /// the copies out of slots enqueued so far, the moves among them: a move
+    /// writes its expert's entry on the stream of copies out of slots, and a
+    /// later entry of the same expert (its eviction, a new upload) must not
+    /// overtake it on the other stream.
+    fn order(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The pieces the memory of pool `pool` is given back and taken in: the
+    /// bytes of a piece (the last one may be shorter) and how many. `(0, 0)`:
+    /// the pool's memory stays as it is.
+    fn pieces(&self, _pool: usize) -> (u64, usize) {
+        (0, 0)
+    }
+
+    /// Gives the memory of piece `piece` of pool `pool` back to the device:
+    /// no slot of it is in use, and the device has done everything that read
+    /// or wrote it.
+    fn give_piece(&mut self, _pool: usize, _piece: usize) {}
+
+    /// Takes memory for piece `piece` of pool `pool` again. False when the
+    /// device has no room for it now, or its memory is not yet given back.
+    fn take_piece(&mut self, _pool: usize, _piece: usize) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }
+
+/// The bytes the memory of a pool of slots is given back and taken in, about
+/// (rounded up to the device's granularity, 2 MiB on the cards measured):
+/// taking or giving 64 MiB costs the driver a millisecond or less (see
+/// `ares_cuda::DeviceRegion`), and it is the piece of the RAM tier.
+pub const VRAM_PIECE: u64 = 64 << 20;
 
 /// Table entries on their way to the device: a ring in pinned memory. An
 /// entry's copy reads its cell when the stream gets to it, so a cell is
@@ -113,7 +148,10 @@ pub struct CudaSlots {
     /// the event behind that copy.
     going_down: HashMap<(usize, u32), Event>,
 
-    pools: Vec<(DeviceBuffer, u64)>,
+    /// One range per pool, its memory in pieces of [`VRAM_PIECE`] that the
+    /// tier gives back when other programs need the device's memory
+    /// (`vram.rs`), and the bytes from one slot to the next.
+    pools: Vec<(DeviceRegion, u64)>,
     tables: DeviceBuffer,
     n_experts: u32,
     entries: PinnedBuffer,
@@ -152,9 +190,12 @@ impl CudaSlots {
     /// Allocates the pools (`(slot bytes, slots)` each, in the order of the
     /// store's plan for this device) and the tables of `n_layers` layers of
     /// `n_experts` experts, after reserving them in the ledgers: `vram` for
-    /// this device, `pinned` for page-locked host memory.
+    /// this device, `pinned` for page-locked host memory. `peers` are the
+    /// other devices of the model, which may write into the pools' memory
+    /// while it is lent to a step's scratch.
     pub fn new(
         device: &Device,
+        peers: &[Device],
         vram: &mut Ledger,
         pinned: &mut Ledger,
         pools: &[(u64, u32)],
@@ -171,11 +212,19 @@ impl CudaSlots {
         let tables = DeviceBuffer::new(device, table_bytes)?;
         // SAFETY: the whole buffer, on this stream's device.
         unsafe { stream.fill(tables.ptr(), 0xFF, table_bytes as usize)? };
+        // A peer writes into a pool's memory only over peer access.
+        let mut writers = Vec::new();
+        for peer in peers.iter().filter(|p| p.ordinal() != device.ordinal()) {
+            if ares_cuda::peer_access(peer.ordinal(), device.ordinal())?.0 {
+                writers.push(peer.clone());
+            }
+        }
         let mut buffers = Vec::with_capacity(pools.len());
         for (index, (stride, slots)) in pools.iter().enumerate() {
             let bytes = stride * u64::from(*slots);
             vram.reserve(format!("expert slots {index} ({slots} of {stride} bytes)"), bytes)?;
-            buffers.push((DeviceBuffer::new(device, bytes.max(16))?, *stride));
+            buffers
+                .push((DeviceRegion::new(device, bytes.max(16), VRAM_PIECE, &writers)?, *stride));
         }
         stream.synchronize()?;
         Ok(Self {
@@ -422,6 +471,27 @@ impl SlotDevice for CudaSlots {
             )?;
         }
         Ok(())
+    }
+
+    fn order(&mut self) -> Result<(), StoreError> {
+        let event = self.event()?;
+        event.record(&self.down)?;
+        self.stream.wait_event(&event)?;
+        self.spare.push(event);
+        Ok(())
+    }
+
+    fn pieces(&self, pool: usize) -> (u64, usize) {
+        let region = &self.pools[pool].0;
+        (region.piece_bytes(), region.n_pieces())
+    }
+
+    fn give_piece(&mut self, pool: usize, piece: usize) {
+        self.pools[pool].0.unmap(piece);
+    }
+
+    fn take_piece(&mut self, pool: usize, piece: usize) -> Result<bool, StoreError> {
+        Ok(self.pools[pool].0.map(piece)?)
     }
 
     fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError> {
