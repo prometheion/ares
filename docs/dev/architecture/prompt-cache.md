@@ -211,7 +211,12 @@ and after a restart of the server. Nothing is written as it is computed.
   the pool (cached pages nobody holds make room), the devices take the bytes,
   and the pages enter the index in order, the last one with the checkpoint,
   which went into a checkpoint place; the buffers stay in RAM as copies. The
-  prompt then starts as from any cached prefix. When the checkpoint finds no
+  run holds its pages until the trim after the pump in which it ended is done
+  (`Cache::release_landed`), so the prompt finds them at the next step and
+  then starts as from any cached prefix. Until 2026-11-28 the run let go of
+  them as it ended: the trim took its far pages first when no other chain
+  ended in one, and the prompt waited for the same run again and again
+  (#104). When the checkpoint finds no
   place, what RAM holds goes for it, the first to go first and without a write
   (`Cache::import_place`): the prompt that waits outranks texts that may come
   again. A record that cannot be read or fails its checksum, a page of the

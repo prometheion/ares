@@ -338,7 +338,11 @@ fn decisions_and_generation_run_together_and_neither_changes_the_other() {
 #[test]
 fn a_cancelled_decision_ends_at_once_and_frees_what_it_held() {
     let model = model(Some(CHECKPOINT));
-    let gate = Gate::default();
+    // The gate holds the decision's first step until the cancel is in. A gate starts open,
+    // and an open one let a test thread that the machine kept waiting see the whole decision
+    // end before it cancelled (CI, #104).
+    let gate = Gate::new();
+    gate.close();
     let e = engine_with(&model, config(4), |host| host.with_gate(gate.clone()));
     let request = decision(&text_of(16, 200), questions(5));
     let id = request.id;

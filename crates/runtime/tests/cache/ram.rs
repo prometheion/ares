@@ -179,7 +179,10 @@ fn a_conversation_that_ram_gave_up_comes_back_from_ssd() {
 /// drive moves through RAM and one request's far pages). The conversation comes back from the
 /// drive, and its run is asked for once (#98 needed the cards to show its loop: the cache unit
 /// tests `far_pages_beyond_the_floor_leave_the_floor_its_place` and
-/// `a_run_whose_import_was_cut_is_not_asked_for_by_the_next_look` show its two causes).
+/// `a_run_whose_import_was_cut_is_not_asked_for_by_the_next_look` show its two causes). Where
+/// the run's far pages were the only ones at the end of a chain, the trim after the run came
+/// back took them, and the request asked for it again for ever: on CI's runners and now and then
+/// on a quiet machine (#104, `a_run_that_came_back_whole_is_left_to_the_look_after_the_trim`).
 #[test]
 fn a_conversation_with_far_pages_comes_back_from_ssd_beside_a_hungry_tier() {
     let dir = TempDir::new("far-floor");

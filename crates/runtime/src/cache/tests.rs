@@ -770,6 +770,53 @@ fn a_run_whose_import_was_cut_is_not_asked_for_by_the_next_look() {
 }
 
 #[test]
+fn a_run_that_came_back_whole_is_left_to_the_look_after_the_trim() {
+    // A text with its checkpoint goes to the drive and leaves RAM, as above.
+    let mut f = Following::new("landed");
+    let mut devices = Devices::default();
+    let hashes = f.hashes.clone();
+    assert!(f.cache.save(0, hashes[2], Owner(1), false).taken);
+    written(&mut f.cache);
+    for i in 1..10 {
+        f.text(i);
+    }
+    f.all_into_ram(&mut devices);
+    f.machine.has(0);
+    for _ in 0..3 {
+        f.trimmed(&mut devices);
+        f.written();
+        f.pumped(&mut devices);
+    }
+    assert!(f.cache.in_ram.as_ref().is_some_and(|ram| ram.get(hashes[0]).is_none()));
+
+    // Every page of the pool is far and the floor keeps none: once only the index holds
+    // the run, the trim takes it first.
+    f.cache.far = Some(FarPages { first: 0, page_bytes: PAGE });
+    let tokens: Vec<u64> = (0..13).collect();
+    let chain = f.cache.chain(&tokens);
+    let probe = f.cache.probe(&mut f.pool, Some(&mut devices), &chain, &tokens);
+    assert!(probe.found.computing.is_some(), "the run is brought back");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while f.cache.busy() {
+        assert!(std::time::Instant::now() < deadline, "the run did not come back");
+        f.cache.pump(&mut f.pool, &mut devices);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(f.cache.ssd_counters().imports_cut, 0, "it came whole");
+    // The trim after the pump in which it came leaves it to the prompt that waited for it,
+    // which then finds it, nobody else holding it (#104: the trim took its far pages, the
+    // prompt looked again and asked the drive for the same run, and so on for ever).
+    f.trimmed(&mut devices);
+    let again = f.cache.probe(&mut f.pool, None, &chain, &tokens);
+    assert!(again.found.computing.is_none(), "the drive was asked again");
+    assert_eq!((again.found.pages.len(), again.idle), (3, 3));
+    assert_eq!(f.cache.ssd_counters().imports, 1);
+    // After that look it is the prompt cache's like any page nobody holds.
+    f.trimmed(&mut devices);
+    assert!(!f.cache.index.holds(hashes[2]), "the next trim takes it");
+}
+
+#[test]
 fn the_coldest_of_a_full_ram_is_written_ahead_and_the_rest_waits() {
     // Room for the floor and four pages more: RAM writes what is beyond
     // room for its reserve of sixteen pages.
