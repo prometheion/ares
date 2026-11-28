@@ -88,7 +88,8 @@ pump's rounds.
 - **Counted** in `/metrics`: `ares_cache_ram_pages`, `ares_cache_ram_bytes`,
   `ares_cache_ram_pages_in_total`, `ares_cache_ram_pages_read_total`,
   `ares_cache_ram_pages_dropped_total` (pages worth keeping that went
-  unwritten: no room, or no level on SSD), and for both levels at once
+  unwritten: no room, or no level on SSD; a page the drive has, or that the
+  writer has been given, is not one of them), and for both levels at once
   `ares_cache_transfer_nanoseconds_total` (the conductor's wait for the
   batches of transfers, counted once whichever level a batch serves).
 - **Measured** 2026-11-16 with the server: Qwen3.8-27B Q4_K_S on the RTX 4070

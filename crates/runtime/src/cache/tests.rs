@@ -549,6 +549,36 @@ fn a_page_that_leaves_the_devices_goes_to_ram_and_comes_back_from_there() {
 }
 
 #[test]
+fn a_page_that_finds_no_room_in_ram_counts_as_dropped_only_when_the_drive_lacks_it() {
+    let mut f = Following::new("lost");
+    let mut devices = Devices::default();
+    // Text 0 goes into RAM and from there to the drive; text 1 stays on the devices.
+    let stored = f.text(0);
+    f.all_into_ram(&mut devices);
+    for hash in &stored {
+        f.cache.clean(Item::Page, *hash);
+    }
+    assert_eq!(f.written().pages_written, 3);
+    let only_here = f.text(1);
+    // A page of each leaves the devices and finds no room in RAM, as happens on a machine
+    // that has room for the floor alone while the floor's buffers are with the readers and
+    // the writer: only the one the drive lacks is dropped unwritten.
+    let leaving = |hashes: &[ChainHash]| Leaving {
+        page: PageId(0),
+        hash: hashes[1],
+        parent: hashes[0],
+        depth: 2,
+        tail: None,
+        checkpoint: None,
+        worth: true,
+    };
+    f.cache.lost(leaving(&stored));
+    assert_eq!(f.cache.ram_counters().pages_dropped, 0, "the drive has it");
+    f.cache.lost(leaving(&only_here));
+    assert_eq!(f.cache.ram_counters().pages_dropped, 1, "the drive lacks it");
+}
+
+#[test]
 fn what_leaves_ram_goes_to_the_drive_and_without_one_it_is_dropped() {
     for ssd in [true, false] {
         let mut f = Following::with(&format!("shrink-{ssd}"), ssd, 4 * STATE + 64 * PAGE);
