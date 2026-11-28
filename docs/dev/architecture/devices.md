@@ -513,7 +513,14 @@ moves and the copies down of what was evicted, where no job runs
 (`gate::retire`). The numbers of the slots without memory stay set aside
 until the memory comes back; then they come back empty and fill as empty
 slots do. That is the bookkeeping of a loan of VRAM to a wide step's scratch
-(`Tier::vacate`, `ExpertStore::vacate_on_device`), and the two keep apart:
+(`Tier::vacate`, `ExpertStore::vacate_on_device`). A move writes its expert's
+table entry on the stream of copies out of slots, and every vacate ends with
+the stream of uploads waiting for that stream (`SlotDevice::order`): an
+eviction of the same expert from the next piece given at the same end of a
+step would otherwise overtake the move's entry, which then names a slot that
+holds another expert or has no memory (seen on the local cards as an illegal
+address and as steps that stood still, `experiments/vram.md`). The two keep
+apart:
 a loan takes the last slots of a pool, and the slots that the steps on lent
 VRAM were sized for at load (the lent steps' pieces, and a pass of the most
 rows laid out without cuts, with a piece more for the cuts) never go
@@ -531,7 +538,7 @@ recurrent state, the step buffers, the drafters and the image tower: what the
 model runs on. The pages of the prompt cache in the device pool do not give
 way either: the pool is one planned reservation whose pages lie anywhere in
 it, so giving its memory back would need the pool in pieces and the pages
-moved out of them, which is not built. When less than the headroom is free and
+moved out of them, which is not built. Measurements: [`../experiments/vram.md`](../experiments/vram.md). When less than the headroom is free and
 nothing more can go (a dense model, or the tier at its floor), the watch says
 so in the log, once until memory is free again, and the engine runs on.
 

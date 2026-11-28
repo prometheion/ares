@@ -50,6 +50,7 @@ repository and are not needed to build, run or test Ares.
 | [`claude-code.md`](experiments/claude-code.md) | Claude Code against Ares |
 | [`images.md`](experiments/images.md) | the image tower and images in a prompt |
 | [`host-memory.md`](experiments/host-memory.md) | the expert tier's worth, giving memory back |
+| [`vram.md`](experiments/vram.md) | both models under a VRAM cap, the expert slots giving VRAM to a program that grows on the card, plans and speed without a cap |
 | [`server.md`](experiments/server.md) | priorities of requests |
 | [`load-and-stop.md`](experiments/load-and-stop.md) | a model loaded again in the same process, a stop while Flash-Next's tiers fill |
 | [`draft-vocab.md`](experiments/draft-vocab.md) | the ready draft vocabularies against the fork's list and none |
