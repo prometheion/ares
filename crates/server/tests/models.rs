@@ -609,7 +609,7 @@ async fn an_engine_stuck_in_a_step_asks_for_a_restart_and_every_request_is_told_
     // an unload would ask its driver to free what it holds.
     drop(on_a);
     w.models.shutdown().await;
-    assert_eq!(w.machine.log(), ["load a", "load d", "unload d"]);
+    assert_eq!(w.machine.log(), ["load a", "load d", "stop", "unload d"]);
 }
 
 // --- start and shutdown -----------------------------------------------------------
