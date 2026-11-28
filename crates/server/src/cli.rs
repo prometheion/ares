@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use ares_server::ini;
 use ares_server::options::{self, Kind, ModelOptions, OPTIONS, Opt, Scope};
+use ares_server::plan::VramCap;
 
 /// What `--help` prints before the options.
 const HEAD: &str = "\
@@ -136,6 +137,8 @@ pub struct Options {
     /// The preset file of `--models-preset`; without one `model` is the one
     /// model to serve.
     pub presets: Option<PathBuf>,
+    /// `--vram`: the most VRAM the engine may hold on its devices.
+    pub vram: Option<VramCap>,
     pub model: ModelOptions,
     /// The options of a model as they were given, by their names and in
     /// their order: with a preset file they are set again over every section.
@@ -240,6 +243,9 @@ pub enum CliError {
     Placed { place: String, message: String },
     #[error("option '{flag}': '{value}' is not {expected}")]
     InvalidValue { flag: &'static str, value: String, expected: &'static str },
+    /// A value that reads as its option's kind but says what cannot be.
+    #[error("option '{flag}': '{value}': {why}")]
+    Refused { flag: &'static str, value: String, why: String },
     #[error("option '{0}' is given twice")]
     Repeated(&'static str),
     #[error("options '{}' and '{}': {reason}", flags[0], flags[1])]
@@ -294,6 +300,7 @@ struct Reading {
     log: LogOptions,
     access: AccessOptions,
     presets: Option<PathBuf>,
+    vram: Option<VramCap>,
     model: ModelOptions,
     given: Vec<(&'static str, String)>,
 }
@@ -310,6 +317,10 @@ impl Reading {
                 self.port = value.trim().parse().map_err(|_| CliError::InvalidPort(value))?;
             }
             "--models-preset" => self.presets = Some(PathBuf::from(value)),
+            "--vram" => match VramCap::parse(&value) {
+                Ok(cap) => self.vram = Some(cap),
+                Err(why) => return Err(CliError::Refused { flag, value, why }),
+            },
             "--log-format" => {
                 self.log.json = match value.as_str() {
                     "text" => false,
@@ -463,6 +474,7 @@ pub fn parse_with(
         log: LogOptions::default(),
         access: AccessOptions::default(),
         presets: None,
+        vram: None,
         model: ModelOptions::default(),
         given: Vec::new(),
     };
@@ -472,7 +484,7 @@ pub fn parse_with(
             None => error,
         })?;
     }
-    let Reading { host, port, timeout, log, access, presets, model, given } = reading;
+    let Reading { host, port, timeout, log, access, presets, vram, model, given } = reading;
     let named = !model.load.model.as_os_str().is_empty();
     match (named, &presets) {
         (false, None) => return Err(CliError::NoModel),
@@ -483,7 +495,7 @@ pub fn parse_with(
     // checked with it when the file is read.
     model.check()?;
     let timeout = std::time::Duration::from_secs(timeout);
-    let options = Options { host, port, timeout, log, access, presets, model, given };
+    let options = Options { host, port, timeout, log, access, presets, vram, model, given };
     Ok(Command::Run(Box::new(options)))
 }
 
@@ -1214,6 +1226,24 @@ mod tests {
         // A switch in the environment says true or false.
         let options = run_with(&["--model=m"], &[("ARES_LOG_TEXT", "true")]);
         assert!(options.log.text);
+    }
+
+    #[test]
+    fn the_vram_cap_is_an_option_of_the_server() {
+        assert_eq!(run(&["--model=m"]).vram, None);
+        assert_eq!(run(&["--model=m", "--vram", "10G"]).vram, Some(VramCap::Every(10 << 30)));
+        let options = run(&["--models-preset", "m.ini", "--vram=0:10G,1:512M"]);
+        assert_eq!(options.vram, Some(VramCap::Each(vec![(0, 10 << 30), (1, 512 << 20)])));
+        assert!(options.given.is_empty(), "not an option of a model: {:?}", options.given);
+        let options = run_with(&["--model=m"], &[("ARES_VRAM", "8G")]);
+        assert_eq!(options.vram, Some(VramCap::Every(8 << 30)));
+        match parse_strs(&["--model=m", "--vram", "0:1G,0:2G"]) {
+            Err(error @ CliError::Refused { .. }) => assert_eq!(
+                error.to_string(),
+                "option '--vram': '0:1G,0:2G': device 0 is named twice"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

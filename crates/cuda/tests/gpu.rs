@@ -9,9 +9,10 @@
 //! ARES_TEST_CUDA=1 cargo test -p ares-cuda --test gpu
 //! ```
 
+use ares_cuda::vram::{VramLimit, set_vram_limit};
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, Kernels, PinnedBuffer, Stream, Wait, device_count,
-    devices, driver_version, peer_access,
+    Device, DeviceBuffer, DevicePtr, Event, Kernels, PinnedBuffer, Stream, Wait,
+    device_count, device_use, devices, driver_version, peer_access,
 };
 use common::{Rng, f32_bytes, gpus, read_f32, upload_f32};
 
@@ -74,6 +75,30 @@ fn an_allocation_that_cannot_fit_is_reported_as_out_of_memory() {
     let Some(gpus) = gpus() else { return };
     let error = DeviceBuffer::new(&gpus[0], 1 << 40).unwrap_err();
     assert!(error.is_out_of_memory(), "{error}");
+}
+
+/// What a plan may take of a device: all that is free, that less a reserve, or what a cap
+/// leaves beside what the process holds.
+#[test]
+fn the_room_of_a_device_follows_its_limit() {
+    let Some(gpus) = gpus() else { return };
+    let mib = 1u64 << 20;
+    let device = &gpus[0];
+    let ordinal = device.ordinal();
+    let free = device.mem_info().unwrap().free;
+    let near = |a: u64, b: u64| a.abs_diff(b) <= 8 * mib;
+    assert!(near(device.room().unwrap(), free));
+    set_vram_limit(ordinal, Some(VramLimit::Reserve(1 << 30)));
+    assert!(near(device.room().unwrap(), free - (1 << 30)));
+    let own = device_use(device.info().pci).unwrap().own;
+    set_vram_limit(ordinal, Some(VramLimit::Cap(own + 512 * mib)));
+    assert!(near(device.room().unwrap(), 512 * mib), "{}", device.room().unwrap());
+    // What the process takes comes off the room under a cap.
+    let held = DeviceBuffer::new(device, 256 * mib).unwrap();
+    assert!(near(device.room().unwrap(), 256 * mib), "{}", device.room().unwrap());
+    drop(held);
+    set_vram_limit(ordinal, None);
+    assert!(near(device.room().unwrap(), free));
 }
 
 #[test]

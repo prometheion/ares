@@ -7,7 +7,10 @@
 //! - [`devices`] and [`peer_access`] describe the hardware without touching
 //!   device memory.
 //! - [`Device`] opens a device of a class this build runs ([`BUILT_CLASSES`]:
-//!   the tested ones; other GPUs are for the Vulkan backend). [`DeviceBuffer`]
+//!   the tested ones; other GPUs are for the Vulkan backend);
+//!   [`Device::room`] is what the engine may take of it ([`vram`]: a cap or a
+//!   reserve), and [`device_use`] what NVML says of its memory and displays.
+//!   [`DeviceBuffer`]
 //!   and [`PinnedBuffer`] own memory on it and next to it; [`gate`] says when
 //!   page-locked memory may change (never while a device runs a step).
 //! - [`Stream`] and [`Event`] order work on a device and between devices.
@@ -33,11 +36,13 @@ mod layers;
 mod memory;
 mod mesh;
 mod module;
+mod nvml;
 mod q4;
 mod sampler;
 mod stream;
 mod sys;
 mod tower;
+pub mod vram;
 
 pub use attention::{
     ATTN_STATUS_DIRECT_MEAN, ATTN_STATUS_NONFINITE, ATTN_STATUS_OVERFLOW, AttendBuffers,
@@ -71,6 +76,7 @@ pub use layers::{MERGE_MAX_WIDTH, MergeNorm, Wire, partial_wire_bytes};
 pub use memory::{DeviceBuffer, DevicePtr, HostRegistration, PinnedBuffer};
 pub use mesh::{Lane, Mesh, PUSH_MAX_ROWS, PUSH_MAX_VALUES, Parcel, PushSlot, Route};
 pub use module::{Args, Function, MAX_ARGS, Module};
+pub use nvml::{DeviceUse, Process, device_use, nvml_available};
 pub use q4::{
     Arrival, Departure, HAND_OVER_MAX_PIECES, IndexerShape, KeyFormat, ListHandOver, MixerMatrix,
     NgramShape, Q4Kernels, ReadWrite, SELECT_MAX_BLOCKS, SelectionRule,

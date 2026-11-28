@@ -37,8 +37,25 @@ Ares was tested with one card and with two.
 
 The defaults are in [options.md](options.md#where-the-model-goes). On
 Flash-Next, `--split tensor` takes exactly two devices, and how the two share a
-layer is measured at load. The engine leaves 256 MiB of each device for the
-driver and whatever else uses the card; the start log says what each device holds.
+layer is measured at load. The start log says what each device holds.
+
+## VRAM
+
+A load plans what it takes of each device against what the device has free
+then, less what the engine leaves there, and the start log says for every
+device what a plan may take and why:
+
+| What is left | When | How much |
+| --- | --- | --- |
+| A cap | `--vram 10G`, or `--vram 0:10G,1:11G` for each device | The engine holds no more than this on the device, everything the driver counts for it there (what `nvidia-smi` shows for the process). |
+| A reserve for a display | The device drives a display: NVML says a display is active on it, or Linux's DRM lists a connected display of the card | A sixteenth of the device's memory, or 32 frames of its displays (4 bytes a pixel of their preferred modes), whichever is more: about 750 MiB on a 12 GiB card with a 1080p display, about 1 GiB on an 8 GiB card with a 4K display. |
+| A reserve for other programs | Other processes hold memory on the device when a model loads | As much as they hold, at most a sixteenth of the device. |
+
+Without a cap and on a device that drives no display and that nothing else
+uses, nothing is held back but 256 MiB for the driver beside the engine's own
+buffers. A cap replaces the reserve on its device: what is left is the
+operator's choice. Without NVML (`libnvidia-ml.so.1`, which comes with the
+driver) a cap is refused and only DRM tells of a display.
 
 ## Peer access between cards
 

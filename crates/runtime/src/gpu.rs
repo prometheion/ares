@@ -973,7 +973,9 @@ impl Worker {
             ..
         } = init;
         let devices = model.devices();
-        let free = device.mem_info()?.free;
+        // What the engine may take of the device: its free memory, less a
+        // reserve or under a cap (`ares_cuda::vram`).
+        let free = device.room()?;
         let mut ledger = Ledger::new(
             format!("CUDA{}", device.ordinal()),
             free.saturating_sub(config.vram_headroom),

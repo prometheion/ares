@@ -25,7 +25,7 @@ use ares_model::qwen35::device::{
 use ares_tokenizer::Tokenizer;
 
 use super::devices::{
-    Held, bandwidth, describe_links, free_of, hold_devices, multiprocessors_of, ordinals, tower_of,
+    Held, bandwidth, describe_links, hold_devices, multiprocessors_of, ordinals, room_of, tower_of,
 };
 use super::files::{chat_options, drafter_files, mtp_takes_part, open_projector, read_vocabulary};
 use super::products::products_line;
@@ -66,7 +66,7 @@ pub(super) fn load(
     let tower_bytes = asked.projector.as_ref().map_or(0, Projector::vram_bytes);
     let mut tower_at = asked.projector.as_ref().map(|p| tower_of(&held, p.home()));
     if let Some(t) = tower_at {
-        held[t].free = held[t].free.saturating_sub(tower_bytes);
+        held[t].room = held[t].room.saturating_sub(tower_bytes);
     }
     let part_options = asked.part_options(options)?;
     let plan = Planning {
@@ -89,7 +89,7 @@ pub(super) fn load(
             if let Some(t) = tower_at
                 && t != chosen
             {
-                keep.free = keep.free.saturating_sub(tower_bytes);
+                keep.room = keep.room.saturating_sub(tower_bytes);
             }
             tower_at = tower_at.map(|_| 0);
             held = vec![keep];
@@ -123,14 +123,15 @@ pub(super) fn load(
     for (h, f) in held.iter().zip(&footprint) {
         tracing::info!(
             "estimate, device {}: weights {}, step scratch and small buffers {}, recurrent \
-             state {} per sequence, K and V {} per 1000 tokens; with this plan {} of {} free",
+             state {} per sequence, K and V {} per 1000 tokens; with this plan {} of the {} a \
+             plan may take",
             h.device.ordinal(),
             Bytes(f.weights),
             Bytes(f.step),
             Bytes(f.per_sequence),
             Bytes(f.per_page * 1000 / u64::from(CELLS_PER_PAGE)),
             Bytes(f.total(parallel, pages)),
-            Bytes(h.free),
+            Bytes(h.room),
         );
     }
     drop(plan);
@@ -340,7 +341,7 @@ impl Planning<'_> {
 
     /// The pages of sequence state that fit on `held` next to `footprint`.
     fn pages_that_fit(&self, held: &[Held], footprint: &[Footprint]) -> u32 {
-        let rooms: Vec<Room> = free_of(held)
+        let rooms: Vec<Room> = room_of(held)
             .iter()
             .zip(footprint)
             .map(|(free, f)| Room {
@@ -468,7 +469,7 @@ impl Planning<'_> {
                     .attention_for_context(
                         self.part,
                         self.parallel,
-                        &free_of(held),
+                        &room_of(held),
                         &multiprocessors_of(held),
                         &shares,
                         VRAM_HEADROOM,
@@ -508,7 +509,7 @@ impl Planning<'_> {
         let most: Vec<f64> = held
             .iter()
             .map(|h| {
-                let usable = h.free.saturating_sub(VRAM_HEADROOM + whole.per_device);
+                let usable = h.room.saturating_sub(VRAM_HEADROOM + whole.per_device);
                 usable as f64 / whole.shared.max(1) as f64
             })
             .collect();
@@ -524,10 +525,10 @@ impl Planning<'_> {
             None => {
                 let error = refuse(format!(
                     "the model does not fit on the devices: it needs about {} with a context of \
-                     {} tokens, and they have {} free",
+                     {} tokens, and a plan may take {} of them",
                     Bytes(whole.shared + whole.per_device * held.len() as u64),
                     self.smallest,
-                    Bytes(held.iter().map(|h| h.free.saturating_sub(VRAM_HEADROOM)).sum()),
+                    Bytes(held.iter().map(|h| h.room.saturating_sub(VRAM_HEADROOM)).sum()),
                 ));
                 Err(short(site, error))
             }
@@ -551,9 +552,9 @@ impl Planning<'_> {
             join(
                 held.iter().zip(footprint).map(|(h, f)| {
                     format!(
-                        "device {} has {} free and the model takes {}{without_k_and_v}",
+                        "a plan may take {} of device {} and the model takes {}{without_k_and_v}",
+                        Bytes(h.room),
                         h.device.ordinal(),
-                        Bytes(h.free),
                         Bytes(f.fixed(parallel))
                     )
                 }),
@@ -746,15 +747,18 @@ fn log_taken(
             Bytes(taken.saturating_sub(report.ledger.iter().map(|(_, bytes)| bytes).sum())),
         );
         let really = taken.saturating_sub(kv_bytes);
+        // What a plan could still take there: under the cap, or beside the
+        // reserve.
+        let room = h.device.room()?;
         tracing::info!(
-            "device {}: the model without K and V took {} (estimated {}); {} are free beyond \
-             the {} left unreserved, room for about {} more tokens of context",
+            "device {}: the model without K and V took {} (estimated {}); a plan may take {} \
+             more beyond the {} left unreserved, room for about {} more tokens of context",
             h.device.ordinal(),
             Bytes(really),
             Bytes(f.fixed(parallel)),
-            Bytes(free.saturating_sub(VRAM_HEADROOM)),
+            Bytes(room.saturating_sub(VRAM_HEADROOM)),
             Bytes(VRAM_HEADROOM),
-            (free.saturating_sub(VRAM_HEADROOM) / report.page_bytes.max(1))
+            (room.saturating_sub(VRAM_HEADROOM) / report.page_bytes.max(1))
                 .saturating_mul(u64::from(CELLS_PER_PAGE)),
         );
         let layouts = &report.layouts;

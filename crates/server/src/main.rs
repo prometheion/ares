@@ -46,7 +46,7 @@ async fn main() -> ExitCode {
     // One model on the command line is the one preset of a server without a
     // preset file. A file that cannot be served is refused here, with its
     // line, before anything is started.
-    let cli::Options { host, port, timeout, log, access, presets, model, given } = options;
+    let cli::Options { host, port, timeout, log, access, presets, vram, model, given } = options;
     let (presets, single) = match &presets {
         Some(file) => match Presets::read(file, &given) {
             Ok(presets) => (presets, None),
@@ -62,6 +62,16 @@ async fn main() -> ExitCode {
         }
     };
 
+    // The VRAM cap is the server's, for the devices of every model: one that
+    // cannot be is refused before anything is started.
+    let used: Option<Vec<u32>> = presets.models.iter().try_fold(Vec::new(), |mut all, preset| {
+        all.extend(preset.options.load.devices.as_ref()?);
+        Some(all)
+    });
+    if let Err(error) = ares_server::load::set_vram_cap(vram, used.as_deref()) {
+        eprintln!("error: {error}\nrun 'ares --help' for the options");
+        return ExitCode::from(2);
+    }
     if let Err(error) = start_log(&log) {
         eprintln!("error: {error}");
         return ExitCode::from(2);

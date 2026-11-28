@@ -46,6 +46,7 @@ tested on an RTX 4070 with an RTX 3060 and on an RTX 4060 Ti (see
 | Prompt cache in RAM | inside `--ram`, the lowest user of it; one checkpoint place is always kept |
 | Prompt cache on SSD | `--cache <DIR>`, `--cache-size`; a conversation resumes after an unload and a restart |
 | One RAM limit | `--ram` covers all page-locked memory; the engine gives memory back when the machine needs it |
+| A VRAM cap | `--vram` caps what the engine holds on each device; a device that drives a display or that other programs use keeps a reserve for them without asking |
 | Usage profile | Flash-Next fills its expert tiers from a profile of use at the start |
 
 ## API

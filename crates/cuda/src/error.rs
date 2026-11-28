@@ -27,6 +27,10 @@ pub enum Error {
     NoSuchKernel(String),
     #[error("{what}: {detail}")]
     Invalid { what: &'static str, detail: String },
+    /// NVML, the driver's management library, could not be used or refused a
+    /// call ([`crate::device_use`]).
+    #[error("NVML: {0}")]
+    Nvml(String),
 }
 
 impl Error {

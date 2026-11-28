@@ -20,6 +20,8 @@
 //! - `devices.rs` opens and describes the devices and their links.
 //! - `ram.rs` is the host RAM of both: one limit, what the engine needs to
 //!   run, and the machine it follows (`Budget`).
+//! - `vram.rs` is what the engine leaves on each device: the cap of `--vram`,
+//!   or a reserve for other programs where the device shows the need.
 //! - `start.rs` is the tail both share: the runtime's settings, the start,
 //!   what the engine found when it started.
 
@@ -31,6 +33,7 @@ mod qwen35;
 mod qwen4exp;
 mod ram;
 mod start;
+mod vram;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,6 +46,7 @@ use ares_runtime::Runtime;
 pub(crate) use devices::Held;
 pub(crate) use files::chat_options;
 pub use ram::{follow, machine};
+pub use vram::set_vram_cap;
 
 use crate::models::{LoadFailure, Loader, Site, Unit};
 use crate::plan::LoadOptions;
